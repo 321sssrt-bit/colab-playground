@@ -301,14 +301,18 @@ impl AppState {
             cx.theme().mode()
         );
         cx.set_global(GlobalAppState(state.clone()));
+        // Globals are dropped after the app's entities, so a handle kept in one would outlive
+        // them; release it when the app quits.
+        cx.on_app_quit(|cx| {
+            cx.remove_global::<GlobalAppState>();
+            async {}
+        })
+        .detach();
         // Cmd+Q (bound with the app menu on macOS only) asks the same question as closing the
         // window.
         platform::install_quit(cx);
         cx.on_action(|_: &platform::Quit, cx: &mut App| {
-            let state = AppState::global(cx);
-            if state.update(cx, |state, cx| state.may_close(cx)) {
-                cx.quit();
-            }
+            AppState::global(cx).update(cx, |state, cx| state.request_quit(cx));
         });
         state
     }

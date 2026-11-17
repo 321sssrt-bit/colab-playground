@@ -134,10 +134,13 @@ impl RootView {
             ),
             fields: Default::default(),
         };
-        // Closing with runtimes still billing asks first (system and drawn close alike).
-        let guard = state.clone();
+        // Closing (system and drawn close alike) quits, asking first while runtimes still
+        // bill. The close itself never removes the window: quitting does. Ely keeps the check
+        // in a global, so it holds the state weakly.
+        let guard = state.downgrade();
         ely_gpui_component::shell::guard_close(window, cx, move |_, cx| {
-            guard.update(cx, |state, cx| state.may_close(cx))
+            guard.update(cx, |state, cx| state.request_quit(cx)).ok();
+            false
         });
         let subscriptions = vec![
             cx.observe(&state, |_, _, cx| cx.notify()),

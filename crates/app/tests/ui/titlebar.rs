@@ -214,7 +214,7 @@ fn with_a_dialog_open_one_click_on_close_asks_before_quitting(cx: &mut TestAppCo
     ignore = "drawn caption buttons are Windows chrome"
 )]
 #[gpui::test]
-fn with_a_dialog_open_and_nothing_billing_one_click_closes(cx: &mut TestAppContext) {
+fn with_a_dialog_open_and_nothing_billing_one_click_quits(cx: &mut TestAppContext) {
     let mut app = TestApp::with(cx, Options::scenario(MockScenario::single()));
     app.click(Route::Sessions.nav_selector());
     app.click(colab_playground::ui::pages::sessions::NEW_SESSION_SELECTOR);
@@ -223,12 +223,20 @@ fn with_a_dialog_open_and_nothing_billing_one_click_closes(cx: &mut TestAppConte
         "a dialog is open"
     );
     let close = app.bounds("caption-Close").expect("the close button");
-    // The window goes away, so click without the harness's settle (which needs the window).
+    // The app quits, so click without the harness's settle.
     app.cx
         .simulate_click(close.center(), gpui::Modifiers::none());
     app.cx.run_until_parked();
-    let windows = (**app.cx).update(|cx| cx.windows().len());
-    assert_eq!(windows, 0, "one click closed the window");
+    assert!(
+        app.state
+            .read_with(&*app.cx, |state, _| state.quit_approved()),
+        "one click quits"
+    );
+    assert!(
+        app.state
+            .read_with(&*app.cx, |state, _| state.overlay().is_none()),
+        "no quit prompt"
+    );
 }
 
 /// Clicks `control` with a dialog open. The test platform does not implement minimising or

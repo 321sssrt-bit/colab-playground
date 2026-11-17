@@ -1,6 +1,6 @@
 //! Quitting while runtimes still bill. The window's close check (Ely's `guard_close`, which
-//! covers the drawn and the system close) asks [`AppState::may_close`]; when something is
-//! billing, or the app cannot tell, it opens the quit prompt instead of closing.
+//! covers the drawn and the system close) calls [`AppState::request_quit`]; when something is
+//! billing, or the app cannot tell, it opens the quit prompt instead of quitting.
 //!
 //! "Leave running" is only described as watched by a watchdog for runtimes that have one;
 //! runtimes opened elsewhere, or whose watchdog on the runtime is not armed (it failed, was
@@ -90,18 +90,21 @@ impl AppState {
         billing
     }
 
-    /// Whether the window may close now; opens the quit prompt otherwise.
-    pub fn may_close(&mut self, cx: &mut Context<Self>) -> bool {
+    /// A close or Quit: with nothing billing the app quits, otherwise the quit prompt opens.
+    /// The window itself never closes on request; quitting closes it (see `approve_quit`).
+    pub fn request_quit(&mut self, cx: &mut Context<Self>) {
         if self.quit == QuitState::Approved {
-            return true;
+            // Already quitting.
+            return;
         }
         if matches!(self.overlay, Some(Overlay::Quit(_))) {
             // Already asking (maybe mid "Stop all"): keep that prompt as it is.
-            return false;
+            return;
         }
         let billing = self.billing();
         if !billing.any() {
-            return true;
+            self.approve_quit(cx);
+            return;
         }
         if !matches!(self.sessions.runtimes, Load::Ready(_)) {
             // The prompt names every runtime; list them now if they are not known yet.
@@ -113,7 +116,6 @@ impl AppState {
             failures: Vec::new(),
         }));
         cx.notify();
-        false
     }
 
     /// Whether the user approved quitting.
@@ -126,8 +128,9 @@ impl AppState {
         self.approve_quit(cx);
     }
 
-    /// The app quits (one window: quitting closes it). Quitting rather than removing the
-    /// window keeps the platform from delivering events to a window that is already gone.
+    /// The app quits (one window: quitting closes it). Quitting rather than also letting the
+    /// close remove the window keeps the platform from handling a window that is already gone
+    /// (a drawn Close is followed by the system's own close message).
     fn approve_quit(&mut self, cx: &mut Context<Self>) {
         self.overlay = None;
         self.quit = QuitState::Approved;

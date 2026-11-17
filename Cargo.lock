@@ -1093,6 +1093,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sys-locale",
+ "tauri-winres",
  "tempfile",
  "url",
 ]
@@ -6935,6 +6936,17 @@ name = "target-features"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1bbb9f3c5c463a01705937a24fdabc5047929ac764b2d5b9cf681c1f5041ed5"
+
+[[package]]
+name = "tauri-winres"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc65d45c68858bfe420dd29e834b5d15dbecf8a07a8a16cf4d532c7b1f69d4b6"
+dependencies = [
+ "dunce",
+ "embed-resource",
+ "toml 1.2.1+spec-1.1.0",
+]
 
 [[package]]
 name = "tauri-winrt-notification"

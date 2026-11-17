@@ -115,6 +115,14 @@ fn about(state: &AppState, handle: &Entity<AppState>, cx: &App) -> impl IntoElem
             SettingsRow::new(tr(cx, keys::SETTINGS_VERSION_TITLE))
                 .control(div().child(env!("CARGO_PKG_VERSION"))),
         )
+        .row(
+            SettingsRow::new(tr(cx, keys::SETTINGS_LICENSE_TITLE)).control(div().child(format!(
+                "{} · {}",
+                env!("CARGO_PKG_LICENSE"),
+                env!("COLAB_PLAYGROUND_COPYRIGHT")
+            ))),
+        )
+        .row(SettingsRow::new(tr(cx, keys::SETTINGS_PROJECT_TITLE)).control(project_link()))
         .row(updates_row(state, handle, cx))
         .row(auto_check_row(state, handle, cx))
         .row(
@@ -253,4 +261,21 @@ fn auto_check_row(state: &AppState, handle: &Entity<AppState>, cx: &App) -> Sett
                     toggle.update(cx, |state, cx| state.set_check_updates(on, cx))
                 }),
         ))
+}
+
+/// Selector of the project page link.
+pub const PROJECT_LINK_SELECTOR: &str = "about-project";
+
+/// The project page (the package repository), opened in the browser like the app's other links.
+fn project_link() -> impl IntoElement {
+    let url = env!("CARGO_PKG_REPOSITORY");
+    let shown = url.trim_start_matches("https://");
+    tagged(
+        PROJECT_LINK_SELECTOR,
+        Button::new(PROJECT_LINK_SELECTOR, shown)
+            .variant(ButtonVariant::Ghost)
+            .size(ControlSize::Sm)
+            .icon(IconName::ExternalLink)
+            .on_click(move |_, _, cx| cx.open_url(url)),
+    )
 }

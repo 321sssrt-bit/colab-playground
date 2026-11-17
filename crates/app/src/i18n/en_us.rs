@@ -1061,4 +1061,6 @@ pub(super) const MESSAGES: Messages = &[
     ),
     (UPDATE_DISMISS, "Dismiss"),
     (UPDATE_BADGE, "New"),
+    (SETTINGS_LICENSE_TITLE, "Licence"),
+    (SETTINGS_PROJECT_TITLE, "Project page"),
 ];

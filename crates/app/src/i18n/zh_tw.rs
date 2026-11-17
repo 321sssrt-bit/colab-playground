@@ -908,4 +908,6 @@ pub(super) const MESSAGES: Messages = &[
     ),
     (UPDATE_DISMISS, "不再提示"),
     (UPDATE_BADGE, "新版本"),
+    (SETTINGS_LICENSE_TITLE, "授權條款"),
+    (SETTINGS_PROJECT_TITLE, "專案首頁"),
 ];

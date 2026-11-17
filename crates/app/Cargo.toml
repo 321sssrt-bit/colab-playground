@@ -8,6 +8,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
+build = "build.rs"
 
 [lib]
 name = "colab_playground"
@@ -19,6 +20,11 @@ doctest = false
 name = "colab-playground"
 path = "src/main.rs"
 test = false
+
+[build-dependencies]
+# Windows version resource and icon for the executable (the build script does nothing for other
+# targets).
+tauri-winres = "0.3"
 
 [dependencies]
 # Ely GPUI Components, pinned to one commit of `main`. The umbrella crate re-exports every

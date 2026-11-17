@@ -413,9 +413,20 @@ fn the_guard_warns_then_stops_as_time_passes(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn closing_with_nothing_billing_just_closes(cx: &mut TestAppContext) {
+fn closing_with_nothing_billing_just_quits(cx: &mut TestAppContext) {
     let app = TestApp::with(cx, Options::scenario(MockScenario::single()));
-    assert!(app.cx.simulate_close(), "nothing runs, so nothing to ask");
+    // The app quits rather than letting the window be removed.
+    assert!(!app.cx.simulate_close(), "the app quits instead");
+    app.cx.run_until_parked();
+    assert!(
+        app.state
+            .read_with(&*app.cx, |state, _| state.quit_approved()),
+        "nothing runs, so nothing to ask"
+    );
+    assert!(
+        app.state
+            .read_with(&*app.cx, |state, _| state.overlay().is_none())
+    );
 }
 
 #[gpui::test]
@@ -598,7 +609,12 @@ fn stop_all_waits_for_a_provision_in_flight_and_leaves_nothing(cx: &mut TestAppC
     app.update(|state, cx| {
         state.start_provision(String::new(), cx);
         assert!(state.is_provisioning());
-        assert!(!state.may_close(cx), "a provision in flight counts");
+        state.request_quit(cx);
+        assert!(
+            matches!(state.overlay(), Some(Overlay::Quit(_))),
+            "a provision in flight counts"
+        );
+        assert!(!state.quit_approved());
         state.quit_stopping_all(cx);
         assert!(
             !state.is_busy(colab_playground::state::Op::StopAll),

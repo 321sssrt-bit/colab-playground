@@ -890,4 +890,6 @@ pub(super) const MESSAGES: Messages = &[
     ),
     (UPDATE_DISMISS, "不再提示"),
     (UPDATE_BADGE, "新版本"),
+    (SETTINGS_LICENSE_TITLE, "许可证"),
+    (SETTINGS_PROJECT_TITLE, "项目主页"),
 ];

@@ -615,6 +615,8 @@ catalog_keys! {
     UPDATE_TITLE => "app.b7.update_title",
     UPDATE_TRY_AGAIN => "app.b7.update_try_again",
     UPDATE_UP_TO_DATE => "app.b7.update_up_to_date",
+    SETTINGS_LICENSE_TITLE => "app.b8.settings_license_title",
+    SETTINGS_PROJECT_TITLE => "app.b8.settings_project_title",
 }
 
 /// A message table: `(key, message)` pairs; `{name}` marks an argument.
