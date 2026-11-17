@@ -1,0 +1,1363 @@
+//! Plugins: declarative manifests whose script runs on the Colab VM.
+//!
+//! A plugin never runs anything on the user's machine. It is a directory with
+//! `plugin.toml` and one script (`.py` or `.sh`) that the host uploads with
+//! `colab exec` and starts detached on the VM. Manifests are validated
+//! strictly (`api = 1`, unknown fields rejected). Bundled plugins are embedded
+//! in the binary; user plugins are copied into `<data>/plugins/<id>/` from a
+//! folder or a `git clone --depth 1` checkout made by the *local* `git`.
+//! See `docs/PLUGINS.md` for the author guide.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+
+use crate::clock::CancelToken;
+use crate::error::{Error, ErrorKind, Result};
+use crate::host::{Host, is_env_key, tail};
+use crate::sessions::Accelerator;
+
+/// Manifest API version understood by this build.
+pub const API_VERSION: u32 = 1;
+/// Largest accepted `plugin.toml`.
+pub const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
+/// Largest accepted script (it travels inside a `colab exec` payload).
+pub const MAX_SCRIPT_BYTES: u64 = 512 * 1024;
+
+/// Text with translations, keyed by locale (`en`, `zh-CN`, `zh-TW`, …).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct LocalizedText(pub BTreeMap<String, String>);
+
+impl LocalizedText {
+    /// The text for `locale`: exact match, then same language, then `en`,
+    /// then any. `None` only when empty.
+    pub fn get(&self, locale: &str) -> Option<&str> {
+        let lang = locale.split('-').next().unwrap_or(locale);
+        self.0
+            .get(locale)
+            .or_else(|| {
+                self.0
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(locale))
+                    .map(|(_, v)| v)
+            })
+            .or_else(|| {
+                self.0
+                    .iter()
+                    .find(|(k, _)| k.split('-').next() == Some(lang))
+                    .map(|(_, v)| v)
+            })
+            .or_else(|| self.0.get("en"))
+            .or_else(|| self.0.values().next())
+            .map(String::as_str)
+    }
+
+    /// True without any translation.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// Default hardware for runs (user-editable in the run form).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProvisionDefaults {
+    /// Accelerator.
+    #[serde(default)]
+    pub accelerator: Option<Accelerator>,
+    /// Minimum GPU memory (0 = any).
+    #[serde(default)]
+    pub min_vram_mib: u32,
+    /// High-RAM shape.
+    #[serde(default)]
+    pub high_mem: bool,
+}
+
+/// Input widget / value type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InputKind {
+    /// Free text.
+    Text,
+    /// A number.
+    Number,
+    /// A checkbox.
+    Bool,
+    /// One of `options`.
+    Select,
+    /// A secret (never written to disk or logs by the host).
+    Secret,
+    /// A Hugging Face model repo id (`owner/name`) with host-side search.
+    HfModel,
+}
+
+/// A form input.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InputSpec {
+    /// Id: `[a-z][a-z0-9_-]*`, at most 32 chars. Reaches the script as `PLUGIN_INPUT_<ID>`.
+    pub id: String,
+    /// Type.
+    #[serde(rename = "type")]
+    pub kind: InputKind,
+    /// Must be non-empty.
+    #[serde(default)]
+    pub required: bool,
+    /// Label (falls back to the id).
+    #[serde(default)]
+    pub label: LocalizedText,
+    /// Help text.
+    #[serde(default)]
+    pub help: LocalizedText,
+    /// Default value (not allowed for secrets).
+    #[serde(default)]
+    pub default: Option<InputValue>,
+    /// Choices for `select`.
+    #[serde(default)]
+    pub options: Vec<String>,
+    /// Lower bound for `number`.
+    #[serde(default)]
+    pub min: Option<f64>,
+    /// Upper bound for `number`.
+    #[serde(default)]
+    pub max: Option<f64>,
+}
+
+impl InputSpec {
+    /// Environment variable name for this input.
+    pub fn env_key(&self) -> String {
+        env_key(&self.id)
+    }
+}
+
+/// `PLUGIN_INPUT_<ID>` with the id upper-cased and `-` mapped to `_`.
+pub fn env_key(id: &str) -> String {
+    format!("PLUGIN_INPUT_{}", id.to_ascii_uppercase().replace('-', "_"))
+}
+
+/// A value for an input.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum InputValue {
+    /// Boolean.
+    Bool(bool),
+    /// Number.
+    Number(f64),
+    /// Text, select choice, secret or repo id.
+    Text(String),
+}
+
+impl InputValue {
+    /// The string passed in the environment.
+    pub fn to_env(&self) -> String {
+        match self {
+            InputValue::Bool(b) => if *b { "1" } else { "0" }.to_owned(),
+            InputValue::Number(n) if n.fract() == 0.0 && n.abs() < 1e15 => format!("{}", *n as i64),
+            InputValue::Number(n) => n.to_string(),
+            InputValue::Text(s) => s.clone(),
+        }
+    }
+}
+
+/// What to run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunSpec {
+    /// Script file in the plugin directory (`.py` runs with the VM's Python,
+    /// `.sh` with bash).
+    pub script: String,
+}
+
+/// A progress stage shown in the run view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StageSpec {
+    /// Id the script reports in `status.json`.
+    pub id: String,
+    /// Label.
+    #[serde(default)]
+    pub label: LocalizedText,
+}
+
+/// A port the host can forward once the run is ready.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EndpointSpec {
+    /// Id.
+    pub id: String,
+    /// Number input holding the VM port.
+    #[serde(default)]
+    pub port_input: Option<String>,
+    /// Fixed VM port (instead of `port_input`).
+    #[serde(default)]
+    pub port: Option<u16>,
+    /// Base path shown to the user (e.g. `/v1`).
+    #[serde(default = "root_path")]
+    pub path: String,
+    /// Health path probed through the tunnel.
+    #[serde(default)]
+    pub health: Option<String>,
+    /// `openai`, `http`, … (lower-case word; informs the endpoint card).
+    #[serde(default = "http_kind")]
+    pub kind: String,
+    /// Label.
+    #[serde(default)]
+    pub label: LocalizedText,
+}
+
+fn root_path() -> String {
+    "/".into()
+}
+fn http_kind() -> String {
+    "http".into()
+}
+
+/// A VM path whose contents the user may want to keep (hook for the
+/// persistence feature; not acted upon yet).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeepSpec {
+    /// Absolute path on the VM.
+    pub path: String,
+    /// Label.
+    #[serde(default)]
+    pub label: LocalizedText,
+}
+
+/// Host capabilities a plugin may ask for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Capability {
+    /// The user's saved Hugging Face token, passed as `PLUGIN_HF_TOKEN`
+    /// when one is stored (optional for the plugin).
+    HfToken,
+}
+
+impl Capability {
+    /// Vault secret name holding the value.
+    pub fn secret_name(self) -> &'static str {
+        match self {
+            Capability::HfToken => "hf_token",
+        }
+    }
+
+    /// Environment variable the script receives.
+    pub fn env_key(self) -> &'static str {
+        match self {
+            Capability::HfToken => "PLUGIN_HF_TOKEN",
+        }
+    }
+}
+
+/// A parsed, validated `plugin.toml`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Manifest {
+    /// Must be [`API_VERSION`].
+    pub api: u32,
+    /// Id: `[a-z0-9][a-z0-9-]*`, at most 48 chars (also the directory name).
+    pub id: String,
+    /// Version string.
+    pub version: String,
+    /// Display name (`en` required).
+    pub name: LocalizedText,
+    /// Description.
+    #[serde(default)]
+    pub description: LocalizedText,
+    /// Default hardware.
+    #[serde(default)]
+    pub provision: ProvisionDefaults,
+    /// Form inputs.
+    #[serde(default)]
+    pub inputs: Vec<InputSpec>,
+    /// Script.
+    pub run: RunSpec,
+    /// Stages.
+    #[serde(default)]
+    pub stages: Vec<StageSpec>,
+    /// Endpoints.
+    #[serde(default)]
+    pub endpoints: Vec<EndpointSpec>,
+    /// Paths worth keeping (persistence hook).
+    #[serde(default)]
+    pub keep: Vec<KeepSpec>,
+    /// Requested capabilities.
+    #[serde(default)]
+    pub needs: Vec<Capability>,
+}
+
+fn invalid(field: &str, reason: &str) -> Error {
+    Error::new(ErrorKind::ManifestInvalid)
+        .with("field", field)
+        .with("reason", reason)
+}
+
+fn is_slug(s: &str, max: usize, first_alpha_only: bool) -> bool {
+    !s.is_empty()
+        && s.len() <= max
+        && s.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || (!first_alpha_only && c.is_ascii_digit()))
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+}
+
+fn valid_locale(k: &str) -> bool {
+    let mut parts = k.split('-');
+    let lang = parts.next().unwrap_or_default();
+    (2..=3).contains(&lang.len())
+        && lang.chars().all(|c| c.is_ascii_lowercase())
+        && parts.all(|p| (2..=8).contains(&p.len()) && p.chars().all(|c| c.is_ascii_alphanumeric()))
+}
+
+fn check_text(field: &str, t: &LocalizedText, need_en: bool) -> Result<()> {
+    if need_en && t.0.get("en").is_none_or(|v| v.trim().is_empty()) {
+        return Err(invalid(field, "an `en` entry is required"));
+    }
+    for (k, v) in &t.0 {
+        if !valid_locale(k) {
+            return Err(invalid(field, "invalid locale key"));
+        }
+        if v.len() > 4000 {
+            return Err(invalid(field, "text too long"));
+        }
+    }
+    Ok(())
+}
+
+fn check_vm_path(field: &str, p: &str) -> Result<()> {
+    if !p.starts_with('/')
+        || p.len() > 256
+        || p.split('/').any(|c| c == "..")
+        || p.chars().any(|c| c.is_control())
+    {
+        return Err(invalid(field, "must be an absolute VM path without `..`"));
+    }
+    Ok(())
+}
+
+/// Validates the script file name (relative, no traversal, `.py`/`.sh`).
+pub fn check_script_name(script: &str) -> Result<()> {
+    let ok_chars = script
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "._-/".contains(c));
+    if script.is_empty()
+        || script.len() > 128
+        || script.starts_with('/')
+        || !ok_chars
+        || script
+            .split('/')
+            .any(|c| c.is_empty() || c == "." || c == "..")
+    {
+        return Err(invalid(
+            "run.script",
+            "must be a relative path inside the plugin directory",
+        ));
+    }
+    if !(script.ends_with(".py") || script.ends_with(".sh")) {
+        return Err(invalid("run.script", "must end in .py or .sh"));
+    }
+    Ok(())
+}
+
+impl Manifest {
+    /// Parses and validates TOML text.
+    pub fn parse(text: &str) -> Result<Manifest> {
+        // Check the API version first so newer manifests get a precise error.
+        let raw: toml::Table =
+            toml::from_str(text).map_err(|e| invalid("toml", "syntax").detail(e.to_string()))?;
+        match raw.get("api").and_then(|v| v.as_integer()) {
+            Some(v) if v == i64::from(API_VERSION) => {}
+            Some(_) => return Err(invalid("api", "unsupported api version")),
+            None => return Err(invalid("api", "missing")),
+        }
+        let m: Manifest =
+            toml::from_str(text).map_err(|e| invalid("toml", "schema").detail(e.to_string()))?;
+        m.validate()?;
+        Ok(m)
+    }
+
+    /// Checks every rule documented in `docs/PLUGINS.md`.
+    pub fn validate(&self) -> Result<()> {
+        if self.api != API_VERSION {
+            return Err(invalid("api", "unsupported api version"));
+        }
+        if !is_slug(&self.id, 48, false) || self.id.contains('_') {
+            return Err(invalid("id", "use lower-case letters, digits and '-'"));
+        }
+        if self.version.is_empty()
+            || self.version.len() > 32
+            || !self
+                .version
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || ".+-".contains(c))
+        {
+            return Err(invalid("version", "invalid version"));
+        }
+        check_text("name", &self.name, true)?;
+        check_text("description", &self.description, false)?;
+        check_script_name(&self.run.script)?;
+        if self.provision.min_vram_mib > 0
+            && !self.provision.accelerator.is_some_and(|a| a.is_gpu())
+        {
+            return Err(invalid("provision.min_vram_mib", "needs a GPU accelerator"));
+        }
+
+        let mut ids = BTreeSet::new();
+        let mut keys = BTreeSet::new();
+        for (i, input) in self.inputs.iter().enumerate() {
+            let f = |name: &str| format!("inputs[{i}].{name}");
+            if !is_slug(&input.id, 32, true) {
+                return Err(invalid(&f("id"), "use [a-z][a-z0-9_-]*"));
+            }
+            if !ids.insert(input.id.clone()) {
+                return Err(invalid(&f("id"), "duplicate id"));
+            }
+            let key = input.env_key();
+            if !is_env_key(&key) || !keys.insert(key) {
+                return Err(invalid(
+                    &f("id"),
+                    "environment name collides with another input",
+                ));
+            }
+            check_text(&f("label"), &input.label, false)?;
+            check_text(&f("help"), &input.help, false)?;
+            match (input.kind, &input.default) {
+                (InputKind::Secret, Some(_)) => {
+                    return Err(invalid(&f("default"), "secrets cannot have defaults"));
+                }
+                (InputKind::Number, Some(d)) if !matches!(d, InputValue::Number(_)) => {
+                    return Err(invalid(&f("default"), "must be a number"));
+                }
+                (InputKind::Bool, Some(d)) if !matches!(d, InputValue::Bool(_)) => {
+                    return Err(invalid(&f("default"), "must be true or false"));
+                }
+                (InputKind::Text | InputKind::Select | InputKind::HfModel, Some(d))
+                    if !matches!(d, InputValue::Text(_)) =>
+                {
+                    return Err(invalid(&f("default"), "must be a string"));
+                }
+                _ => {}
+            }
+            if input.kind == InputKind::Select {
+                if input.options.is_empty()
+                    || input.options.iter().any(|o| o.is_empty() || o.len() > 128)
+                {
+                    return Err(invalid(&f("options"), "a select needs non-empty options"));
+                }
+                if let Some(InputValue::Text(d)) = &input.default
+                    && !input.options.contains(d)
+                {
+                    return Err(invalid(&f("default"), "not one of the options"));
+                }
+            } else if !input.options.is_empty() {
+                return Err(invalid(&f("options"), "only selects have options"));
+            }
+            if (input.min.is_some() || input.max.is_some()) && input.kind != InputKind::Number {
+                return Err(invalid(&f("min"), "only numbers have bounds"));
+            }
+            if let (Some(InputValue::Number(d)), true) =
+                (&input.default, input.kind == InputKind::Number)
+                && (input.min.is_some_and(|m| *d < m) || input.max.is_some_and(|m| *d > m))
+            {
+                return Err(invalid(&f("default"), "outside min/max"));
+            }
+        }
+
+        let mut stage_ids = BTreeSet::new();
+        for (i, s) in self.stages.iter().enumerate() {
+            if !is_slug(&s.id, 32, true) || !stage_ids.insert(s.id.clone()) {
+                return Err(invalid(
+                    &format!("stages[{i}].id"),
+                    "invalid or duplicate id",
+                ));
+            }
+            check_text(&format!("stages[{i}].label"), &s.label, false)?;
+        }
+
+        let mut ep_ids = BTreeSet::new();
+        for (i, e) in self.endpoints.iter().enumerate() {
+            let f = |name: &str| format!("endpoints[{i}].{name}");
+            if !is_slug(&e.id, 32, true) || !ep_ids.insert(e.id.clone()) {
+                return Err(invalid(&f("id"), "invalid or duplicate id"));
+            }
+            match (&e.port_input, e.port) {
+                (Some(pi), None) => {
+                    let ok = self
+                        .inputs
+                        .iter()
+                        .any(|x| &x.id == pi && x.kind == InputKind::Number);
+                    if !ok {
+                        return Err(invalid(&f("port_input"), "must name a number input"));
+                    }
+                }
+                (None, Some(p)) => {
+                    if p == 0 || p == crate::cli::RESERVED_VM_PORT {
+                        return Err(invalid(&f("port"), "port 0 and 8080 are not allowed"));
+                    }
+                }
+                _ => {
+                    return Err(invalid(
+                        &f("port"),
+                        "give exactly one of port_input or port",
+                    ));
+                }
+            }
+            if !e.path.starts_with('/') || e.path.chars().any(|c| c.is_whitespace()) {
+                return Err(invalid(&f("path"), "must start with '/'"));
+            }
+            if e.health
+                .as_ref()
+                .is_some_and(|h| !h.starts_with('/') || h.chars().any(|c| c.is_whitespace()))
+            {
+                return Err(invalid(&f("health"), "must start with '/'"));
+            }
+            if e.kind.is_empty()
+                || e.kind.len() > 16
+                || !e.kind.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+            {
+                return Err(invalid(&f("kind"), "lower-case word"));
+            }
+            check_text(&f("label"), &e.label, false)?;
+        }
+
+        for (i, k) in self.keep.iter().enumerate() {
+            check_vm_path(&format!("keep[{i}].path"), &k.path)?;
+            check_text(&format!("keep[{i}].label"), &k.label, false)?;
+        }
+        let needs: BTreeSet<_> = self.needs.iter().collect();
+        if needs.len() != self.needs.len() {
+            return Err(invalid("needs", "duplicate capability"));
+        }
+        Ok(())
+    }
+
+    /// The input with this id.
+    pub fn input(&self, id: &str) -> Option<&InputSpec> {
+        self.inputs.iter().find(|i| i.id == id)
+    }
+}
+
+/// Values for a run, after defaults and validation.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ResolvedInputs {
+    /// `PLUGIN_INPUT_*` pairs for `colab exec --env`.
+    pub env: Vec<(String, String)>,
+    /// Secret values to redact from logs.
+    pub secrets: Vec<String>,
+    /// Final values by input id (secrets included; never persist this).
+    pub values: BTreeMap<String, InputValue>,
+}
+
+/// Validates repo ids like `owner/name`.
+pub fn is_repo_id(s: &str) -> bool {
+    let mut parts = s.split('/');
+    let ok = |p: Option<&str>| {
+        p.is_some_and(|p| {
+            !p.is_empty()
+                && p.len() <= 96
+                && !p.starts_with(['-', '.'])
+                && p.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+        })
+    };
+    ok(parts.next()) && ok(parts.next()) && parts.next().is_none()
+}
+
+/// Applies defaults, checks types and requirements, and maps inputs to env.
+pub fn resolve_inputs(
+    m: &Manifest,
+    provided: &BTreeMap<String, InputValue>,
+) -> Result<ResolvedInputs> {
+    for k in provided.keys() {
+        if m.input(k).is_none() {
+            return Err(Error::invalid(k, "unknown input"));
+        }
+    }
+    let mut out = ResolvedInputs::default();
+    for spec in &m.inputs {
+        let value = provided
+            .get(&spec.id)
+            .cloned()
+            .or_else(|| spec.default.clone());
+        let value = match (spec.kind, value) {
+            (_, None) => None,
+            (InputKind::Number, Some(InputValue::Text(t))) => Some(InputValue::Number(
+                t.trim()
+                    .parse::<f64>()
+                    .map_err(|_| Error::invalid(&spec.id, "not a number"))?,
+            )),
+            (InputKind::Bool, Some(InputValue::Text(t))) => {
+                Some(InputValue::Bool(matches!(t.as_str(), "1" | "true" | "yes")))
+            }
+            (_, Some(v)) => Some(v),
+        };
+        let empty = match &value {
+            None => true,
+            Some(InputValue::Text(t)) => t.trim().is_empty(),
+            _ => false,
+        };
+        if empty {
+            if spec.required {
+                return Err(Error::invalid(&spec.id, "required"));
+            }
+            continue;
+        }
+        let value = value.unwrap_or(InputValue::Bool(false));
+        match (spec.kind, &value) {
+            (InputKind::Number, InputValue::Number(n)) => {
+                if !n.is_finite()
+                    || spec.min.is_some_and(|m| *n < m)
+                    || spec.max.is_some_and(|m| *n > m)
+                {
+                    return Err(Error::invalid(&spec.id, "out of range"));
+                }
+            }
+            (InputKind::Bool, InputValue::Bool(_)) => {}
+            (InputKind::Select, InputValue::Text(t)) => {
+                if !spec.options.contains(t) {
+                    return Err(Error::invalid(&spec.id, "not one of the options"));
+                }
+            }
+            (InputKind::HfModel, InputValue::Text(t)) => {
+                if !is_repo_id(t.trim()) {
+                    return Err(Error::invalid(&spec.id, "expected owner/name"));
+                }
+            }
+            (InputKind::Text | InputKind::Secret, InputValue::Text(t)) => {
+                if t.len() > 8192 || t.contains('\0') {
+                    return Err(Error::invalid(&spec.id, "too long"));
+                }
+            }
+            _ => return Err(Error::invalid(&spec.id, "wrong type")),
+        }
+        let env_value = match &value {
+            InputValue::Text(t) if spec.kind == InputKind::HfModel => t.trim().to_owned(),
+            v => v.to_env(),
+        };
+        if spec.kind == InputKind::Secret {
+            out.secrets.push(env_value.clone());
+        }
+        out.env.push((spec.env_key(), env_value));
+        out.values.insert(spec.id.clone(), value);
+    }
+    Ok(out)
+}
+
+/// An endpoint with its port resolved from the inputs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedEndpoint {
+    /// Endpoint id.
+    pub id: String,
+    /// VM port.
+    pub remote_port: u16,
+    /// Base path.
+    pub path: String,
+    /// Health path.
+    pub health: Option<String>,
+    /// Kind (`openai`, `http`, …).
+    pub kind: String,
+    /// Label.
+    pub label: LocalizedText,
+}
+
+/// Resolves endpoint ports from the final input values.
+pub fn resolve_endpoints(
+    m: &Manifest,
+    values: &BTreeMap<String, InputValue>,
+) -> Result<Vec<ResolvedEndpoint>> {
+    m.endpoints
+        .iter()
+        .map(|e| {
+            let port = match (&e.port_input, e.port) {
+                (_, Some(p)) => p,
+                (Some(pi), None) => match values.get(pi) {
+                    Some(InputValue::Number(n))
+                        if *n >= 1.0 && *n <= 65535.0 && n.fract() == 0.0 =>
+                    {
+                        *n as u16
+                    }
+                    _ => return Err(Error::invalid(pi, "invalid port")),
+                },
+                (None, None) => return Err(invalid("endpoints", "no port")),
+            };
+            if port == crate::cli::RESERVED_VM_PORT {
+                return Err(Error::new(ErrorKind::PortReserved).with("port", port));
+            }
+            Ok(ResolvedEndpoint {
+                id: e.id.clone(),
+                remote_port: port,
+                path: e.path.clone(),
+                health: e.health.clone(),
+                kind: e.kind.clone(),
+                label: e.label.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Where a plugin came from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PluginSource {
+    /// Embedded in the binary (cannot be removed, only disabled).
+    Bundled,
+    /// Installed under the data directory (or in memory for the mock).
+    User,
+}
+
+/// A plugin ready to run.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoadedPlugin {
+    /// Its manifest.
+    pub manifest: Manifest,
+    /// Script bytes.
+    pub script: Vec<u8>,
+    /// Origin.
+    pub source: PluginSource,
+}
+
+/// Summary for the plugin list.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PluginInfo {
+    /// Manifest.
+    pub manifest: Manifest,
+    /// Origin.
+    pub source: PluginSource,
+    /// Enabled flag.
+    pub enabled: bool,
+}
+
+/// Where an install candidate came from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PluginOrigin {
+    /// A local folder.
+    Folder {
+        /// Path as given.
+        path: String,
+    },
+    /// A Git URL (cloned with the local `git`).
+    Git {
+        /// URL as given.
+        url: String,
+    },
+}
+
+/// What the confirmation dialog shows before installing. Installing runs the
+/// script on the user's paid runtime later; nothing runs locally.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PluginPreview {
+    /// Validated manifest.
+    pub manifest: Manifest,
+    /// Origin.
+    pub origin: PluginOrigin,
+    /// Script size in bytes.
+    pub script_bytes: u64,
+    /// Version currently installed with the same id, if any.
+    pub replaces_version: Option<String>,
+    /// Staged copy of the files (manifest + script) to install from.
+    pub staged_dir: PathBuf,
+}
+
+/// Bundled plugins: (manifest, script bytes).
+pub fn bundled() -> Vec<(&'static str, &'static [u8])> {
+    vec![(
+        include_str!("../../../plugins/llama-cpp/plugin.toml"),
+        include_bytes!("../../../plugins/llama-cpp/worker.py"),
+    )]
+}
+
+/// Reads and validates a plugin directory (no symlinked or oversized files,
+/// script confined to the directory).
+pub fn load_dir(dir: &Path) -> Result<(Manifest, Vec<u8>)> {
+    let manifest_path = dir.join("plugin.toml");
+    let text = read_regular(&manifest_path, MAX_MANIFEST_BYTES, "plugin.toml")?;
+    let manifest =
+        Manifest::parse(&String::from_utf8(text).map_err(|_| invalid("toml", "not UTF-8"))?)?;
+    let script_path = dir.join(&manifest.run.script);
+    let canon_dir = dir.canonicalize()?;
+    let canon_script = script_path
+        .canonicalize()
+        .map_err(|_| invalid("run.script", "file not found"))?;
+    if !canon_script.starts_with(&canon_dir) {
+        return Err(invalid("run.script", "outside the plugin directory"));
+    }
+    let script = read_regular(&script_path, MAX_SCRIPT_BYTES, "run.script")?;
+    Ok((manifest, script))
+}
+
+fn read_regular(path: &Path, max: u64, field: &str) -> Result<Vec<u8>> {
+    let meta = std::fs::symlink_metadata(path).map_err(|_| invalid(field, "file not found"))?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err(invalid(field, "must be a regular file (no symlinks)"));
+    }
+    if meta.len() > max {
+        return Err(invalid(field, "file too large"));
+    }
+    Ok(std::fs::read(path)?)
+}
+
+/// Validates a Git URL: `https://…`, `ssh://…` or `user@host:path`.
+pub fn validate_git_url(url: &str) -> Result<()> {
+    let bad = || {
+        Error::invalid("url", "use an https://, ssh:// or user@host:path Git URL")
+            .with("value", url)
+    };
+    if url.is_empty() || url.len() > 512 || url.starts_with('-') || url.contains("::") {
+        return Err(bad());
+    }
+    if url
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || c == '\\')
+    {
+        return Err(bad());
+    }
+    let host_ok = |h: &str| {
+        !h.is_empty()
+            && !h.starts_with('-')
+            && h.chars()
+                .all(|c| c.is_ascii_alphanumeric() || ".-:[]@_".contains(c))
+    };
+    if let Some(rest) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("ssh://"))
+    {
+        let host = rest.split('/').next().unwrap_or_default();
+        return if host_ok(host) && rest.len() > host.len() + 1 {
+            Ok(())
+        } else {
+            Err(bad())
+        };
+    }
+    if let Some((user_host, path)) = url.split_once(':')
+        && let Some((user, host)) = user_host.split_once('@')
+    {
+        let user_ok = !user.is_empty()
+            && user
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c));
+        if user_ok
+            && host_ok(host)
+            && !path.is_empty()
+            && !path.starts_with('-')
+            && !url.contains("://")
+        {
+            return Ok(());
+        }
+    }
+    Err(bad())
+}
+
+/// `git clone` arguments (pure). Protocols that can run commands or read
+/// local files are disabled; hooks are never cloned; symlinks are checked out
+/// as plain files.
+pub fn git_clone_args(url: &str, dest: &str) -> Result<Vec<String>> {
+    validate_git_url(url)?;
+    Ok([
+        "-c",
+        "protocol.ext.allow=never",
+        "-c",
+        "protocol.file.allow=never",
+        "-c",
+        "core.symlinks=false",
+        "clone",
+        "--depth",
+        "1",
+        "--no-tags",
+        "--single-branch",
+        "--",
+        url,
+        dest,
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect())
+}
+
+/// Clones `url` with the **local** `git` into a new directory under `staging`
+/// and returns that directory.
+pub fn clone_git(url: &str, staging: &Path, cancel: &CancelToken) -> Result<PathBuf> {
+    let dest = staging.join(format!("git-{}", crate::accounts::nonce()));
+    std::fs::create_dir_all(staging)?;
+    let args = git_clone_args(url, &dest.to_string_lossy())?;
+    let env = vec![
+        ("GIT_TERMINAL_PROMPT".to_owned(), "0".to_owned()),
+        ("GIT_LFS_SKIP_SMUDGE".to_owned(), "1".to_owned()),
+    ];
+    let out =
+        Host::Local.run_program("git", &args, &env, cancel, Some(Duration::from_secs(300)))?;
+    if !out.success() {
+        let _ = std::fs::remove_dir_all(&dest);
+        return Err(Error::new(ErrorKind::GitFailed)
+            .with("url", url)
+            .detail(tail(&out.stderr, 600)));
+    }
+    Ok(dest)
+}
+
+/// Installed plugins plus enable flags.
+#[derive(Debug)]
+pub struct PluginStore {
+    dir: Option<PathBuf>,
+    flags_path: Option<PathBuf>,
+    plugins: Vec<LoadedPlugin>,
+    flags: BTreeMap<String, bool>,
+    /// Problems with installed plugins that failed to load (id/dir → error).
+    pub load_errors: Vec<(String, Error)>,
+}
+
+impl PluginStore {
+    /// Loads bundled plugins and, when `dir` is given, user plugins from it.
+    pub fn load(dir: Option<&Path>, flags_path: Option<&Path>) -> Result<PluginStore> {
+        let mut store = PluginStore {
+            dir: dir.map(Path::to_owned),
+            flags_path: flags_path.map(Path::to_owned),
+            plugins: Vec::new(),
+            flags: BTreeMap::new(),
+            load_errors: Vec::new(),
+        };
+        for (toml, script) in bundled() {
+            let manifest = Manifest::parse(toml)?;
+            store.plugins.push(LoadedPlugin {
+                manifest,
+                script: script.to_vec(),
+                source: PluginSource::Bundled,
+            });
+        }
+        if let Some(path) = &store.flags_path
+            && let Ok(text) = std::fs::read_to_string(path)
+        {
+            store.flags = serde_json::from_str(&text).unwrap_or_default();
+        }
+        if let Some(dir) = &store.dir
+            && let Ok(entries) = std::fs::read_dir(dir)
+        {
+            let mut dirs: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect();
+            dirs.sort();
+            for d in dirs {
+                let label = d
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                match load_dir(&d) {
+                    Ok((m, _)) if m.id != label => {
+                        store
+                            .load_errors
+                            .push((label, invalid("id", "does not match its directory")));
+                    }
+                    Ok((m, _)) if store.get(&m.id).is_some() => {
+                        store.load_errors.push((
+                            label,
+                            Error::new(ErrorKind::PluginExists).with("plugin", &m.id),
+                        ));
+                    }
+                    Ok((manifest, script)) => {
+                        store.plugins.push(LoadedPlugin {
+                            manifest,
+                            script,
+                            source: PluginSource::User,
+                        });
+                    }
+                    Err(e) => store.load_errors.push((label, e)),
+                }
+            }
+        }
+        Ok(store)
+    }
+
+    /// All plugins.
+    pub fn list(&self) -> Vec<PluginInfo> {
+        self.plugins
+            .iter()
+            .map(|p| PluginInfo {
+                manifest: p.manifest.clone(),
+                source: p.source.clone(),
+                enabled: self.enabled(&p.manifest.id),
+            })
+            .collect()
+    }
+
+    /// A plugin by id.
+    pub fn get(&self, id: &str) -> Option<&LoadedPlugin> {
+        self.plugins.iter().find(|p| p.manifest.id == id)
+    }
+
+    /// Enabled unless explicitly disabled.
+    pub fn enabled(&self, id: &str) -> bool {
+        self.flags.get(id).copied().unwrap_or(true)
+    }
+
+    /// Validates a folder and stages a copy of its manifest and script.
+    pub fn inspect_folder(
+        &self,
+        path: &Path,
+        staging: &Path,
+        origin: PluginOrigin,
+    ) -> Result<PluginPreview> {
+        let (manifest, script) = load_dir(path)?;
+        if self
+            .get(&manifest.id)
+            .is_some_and(|p| p.source == PluginSource::Bundled)
+        {
+            return Err(Error::new(ErrorKind::PluginExists).with("plugin", &manifest.id));
+        }
+        let staged = staging.join(format!("stage-{}", crate::accounts::nonce()));
+        write_plugin_files(
+            &staged,
+            &manifest,
+            &std::fs::read(path.join("plugin.toml"))?,
+            &script,
+        )?;
+        Ok(PluginPreview {
+            replaces_version: self.get(&manifest.id).map(|p| p.manifest.version.clone()),
+            script_bytes: script.len() as u64,
+            manifest,
+            origin,
+            staged_dir: staged,
+        })
+    }
+
+    /// Installs a previewed plugin (replacing a user plugin with the same id).
+    pub fn install(&mut self, preview: &PluginPreview) -> Result<PluginInfo> {
+        let (manifest, script) = load_dir(&preview.staged_dir)?;
+        if manifest != preview.manifest {
+            return Err(invalid("plugin.toml", "changed since it was previewed"));
+        }
+        if self
+            .get(&manifest.id)
+            .is_some_and(|p| p.source == PluginSource::Bundled)
+        {
+            return Err(Error::new(ErrorKind::PluginExists).with("plugin", &manifest.id));
+        }
+        if let Some(dir) = &self.dir {
+            let target = dir.join(&manifest.id);
+            let toml = std::fs::read(preview.staged_dir.join("plugin.toml"))?;
+            let tmp = dir.join(format!(".{}.new", manifest.id));
+            let _ = std::fs::remove_dir_all(&tmp);
+            write_plugin_files(&tmp, &manifest, &toml, &script)?;
+            let _ = std::fs::remove_dir_all(&target);
+            std::fs::rename(&tmp, &target)?;
+        }
+        let _ = std::fs::remove_dir_all(&preview.staged_dir);
+        self.plugins.retain(|p| p.manifest.id != manifest.id);
+        self.plugins.push(LoadedPlugin {
+            manifest: manifest.clone(),
+            script,
+            source: PluginSource::User,
+        });
+        self.flags.remove(&manifest.id);
+        self.save_flags()?;
+        Ok(PluginInfo {
+            manifest,
+            source: PluginSource::User,
+            enabled: true,
+        })
+    }
+
+    /// Enables or disables a plugin.
+    pub fn set_enabled(&mut self, id: &str, enabled: bool) -> Result<()> {
+        if self.get(id).is_none() {
+            return Err(Error::new(ErrorKind::PluginNotFound).with("plugin", id));
+        }
+        self.flags.insert(id.to_owned(), enabled);
+        self.save_flags()
+    }
+
+    /// Removes a user plugin (bundled ones can only be disabled).
+    pub fn remove(&mut self, id: &str) -> Result<()> {
+        match self.get(id).map(|p| p.source.clone()) {
+            None => Err(Error::new(ErrorKind::PluginNotFound).with("plugin", id)),
+            Some(PluginSource::Bundled) => Err(Error::invalid(
+                "plugin",
+                "bundled plugins can only be disabled",
+            )),
+            Some(PluginSource::User) => {
+                if let Some(dir) = &self.dir
+                    && is_slug(id, 48, false)
+                {
+                    let _ = std::fs::remove_dir_all(dir.join(id));
+                }
+                self.plugins.retain(|p| p.manifest.id != id);
+                self.flags.remove(id);
+                self.save_flags()
+            }
+        }
+    }
+
+    fn save_flags(&self) -> Result<()> {
+        if let Some(path) = &self.flags_path {
+            crate::paths::write_atomic(
+                path,
+                serde_json::to_string_pretty(&self.flags)?.as_bytes(),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn write_plugin_files(dir: &Path, manifest: &Manifest, toml: &[u8], script: &[u8]) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(dir.join("plugin.toml"), toml)?;
+    let script_path = dir.join(&manifest.run.script);
+    if let Some(parent) = script_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(script_path, script)?;
+    Ok(())
+}
+
+/// Replaces every occurrence of a secret in `text` with `***`.
+pub fn redact(text: &str, secrets: &[String]) -> String {
+    let mut out = text.to_owned();
+    for s in secrets.iter().filter(|s| s.len() >= 4) {
+        out = out.replace(s.as_str(), "***");
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MINIMAL: &str = r#"
+api = 1
+id = "demo"
+version = "0.1.0"
+[name]
+en = "Demo"
+zh-CN = "演示"
+[run]
+script = "main.py"
+"#;
+
+    /// Appends tables after the minimal manifest.
+    fn with(extra: &str) -> String {
+        format!("{MINIMAL}\n{extra}")
+    }
+
+    /// Inserts top-level keys before the first table.
+    fn top(keys: &str) -> String {
+        MINIMAL.replace("[name]", &format!("{keys}\n[name]"))
+    }
+
+    #[test]
+    fn bundled_llama_manifest_is_valid() {
+        let store = PluginStore::load(None, None).unwrap();
+        let p = store.get("llama-cpp").expect("bundled plugin");
+        assert_eq!(p.source, PluginSource::Bundled);
+        assert!(p.manifest.needs.contains(&Capability::HfToken));
+        assert!(p.manifest.keep.is_empty());
+        assert!(!p.script.is_empty());
+        assert_eq!(
+            p.manifest.name.get("zh-TW").map(|s| !s.is_empty()),
+            Some(true)
+        );
+        let ep = &p.manifest.endpoints[0];
+        assert_eq!(ep.port_input.as_deref(), Some("port"));
+    }
+
+    #[test]
+    fn localized_fallbacks() {
+        let m = Manifest::parse(MINIMAL).unwrap();
+        assert_eq!(m.name.get("zh-CN"), Some("演示"));
+        assert_eq!(m.name.get("zh-TW"), Some("演示"), "same language before en");
+        assert_eq!(m.name.get("fr"), Some("Demo"));
+    }
+
+    #[test]
+    fn strict_validation() {
+        let bad = [
+            MINIMAL.replace("api = 1", "api = 2"),
+            MINIMAL.replace("api = 1\n", ""),
+            MINIMAL.replace("id = \"demo\"", "id = \"../x\""),
+            MINIMAL.replace("en = \"Demo\"", "fr = \"Demo\""),
+            MINIMAL.replace("main.py", "../main.py"),
+            MINIMAL.replace("main.py", "main.exe"),
+            top("unknown = 1"),
+            with("[[inputs]]\nid = \"a\"\ntype = \"secret\"\ndefault = \"x\""),
+            with("[[inputs]]\nid = \"q\"\ntype = \"select\"\noptions = [\"a\"]\ndefault = \"b\""),
+            with(
+                "[[inputs]]\nid = \"a-b\"\ntype = \"text\"\n[[inputs]]\nid = \"a_b\"\ntype = \"text\"",
+            ),
+            with(
+                "[[inputs]]\nid = \"p\"\ntype = \"text\"\n[[endpoints]]\nid = \"e\"\nport_input = \"p\"",
+            ),
+            with("[[endpoints]]\nid = \"e\"\nport = 8080"),
+            with("[[keep]]\npath = \"relative/path\""),
+            top("needs = [\"aws_keys\"]"),
+            with("[provision]\nmin_vram_mib = 1000"),
+        ];
+        for (i, text) in bad.iter().enumerate() {
+            let err = Manifest::parse(text).expect_err(&format!("case {i} should fail"));
+            assert!(err.is(ErrorKind::ManifestInvalid), "case {i}: {err}");
+        }
+        assert_eq!(
+            Manifest::parse(&MINIMAL.replace("api = 1", "api = 2"))
+                .unwrap_err()
+                .param("field"),
+            Some("api")
+        );
+        let ok = top("needs = [\"hf_token\"]")
+            + "\n[[keep]]\npath = \"/content/out\"\n[keep.label]\nen = \"Outputs\"\n";
+        assert!(Manifest::parse(&top("needs = [\"hf_token\", \"hf_token\"]")).is_err());
+        let m = Manifest::parse(&ok).unwrap();
+        assert_eq!(m.keep[0].path, "/content/out");
+    }
+
+    #[test]
+    fn inputs_resolve_to_env_and_secrets() {
+        let m = Manifest::parse(&with(
+            r#"
+[[inputs]]
+id = "repo"
+type = "hf-model"
+required = true
+[[inputs]]
+id = "quant"
+type = "select"
+options = ["auto", "Q8_0"]
+default = "auto"
+[[inputs]]
+id = "port"
+type = "number"
+default = 8000
+min = 1
+max = 65535
+[[inputs]]
+id = "api-key"
+type = "secret"
+[[inputs]]
+id = "mtp"
+type = "bool"
+default = true
+[[endpoints]]
+id = "api"
+port_input = "port"
+path = "/v1"
+health = "/health"
+kind = "openai"
+"#,
+        ))
+        .unwrap();
+        let mut given = BTreeMap::new();
+        assert!(
+            resolve_inputs(&m, &given)
+                .unwrap_err()
+                .is(ErrorKind::InvalidInput)
+        );
+        given.insert(
+            "repo".into(),
+            InputValue::Text(" unsloth/Qwen3-0.6B-GGUF ".into()),
+        );
+        given.insert("api-key".into(), InputValue::Text("sk-secret".into()));
+        given.insert("port".into(), InputValue::Text("8001".into()));
+        let r = resolve_inputs(&m, &given).unwrap();
+        let env: BTreeMap<_, _> = r.env.iter().cloned().collect();
+        assert_eq!(env["PLUGIN_INPUT_REPO"], "unsloth/Qwen3-0.6B-GGUF");
+        assert_eq!(env["PLUGIN_INPUT_QUANT"], "auto");
+        assert_eq!(env["PLUGIN_INPUT_PORT"], "8001");
+        assert_eq!(env["PLUGIN_INPUT_API_KEY"], "sk-secret");
+        assert_eq!(env["PLUGIN_INPUT_MTP"], "1");
+        assert_eq!(r.secrets, vec!["sk-secret".to_owned()]);
+        let eps = resolve_endpoints(&m, &r.values).unwrap();
+        assert_eq!(eps[0].remote_port, 8001);
+        given.insert("port".into(), InputValue::Number(70000.0));
+        assert!(resolve_inputs(&m, &given).is_err());
+        given.insert("port".into(), InputValue::Number(8000.0));
+        given.insert("repo".into(), InputValue::Text("not a repo".into()));
+        assert!(resolve_inputs(&m, &given).is_err());
+        given.insert("bogus".into(), InputValue::Bool(true));
+        assert!(resolve_inputs(&m, &given).is_err());
+        assert_eq!(redact("key=sk-secret!", &r.secrets), "key=***!");
+    }
+
+    #[test]
+    fn git_urls() {
+        for ok in [
+            "https://github.com/u/p.git",
+            "ssh://git@github.com/u/p",
+            "git@github.com:u/p.git",
+        ] {
+            assert!(validate_git_url(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "--upload-pack=x",
+            "ext::sh -c touch% /tmp/pwned",
+            "file:///etc",
+            "/local/path",
+            "https://",
+            "http://example.com/p",
+            "git@host:-oProxyCommand=x",
+            "https://host/p p",
+        ] {
+            assert!(validate_git_url(bad).is_err(), "{bad}");
+        }
+        let args = git_clone_args("https://github.com/u/p.git", "/tmp/x").unwrap();
+        let dd = args.iter().position(|a| a == "--").unwrap();
+        assert_eq!(&args[dd + 1..], ["https://github.com/u/p.git", "/tmp/x"]);
+        assert!(args.contains(&"protocol.ext.allow=never".to_owned()));
+    }
+
+    #[test]
+    fn folder_install_enable_remove() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("plugin.toml"), MINIMAL).unwrap();
+        std::fs::write(src.join("main.py"), "print('hi')\n").unwrap();
+        let data = tmp.path().join("data");
+        let mut store = PluginStore::load(
+            Some(&data.join("plugins")),
+            Some(&data.join("plugins.json")),
+        )
+        .unwrap();
+        let preview = store
+            .inspect_folder(
+                &src,
+                &data.join("staging"),
+                PluginOrigin::Folder {
+                    path: src.display().to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(preview.manifest.id, "demo");
+        assert_eq!(preview.replaces_version, None);
+        store.install(&preview).unwrap();
+        store.set_enabled("demo", false).unwrap();
+        let reloaded = PluginStore::load(
+            Some(&data.join("plugins")),
+            Some(&data.join("plugins.json")),
+        )
+        .unwrap();
+        assert!(reloaded.get("demo").is_some());
+        assert!(!reloaded.enabled("demo"));
+        assert!(reloaded.enabled("llama-cpp"));
+        let mut reloaded = reloaded;
+        reloaded.remove("demo").unwrap();
+        assert!(reloaded.remove("llama-cpp").is_err());
+        assert!(!data.join("plugins").join("demo").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_scripts_are_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("plugin.toml"), MINIMAL).unwrap();
+        std::fs::write(tmp.path().join("secret.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("secret.txt"), tmp.path().join("main.py"))
+            .unwrap();
+        assert!(
+            load_dir(tmp.path())
+                .unwrap_err()
+                .is(ErrorKind::ManifestInvalid)
+        );
+    }
+}

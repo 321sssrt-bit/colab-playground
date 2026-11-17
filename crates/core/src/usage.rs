@@ -1,0 +1,463 @@
+//! Live compute-unit usage per account (DESIGN §4.5.1).
+//!
+//! Colab only reports account totals (balance, burn rate, number of
+//! assignments). This module turns successive readings into what the UI shows:
+//!
+//! * [`UsageSnapshot`] — the last reading, marked `stale` when a later fetch
+//!   failed. Unknown is never treated as zero.
+//! * [`poll_due`] — the cadence from [`Defaults`] (30 s while the account has
+//!   sessions, 5 min otherwise by default; manual refresh is always allowed).
+//! * [`UsageSnapshot::eta`] — time left at the current rate.
+//! * [`BalanceHistory`] — a small ring buffer of balances for a sparkline.
+//! * [`RateAttribution`] — an *estimated* per-session burn rate, taken from the
+//!   change of the account rate observed when sessions start or stop, split
+//!   evenly when ambiguous. All per-session figures are estimates (`≈`).
+
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::time::{Duration, SystemTime};
+
+use serde::{Deserialize, Serialize};
+
+use crate::clock::serde_secs;
+use crate::defaults::Defaults;
+use crate::error::Error;
+/// Default capacity of [`BalanceHistory`] (one hour at 30 s).
+pub const HISTORY_CAPACITY: usize = 120;
+
+/// One raw reading of an account's compute units.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Usage {
+    /// Remaining balance in compute units.
+    pub balance_cu: f64,
+    /// Current burn rate of the whole account in CU per hour.
+    pub rate_cu_per_hour: f64,
+    /// Active assignments (runtimes) on the account, managed or not.
+    pub assignments: u32,
+}
+
+/// The latest known usage of an account.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct UsageSnapshot {
+    /// Remaining balance in compute units.
+    pub balance_cu: f64,
+    /// Burn rate in CU per hour.
+    pub rate_cu_per_hour: f64,
+    /// Active assignments.
+    pub assignments: u32,
+    /// When these values were fetched.
+    #[serde(with = "serde_secs")]
+    pub fetched_at: SystemTime,
+    /// A later fetch failed: the values are the last known ones.
+    pub stale: bool,
+}
+
+impl UsageSnapshot {
+    /// A fresh snapshot of `usage` taken at `at`.
+    pub fn new(usage: Usage, at: SystemTime) -> Self {
+        UsageSnapshot {
+            balance_cu: usage.balance_cu,
+            rate_cu_per_hour: usage.rate_cu_per_hour,
+            assignments: usage.assignments,
+            fetched_at: at,
+            stale: false,
+        }
+    }
+
+    /// The raw reading.
+    pub fn usage(&self) -> Usage {
+        Usage {
+            balance_cu: self.balance_cu,
+            rate_cu_per_hour: self.rate_cu_per_hour,
+            assignments: self.assignments,
+        }
+    }
+
+    /// Time until the balance reaches zero at the current rate: `balance / rate`.
+    /// `None` when nothing is burning; zero when the balance is exhausted.
+    pub fn eta(&self) -> Option<Duration> {
+        if self.balance_cu <= 0.0 {
+            return Some(Duration::ZERO);
+        }
+        if self.rate_cu_per_hour <= 0.0 || !self.rate_cu_per_hour.is_finite() {
+            return None;
+        }
+        Some(Duration::from_secs_f64(
+            (self.balance_cu / self.rate_cu_per_hour * 3600.0).min(1e12),
+        ))
+    }
+
+    /// Balance extrapolated to `now` with the sampled rate.
+    pub fn projected_balance(&self, now: SystemTime) -> f64 {
+        let age_h = now
+            .duration_since(self.fetched_at)
+            .unwrap_or_default()
+            .as_secs_f64()
+            / 3600.0;
+        self.balance_cu - self.rate_cu_per_hour.max(0.0) * age_h
+    }
+
+    /// Not stale and at most `max_age` old.
+    pub fn is_fresh(&self, now: SystemTime, max_age: Duration) -> bool {
+        !self.stale && now.duration_since(self.fetched_at).unwrap_or_default() <= max_age
+    }
+}
+
+/// True when a poll is due given the last attempt (successful or not) and
+/// the cadence in `defaults`.
+pub fn poll_due(
+    last_attempt: Option<SystemTime>,
+    now: SystemTime,
+    has_sessions: bool,
+    defaults: &Defaults,
+) -> bool {
+    match last_attempt {
+        None => true,
+        Some(t) => {
+            now.duration_since(t).unwrap_or_default() >= defaults.usage_poll_interval(has_sessions)
+        }
+    }
+}
+
+/// One point of [`BalanceHistory`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct BalancePoint {
+    /// When.
+    #[serde(with = "serde_secs")]
+    pub at: SystemTime,
+    /// Balance in compute units.
+    pub balance_cu: f64,
+}
+
+/// A bounded history of balances (oldest dropped first).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BalanceHistory {
+    capacity: usize,
+    points: VecDeque<BalancePoint>,
+}
+
+impl Default for BalanceHistory {
+    fn default() -> Self {
+        BalanceHistory::with_capacity(HISTORY_CAPACITY)
+    }
+}
+
+impl BalanceHistory {
+    /// An empty history keeping at most `capacity` points (minimum 1).
+    pub fn with_capacity(capacity: usize) -> Self {
+        BalanceHistory {
+            capacity: capacity.max(1),
+            points: VecDeque::new(),
+        }
+    }
+
+    /// Appends a point; a point at the same instant replaces the last one.
+    pub fn push(&mut self, at: SystemTime, balance_cu: f64) {
+        if let Some(last) = self.points.back_mut()
+            && last.at == at
+        {
+            last.balance_cu = balance_cu;
+            return;
+        }
+        self.points.push_back(BalancePoint { at, balance_cu });
+        while self.points.len() > self.capacity {
+            self.points.pop_front();
+        }
+    }
+
+    /// Points, oldest first.
+    pub fn points(&self) -> Vec<BalancePoint> {
+        self.points.iter().copied().collect()
+    }
+
+    /// Number of points.
+    pub fn len(&self) -> usize {
+        self.points.len()
+    }
+
+    /// True when empty.
+    pub fn is_empty(&self) -> bool {
+        self.points.is_empty()
+    }
+}
+
+/// Estimated per-session burn rates for one account.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RateAttribution {
+    last_rate: Option<f64>,
+    rates: BTreeMap<String, Option<f64>>,
+}
+
+impl RateAttribution {
+    /// Folds in a fresh account reading.
+    ///
+    /// `live` are the app-managed sessions running now. Sessions that appeared
+    /// since the previous reading share the rate increase (plus whatever the
+    /// sessions that disappeared were estimated at) evenly. Sessions without
+    /// an estimate (first reading, no positive increase) share whatever rate
+    /// is not yet explained, evenly with the unmanaged runtimes
+    /// (`assignments` beyond `live`).
+    pub fn observe(&mut self, account_rate: f64, assignments: u32, live: &BTreeSet<String>) {
+        let rate = account_rate.max(0.0);
+        let mut freed = 0.0;
+        self.rates.retain(|name, r| {
+            if live.contains(name) {
+                true
+            } else {
+                freed += r.unwrap_or(0.0);
+                false
+            }
+        });
+        let started: Vec<String> = live
+            .iter()
+            .filter(|n| !self.rates.contains_key(*n))
+            .cloned()
+            .collect();
+        let delta_share = match self.last_rate {
+            Some(prev) if !started.is_empty() => {
+                let delta = rate - prev + freed;
+                (delta > 1e-9).then(|| delta / started.len() as f64)
+            }
+            _ => None,
+        };
+        for name in started {
+            self.rates.insert(name, delta_share);
+        }
+        let unknown: Vec<String> = self
+            .rates
+            .iter()
+            .filter(|(_, r)| r.is_none())
+            .map(|(n, _)| n.clone())
+            .collect();
+        if !unknown.is_empty() {
+            let known: f64 = self.rates.values().flatten().sum();
+            let unmanaged = (assignments as usize).saturating_sub(live.len());
+            let share = (rate - known).max(0.0) / (unknown.len() + unmanaged) as f64;
+            for name in unknown {
+                self.rates.insert(name, Some(share));
+            }
+        }
+        self.last_rate = Some(rate);
+    }
+
+    /// Estimated rate of a session (CU/h).
+    pub fn rate_of(&self, name: &str) -> Option<f64> {
+        self.rates.get(name).copied().flatten()
+    }
+
+    /// All estimates.
+    pub fn rates(&self) -> BTreeMap<String, f64> {
+        self.rates
+            .iter()
+            .filter_map(|(n, r)| r.map(|r| (n.clone(), r)))
+            .collect()
+    }
+}
+
+/// Everything known about one account's usage.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AccountUsage {
+    /// Latest snapshot.
+    pub snapshot: Option<UsageSnapshot>,
+    /// Balance history.
+    pub history: BalanceHistory,
+    /// Per-session estimates.
+    pub attribution: RateAttribution,
+    /// Last fetch attempt (successful or not), for [`poll_due`].
+    #[serde(default, with = "serde_secs::option")]
+    pub last_attempt: Option<SystemTime>,
+    /// Why the last fetch failed, if it did.
+    pub last_error: Option<Error>,
+}
+
+impl AccountUsage {
+    /// Records a successful fetch.
+    pub fn record_success(&mut self, usage: Usage, now: SystemTime, live: &BTreeSet<String>) {
+        self.snapshot = Some(UsageSnapshot::new(usage, now));
+        self.history.push(now, usage.balance_cu);
+        self.attribution
+            .observe(usage.rate_cu_per_hour, usage.assignments, live);
+        self.last_attempt = Some(now);
+        self.last_error = None;
+    }
+
+    /// Records a failed fetch: keeps the last values and marks them stale.
+    pub fn record_failure(&mut self, error: Error, now: SystemTime) {
+        if let Some(s) = self.snapshot.as_mut() {
+            s.stale = true;
+        }
+        self.last_attempt = Some(now);
+        self.last_error = Some(error);
+    }
+
+    /// Runtimes the app does not know about (`assignments` beyond `known`).
+    pub fn unmanaged_runtimes(&self, known: usize) -> u32 {
+        self.snapshot
+            .map(|s| s.assignments.saturating_sub(known as u32))
+            .unwrap_or(0)
+    }
+}
+
+/// Sums balances and rates of the accounts whose usage is known. Unknown
+/// accounts are skipped, never counted as zero; `complete` says whether all were known.
+pub fn totals<'a>(snapshots: impl IntoIterator<Item = Option<&'a UsageSnapshot>>) -> UsageTotals {
+    let mut t = UsageTotals {
+        balance_cu: 0.0,
+        rate_cu_per_hour: 0.0,
+        accounts: 0,
+        complete: true,
+        any_stale: false,
+    };
+    for s in snapshots {
+        match s {
+            Some(s) => {
+                t.balance_cu += s.balance_cu;
+                t.rate_cu_per_hour += s.rate_cu_per_hour;
+                t.accounts += 1;
+                t.any_stale |= s.stale;
+            }
+            None => t.complete = false,
+        }
+    }
+    t
+}
+
+/// Totals across accounts for the Accounts page.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct UsageTotals {
+    /// Sum of known balances.
+    pub balance_cu: f64,
+    /// Sum of known rates.
+    pub rate_cu_per_hour: f64,
+    /// Accounts included.
+    pub accounts: u32,
+    /// False if some account's usage is unknown.
+    pub complete: bool,
+    /// True if some included snapshot is stale.
+    pub any_stale: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn t(s: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000 + s)
+    }
+    fn set(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+    fn u(b: f64, r: f64, n: u32) -> Usage {
+        Usage {
+            balance_cu: b,
+            rate_cu_per_hour: r,
+            assignments: n,
+        }
+    }
+
+    #[test]
+    fn cadence() {
+        let d = Defaults::default();
+        assert!(poll_due(None, t(0), false, &d));
+        assert!(!poll_due(Some(t(0)), t(29), true, &d));
+        assert!(poll_due(Some(t(0)), t(30), true, &d));
+        assert!(!poll_due(Some(t(0)), t(299), false, &d));
+        assert!(poll_due(Some(t(0)), t(300), false, &d));
+        let fast = Defaults {
+            usage_poll_active: Duration::from_secs(5),
+            ..Defaults::default()
+        };
+        assert!(poll_due(Some(t(0)), t(5), true, &fast));
+    }
+
+    #[test]
+    fn eta_and_projection() {
+        let s = UsageSnapshot::new(u(10.0, 4.0, 1), t(0));
+        assert_eq!(s.eta(), Some(Duration::from_secs(9000)));
+        assert_eq!(UsageSnapshot::new(u(10.0, 0.0, 0), t(0)).eta(), None);
+        assert_eq!(
+            UsageSnapshot::new(u(0.0, 4.0, 1), t(0)).eta(),
+            Some(Duration::ZERO)
+        );
+        assert!((s.projected_balance(t(1800)) - 8.0).abs() < 1e-9);
+        assert!(s.is_fresh(t(60), Duration::from_secs(300)));
+        assert!(!s.is_fresh(t(301), Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn failure_marks_stale_and_keeps_values() {
+        let mut a = AccountUsage::default();
+        a.record_failure(Error::new(crate::ErrorKind::Http), t(0));
+        assert!(a.snapshot.is_none(), "unknown stays unknown, not zero");
+        a.record_success(u(50.0, 5.0, 1), t(30), &set(&["s1"]));
+        a.record_failure(Error::new(crate::ErrorKind::Http), t(60));
+        let s = a.snapshot.unwrap();
+        assert!(s.stale);
+        assert_eq!(s.balance_cu, 50.0);
+        assert_eq!(a.last_attempt, Some(t(60)));
+        assert!(!s.is_fresh(t(61), Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn history_is_a_ring_buffer() {
+        let mut h = BalanceHistory::with_capacity(3);
+        for i in 0..5 {
+            h.push(t(i), i as f64);
+        }
+        h.push(t(4), 40.0);
+        let p = h.points();
+        assert_eq!(p.len(), 3);
+        assert_eq!(p[0].balance_cu, 2.0);
+        assert_eq!(p[2].balance_cu, 40.0);
+    }
+
+    #[test]
+    fn attribution_from_rate_deltas() {
+        let mut a = RateAttribution::default();
+        a.observe(0.0, 0, &set(&[]));
+        // s1 starts: rate goes 0 -> 11.8, all of it is s1.
+        a.observe(11.8, 1, &set(&["s1"]));
+        assert_eq!(a.rate_of("s1"), Some(11.8));
+        // s2 (a T4) starts: +1.8.
+        a.observe(13.6, 2, &set(&["s1", "s2"]));
+        assert!((a.rate_of("s2").unwrap() - 1.8).abs() < 1e-9);
+        assert_eq!(a.rate_of("s1"), Some(11.8));
+        // s1 stops and s3 starts in the same interval: s3 gets the change plus s1's freed rate.
+        a.observe(7.0, 2, &set(&["s2", "s3"]));
+        assert!((a.rate_of("s3").unwrap() - 5.2).abs() < 1e-9);
+        assert_eq!(a.rate_of("s1"), None);
+    }
+
+    #[test]
+    fn ambiguous_starts_split_evenly_with_unmanaged() {
+        let mut a = RateAttribution::default();
+        // First reading ever: two sessions plus one unmanaged runtime share 9 CU/h.
+        a.observe(9.0, 3, &set(&["a", "b"]));
+        assert_eq!(a.rate_of("a"), Some(3.0));
+        assert_eq!(a.rate_of("b"), Some(3.0));
+        // Two start together: the increase is split evenly.
+        a.observe(13.0, 5, &set(&["a", "b", "c", "d"]));
+        assert_eq!(a.rate_of("c"), Some(2.0));
+        assert_eq!(a.rate_of("d"), Some(2.0));
+        // A start without a rate increase (already billed at the previous
+        // reading) falls back to the unexplained remainder.
+        let mut b = RateAttribution::default();
+        b.observe(5.0, 1, &set(&[]));
+        b.observe(5.0, 1, &set(&["late"]));
+        assert_eq!(b.rate_of("late"), Some(5.0));
+    }
+
+    #[test]
+    fn unmanaged_and_totals() {
+        let mut a = AccountUsage::default();
+        a.record_success(u(80.0, 13.6, 3), t(0), &set(&["s1", "s2"]));
+        assert_eq!(a.unmanaged_runtimes(2), 1);
+        let s1 = UsageSnapshot::new(u(10.0, 1.0, 1), t(0));
+        let mut s2 = UsageSnapshot::new(u(5.0, 2.0, 1), t(0));
+        s2.stale = true;
+        let tot = totals([Some(&s1), Some(&s2), None]);
+        assert_eq!(tot.balance_cu, 15.0);
+        assert_eq!(tot.accounts, 2);
+        assert!(!tot.complete);
+        assert!(tot.any_stale);
+    }
+}
