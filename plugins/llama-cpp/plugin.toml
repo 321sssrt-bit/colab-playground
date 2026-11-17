@@ -1,0 +1,192 @@
+api = 1
+id = "llama-cpp"
+version = "0.1.0"
+# Optional: a saved Hugging Face token is passed for private / gated repos.
+needs = ["hf_token"]
+
+[name]
+en = "Deploy a GGUF model"
+zh-CN = "部署 GGUF 模型"
+zh-TW = "部署 GGUF 模型"
+
+[description]
+en = "Serve a Hugging Face GGUF model with llama.cpp on a Colab GPU and get an OpenAI-compatible API plus a web chat. The best quantisation that fits the assigned GPU is picked automatically."
+zh-CN = "在 Colab GPU 上用 llama.cpp 运行 Hugging Face 的 GGUF 模型，提供 OpenAI 兼容 API 和网页聊天。会根据分配到的 GPU 自动选择放得下的最佳量化版本。"
+zh-TW = "在 Colab GPU 上用 llama.cpp 執行 Hugging Face 的 GGUF 模型，提供 OpenAI 相容 API 與網頁聊天。會依分配到的 GPU 自動選擇放得下的最佳量化版本。"
+
+[provision]
+accelerator = "A100"
+min_vram_mib = 0
+high_mem = false
+
+[[inputs]]
+id = "repo"
+type = "hf-model"
+required = true
+[inputs.label]
+en = "Model repository"
+zh-CN = "模型仓库"
+zh-TW = "模型儲存庫"
+[inputs.help]
+en = "A Hugging Face repo with GGUF files, e.g. unsloth/Qwen3-0.6B-GGUF."
+zh-CN = "包含 GGUF 文件的 Hugging Face 仓库，例如 unsloth/Qwen3-0.6B-GGUF。"
+zh-TW = "包含 GGUF 檔案的 Hugging Face 儲存庫，例如 unsloth/Qwen3-0.6B-GGUF。"
+
+[[inputs]]
+id = "quant"
+type = "select"
+options = ["auto", "Q8_0", "Q6_K", "Q5_K_M", "Q4_K_M", "IQ4_XS", "Q3_K_M"]
+default = "auto"
+[inputs.label]
+en = "Quantisation"
+zh-CN = "量化"
+zh-TW = "量化"
+[inputs.help]
+en = "auto picks the highest quality that fits the GPU memory."
+zh-CN = "auto 会选择显存放得下的最高质量版本。"
+zh-TW = "auto 會選擇顯示記憶體放得下的最高品質版本。"
+
+[[inputs]]
+id = "ctx"
+type = "number"
+default = 0
+min = 0
+max = 1048576
+[inputs.label]
+en = "Context length"
+zh-CN = "上下文长度"
+zh-TW = "上下文長度"
+[inputs.help]
+en = "0 = the model's maximum, reduced automatically if it does not fit."
+zh-CN = "0 = 模型最大值，放不下时自动减小。"
+zh-TW = "0 = 模型最大值，放不下時自動減小。"
+
+[[inputs]]
+id = "port"
+type = "number"
+default = 8000
+min = 1024
+max = 65535
+[inputs.label]
+en = "Server port on the VM"
+zh-CN = "VM 上的服务端口"
+zh-TW = "VM 上的服務連接埠"
+
+[[inputs]]
+id = "alias"
+type = "text"
+[inputs.label]
+en = "Model id in the API"
+zh-CN = "API 中的模型 id"
+zh-TW = "API 中的模型 id"
+[inputs.help]
+en = "Leave empty to derive it from the repository name."
+zh-CN = "留空则根据仓库名推导。"
+zh-TW = "留空則依儲存庫名稱推導。"
+
+[[inputs]]
+id = "kv"
+type = "select"
+options = ["auto", "f16", "q8_0", "q4_0"]
+default = "auto"
+[inputs.label]
+en = "KV cache type"
+zh-CN = "KV 缓存类型"
+zh-TW = "KV 快取類型"
+
+[[inputs]]
+id = "mmproj"
+type = "text"
+default = "auto"
+[inputs.label]
+en = "Vision projector"
+zh-CN = "视觉投影文件"
+zh-TW = "視覺投影檔案"
+[inputs.help]
+en = "auto loads one if the repo has it (f16 preferred), none disables it, or part of a file name."
+zh-CN = "auto：仓库里有就加载（优先 f16）；none：不加载；也可以填文件名的一部分。"
+zh-TW = "auto：儲存庫有就載入（優先 f16）；none：不載入；也可以填檔名的一部分。"
+
+[[inputs]]
+id = "mtp"
+type = "select"
+options = ["auto", "on", "off"]
+default = "auto"
+[inputs.label]
+en = "Speculative decoding (MTP)"
+zh-CN = "投机解码（MTP）"
+zh-TW = "推測解碼（MTP）"
+
+[[inputs]]
+id = "llama_tag"
+type = "text"
+default = "latest"
+[inputs.label]
+en = "llama.cpp build"
+zh-CN = "llama.cpp 版本"
+zh-TW = "llama.cpp 版本"
+
+[[inputs]]
+id = "api_key"
+type = "secret"
+[inputs.label]
+en = "API key (optional)"
+zh-CN = "API 密钥（可选）"
+zh-TW = "API 金鑰（選填）"
+
+[[inputs]]
+id = "extra_args"
+type = "text"
+[inputs.label]
+en = "Extra llama-server arguments"
+zh-CN = "额外的 llama-server 参数"
+zh-TW = "額外的 llama-server 參數"
+
+[run]
+script = "worker.py"
+
+[[stages]]
+id = "detect"
+[stages.label]
+en = "Check the GPU"
+zh-CN = "检查 GPU"
+zh-TW = "檢查 GPU"
+
+[[stages]]
+id = "plan"
+[stages.label]
+en = "Choose a quantisation"
+zh-CN = "选择量化版本"
+zh-TW = "選擇量化版本"
+
+[[stages]]
+id = "download"
+[stages.label]
+en = "Download the model"
+zh-CN = "下载模型"
+zh-TW = "下載模型"
+
+[[stages]]
+id = "server"
+[stages.label]
+en = "Start the server"
+zh-CN = "启动服务"
+zh-TW = "啟動服務"
+
+[[stages]]
+id = "warmup"
+[stages.label]
+en = "Warm up"
+zh-CN = "预热"
+zh-TW = "預熱"
+
+[[endpoints]]
+id = "api"
+port_input = "port"
+path = "/v1"
+health = "/health"
+kind = "openai"
+[endpoints.label]
+en = "OpenAI-compatible API and web chat"
+zh-CN = "OpenAI 兼容 API 与网页聊天"
+zh-TW = "OpenAI 相容 API 與網頁聊天"
