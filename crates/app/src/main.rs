@@ -2,7 +2,7 @@
 
 use colab_playground::{
     app,
-    backend::{BACKEND_ENV, USAGE, source_from_args},
+    backend::{BACKEND_ENV, source_from_args, usage},
     platform,
     settings::{CONFIG_DIR_ENV, SettingsStore, config_dir},
     state::StateOptions,
@@ -19,7 +19,7 @@ fn main() {
         Ok(source) => source,
         Err(error) => {
             log::error!("{error}");
-            eprintln!("colab-playground: {error}\n{USAGE}");
+            eprintln!("colab-playground: {error}\n{}", usage());
             std::process::exit(2);
         }
     };

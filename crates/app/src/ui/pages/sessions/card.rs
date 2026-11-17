@@ -151,6 +151,17 @@ pub(super) fn render(
     if !runtime.managed {
         card = card.child(Caption::new(tr(cx, keys::RUNTIME_UNMANAGED_HINT)));
     }
+    let armed = tracked
+        .and_then(|t| t.watchdog.as_ref())
+        .and_then(|w| w.enforced_deadline())
+        .is_some();
+    if runtime.auto_stop_at.is_some() && !armed {
+        // The time comes from the app-side limit alone; the quit prompt says the same.
+        card = card.child(tagged(
+            format!("auto-stop-app-only {label}"),
+            InlineMessage::new(Severity::Warning, tr(cx, keys::RUNTIME_AUTO_STOP_APP_ONLY)),
+        ));
+    }
     if let Some(error) = state.guard_stop_failure(&runtime.id) {
         let retry = handle.clone();
         let target = runtime.id.clone();

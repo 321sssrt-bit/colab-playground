@@ -498,6 +498,77 @@ fn cancelling_auto_stop_asks_first_and_it_can_be_set_again(cx: &mut TestAppConte
         matches!(auto_stop(&mut app), Some(Some(_))),
         "an auto-stop is set again"
     );
+    assert_eq!(
+        watchdog_armed(&mut app, "a100-7f3a"),
+        Some(true),
+        "on the runtime itself"
+    );
+    assert!(!app.shown("auto-stop-app-only a100-7f3a"));
+    let billing = app.read(|state, _| state.billing());
+    assert!(
+        billing
+            .watched
+            .iter()
+            .any(|r| r.name.as_deref() == Some("a100-7f3a")),
+        "the quit prompt lists it as stopping on its own: {billing:?}"
+    );
+}
+
+fn watchdog_armed(app: &mut TestApp<'_>, name: &str) -> Option<bool> {
+    app.read(|state, _| {
+        state.runtimes().ready().and_then(|view| {
+            view.runtimes
+                .iter()
+                .find(|r| r.id.name.as_deref() == Some(name))
+                .and_then(|r| r.tracked.as_ref())
+                .and_then(|t| t.watchdog.as_ref())
+                .map(|w| w.armed)
+        })
+    })
+}
+
+#[gpui::test]
+fn an_auto_stop_the_runtime_could_not_take_applies_only_while_the_app_is_open(
+    cx: &mut TestAppContext,
+) {
+    use colab_playground::ui::pages::sessions::{
+        cancel_auto_stop_selector, set_auto_stop_selector,
+    };
+    let mut app = TestApp::new(cx);
+    on_sessions(&mut app);
+    app.click(&cancel_auto_stop_selector("a100-7f3a"));
+    app.click(colab_playground::ui::overlays::CANCEL_AUTO_STOP_CONFIRM);
+    app.set_failures(MockFailures {
+        watchdog_restart_fails: true,
+        ..MockFailures::default()
+    });
+    app.click(&set_auto_stop_selector("a100-7f3a"));
+    assert_eq!(watchdog_armed(&mut app, "a100-7f3a"), Some(false));
+    let set = app.cx.update(|_, cx| {
+        colab_playground::i18n::tr_args(
+            cx,
+            colab_playground::i18n::keys::AUTO_STOP_SET,
+            &[("time", "2 h")],
+        )
+    });
+    assert!(
+        app.toasts_with_severity()
+            .contains(&(set, Some(ely_gpui_component::primitives::Severity::Warning))),
+        "a warning, not a success: {:?}",
+        app.toasts_with_severity()
+    );
+    assert!(
+        app.shown("auto-stop-app-only a100-7f3a"),
+        "the card says it applies only while the app is open"
+    );
+    let billing = app.read(|state, _| state.billing());
+    assert!(
+        billing
+            .unwatched
+            .iter()
+            .any(|r| r.name.as_deref() == Some("a100-7f3a")),
+        "the quit prompt lists it as having no automatic stop: {billing:?}"
+    );
 }
 
 #[gpui::test]

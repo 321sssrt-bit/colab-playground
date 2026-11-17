@@ -354,6 +354,17 @@ impl<'a> TestApp<'a> {
         })
     }
 
+    /// Toast titles with their severity, oldest first.
+    pub fn toasts_with_severity(
+        &mut self,
+    ) -> Vec<(
+        SharedString,
+        Option<ely_gpui_component::primitives::Severity>,
+    )> {
+        let toaster = self.read(|state, _| state.toaster().clone());
+        self.cx.update(|_, cx| toaster.read(cx).shown())
+    }
+
     /// The temporary config directory, if the app has one.
     pub fn config_dir(&self) -> Option<&Path> {
         self.config_dir.as_deref()

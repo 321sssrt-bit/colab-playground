@@ -3,8 +3,9 @@
 //! billing, or the app cannot tell, it opens the quit prompt instead of closing.
 //!
 //! "Leave running" is only described as watched by a watchdog for runtimes that have one;
-//! runtimes opened elsewhere, or whose watchdog failed or was cancelled, have no automatic
-//! stop and the prompt says so, listing every runtime by name and account.
+//! runtimes opened elsewhere, or whose watchdog on the runtime is not armed (it failed, was
+//! cancelled or could not be restarted), have no automatic stop and the prompt says so,
+//! listing every runtime by name and account.
 
 use colab_playground_core::{Error, ErrorKind, backend::RuntimeRef};
 use gpui::Context;
@@ -67,12 +68,12 @@ impl AppState {
         match &self.sessions.runtimes {
             Load::Ready(view) => {
                 for runtime in &view.runtimes {
+                    // Stops on its own only if the watchdog on the runtime is armed with a deadline.
                     let watched = runtime
                         .tracked
                         .as_ref()
                         .and_then(|t| t.watchdog.as_ref())
-                        .is_some_and(|w| w.deadline.is_some() && !w.cancelled)
-                        && !self.sessions.rearmed.contains(&runtime.id);
+                        .is_some_and(|w| w.enforced_deadline().is_some());
                     if watched {
                         billing.watched.push(runtime.id.clone());
                     } else {

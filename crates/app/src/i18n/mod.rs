@@ -590,6 +590,7 @@ catalog_keys! {
     QUIT_STOP_WIPED => "app.b3.quit_stop_wiped",
     RUNTIME_SET_AUTO_STOP => "app.b3.runtime_set_auto_stop",
     SESSIONS_ESTIMATE_NOTE => "app.b3.sessions_estimate_note",
+    RUNTIME_AUTO_STOP_APP_ONLY => "app.b5.runtime_auto_stop_app_only",
     RUN_LIMIT_HINT => "app.b3.run_limit_hint",
     SWITCH_UNMANAGED => "app.b3.switch_unmanaged",
     SWITCH_UNMANAGED_ITEM => "app.b3.switch_unmanaged_item",

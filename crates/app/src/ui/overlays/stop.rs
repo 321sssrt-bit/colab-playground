@@ -88,13 +88,11 @@ pub(super) fn cancel_auto_stop(
         Severity::Warning,
         tr_args(cx, keys::CANCEL_AUTO_STOP_BODY, &[("name", &prompt.label)]),
     ))
-    .children(state.rearm_duration().map(|by| {
-        Paragraph::new(tr_args(
-            cx,
-            keys::CANCEL_AUTO_STOP_REARM,
-            &[("time", &crate::format::duration(cx, by))],
-        ))
-    }));
+    .children(
+        state
+            .rearm_duration()
+            .map(|_| Paragraph::new(tr(cx, keys::CANCEL_AUTO_STOP_REARM))),
+    );
     if let Some(error) = &prompt.error {
         dialog = dialog.child(error_view::alert(
             "cancel-auto-stop",

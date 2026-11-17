@@ -37,9 +37,6 @@ pub struct SessionsState {
     pub(crate) stop_failures: HashMap<RuntimeRef, Error>,
     pub(crate) tunnels: BTreeMap<TunnelId, TunnelInfo>,
     pub(crate) guard_error: Option<Error>,
-    /// Runtimes whose auto-stop was set again after a cancel: core's watchdog exited on the
-    /// cancel, so only the app-side guard enforces it (while the app is open).
-    pub(crate) rearmed: std::collections::HashSet<RuntimeRef>,
 }
 
 /// A runtime that ended while the app watched, and why.
@@ -259,14 +256,12 @@ impl AppState {
         );
     }
 
-    /// How long Extend gives `runtime`: its own runtime limit, else the default one. `None`
-    /// when neither has a limit (then there is no auto-stop to move).
+    /// How far ahead Extend puts `runtime`'s auto-stop, counted from now: the default runtime
+    /// limit (Settings, else core's own). The session's recorded limit is not used: it counts
+    /// from the session's start and grows with every extension.
     pub fn extension_for(&self, runtime: &Runtime) -> Option<Duration> {
-        runtime
-            .tracked
-            .as_ref()
-            .and_then(|tracked| tracked.policy.max_runtime)
-            .or(self.defaults().max_runtime)
+        let _ = runtime;
+        self.rearm_duration()
     }
 
     /// Moves `target`'s auto-stop to [`Self::extension_for`] from now.
@@ -281,16 +276,14 @@ impl AppState {
             move |backend, cancel| backend.extend_session(&work_target, by, cancel),
             move |state, result, cx| {
                 match result {
-                    Ok(_) => {
+                    Ok(info) => {
                         state.sessions.warnings.remove(&target);
-                        state.toast_done(
-                            tr_args(
-                                cx,
-                                keys::EXTEND_DONE,
-                                &[("time", &format::duration(cx, by))],
-                            ),
+                        let title = tr_args(
                             cx,
+                            keys::EXTEND_DONE,
+                            &[("time", &format::duration(cx, by))],
                         );
+                        state.toast_auto_stop(title, info.armed, cx);
                         state.load_runtimes(cx);
                     }
                     Err(error) => state.toast_error(&error, cx),
@@ -372,8 +365,8 @@ impl AppState {
     }
 
     /// Sets an auto-stop again on `target` (after it was cancelled), [`Self::rearm_duration`]
-    /// from now. Core's `extend_session` rewrites the deadline, but the runtime's watchdog
-    /// exited on the cancel, so from then on only the app-side guard enforces it.
+    /// from now. Core's `extend_session` restarts the watchdog on the runtime; when that fails
+    /// the limit still holds through the app-side guard, and the toast says so.
     pub fn set_auto_stop(&mut self, target: RuntimeRef, cx: &mut Context<Self>) {
         let Some(by) = self.rearm_duration() else {
             return;
@@ -385,16 +378,13 @@ impl AppState {
             move |backend, cancel| backend.extend_session(&work_target, by, cancel),
             move |state, result, cx| {
                 match result {
-                    Ok(_) => {
-                        state.sessions.rearmed.insert(target.clone());
-                        state.toast_done(
-                            tr_args(
-                                cx,
-                                keys::AUTO_STOP_SET,
-                                &[("time", &format::duration(cx, by))],
-                            ),
+                    Ok(info) => {
+                        let title = tr_args(
                             cx,
+                            keys::AUTO_STOP_SET,
+                            &[("time", &format::duration(cx, by))],
                         );
+                        state.toast_auto_stop(title, info.armed, cx);
                         state.load_runtimes(cx);
                     }
                     Err(error) => state.toast_error(&error, cx),
@@ -565,6 +555,22 @@ impl AppState {
     pub fn clear_ended(&mut self, cx: &mut Context<Self>) {
         self.sessions.ended.clear();
         cx.notify();
+    }
+
+    /// After moving or setting an auto-stop: whether the runtime itself will stop then (its
+    /// watchdog is armed, so it works with the app closed) or only this app will, while open.
+    fn toast_auto_stop(&self, title: gpui::SharedString, armed: bool, cx: &mut Context<Self>) {
+        let toast = if armed {
+            Toast::new(title)
+                .body(tr(cx, keys::PROV_WATCHDOG))
+                .severity(Severity::Success)
+        } else {
+            Toast::new(title)
+                .body(tr(cx, keys::PROV_WATCHDOG_FAILED))
+                .severity(Severity::Warning)
+                .stay(None)
+        };
+        self.toast(toast, cx);
     }
 
     /// An error toast for a failed action, explained in the user's terms.

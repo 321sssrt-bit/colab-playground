@@ -984,10 +984,7 @@ pub(super) const MESSAGES: Messages = &[
         "{count} more that could not be listed",
     ),
     (RUNTIME_SET_AUTO_STOP, "Set auto-stop in {time}"),
-    (
-        AUTO_STOP_SET,
-        "Auto-stop set for {time} from now. This app enforces it while it is open.",
-    ),
+    (AUTO_STOP_SET, "Auto-stop set for {time} from now"),
     (CANCEL_AUTO_STOP_TITLE, "Cancel auto-stop?"),
     (
         CANCEL_AUTO_STOP_BODY,
@@ -995,7 +992,7 @@ pub(super) const MESSAGES: Messages = &[
     ),
     (
         CANCEL_AUTO_STOP_REARM,
-        "You can set an auto-stop again from its card ({time} from then), but only this app enforces it then, while it is open: the stop on the runtime itself cannot be restarted.",
+        "You can set an auto-stop again from its card.",
     ),
     (CANCEL_AUTO_STOP_KEEP, "Keep auto-stop"),
     (
@@ -1033,5 +1030,9 @@ pub(super) const MESSAGES: Messages = &[
     (
         RUN_LIMIT_HINT,
         "Choose a session that is already running above, stop one, or raise the limit in Settings.",
+    ),
+    (
+        RUNTIME_AUTO_STOP_APP_ONLY,
+        "The stop could not be set on the runtime, so this auto-stop applies only while this app is open.",
     ),
 ];

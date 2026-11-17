@@ -816,10 +816,7 @@ pub(super) const MESSAGES: Messages = &[
     (SWITCH_UNMANAGED_ITEM, "{name}"),
     (SWITCH_UNMANAGED_MORE, "另有 {count} 个无法列出"),
     (RUNTIME_SET_AUTO_STOP, "设置 {time}后自动停止"),
-    (
-        AUTO_STOP_SET,
-        "已设置 {time}后自动停止，由本应用在打开期间执行。",
-    ),
+    (AUTO_STOP_SET, "已设置 {time}后自动停止"),
     (CANCEL_AUTO_STOP_TITLE, "取消自动停止？"),
     (
         CANCEL_AUTO_STOP_BODY,
@@ -827,7 +824,7 @@ pub(super) const MESSAGES: Messages = &[
     ),
     (
         CANCEL_AUTO_STOP_REARM,
-        "之后可以在它的卡片上重新设置自动停止（从那时起 {time}），但届时只由本应用在打开期间执行：运行时上的自动停止无法重新启动。",
+        "之后可以在它的卡片上重新设置自动停止。",
     ),
     (CANCEL_AUTO_STOP_KEEP, "保留自动停止"),
     (
@@ -865,5 +862,9 @@ pub(super) const MESSAGES: Messages = &[
     (
         RUN_LIMIT_HINT,
         "可以在上方选择一个已在运行的会话、先停止一个，或在设置中调高上限。",
+    ),
+    (
+        RUNTIME_AUTO_STOP_APP_ONLY,
+        "未能在运行时上设置自动停止，所以这个自动停止只在本应用打开时有效。",
     ),
 ];

@@ -124,7 +124,7 @@ pub struct MockFlags {
 
 impl MockFlags {
     /// Names accepted by `--mock-fail` (comma-separated).
-    pub const FAILURES: [&'static str; 9] = [
+    pub const FAILURES: [&'static str; 10] = [
         "cli-missing",
         "install-fails",
         "keyring",
@@ -134,6 +134,7 @@ impl MockFlags {
         "not-entitled",
         "ssh-busy",
         "plugin-fails",
+        "watchdog-restart-fails",
     ];
 
     /// Reads `--mock-scenario demo|single|signed-out` (default `demo`) and
@@ -170,6 +171,7 @@ impl MockFlags {
                     }
                     "ssh-busy" => flags.failures.ssh_busy_attempts = 1,
                     "plugin-fails" => flags.failures.plugin_fail_stage = Some("download".into()),
+                    "watchdog-restart-fails" => flags.failures.watchdog_restart_fails = true,
                     "login-invalid-code" => {
                         flags.failures.login = Some(MockLoginFailure::InvalidCode)
                     }
@@ -185,7 +187,12 @@ impl MockFlags {
 }
 
 /// How to call the program, printed with any argument error.
-pub const USAGE: &str = "usage: colab-playground [--real | --mock [--mock-scenario demo|single|signed-out] [--mock-fail NAME[,NAME...]]]";
+pub fn usage() -> String {
+    format!(
+        "usage: colab-playground [--real | --mock [--mock-scenario demo|single|signed-out] [--mock-fail NAME[,NAME...]]]\n  --mock-fail names: {}",
+        MockFlags::FAILURES.join(", ")
+    )
+}
 
 /// Flags that take a value.
 const VALUE_FLAGS: [&str; 2] = ["--mock-scenario", "--mock-fail"];
@@ -389,6 +396,9 @@ mod tests {
         );
         assert!(check_args::<&str>(&[]).is_ok());
         assert!(check_args(&["--real"]).is_ok());
+        let flags = MockFlags::parse(&["--mock", "--mock-fail", "watchdog-restart-fails"]).unwrap();
+        assert!(flags.failures.watchdog_restart_fails);
+        assert!(super::usage().contains("watchdog-restart-fails"));
 
         // Simulation flags without the simulation would start the real backend.
         assert!(matches!(
