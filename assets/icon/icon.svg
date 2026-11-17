@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!--
+    Colab Playground application icon: the title bar's lightning bolt on an ink tile.
+    Master drawing for 64 px and up; icon-16/24/32/48.svg are the small-size drawings.
+    Full tile for Windows and Linux; export.py fits it into Apple's 824/1024 safe area for macOS.
+
+    The bolt path is Lucide's "zap" icon (lucide-static 1.48.0, shipped with Ely GPUI
+    Components as IconName::Zap), used unchanged at its 2-unit stroke under the ISC License:
+
+    ISC License
+
+    Copyright (c) 2026 Lucide Icons and Contributors
+
+    Permission to use, copy, modify, and/or distribute this software for any
+    purpose with or without fee is hereby granted, provided that the above
+    copyright notice and this permission notice appear in all copies.
+
+    THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+    WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+    MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+    ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+    WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+    ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+    OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+  -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2B2825"/>
+      <stop offset="1" stop-color="#161412"/>
+    </linearGradient>
+  </defs>
+  <!-- Tile: radius 230/1024 matches Apple's 185/824 corner ratio, so the macOS fit is a plain scale. -->
+  <rect width="1024" height="1024" rx="230" fill="url(#tile)"/>
+  <!-- Faint inner rim so the tile keeps its edge on dark taskbars and docks. -->
+  <rect x="6" y="6" width="1012" height="1012" rx="224" fill="none" stroke="#FFFFFF" stroke-opacity="0.12" stroke-width="12"/>
+  <!-- Bolt: the 24-unit Lucide grid scaled 27x and centred (the path is point-symmetric about 12,12). -->
+  <g transform="translate(188 188) scale(27)" fill="none" stroke="#F3F1EE" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M15.914 4 a1.5 1.5 0 0 0 -2.474 -1.561 l-9 9 A1.5 1.5 0 0 0 5.5 14 h4.002 a0.5 0.5 0 0 1 0.471 0.666 L8.086 20 a1.5 1.5 0 0 0 2.475 1.56 l9 -9 A1.5 1.5 0 0 0 18.5 10 h-3.997 a0.5 0.5 0 0 1 -0.472 -0.667 z"/>
+  </g>
+</svg>

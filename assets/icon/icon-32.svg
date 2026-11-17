@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
+  <!--
+    Colab Playground icon, drawing for 32 px (see icon.svg for the master): a larger bolt,
+    a heavier stroke and a 1 px rim, so it stays legible at this size.
+    Bolt path: Lucide "zap" (lucide-static 1.48.0), ISC License; notice in icon.svg and LICENSE-lucide.txt.
+  -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2B2825"/>
+      <stop offset="1" stop-color="#161412"/>
+    </linearGradient>
+  </defs>
+  <rect width="32" height="32" rx="7.2" fill="url(#tile)"/>
+  <rect x="0.5" y="0.5" width="31" height="31" rx="6.7" fill="none" stroke="#FFFFFF" stroke-opacity="0.14" stroke-width="1"/>
+  <g transform="translate(4 4) scale(1)" fill="none" stroke="#F3F1EE" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M15.914 4 a1.5 1.5 0 0 0 -2.474 -1.561 l-9 9 A1.5 1.5 0 0 0 5.5 14 h4.002 a0.5 0.5 0 0 1 0.471 0.666 L8.086 20 a1.5 1.5 0 0 0 2.475 1.56 l9 -9 A1.5 1.5 0 0 0 18.5 10 h-3.997 a0.5 0.5 0 0 1 -0.472 -0.667 z"/>
+  </g>
+</svg>
