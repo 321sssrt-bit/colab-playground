@@ -142,6 +142,37 @@ fn a_failed_stage_says_whether_the_runtime_still_bills(cx: &mut TestAppContext) 
     assert!(left.runtimes.is_empty());
 }
 
+#[gpui::test]
+fn a_runtime_is_only_called_stopped_when_its_account_was_listed(cx: &mut TestAppContext) {
+    let options = Options {
+        failures: MockFailures {
+            plugin_fail_stage: Some("download".into()),
+            ..MockFailures::default()
+        },
+        ..Options::scenario(MockScenario::single())
+    };
+    let mut app = TestApp::with(cx, options);
+    open_deploy_form(&mut app);
+    app.fill(
+        |inputs| inputs.field("repo").expect("the model field"),
+        REPO,
+    );
+    app.click(RUN_START);
+    assert!(matches!(run_phase(&mut app), Some(RunPhase::Failed(_))));
+    assert!(
+        app.shown("run-session-stopped"),
+        "the listing no longer has it"
+    );
+    // The run's account cannot be listed now: whether its runtime is gone is not known.
+    app.set_failures(MockFailures {
+        unlisted_accounts: vec!["ada@example.com".into()],
+        ..MockFailures::default()
+    });
+    app.update(|state, cx| state.load_runtimes(cx));
+    assert!(!app.shown("run-session-stopped"));
+    assert!(app.shown(colab_playground::ui::pages::plugins::RUN_SESSION_UNKNOWN_SELECTOR));
+}
+
 const FIXTURE_MANIFEST: &str = r#"api = 1
 id = "hello-web"
 version = "0.2.0"

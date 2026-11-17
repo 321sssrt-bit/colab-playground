@@ -35,6 +35,10 @@ pub const NEW_SESSION_SELECTOR: &str = "sessions-new";
 pub const PROVISIONING_SELECTOR: &str = "sessions-provisioning";
 /// Selector of the ended list.
 pub const ENDED_SELECTOR: &str = "sessions-ended";
+/// Selector of the empty state when every account was listed and nothing runs.
+pub const EMPTY_SELECTOR: &str = "sessions-empty";
+/// Selector of the empty state when some accounts could not be listed.
+pub const EMPTY_PARTIAL_SELECTOR: &str = "sessions-empty-partial";
 
 /// The Sessions page.
 pub fn render(state: &AppState, handle: &Entity<AppState>, cx: &App) -> Page {
@@ -139,21 +143,25 @@ pub fn render(state: &AppState, handle: &Entity<AppState>, cx: &App) -> Page {
             }
             if view.runtimes.is_empty() {
                 let new = handle.clone();
-                page.child(
-                    EmptyState::new(
-                        "sessions-empty",
-                        IconName::Server,
-                        tr(cx, keys::SESSIONS_EMPTY_TITLE),
-                    )
-                    .body(tr(cx, keys::SESSIONS_EMPTY_BODY))
-                    .action(
-                        Button::new("sessions-empty-new", tr(cx, keys::NEW_TITLE))
-                            .icon(IconName::Plus)
-                            .on_click(move |_, _, cx| {
-                                new.update(cx, |state, cx| state.open_new_session(cx))
-                            }),
-                    ),
-                )
+                // "Nothing is running" only when every account was listed; otherwise it covers
+                // just the accounts that were (the ones that were not are reported above).
+                let (selector, title) = if view.errors.is_empty() {
+                    (EMPTY_SELECTOR, keys::SESSIONS_EMPTY_TITLE)
+                } else {
+                    (EMPTY_PARTIAL_SELECTOR, keys::SESSIONS_EMPTY_PARTIAL_TITLE)
+                };
+                page.child(tagged(
+                    selector,
+                    EmptyState::new("sessions-empty", IconName::Server, tr(cx, title))
+                        .body(tr(cx, keys::SESSIONS_EMPTY_BODY))
+                        .action(
+                            Button::new("sessions-empty-new", tr(cx, keys::NEW_TITLE))
+                                .icon(IconName::Plus)
+                                .on_click(move |_, _, cx| {
+                                    new.update(cx, |state, cx| state.open_new_session(cx))
+                                }),
+                        ),
+                ))
             } else {
                 page.child(Caption::new(tr(cx, keys::SESSIONS_ESTIMATE_NOTE)))
                     .children(groups(&view.runtimes, state, handle, cx))

@@ -903,4 +903,7 @@ pub(super) const MESSAGES: Messages = &[
         "应用无法列出各账号上的运行时，可能仍有运行时在计费。",
     ),
     (QUIT_STOP_ALL_FAILED, "无法停止运行时：{why}"),
+    (SUMMARY_INCOMPLETE, "不完整"),
+    (SUMMARY_NOT_COUNTED, "未计入：{emails}"),
+    (SESSIONS_EMPTY_PARTIAL_TITLE, "能列出的账号上没有运行时"),
 ];

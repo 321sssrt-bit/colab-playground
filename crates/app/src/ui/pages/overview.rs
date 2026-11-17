@@ -37,6 +37,10 @@ use crate::{
 pub const CHECKLIST_SELECTOR: &str = "overview-checklist";
 /// Selector of the summary card shown once set up.
 pub const SUMMARY_SELECTOR: &str = "overview-summary";
+/// Selector of the mark on a runtime count that leaves accounts out.
+pub const RUNTIMES_INCOMPLETE_SELECTOR: &str = "summary runtimes-incomplete";
+/// Selector of the line naming the accounts a runtime count leaves out.
+pub const RUNTIMES_UNCOUNTED_SELECTOR: &str = "summary runtimes-uncounted";
 /// Selector around the Install button.
 pub const INSTALL_SELECTOR: &str = "install-start";
 /// Selector around the Cancel button of a running install.
@@ -609,11 +613,31 @@ fn summary(state: &AppState, handle: &Entity<AppState>, cx: &App) -> impl IntoEl
             Some(eta) => format::approx(cx, &format::duration(cx, eta)),
         },
     };
+    // Unknown is never shown as zero: with no account's usage known the count is unknown, and
+    // a sum that leaves accounts out is marked and says which.
     let totals = state.usage_summary();
+    let uncounted = state.uncounted_accounts();
+    let incomplete = totals.known > 0 && !uncounted.is_empty();
     let runtimes = if totals.known == 0 {
         unknown()
     } else {
         SharedString::from(totals.runtimes.to_string())
+    };
+    let runtimes_mark = incomplete.then(|| {
+        tagged(
+            RUNTIMES_INCOMPLETE_SELECTOR,
+            Badge::new(tr(cx, keys::SUMMARY_INCOMPLETE)).tone(Tone::Warning),
+        )
+        .into_any_element()
+    });
+    let runtimes_note = if incomplete {
+        tagged(
+            RUNTIMES_UNCOUNTED_SELECTOR,
+            Caption::new(not_counted(&uncounted, cx)),
+        )
+        .into_any_element()
+    } else {
+        Caption::new(tr(cx, keys::SUMMARY_RUNTIMES_ALL)).into_any_element()
     };
     let stale_note = snapshot
         .filter(|s| usage_is_stale(s, state.usage_now()))
@@ -645,7 +669,7 @@ fn summary(state: &AppState, handle: &Entity<AppState>, cx: &App) -> impl IntoEl
                     }),
             )),
     );
-    let tile = |id: &str, label: &str, value: SharedString| {
+    let tile = |id: &str, label: &str, value: SharedString, mark: Option<AnyElement>| {
         tagged(
             format!("summary {id} {value}"),
             div()
@@ -657,9 +681,16 @@ fn summary(state: &AppState, handle: &Entity<AppState>, cx: &App) -> impl IntoEl
                 .child(Caption::new(tr(cx, label)))
                 .child(
                     div()
-                        .text_size(theme.text_size(TextSize::Xl))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(value),
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_size(theme.text_size(TextSize::Xl))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(value),
+                        )
+                        .children(mark),
                 ),
         )
     };
@@ -678,18 +709,37 @@ fn summary(state: &AppState, handle: &Entity<AppState>, cx: &App) -> impl IntoEl
                     .flex()
                     .flex_wrap()
                     .gap_6()
-                    .child(tile("balance", keys::SUMMARY_BALANCE, balance))
-                    .child(tile("rate", keys::SUMMARY_RATE, rate))
-                    .child(tile("left", keys::SUMMARY_TIME_LEFT, left))
+                    .child(tile("balance", keys::SUMMARY_BALANCE, balance, None))
+                    .child(tile("rate", keys::SUMMARY_RATE, rate, None))
+                    .child(tile("left", keys::SUMMARY_TIME_LEFT, left, None))
                     .child(
-                        tile("runtimes", keys::SUMMARY_RUNTIMES, runtimes)
-                            .child(Caption::new(tr(cx, keys::SUMMARY_RUNTIMES_ALL))),
+                        tile("runtimes", keys::SUMMARY_RUNTIMES, runtimes, runtimes_mark)
+                            .child(runtimes_note),
                     ),
             )
             .children(stale_note.map(|note| InlineMessage::new(Severity::Warning, tr(cx, note))))
             .children(failure),
     )
     .w_full()
+}
+
+/// The accounts a runtime count leaves out: by email while they fit on the tile (two at most,
+/// all with an email), otherwise how many.
+fn not_counted(uncounted: &[Option<String>], cx: &App) -> SharedString {
+    let emails: Option<Vec<&str>> = uncounted.iter().map(Option::as_deref).collect();
+    match emails {
+        Some(emails) if emails.len() <= 2 => tr_args(
+            cx,
+            keys::SUMMARY_NOT_COUNTED,
+            &[("emails", &emails.join(", "))],
+        ),
+        _ if uncounted.len() == 1 => tr(cx, keys::ACCOUNTS_TOTAL_MISSING_ONE),
+        _ => tr_args(
+            cx,
+            keys::ACCOUNTS_TOTAL_MISSING_MANY,
+            &[("count", &uncounted.len().to_string())],
+        ),
+    }
 }
 
 /// Warns about runtimes the app did not start that are billing.

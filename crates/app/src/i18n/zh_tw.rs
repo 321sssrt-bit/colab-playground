@@ -921,4 +921,7 @@ pub(super) const MESSAGES: Messages = &[
         "應用程式無法列出各帳號上的執行階段，可能仍有執行階段在計費。",
     ),
     (QUIT_STOP_ALL_FAILED, "無法停止執行階段：{why}"),
+    (SUMMARY_INCOMPLETE, "不完整"),
+    (SUMMARY_NOT_COUNTED, "未計入：{emails}"),
+    (SESSIONS_EMPTY_PARTIAL_TITLE, "能列出的帳號上沒有執行階段"),
 ];

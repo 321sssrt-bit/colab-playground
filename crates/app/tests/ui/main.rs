@@ -6,6 +6,7 @@
 mod support;
 
 mod accounts;
+mod counts;
 mod defaults;
 mod fonts;
 mod harness;

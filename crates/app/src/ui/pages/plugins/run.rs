@@ -36,6 +36,8 @@ use crate::{
 pub const RUN_CANCEL: &str = "run-cancel";
 /// Selector of "Stop and end billing" after a failure.
 pub const RUN_STOP: &str = "run-stop";
+/// Selector of the line saying the app could not check whether the run's runtime still runs.
+pub const RUN_SESSION_UNKNOWN_SELECTOR: &str = "run-session-unknown";
 /// Selector around an endpoint card: `endpoint <id>`.
 pub const ENDPOINT_SELECTOR: &str = "endpoint";
 
@@ -316,14 +318,28 @@ fn billing_after_end(
     if state.is_busy(Op::Runtimes) || state.runtimes().is_loading() {
         return Caption::new(tr(cx, keys::RUN_CHECKING)).into_any_element();
     }
-    match state.runtimes() {
-        Load::Ready(_) => tagged(
+    // Gone only if the list is complete for the run's account (any account, when the run did
+    // not record one).
+    let listed = match state.runtimes() {
+        Load::Ready(view) => !view.errors.iter().any(|failure| {
+            run.account
+                .as_ref()
+                .is_none_or(|account| &failure.account == account)
+        }),
+        _ => false,
+    };
+    if listed {
+        tagged(
             "run-session-stopped",
             InlineMessage::new(Severity::Info, tr(cx, keys::RUN_SESSION_STOPPED)),
         )
-        .into_any_element(),
-        _ => InlineMessage::new(Severity::Warning, tr(cx, keys::RUN_SESSION_UNKNOWN))
-            .into_any_element(),
+        .into_any_element()
+    } else {
+        tagged(
+            RUN_SESSION_UNKNOWN_SELECTOR,
+            InlineMessage::new(Severity::Warning, tr(cx, keys::RUN_SESSION_UNKNOWN)),
+        )
+        .into_any_element()
     }
 }
 

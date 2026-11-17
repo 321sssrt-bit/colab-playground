@@ -622,6 +622,9 @@ catalog_keys! {
     QUIT_TITLE_UNCHECKED => "app.b9.quit_title_unchecked",
     QUIT_UNCHECKED => "app.b9.quit_unchecked",
     QUIT_STOP_ALL_FAILED => "app.b9.quit_stop_all_failed",
+    SUMMARY_INCOMPLETE => "app.b10.summary_incomplete",
+    SUMMARY_NOT_COUNTED => "app.b10.summary_not_counted",
+    SESSIONS_EMPTY_PARTIAL_TITLE => "app.b10.sessions_empty_partial_title",
 }
 
 /// A message table: `(key, message)` pairs; `{name}` marks an argument.

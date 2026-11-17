@@ -288,6 +288,26 @@ impl<'a> TestApp<'a> {
         result
     }
 
+    /// Applies `update` to the app state and draws a frame without running the executor, so
+    /// a state that pending work (a listing in flight) ends at the next settle can be seen.
+    pub fn update_and_draw<R>(
+        &mut self,
+        update: impl FnOnce(&mut AppState, &mut Context<AppState>) -> R,
+    ) -> R {
+        let state = self.state.clone();
+        let result = self.cx.update(|_, cx| state.update(cx, update));
+        self.draw_now();
+        result
+    }
+
+    /// Draws a frame now, without running the executor first.
+    pub fn draw_now(&mut self) {
+        self.cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+    }
+
     /// The page on show.
     pub fn route(&mut self) -> Route {
         self.read(|state, _| state.route())

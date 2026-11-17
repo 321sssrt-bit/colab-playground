@@ -1074,4 +1074,10 @@ pub(super) const MESSAGES: Messages = &[
         "The app couldn't list the runtimes on your accounts, so some may still be billing.",
     ),
     (QUIT_STOP_ALL_FAILED, "Couldn't stop the runtimes: {why}"),
+    (SUMMARY_INCOMPLETE, "Incomplete"),
+    (SUMMARY_NOT_COUNTED, "Not counted: {emails}"),
+    (
+        SESSIONS_EMPTY_PARTIAL_TITLE,
+        "Nothing is running on the accounts that could be listed",
+    ),
 ];

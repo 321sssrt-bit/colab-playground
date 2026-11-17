@@ -144,6 +144,24 @@ impl AppState {
         summary
     }
 
+    /// Saved accounts with no usage snapshot yet (not loaded, or every fetch failed), by email
+    /// (`None` when the account has none): totals do not count them.
+    pub fn uncounted_accounts(&self) -> Vec<Option<String>> {
+        self.accounts
+            .ready()
+            .map(|view| {
+                view.accounts
+                    .iter()
+                    .filter(|account| {
+                        self.usage_for(&account.id)
+                            .is_none_or(|usage| usage.snapshot.is_none())
+                    })
+                    .map(|account| account.email.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Accounts with runtimes this app does not manage, and how many.
     pub fn unmanaged(&self) -> Vec<(Option<String>, u32)> {
         self.usage

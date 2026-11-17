@@ -205,3 +205,20 @@ fn after_a_failed_stop_all_a_listing_that_finds_nothing_quits(cx: &mut TestAppCo
     app.settle();
     assert!(app.read(|state, _| state.quit_approved()));
 }
+
+#[gpui::test]
+fn while_checking_the_prompt_says_it_closes_by_itself(cx: &mut TestAppContext) {
+    let options = Options {
+        failures: listing_fails(),
+        ..Options::scenario(MockScenario::single())
+    };
+    let mut app = TestApp::with(cx, options);
+    app.set_failures(MockFailures::default());
+    assert!(!app.cx.simulate_close());
+    // Drawn before the fresh listing arrives.
+    app.draw_now();
+    assert!(app.shown(QUIT_CHECKING));
+    assert!(!app.shown(QUIT_UNCHECKED));
+    app.settle();
+    assert!(app.read(|state, _| state.quit_approved()));
+}
