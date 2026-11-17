@@ -18,7 +18,7 @@ they are, see [Where things are stored](#where-things-are-stored)).
 - **Linux x64:** unpack `colab-playground-<version>-x86_64-unknown-linux-gnu.tar.gz`
   (`tar -xzf <file>`) and run `colab-playground` in the folder it creates. It needs glibc 2.35 or
   newer (for example Ubuntu 22.04 or Debian 12 and later) and libraries a desktop installation
-  already has, among them xkbcommon-x11 and fontconfig.
+  already has: libxcb, libxkbcommon and libxkbcommon-x11.
 - **macOS 11 or later on Apple silicon:** unzip `colab-playground-<version>-aarch64-apple-darwin.zip`
   and move `Colab Playground.app` to Applications. It is not notarised by Apple, so macOS refuses
   the first launch: try to open it once, then open System Settings → Privacy & Security and, under
