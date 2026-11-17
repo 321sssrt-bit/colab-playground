@@ -101,6 +101,7 @@ pub fn kind_key(kind: ErrorKind) -> Option<&'static str> {
         K::InstallFailed => keys::ERR_INSTALL_FAILED,
         K::Http => keys::ERR_HTTP,
         K::HttpUnavailable => keys::ERR_HTTP_UNAVAILABLE,
+        K::RateLimited => keys::ERR_RATE_LIMITED,
         K::Parse => keys::ERR_PARSE,
         K::Io => keys::ERR_IO,
         K::Timeout => keys::ERR_TIMEOUT,

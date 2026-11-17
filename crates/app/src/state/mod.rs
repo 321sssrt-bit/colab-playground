@@ -18,6 +18,7 @@ mod quit;
 mod runs;
 mod sessions;
 mod tunnels;
+mod updates;
 mod usage;
 
 use std::sync::Arc;
@@ -49,6 +50,7 @@ pub use quit::{Billing, QuitPrompt};
 pub use runs::{HF_RESULTS, HfLookup, PluginRun, PluginView, RunForm, RunPhase};
 pub use sessions::{EndReason, Ended, StopPrompt, runtime_label};
 pub use tunnels::{FORWARD_START_PORT, ForwardForm, local_url};
+pub use updates::{UPDATE_INTERVAL, UpdateCheck, is_newer};
 pub use usage::{
     POLL_CHECK, UsageSummary, is_stale as usage_is_stale, stale_note as usage_stale_note, summarize,
 };
@@ -154,6 +156,7 @@ pub struct AppState {
     quit: quit::QuitState,
     stop_all_pending: bool,
     settings_focus: bool,
+    update: updates::UpdateCheck,
 }
 
 /// A dialog other than the account ones (those are [`AccountDialog`]).
@@ -277,6 +280,7 @@ impl AppState {
                 quit: quit::QuitState::default(),
                 stop_all_pending: false,
                 settings_focus: false,
+                update: updates::UpdateCheck::default(),
             };
             state.font_fallbacks = platform::font_fallbacks(language, &state.cjk_fonts);
             state.apply_mode(true, cx);

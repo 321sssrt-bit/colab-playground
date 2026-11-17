@@ -15,4 +15,5 @@ mod plugins;
 mod sessions;
 mod settings_page;
 mod titlebar;
+mod updates;
 mod usage;

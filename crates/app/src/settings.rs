@@ -113,6 +113,41 @@ pub struct Settings {
         skip_serializing_if = "Option::is_none"
     )]
     pub colab_python: Option<String>,
+    /// Check GitHub for a newer release automatically (once a day).
+    #[serde(default, deserialize_with = "lenient")]
+    pub check_updates: OnByDefault,
+    /// When the last update check was made (seconds since the Unix epoch, backend clock).
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub update_checked_at: Option<u64>,
+    /// The newest release a check found, while it is newer than this build.
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub update_latest: Option<String>,
+    /// The release whose notice the user dismissed.
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub update_dismissed: Option<String>,
+}
+
+/// A switch that is on unless the user turned it off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct OnByDefault(pub bool);
+
+impl Default for OnByDefault {
+    fn default() -> Self {
+        OnByDefault(true)
+    }
 }
 
 /// `defaults` from stored JSON, keeping every field that parses; returns the names of the

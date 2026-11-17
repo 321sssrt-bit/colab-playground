@@ -124,7 +124,7 @@ pub struct MockFlags {
 
 impl MockFlags {
     /// Names accepted by `--mock-fail` (comma-separated).
-    pub const FAILURES: [&'static str; 10] = [
+    pub const FAILURES: [&'static str; 12] = [
         "cli-missing",
         "install-fails",
         "keyring",
@@ -135,6 +135,8 @@ impl MockFlags {
         "ssh-busy",
         "plugin-fails",
         "watchdog-restart-fails",
+        "update-available",
+        "update-check-fails",
     ];
 
     /// Reads `--mock-scenario demo|single|signed-out` (default `demo`) and
@@ -171,6 +173,8 @@ impl MockFlags {
                     }
                     "ssh-busy" => flags.failures.ssh_busy_attempts = 1,
                     "plugin-fails" => flags.failures.plugin_fail_stage = Some("download".into()),
+                    "update-available" => flags.failures.update_available = true,
+                    "update-check-fails" => flags.failures.update_check_fails = true,
                     "watchdog-restart-fails" => flags.failures.watchdog_restart_fails = true,
                     "login-invalid-code" => {
                         flags.failures.login = Some(MockLoginFailure::InvalidCode)
@@ -398,6 +402,11 @@ mod tests {
         assert!(check_args(&["--real"]).is_ok());
         let flags = MockFlags::parse(&["--mock", "--mock-fail", "watchdog-restart-fails"]).unwrap();
         assert!(flags.failures.watchdog_restart_fails);
+        let flags =
+            MockFlags::parse(&["--mock", "--mock-fail=update-available,update-check-fails"])
+                .unwrap();
+        assert!(flags.failures.update_available && flags.failures.update_check_fails);
+        assert!(super::usage().contains("update-available"));
         assert!(super::usage().contains("watchdog-restart-fails"));
 
         // Simulation flags without the simulation would start the real backend.

@@ -83,6 +83,8 @@ pub enum Op {
     HfFiles(u64),
     /// Stopping every runtime before quitting.
     StopAll,
+    /// Checking GitHub for a newer release.
+    UpdateCheck,
 }
 
 impl Op {

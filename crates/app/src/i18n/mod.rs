@@ -598,6 +598,23 @@ catalog_keys! {
     UNIT_HOURS => "app.b3.unit_hours",
     UNIT_MINUTES => "app.b3.unit_minutes",
     UNIT_SECONDS => "app.b3.unit_seconds",
+    ERR_RATE_LIMITED => "app.b7.err_rate_limited",
+    UPDATE_AUTO => "app.b7.update_auto",
+    UPDATE_AUTO_HINT => "app.b7.update_auto_hint",
+    UPDATE_AVAILABLE => "app.b7.update_available",
+    UPDATE_BADGE => "app.b7.update_badge",
+    UPDATE_CHECK => "app.b7.update_check",
+    UPDATE_CHECKING => "app.b7.update_checking",
+    UPDATE_DISMISS => "app.b7.update_dismiss",
+    UPDATE_FAILED => "app.b7.update_failed",
+    UPDATE_FAILED_TITLE => "app.b7.update_failed_title",
+    UPDATE_NOTICE_BODY => "app.b7.update_notice_body",
+    UPDATE_NOTICE_TITLE => "app.b7.update_notice_title",
+    UPDATE_NOT_CHECKED => "app.b7.update_not_checked",
+    UPDATE_OPEN_PAGE => "app.b7.update_open_page",
+    UPDATE_TITLE => "app.b7.update_title",
+    UPDATE_TRY_AGAIN => "app.b7.update_try_again",
+    UPDATE_UP_TO_DATE => "app.b7.update_up_to_date",
 }
 
 /// A message table: `(key, message)` pairs; `{name}` marks an argument.

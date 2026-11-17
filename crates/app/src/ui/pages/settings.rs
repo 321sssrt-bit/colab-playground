@@ -12,8 +12,8 @@ use ely_gpui_component::{
     typography::{Caption, MiddleEllipsis},
 };
 use gpui::{
-    App, Entity, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement,
-    Styled, div,
+    App, Entity, InteractiveElement, IntoElement, ParentElement, SharedString,
+    StatefulInteractiveElement, Styled, div,
 };
 
 use crate::{
@@ -115,6 +115,8 @@ fn about(state: &AppState, handle: &Entity<AppState>, cx: &App) -> impl IntoElem
             SettingsRow::new(tr(cx, keys::SETTINGS_VERSION_TITLE))
                 .control(div().child(env!("CARGO_PKG_VERSION"))),
         )
+        .row(updates_row(state, handle, cx))
+        .row(auto_check_row(state, handle, cx))
         .row(
             SettingsRow::new(tr(cx, keys::SETTINGS_BACKEND_TITLE))
                 .description(tr(cx, keys::SETTINGS_BACKEND_DESCRIPTION))
@@ -164,4 +166,91 @@ fn settings_file(path: String, handle: &Entity<AppState>, cx: &App) -> impl Into
                 .flex_none(),
             ),
     )
+}
+
+/// Selector of "Check for updates".
+pub const UPDATE_CHECK_SELECTOR: &str = "update-check";
+/// Selector of "Open download page" in About.
+pub const UPDATE_OPEN_SELECTOR: &str = "update-open";
+/// Selector of the automatic-check switch.
+pub const UPDATE_AUTO_SELECTOR: &str = "update-auto";
+
+/// The update status, "Check for updates", and "Open download page" when there is a newer
+/// release. Selector of the status: `update-status <state>`.
+fn updates_row(state: &AppState, handle: &Entity<AppState>, cx: &App) -> SettingsRow {
+    use crate::state::UpdateCheck;
+    let checking = matches!(state.update_check(), UpdateCheck::Checking);
+    let available = state.update_available();
+    let (name, status): (&str, SharedString) = match (state.update_check(), &available) {
+        (UpdateCheck::Checking, _) => ("checking", tr(cx, keys::UPDATE_CHECKING)),
+        (_, Some((version, _))) => (
+            "available",
+            tr_args(cx, keys::UPDATE_AVAILABLE, &[("version", version)]),
+        ),
+        (UpdateCheck::Failed(error), None) => (
+            "failed",
+            tr_args(
+                cx,
+                keys::UPDATE_FAILED,
+                &[("why", &crate::errors::explain(error, false, cx).message)],
+            ),
+        ),
+        (UpdateCheck::UpToDate, None) => ("up-to-date", tr(cx, keys::UPDATE_UP_TO_DATE)),
+        _ => ("idle", tr(cx, keys::UPDATE_NOT_CHECKED)),
+    };
+    let failed = matches!(state.update_check(), UpdateCheck::Failed(_)) && available.is_none();
+    let check = handle.clone();
+    let mut controls = div()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .justify_end()
+        .gap_2()
+        .child(tagged(
+            UPDATE_CHECK_SELECTOR,
+            Button::new(
+                UPDATE_CHECK_SELECTOR,
+                tr(
+                    cx,
+                    if failed {
+                        keys::UPDATE_TRY_AGAIN
+                    } else {
+                        keys::UPDATE_CHECK
+                    },
+                ),
+            )
+            .size(ControlSize::Sm)
+            .loading(checking)
+            .disabled(checking)
+            .on_click(move |_, _, cx| check.update(cx, |state, cx| state.check_updates_now(cx))),
+        ));
+    if available.is_some() {
+        let open = handle.clone();
+        controls = controls.child(tagged(
+            UPDATE_OPEN_SELECTOR,
+            Button::new(UPDATE_OPEN_SELECTOR, tr(cx, keys::UPDATE_OPEN_PAGE))
+                .size(ControlSize::Sm)
+                .primary()
+                .icon(IconName::ExternalLink)
+                .on_click(move |_, _, cx| open.update(cx, |state, cx| state.open_update_page(cx))),
+        ));
+    }
+    SettingsRow::new(tr(cx, keys::UPDATE_TITLE))
+        .description(status.clone())
+        .control(tagged(format!("update-status {name}"), controls))
+}
+
+/// "Check for updates automatically", with what it sends.
+fn auto_check_row(state: &AppState, handle: &Entity<AppState>, cx: &App) -> SettingsRow {
+    let toggle = handle.clone();
+    SettingsRow::new(tr(cx, keys::UPDATE_AUTO))
+        .description(tr(cx, keys::UPDATE_AUTO_HINT))
+        .control(tagged(
+            UPDATE_AUTO_SELECTOR,
+            ely_gpui_component::forms::Switch::new(UPDATE_AUTO_SELECTOR, state.checks_updates())
+                .name(tr(cx, keys::UPDATE_AUTO))
+                .on_change(move |on, _, cx| {
+                    toggle.update(cx, |state, cx| state.set_check_updates(on, cx))
+                }),
+        ))
 }

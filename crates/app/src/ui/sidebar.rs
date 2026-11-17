@@ -29,22 +29,34 @@ pub const ACCOUNT_SLOT_SELECTOR: &str = "sidebar-account";
 pub const USAGE_SLOT_SELECTOR: &str = "sidebar-usage";
 /// Selector of the demo-data badge shown with the mock backend.
 pub const DEMO_BADGE_SELECTOR: &str = "sidebar-demo";
+/// Selector around the Settings entry while a newer release is available.
+pub const UPDATE_MARK_SELECTOR: &str = "sidebar-update";
 
 /// The sidebar for `state`; `handle` is the same state, for click handlers.
 pub fn render(state: &AppState, handle: &Entity<AppState>, cx: &App) -> impl IntoElement {
     let current = state.route();
+    // A newer release stays marked on Settings (where About offers it) until this build is it.
+    let update = state.update_available().is_some();
     let items = Route::ALL.map(|route| {
         let handle = handle.clone();
-        tagged(
+        let item = NavItem::new(
             route.nav_selector(),
-            NavItem::new(
-                route.nav_selector(),
-                route.icon(),
-                tr(cx, route.title_key()),
-            )
-            .active(route == current)
-            .on_click(move |_, cx| handle.update(cx, |state, cx| state.navigate(route, cx))),
+            route.icon(),
+            tr(cx, route.title_key()),
         )
+        .active(route == current)
+        .on_click(move |_, cx| handle.update(cx, |state, cx| state.navigate(route, cx)));
+        let item = if update && route == Route::Settings {
+            item.count(tr(cx, keys::UPDATE_BADGE))
+        } else {
+            item
+        };
+        let marked = if update && route == Route::Settings {
+            UPDATE_MARK_SELECTOR
+        } else {
+            ""
+        };
+        tagged(route.nav_selector(), tagged(marked, item))
     });
     Sidebar::new("sidebar", false).child(
         div()
