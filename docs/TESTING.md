@@ -45,8 +45,10 @@ and Settings → About → Backend must read "Colab CLI".
    end billing after" 15 minutes, "Start session". Expect "Asking Colab for a runtime…", then
    "Auto-stop is set on the runtime; it works even if this app is closed." and "`<name>` is ready.".
    The card shows the auto-stop countdown and the Colab web UI lists the runtime. Try "Extend
-   by …". If "Couldn't set the automatic stop on the runtime" appears, stop the runtime now and
-   skip step 10.
+   by …". Then "Cancel auto-stop", confirm, and "Set auto-stop in …" on the same card: expect
+   "Auto-stop is set on the runtime…" again (the watchdog is restarted) and no "applies only while
+   this app is open" note on the card. If "Couldn't set the automatic stop on the runtime" appears
+   at any point, stop the runtime now and skip step 10.
 5. **Forward a port.** On that card, "Forward a port" (runtime port 8000, any free local port, no
    health path). Expect "Connecting", then "Up": the `colab ssh` tunnel works. Nothing listens on
    the runtime yet, so the address does not answer (with a health path: "Up, not answering").

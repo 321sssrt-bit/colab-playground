@@ -46,7 +46,8 @@ cargo run -p colab-playground -- --mock-scenario signed-out --mock-fail cli-miss
   `single`: one account, nothing running. `signed-out`: first run, no account.
 - `--mock-fail a,b,…` injects failures: `cli-missing`, `install-fails`, `keyring`, `usage-fails`,
   `login-invalid-code`, `login-unverified`, `not-entitled` (A100 and H100), `ssh-busy` (the first
-  forward gets HTTP 429), `plugin-fails` (at the download stage).
+  forward gets HTTP 429), `plugin-fails` (at the download stage), `watchdog-restart-fails` (setting
+  an auto-stop again after cancelling it cannot put the stop back on the runtime).
 - Both accept `--flag value` or `--flag=value` and apply only when the mock is selected (add
   `--mock` to a release build). A simulated A100 has 40 GB first and 80 GB on the next attempt:
   set a minimum GPU memory of 70 GB to watch the retry. Git plugin installs are not simulated.
