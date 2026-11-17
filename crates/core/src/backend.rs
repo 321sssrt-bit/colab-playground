@@ -197,6 +197,14 @@ pub struct SwitchImpact {
     /// Managed sessions of the current account that keep running (and
     /// billing) under their watchdog.
     pub sessions_left_running: Vec<TrackedSession>,
+    /// Runtimes on the current account the app does not manage (e.g. opened
+    /// in the browser). They keep billing too and have no watchdog.
+    #[serde(default)]
+    pub unmanaged_left_running: Vec<RuntimeRef>,
+    /// How many unmanaged runtimes the current account has. Can exceed the
+    /// list when they could not be listed (then known only from usage).
+    #[serde(default)]
+    pub unmanaged_count: u32,
 }
 
 /// Where a plugin runs.

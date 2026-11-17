@@ -775,6 +775,78 @@ fn python_repr(s: &str) -> String {
     out
 }
 
+#[test]
+fn switch_impact_lists_unmanaged_runtimes_via_the_helper() {
+    let f = fixture();
+    let alice = f.adopt_alice();
+    let bob = f.add_bob();
+    f.provision("bob-t4", Accelerator::T4);
+    f.edit_server(|s| {
+        s["accounts"]["bob"]["assignments"]["browser-9"] =
+            json!({"accelerator": "L4", "variant": "GPU", "shape": "STANDARD"});
+    });
+    let impact = f.b.switch_impact(&alice.id).unwrap();
+    assert_eq!(impact.from.as_ref(), Some(&bob.id));
+    assert_eq!(impact.sessions_left_running.len(), 1);
+    assert_eq!(impact.unmanaged_count, 1);
+    assert_eq!(impact.unmanaged_left_running[0].endpoint, "browser-9");
+    assert_eq!(impact.unmanaged_left_running[0].account, bob.id);
+    let same = f.b.switch_impact(&bob.id).unwrap();
+    assert_eq!(same.unmanaged_count, 0);
+}
+
+/// Overriding only the `colab` path derives the interpreter from its
+/// shebang (no Python is run), and bad paths say what to fix.
+#[test]
+fn colab_path_override_derives_the_interpreter() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let s = |p: &Path| p.to_string_lossy().into_owned();
+    let exe = |p: &Path, text: &str| {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, text).unwrap();
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    let resolve = |p: &Path| Toolchain::from_colab_path(s(p)).resolve(&Host::Local, &[], &nc());
+    let reason = |p: &Path| resolve(p).unwrap_err().param("reason").map(str::to_owned);
+
+    assert_eq!(
+        reason(&root.join("missing/colab")).as_deref(),
+        Some("not_found")
+    );
+    let plain = root.join("plain/colab");
+    std::fs::create_dir_all(plain.parent().unwrap()).unwrap();
+    std::fs::write(&plain, "#!/usr/bin/python3\n").unwrap();
+    assert_eq!(reason(&plain).as_deref(), Some("not_executable"));
+    let shell = root.join("shell/colab");
+    exe(&shell, "#!/bin/sh\necho hi\n");
+    assert_eq!(reason(&shell).as_deref(), Some("no_python_shebang"));
+
+    // A uv/pip entry script whose interpreter is missing, then present.
+    let venv_python = root.join("venv/bin/python");
+    let entry = root.join("venv/bin/colab");
+    exe(&entry, &format!("#!{}\nimport sys\n", s(&venv_python)));
+    let err = resolve(&entry).unwrap_err();
+    assert_eq!(err.param("reason"), Some("interpreter_missing"));
+    assert_eq!(err.param("interpreter"), Some(s(&venv_python).as_str()));
+    exe(&venv_python, "#!/bin/sh\nexit 0\n");
+    assert_eq!(resolve(&entry).unwrap().helper_python, s(&venv_python));
+
+    // Through a symlink (as ~/.local/bin/colab is), and the /bin/sh launcher form.
+    let link = root.join("bin/colab");
+    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&entry, &link).unwrap();
+    assert_eq!(resolve(&link).unwrap().helper_python, s(&venv_python));
+    let launcher = root.join("venv/bin/colab-launcher");
+    exe(
+        &launcher,
+        "#!/bin/sh\n'''exec' \"$(dirname -- \"$(realpath -- \"$0\")\")\"/'python' \"$0\" \"$@\"\n' '''\n",
+    );
+    let t = resolve(&launcher).unwrap();
+    assert_eq!(t.helper_python, s(&root.join("venv/bin").join("python")));
+    assert_eq!(t.colab, s(&launcher));
+}
+
 /// The real launch and poll snippets, run in one Python process standing in
 /// for the kernel (globals persist between cells, as in Colab): a secret the
 /// script prints or puts into status.json never appears in the poll output.

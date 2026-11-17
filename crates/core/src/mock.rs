@@ -73,6 +73,17 @@ pub struct MockFailures {
     pub plugin_fail_stage: Option<String>,
     /// Usage fetches fail (snapshots turn stale).
     pub usage_fetch_fails: bool,
+    /// The CLI's credential slot holds a signed-in Google account that is not
+    /// saved yet, so `accounts()` reports `unadopted` (and no active account)
+    /// until `adopt_active_account`. Applied at construction and whenever the
+    /// switch is turned on with [`MockBackend::set_failures`]; turning it off
+    /// signs that credential out.
+    pub unadopted_slot: bool,
+    /// An add-account flow was interrupted (as after a crash): the credential
+    /// slot is empty with a backup pending, and the next `accounts()` restores
+    /// it and reports `recovered_pending_add` once. Applied at construction and
+    /// whenever the switch is turned on.
+    pub interrupted_add: bool,
 }
 
 impl Default for MockFailures {
@@ -87,6 +98,8 @@ impl Default for MockFailures {
             ssh_busy_attempts: 0,
             plugin_fail_stage: None,
             usage_fetch_fails: false,
+            unadopted_slot: false,
+            interrupted_add: false,
         }
     }
 }
@@ -308,9 +321,102 @@ struct World {
     reserved: u32,
     next_id: u32,
     failures: MockFailures,
+    /// The slot holds this not-yet-saved credential (email).
+    unadopted_email: Option<String>,
+    /// An add-account backup is pending: the account that was in the slot.
+    pending_add: Option<Option<AccountId>>,
+    /// A `LoginFlow` is alive.
+    login_live: bool,
 }
 
+/// Email of the credential `MockFailures::unadopted_slot` puts in the slot.
+pub const MOCK_UNADOPTED_EMAIL: &str = "pat@example.com";
+
 impl World {
+    /// Applies switches that model state (rather than being read on use)
+    /// when they change from `old`.
+    fn apply_switches(&mut self, old: &MockFailures) {
+        let new = self.failures.clone();
+        if new.cli_missing != old.cli_missing {
+            self.cli_installed = !new.cli_missing;
+        }
+        self.ssh_busy_left = new.ssh_busy_attempts;
+        if new.a100_vram_sequence != old.a100_vram_sequence {
+            self.a100_attempt = 0;
+        }
+        if new.unadopted_slot && !old.unadopted_slot {
+            self.active = None;
+            self.unadopted_email = Some(MOCK_UNADOPTED_EMAIL.to_owned());
+        } else if !new.unadopted_slot && old.unadopted_slot {
+            self.unadopted_email = None;
+        }
+        if new.interrupted_add && !old.interrupted_add && self.pending_add.is_none() {
+            let previous = self.active.take();
+            self.pending_add = Some(previous);
+            self.tunnels.clear();
+        }
+    }
+
+    /// Restores the account backed up by a pending add (no-op without one).
+    fn rollback_add(&mut self) -> bool {
+        match self.pending_add.take() {
+            Some(previous) => {
+                self.active = previous;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Saves the unadopted slot credential as an account and makes it active.
+    fn adopt_unadopted(&mut self, now: SystemTime) -> Option<AccountId> {
+        let email = self.unadopted_email.take()?;
+        let id = match self.accounts.iter().find(|a| a.email == email) {
+            Some(a) => a.id.clone(),
+            None => {
+                let id = self.fresh_account_id();
+                self.accounts.push(MAccount {
+                    id: id.clone(),
+                    email,
+                    created_at: now,
+                    balance: 100.0,
+                });
+                id
+            }
+        };
+        self.active = Some(id.clone());
+        Some(id)
+    }
+
+    fn fresh_account_id(&self) -> AccountId {
+        let mut n = self.accounts.len() + 1;
+        loop {
+            let id = AccountId::new(format!("mock{n}")).unwrap_or_else(|_| AccountId::generate());
+            if !self.accounts.iter().any(|a| a.id == id) {
+                return id;
+            }
+            n += 1;
+        }
+    }
+
+    /// Runtimes on `account` the app does not track.
+    fn unmanaged_on(&self, account: &AccountId) -> Vec<RuntimeRef> {
+        self.runtimes
+            .iter()
+            .filter(|r| &r.account == account)
+            .filter(|r| {
+                r.name
+                    .as_ref()
+                    .is_none_or(|n| self.ledger.live(account, n).is_none())
+            })
+            .map(|r| RuntimeRef {
+                account: r.account.clone(),
+                endpoint: r.endpoint.clone(),
+                name: r.name.clone(),
+            })
+            .collect()
+    }
+
     /// Burns balances up to `now`.
     fn settle(&mut self, now: SystemTime) {
         let hours = now
@@ -481,7 +587,15 @@ impl MockBackend {
             reserved: 0,
             next_id: 0,
             failures: cfg.failures.clone(),
+            unadopted_email: None,
+            pending_add: None,
+            login_live: false,
         };
+        let off = MockFailures {
+            cli_missing: cfg.failures.cli_missing,
+            ..MockFailures::default()
+        };
+        world.apply_switches(&off);
         for (i, r) in cfg.scenario.runtimes.iter().enumerate() {
             let Some(account) = world.accounts.get(r.account).map(|a| a.id.clone()) else {
                 continue;
@@ -524,10 +638,14 @@ impl MockBackend {
     }
 
     /// Replaces the failure switches at runtime (UI tests flip them mid-test).
+    /// Every switch takes effect immediately: switches read on use apply to
+    /// the next call; state switches (`cli_missing`, `unadopted_slot`,
+    /// `interrupted_add`, `ssh_busy_attempts`, `a100_vram_sequence`) are
+    /// applied when they change.
     pub fn set_failures(&self, failures: MockFailures) {
         let mut w = self.w();
-        w.ssh_busy_left = failures.ssh_busy_attempts;
-        w.failures = failures;
+        let old = std::mem::replace(&mut w.failures, failures);
+        w.apply_switches(&old);
     }
 
     /// Adds an unmanaged runtime (as if opened in the browser) to `account`.
@@ -591,9 +709,13 @@ impl MockBackend {
         AccountsView {
             accounts: w.account_views(),
             active: w.active.clone(),
-            has_token: w.active.is_some(),
-            unadopted: false,
-            active_email: w.active.as_ref().and_then(|a| w.email(a)),
+            has_token: w.active.is_some() || w.unadopted_email.is_some(),
+            unadopted: w.unadopted_email.is_some(),
+            active_email: w
+                .active
+                .as_ref()
+                .and_then(|a| w.email(a))
+                .or_else(|| w.unadopted_email.clone()),
             recovered_pending_add: false,
         }
     }
@@ -762,6 +884,18 @@ impl ProvisionOps for MockOps<'_> {
 struct MockLoginFlow {
     m: MockBackend,
     url: String,
+    finished: bool,
+}
+
+impl Drop for MockLoginFlow {
+    /// Like the real flow: anything but success restores the previous account.
+    fn drop(&mut self) {
+        if !self.finished {
+            let mut w = self.m.w();
+            w.rollback_add();
+            w.login_live = false;
+        }
+    }
 }
 
 impl LoginFlow for MockLoginFlow {
@@ -769,7 +903,7 @@ impl LoginFlow for MockLoginFlow {
         &self.url
     }
 
-    fn submit_code(self: Box<Self>, code: &str, cancel: &CancelToken) -> Result<Account> {
+    fn submit_code(mut self: Box<Self>, code: &str, cancel: &CancelToken) -> Result<Account> {
         if code.trim().is_empty() {
             return Err(Error::invalid("code", "paste the code exactly as shown"));
         }
@@ -785,9 +919,8 @@ impl LoginFlow for MockLoginFlow {
         }
         let now = self.m.now_();
         let mut w = self.m.w();
-        let n = w.accounts.len() + 1;
-        let id = AccountId::new(format!("mock{n}")).unwrap_or_else(|_| AccountId::generate());
-        let email = format!("user{n}@example.com");
+        let id = w.fresh_account_id();
+        let email = format!("user{}@example.com", w.accounts.len() + 1);
         w.accounts.push(MAccount {
             id: id.clone(),
             email: email.clone(),
@@ -795,7 +928,11 @@ impl LoginFlow for MockLoginFlow {
             balance: 100.0,
         });
         w.active = Some(id.clone());
+        w.pending_add = None;
+        w.login_live = false;
         w.tunnels.clear();
+        drop(w);
+        self.finished = true;
         Ok(Account {
             id,
             email: Some(email),
@@ -937,19 +1074,30 @@ impl Backend for MockBackend {
             stream: Stream::Stdout,
             text: "Installed 1 executable: colab".into(),
         });
-        self.w().cli_installed = true;
+        let mut w = self.w();
+        w.cli_installed = true;
+        w.failures.cli_missing = false;
         Ok(())
     }
 
     fn accounts(&self, cancel: &CancelToken) -> Result<AccountsView> {
         self.ready()?;
         self.step(cancel)?;
-        Ok(self.view())
+        // Like the real backend: an interrupted add (no live flow) is rolled back.
+        let recovered = {
+            let mut w = self.w();
+            !w.login_live && w.rollback_add()
+        };
+        let mut view = self.view();
+        view.recovered_pending_add = recovered;
+        Ok(view)
     }
 
     fn adopt_active_account(&self, _: &CancelToken) -> Result<Account> {
         self.ready()?;
-        let w = self.w();
+        let now = self.now_();
+        let mut w = self.w();
+        w.adopt_unadopted(now);
         let id = w
             .active
             .clone()
@@ -963,10 +1111,25 @@ impl Backend for MockBackend {
     fn begin_add_account(&self, cancel: &CancelToken) -> Result<Box<dyn LoginFlow>> {
         self.ready()?;
         self.step(cancel)?;
-        if self.w().failures.login == Some(MockLoginFailure::CancelledBeforeUrl) {
-            return Err(Error::new(ErrorKind::LoginCancelled));
+        let now = self.now_();
+        {
+            let mut w = self.w();
+            if w.pending_add.is_some() {
+                return Err(Error::new(ErrorKind::AddInProgress));
+            }
+            if w.failures.login == Some(MockLoginFailure::CancelledBeforeUrl) {
+                return Err(Error::new(ErrorKind::LoginCancelled));
+            }
+            // Like the real backend: save an unsaved credential first, then
+            // back up and clear the slot while the flow is alive.
+            w.adopt_unadopted(now);
+            let previous = w.active.take();
+            w.pending_add = Some(previous);
+            w.login_live = true;
+            w.tunnels.clear();
         }
         Ok(Box::new(MockLoginFlow {
+            finished: false,
             m: self.clone(),
             url: "https://accounts.google.com/o/oauth2/auth?client_id=mock&redirect_uri=https%3A%2F%2Fsdk.cloud.google.com%2Fapplicationdefaultauthcode.html".into(),
         }))
@@ -979,6 +1142,10 @@ impl Backend for MockBackend {
         }
         let from = w.active.clone();
         let switching = from.as_ref() != Some(to);
+        let unmanaged = match (&from, switching) {
+            (Some(f), true) => w.unmanaged_on(f),
+            _ => vec![],
+        };
         Ok(SwitchImpact {
             from: from.clone(),
             to: to.clone(),
@@ -994,6 +1161,8 @@ impl Backend for MockBackend {
                 .filter(|e| switching && e.stopped.is_none() && Some(&e.account) == from.as_ref())
                 .cloned()
                 .collect(),
+            unmanaged_count: unmanaged.len() as u32,
+            unmanaged_left_running: unmanaged,
         })
     }
 
@@ -1940,6 +2109,270 @@ mod tests {
         assert_eq!(impact.sessions_left_running.len(), 2);
         m.switch_account(&other, &nc()).unwrap();
         assert!(m.tunnels().is_empty());
+    }
+
+    #[test]
+    fn pending_add_clears_the_slot_and_every_non_success_restores_it() {
+        let (m, _) = mock(MockScenario::demo());
+        let original = m.accounts(&nc()).unwrap().active.unwrap();
+        // While a flow is alive the slot is empty; cancel restores it.
+        let flow = m.begin_add_account(&nc()).unwrap();
+        let mid = m.accounts(&nc()).unwrap();
+        assert_eq!(mid.active, None);
+        assert!(!mid.has_token && !mid.recovered_pending_add);
+        assert!(
+            m.begin_add_account(&nc())
+                .err()
+                .unwrap()
+                .is(ErrorKind::AddInProgress)
+        );
+        flow.cancel().unwrap();
+        assert_eq!(m.accounts(&nc()).unwrap().active.as_ref(), Some(&original));
+        // Dropping the flow restores it too.
+        drop(m.begin_add_account(&nc()).unwrap());
+        assert_eq!(m.accounts(&nc()).unwrap().active.as_ref(), Some(&original));
+        // A rejected code restores it.
+        m.set_failures(MockFailures {
+            login: Some(MockLoginFailure::InvalidCode),
+            ..Default::default()
+        });
+        let err = m
+            .begin_add_account(&nc())
+            .unwrap()
+            .submit_code("x", &nc())
+            .unwrap_err();
+        assert!(err.is(ErrorKind::LoginInvalidCode));
+        assert_eq!(m.accounts(&nc()).unwrap().active.as_ref(), Some(&original));
+        // Success replaces it.
+        m.set_failures(MockFailures::default());
+        let added = m
+            .begin_add_account(&nc())
+            .unwrap()
+            .submit_code("4/ok", &nc())
+            .unwrap();
+        let v = m.accounts(&nc()).unwrap();
+        assert_eq!(v.active, Some(added.id));
+        assert_eq!(v.accounts.len(), 3);
+    }
+
+    #[test]
+    fn unadopted_slot_and_interrupted_add_scenarios() {
+        let (cfg, _) = MockConfig::headless(MockScenario::single());
+        let mut cfg = cfg;
+        cfg.failures.unadopted_slot = true;
+        let m = MockBackend::new(cfg);
+        let v = m.accounts(&nc()).unwrap();
+        assert!(v.unadopted && v.has_token && v.active.is_none());
+        assert_eq!(v.active_email.as_deref(), Some(MOCK_UNADOPTED_EMAIL));
+        let adopted = m.adopt_active_account(&nc()).unwrap();
+        assert_eq!(adopted.email.as_deref(), Some(MOCK_UNADOPTED_EMAIL));
+        let v = m.accounts(&nc()).unwrap();
+        assert!(!v.unadopted && v.active == Some(adopted.id.clone()));
+
+        // An interrupted add is rolled back on the next accounts() and reported once.
+        m.set_failures(MockFailures {
+            interrupted_add: true,
+            ..Default::default()
+        });
+        let v = m.accounts(&nc()).unwrap();
+        assert!(v.recovered_pending_add);
+        assert_eq!(v.active, Some(adopted.id.clone()));
+        assert!(!m.accounts(&nc()).unwrap().recovered_pending_add);
+
+        let (cfg, _) = MockConfig::headless(MockScenario::single());
+        let mut cfg = cfg;
+        cfg.failures.interrupted_add = true;
+        let m = MockBackend::new(cfg);
+        let v = m.accounts(&nc()).unwrap();
+        assert!(v.recovered_pending_add && v.active.is_some());
+    }
+
+    #[test]
+    fn every_failure_switch_flips_at_runtime() {
+        let (m, _) = mock(MockScenario::single());
+        let on = |f: MockFailures| m.set_failures(f);
+        let off = || m.set_failures(MockFailures::default());
+        let d = MockFailures::default;
+
+        on(MockFailures {
+            cli_missing: true,
+            ..d()
+        });
+        assert!(m.accounts(&nc()).unwrap_err().is(ErrorKind::NotInstalled));
+        assert!(m.probe(&nc()).unwrap().colab.is_none());
+        off();
+        assert!(m.accounts(&nc()).is_ok());
+        assert!(m.probe(&nc()).unwrap().colab.is_some());
+
+        on(MockFailures {
+            install_fails: true,
+            ..d()
+        });
+        let (tx, _rx) = mpsc::channel();
+        assert!(
+            m.install_cli(InstallMethod::Uv, tx, &nc())
+                .unwrap_err()
+                .is(ErrorKind::InstallFailed)
+        );
+        off();
+
+        on(MockFailures {
+            keyring_unavailable: true,
+            ..d()
+        });
+        assert!(
+            m.accounts(&nc())
+                .unwrap_err()
+                .is(ErrorKind::KeyringUnavailable)
+        );
+        assert!(!m.probe(&nc()).unwrap().keyring_ok);
+        off();
+
+        on(MockFailures {
+            usage_fetch_fails: true,
+            ..d()
+        });
+        m.refresh_usage(&[], &nc()).unwrap();
+        off();
+        assert!(
+            !m.refresh_usage(&[], &nc()).unwrap()[0]
+                .snapshot
+                .unwrap()
+                .stale
+        );
+        on(MockFailures {
+            usage_fetch_fails: true,
+            ..d()
+        });
+        assert!(
+            m.refresh_usage(&[], &nc()).unwrap()[0]
+                .snapshot
+                .unwrap()
+                .stale
+        );
+        off();
+
+        on(MockFailures {
+            login: Some(MockLoginFailure::VerificationFailed),
+            ..d()
+        });
+        let err = m
+            .begin_add_account(&nc())
+            .unwrap()
+            .submit_code("c", &nc())
+            .unwrap_err();
+        assert!(err.is(ErrorKind::LoginVerificationFailed));
+        off();
+
+        on(MockFailures {
+            not_entitled: vec![Accelerator::T4],
+            ..d()
+        });
+        let spec = ProvisionSpec {
+            accelerator: Accelerator::T4,
+            ..m.defaults().provision_spec("t4-x")
+        };
+        let (tx, _rx) = mpsc::channel();
+        assert!(
+            m.provision(spec.clone(), tx, &nc())
+                .unwrap_err()
+                .is(ErrorKind::NotEntitled)
+        );
+        off();
+        let (tx, _rx) = mpsc::channel();
+        m.provision(spec, tx, &nc()).unwrap();
+
+        let acct = m.accounts(&nc()).unwrap().active.unwrap();
+        let tspec = |port| TunnelSpec {
+            account: acct.clone(),
+            session: "t4-x".into(),
+            local_port: port,
+            remote_port: 8000,
+            health_path: None,
+        };
+        on(MockFailures {
+            ssh_busy_attempts: u32::MAX,
+            ..d()
+        });
+        let (tx, trx) = mpsc::channel();
+        m.open_tunnel(tspec(18100), tx).unwrap();
+        assert!(trx.try_iter().any(|e| matches!(
+            e,
+            TunnelEvent::State {
+                state: TunnelState::Failed { .. },
+                ..
+            }
+        )));
+        off();
+        let (tx, trx) = mpsc::channel();
+        m.open_tunnel(tspec(18101), tx).unwrap();
+        assert!(trx.try_iter().any(|e| matches!(
+            e,
+            TunnelEvent::State {
+                state: TunnelState::Up,
+                ..
+            }
+        )));
+
+        on(MockFailures {
+            plugin_fail_stage: Some("plan".into()),
+            ..d()
+        });
+        let mut run = m.plugin_run_template("llama-cpp").unwrap();
+        run.inputs.insert(
+            "repo".into(),
+            crate::plugins::InputValue::Text("unsloth/Qwen3-0.6B-GGUF".into()),
+        );
+        run.target = RunTarget::Existing {
+            name: "t4-x".into(),
+        };
+        let (tx, _rx) = mpsc::channel();
+        assert_eq!(
+            m.run_plugin(run.clone(), tx, &nc())
+                .unwrap_err()
+                .param("stage"),
+            Some("plan")
+        );
+        off();
+        let (tx, _rx) = mpsc::channel();
+        assert_eq!(
+            m.run_plugin(run, tx, &nc()).unwrap().status.state,
+            RunState::Ready
+        );
+
+        // The A100 sequence restarts when it changes.
+        on(MockFailures {
+            a100_vram_sequence: vec![81_920],
+            ..d()
+        });
+        m.stop_session(
+            &m.runtimes(&nc()).unwrap().runtimes[0].id,
+            StopOptions::default(),
+            &nc(),
+        )
+        .unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let out = m
+            .provision(m.defaults().provision_spec("big"), tx, &nc())
+            .unwrap();
+        assert_eq!(out.hardware.vram_mib, Some(81_920));
+    }
+
+    #[test]
+    fn switch_impact_reports_unmanaged_runtimes_left_running() {
+        let (m, _) = mock(MockScenario::demo());
+        let accts = m.accounts(&nc()).unwrap();
+        let impact = m.switch_impact(&accts.accounts[1].id).unwrap();
+        assert_eq!(impact.unmanaged_count, 1);
+        assert_eq!(impact.unmanaged_left_running.len(), 1);
+        assert_eq!(
+            impact.unmanaged_left_running[0].account,
+            accts.accounts[0].id
+        );
+        assert!(impact.unmanaged_left_running[0].name.is_none());
+        let same = m.switch_impact(&accts.accounts[0].id).unwrap();
+        assert_eq!(same.unmanaged_count, 0);
+        assert!(same.unmanaged_left_running.is_empty());
     }
 
     #[test]

@@ -619,12 +619,131 @@ impl ProbeReport {
 
 /// Paths (as seen by the host shell) of the `colab` executable and the Python
 /// interpreter that runs it (and therefore has its `keyring` and `google-auth`).
+///
+/// An empty `helper_python` (see [`Toolchain::from_colab_path`]) means "derive
+/// it from the shebang of `colab`"; the real backend does so on first use.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Toolchain {
     /// Absolute path of `colab`.
     pub colab: String,
-    /// Absolute path of the CLI's Python interpreter.
+    /// Absolute path of the CLI's Python interpreter (empty: derive it).
     pub helper_python: String,
+}
+
+/// Validates a `colab` path on the host and derives its interpreter. Prints
+/// `CPG key=value` lines; `reason=` explains a failure.
+const RESOLVE_SCRIPT: &str = r#"c=$1
+[ -e "$c" ] || { echo "CPG reason=not_found"; exit 0; }
+r=$(readlink -f -- "$c" 2>/dev/null || printf %s "$c")
+[ -f "$r" ] || { echo "CPG reason=not_a_file"; exit 0; }
+[ -x "$r" ] || { echo "CPG reason=not_executable"; exit 0; }
+l1=$(head -n 1 -- "$r" 2>/dev/null)
+l2=$(sed -n 2p -- "$r" 2>/dev/null)
+py=""
+case "$l1" in
+  '#!/bin/sh'*|'#!/usr/bin/env sh'*) case "$l2" in *exec*) py="$(dirname -- "$r")/python" ;; esac ;;
+  '#!'*) py=${l1#??}; set -- $py; py=$1; case "$py" in */env) py=$(command -v "$2" 2>/dev/null) ;; esac ;;
+esac
+case "$py" in *python*) ;; *) echo "CPG reason=no_python_shebang"; exit 0 ;; esac
+[ -x "$py" ] || { printf 'CPG interpreter=%s
+CPG reason=interpreter_missing
+' "$py"; exit 0; }
+printf 'CPG helper_python=%s
+' "$py"
+"#;
+
+impl Toolchain {
+    /// A toolchain from an overridden `colab` path only; the interpreter is
+    /// derived from its shebang on first use ([`Toolchain::resolve`]).
+    pub fn from_colab_path(colab: impl Into<String>) -> Toolchain {
+        Toolchain {
+            colab: colab.into(),
+            helper_python: String::new(),
+        }
+    }
+
+    /// True while `helper_python` still has to be derived.
+    pub fn needs_resolution(&self) -> bool {
+        self.helper_python.is_empty()
+    }
+
+    /// Checks `colab` on the host (absolute, exists, executable, a Python
+    /// entry script) and fills in `helper_python` from its shebang (also the
+    /// `uv` / pip `#!/bin/sh` launcher form). Runs no Python. Spawns a host
+    /// script: real mode only. Failures are `InvalidInput` with
+    /// `field = "colab_path"`, `value`, and `reason`: `not_absolute`,
+    /// `not_found`, `not_a_file`, `not_executable`, `no_python_shebang`, or
+    /// `interpreter_missing` (with `interpreter`).
+    pub fn resolve(
+        &self,
+        host: &Host,
+        env: &[(String, String)],
+        cancel: &CancelToken,
+    ) -> Result<Toolchain> {
+        if !self.needs_resolution() {
+            return Ok(self.clone());
+        }
+        if !self.colab.starts_with('/') {
+            return Err(colab_path_error(&self.colab, "not_absolute", None));
+        }
+        let mut req = ScriptRequest::new(RESOLVE_SCRIPT)
+            .arg(&self.colab)
+            .timeout(Duration::from_secs(60));
+        req.env = env.to_vec();
+        let out = host.run_quiet(req, cancel)?;
+        parse_resolution(&self.colab, &out.stdout)
+    }
+}
+
+fn colab_path_error(path: &str, reason: &str, interpreter: Option<&str>) -> Error {
+    let what = match reason {
+        "not_absolute" => "give the absolute path of the colab executable on the host",
+        "not_found" => "no file at this path on the host; check the path (inside WSL on Windows)",
+        "not_a_file" => "the path is not a regular file",
+        "not_executable" => {
+            "the file is not executable (chmod +x, or point at the installed entry script)"
+        }
+        "no_python_shebang" => {
+            "not a Python entry script; point at the colab installed by uv or pip"
+        }
+        "interpreter_missing" => {
+            "the interpreter named in its shebang does not exist; reinstall the CLI"
+        }
+        _ => "invalid colab path",
+    };
+    let mut e = Error::invalid("colab_path", what)
+        .with("value", path)
+        .with("reason", reason);
+    if let Some(i) = interpreter {
+        e = e.with("interpreter", i);
+    }
+    e
+}
+
+/// Parses the output of the resolution script (pure).
+pub fn parse_resolution(colab: &str, stdout: &str) -> Result<Toolchain> {
+    let mut helper = None;
+    let mut reason = None;
+    let mut interpreter = None;
+    for line in stdout.lines() {
+        let Some((k, v)) = line.strip_prefix("CPG ").and_then(|r| r.split_once('=')) else {
+            continue;
+        };
+        match k {
+            "helper_python" => helper = Some(v.trim().to_owned()),
+            "reason" => reason = Some(v.trim().to_owned()),
+            "interpreter" => interpreter = Some(v.trim().to_owned()),
+            _ => {}
+        }
+    }
+    match (helper, reason) {
+        (Some(h), None) if !h.is_empty() => Ok(Toolchain {
+            colab: colab.to_owned(),
+            helper_python: h,
+        }),
+        (_, Some(r)) => Err(colab_path_error(colab, &r, interpreter.as_deref())),
+        _ => Err(Error::new(ErrorKind::Parse).detail(tail(stdout, 300))),
+    }
 }
 
 fn spawn_invocation(inv: &Invocation, stdin: Stdio) -> std::io::Result<Child> {
@@ -998,6 +1117,51 @@ mod tests {
         assert!(r.keyring_ok);
         let tc = r.toolchain().unwrap();
         assert!(tc.helper_python.ends_with("/bin/python"));
+    }
+
+    #[test]
+    fn colab_path_override_resolution() {
+        let t = Toolchain::from_colab_path("/opt/colab");
+        assert!(t.needs_resolution());
+        let ok =
+            parse_resolution("/opt/colab", "noise\nCPG helper_python=/venv/bin/python\n").unwrap();
+        assert_eq!(ok.helper_python, "/venv/bin/python");
+        assert!(!ok.needs_resolution());
+        let e = parse_resolution(
+            "/opt/colab",
+            "CPG interpreter=/gone/python\nCPG reason=interpreter_missing\n",
+        )
+        .unwrap_err();
+        assert!(e.is(ErrorKind::InvalidInput));
+        assert_eq!(e.param("field"), Some("colab_path"));
+        assert_eq!(e.param("reason"), Some("interpreter_missing"));
+        assert_eq!(e.param("interpreter"), Some("/gone/python"));
+        assert_eq!(
+            parse_resolution("/x", "CPG reason=not_found")
+                .unwrap_err()
+                .param("reason"),
+            Some("not_found")
+        );
+        assert!(
+            parse_resolution("/x", "garbage")
+                .unwrap_err()
+                .is(ErrorKind::Parse)
+        );
+        // Relative paths are refused before anything runs.
+        let e = Toolchain::from_colab_path("colab")
+            .resolve(&Host::Wsl { distro: None }, &[], &CancelToken::new())
+            .unwrap_err();
+        assert_eq!(e.param("reason"), Some("not_absolute"));
+        // An already complete toolchain resolves to itself without spawning.
+        let full = Toolchain {
+            colab: "/c".into(),
+            helper_python: "/p".into(),
+        };
+        assert_eq!(
+            full.resolve(&Host::Wsl { distro: None }, &[], &CancelToken::new())
+                .unwrap(),
+            full
+        );
     }
 
     #[test]
