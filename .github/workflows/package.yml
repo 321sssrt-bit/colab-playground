@@ -215,6 +215,9 @@ jobs:
         with:
           pattern: colab-playground-*
           merge-multiple: true
+          # Keep each file as it was uploaded: the macOS download is itself a zip, which would
+          # otherwise be unpacked into a folder here.
+          skip-decompress: true
           path: dist
       - name: Write SHA256SUMS
         working-directory: dist
@@ -249,6 +252,7 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           merge-multiple: true
+          skip-decompress: true # as in the checksums job: the macOS zip stays a zip
           path: dist
       - name: Check the files
         working-directory: dist
