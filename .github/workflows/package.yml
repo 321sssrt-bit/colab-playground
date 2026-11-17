@@ -125,9 +125,12 @@ jobs:
           readelf -d "$stage/colab-playground" | grep NEEDED
           install -m 644 LICENSE README.md "$stage/"
           tar -C "$RUNNER_TEMP" --owner=0 --group=0 --numeric-owner -czf "dist/$BASE.tar.gz" "$BASE"
-          # A browser download drops the executable bit; the archive must carry it.
-          tar -tzvf "dist/$BASE.tar.gz"
-          if ! tar -tzvf "dist/$BASE.tar.gz" | grep -Eq "^-rwxr-xr-x .* $BASE/colab-playground\$"; then
+          # A browser download drops the executable bit; the archive must carry it. The listing is
+          # read once into a variable: grep -q stops at its first match, which would break a pipe
+          # from tar and fail the step under pipefail.
+          listing=$(tar -tzvf "dist/$BASE.tar.gz")
+          echo "$listing"
+          if ! grep -Eq "^-rwxr-xr-x .* $BASE/colab-playground\$" <<<"$listing"; then
             echo "::error::The binary in the archive is not executable"
             exit 1
           fi
