@@ -45,12 +45,33 @@ A stopped runtime is wiped, and the guards stop runtimes on their own. A session
   is gone. A reattach
   could read the run directory on the VM (`status.json`, `run.log`).
 
+### The Colab API as a backend
+
+Colab has an official REST API and a hosted MCP endpoint
+([announcement](https://medium.com/google-colab/the-google-colab-api-and-mcp-endpoint-for-developers-and-agents-65cfef497056)).
+A backend built on the API would send HTTPS requests itself instead of starting `colab`: a third
+implementation of the `Backend` trait beside the CLI one and the mock.
+
+- **What the API offers** (from the announcement): create, get, list and delete runtimes; list the
+  machine types the subscription allows and read the subscription tier; each runtime returns the
+  credentials of its Jupyter server; OAuth 2.0.
+- **What it would improve:** no WSL on Windows and no CLI to install. The app would keep one token
+  per account, so switching accounts would no longer change the `colab` sign-in of the whole
+  machine. Hardware an account is not entitled to would be known before a start, not after a
+  failed one.
+- **To find out first:** the announcement mentions neither the compute-unit balance and burn rate
+  (what the cost guards read) nor SSH (what port forwarding uses). Running code would mean
+  speaking the Jupyter protocol to the runtime; `execute_code` exists only on the MCP endpoint.
+- **Sign-in cost:** the API must be enabled in a Google Cloud project that has an OAuth client.
+  Either every user creates their own, or the app ships a client that Google has verified.
+
 ### Platform and distribution
 
-- **Installers** (MSI or MSIX, a DMG, AppImage, Flatpak or `.deb`) are deliberately not planned for
-  now: releases ship portable files ([RELEASING.md](RELEASING.md#the-downloads)). Each format would
-  need its own step in `package.yml` (for example WiX for an MSI, `hdiutil` for a DMG) and a decision
-  on what uninstalling does with the settings and data.
+- **Optional installers** next to the portable files, for people who prefer one: an MSI or MSIX for
+  Windows, a DMG for macOS, a `.deb`, an AppImage or a Flatpak for Linux. The portable files stay
+  ([RELEASING.md](RELEASING.md#the-downloads)). Each format needs its own step in `package.yml`
+  (for example WiX for an MSI, `hdiutil` for a DMG) and a decision on what uninstalling does with
+  the settings and data.
 - **Code signing and notarisation** are deliberately not planned for now, so Windows SmartScreen and
   macOS Gatekeeper ask users to confirm the first launch ([USAGE.md](USAGE.md#install-a-release)).
   Windows would need an Authenticode certificate or a signing service and a `signtool` step; macOS
