@@ -8,7 +8,7 @@ edition = "2024"
 rust-version = "1.98"
 authors = ["ScarletKc"]
 license = "MIT"
-# The one project description; README, the About text and the GitHub repo use the same sentence.
+# The one project description; the README and the GitHub repo use the same sentence.
 description = "A desktop app for the Google Colab CLI: accounts, GPU sessions with cost guards, port forwarding and plugins."
 repository = "https://github.com/scarletkc/colab-playground"
 publish = false
