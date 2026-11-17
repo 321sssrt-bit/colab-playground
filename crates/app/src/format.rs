@@ -2,7 +2,11 @@
 
 use std::time::{Duration, SystemTime};
 
-use colab_playground_core::{backend::InstallMethod, sessions::Accelerator};
+use colab_playground_core::{
+    backend::InstallMethod,
+    guard::{Concern, Limit},
+    sessions::Accelerator,
+};
 use ely_gpui_component::i18n::I18n;
 use gpui::{App, SharedString};
 
@@ -104,5 +108,94 @@ pub fn install_method_value(method: InstallMethod) -> &'static str {
         InstallMethod::Uv => "uv",
         InstallMethod::InstallUvThenCli => "uv-first",
         InstallMethod::PipUser => "pip",
+    }
+}
+
+/// GPU memory in whole GB (`mib` / 1024, rounded).
+pub fn vram(cx: &App, mib: u32) -> SharedString {
+    let gb = (f64::from(mib) / 1024.0).round();
+    tr_args(cx, keys::FMT_GB, &[("n", &number(cx, gb, 0))])
+}
+
+/// What hardware came back: the GPU's name and memory, either part when known.
+pub fn hardware(cx: &App, gpu: Option<&str>, vram_mib: Option<u32>) -> Option<SharedString> {
+    match (gpu, vram_mib) {
+        (Some(gpu), Some(mib)) => Some(format!("{gpu} · {}", vram(cx, mib)).into()),
+        (Some(gpu), None) => Some(gpu.to_owned().into()),
+        (None, Some(mib)) => Some(vram(cx, mib)),
+        (None, None) => None,
+    }
+}
+
+/// One guard concern in words: which limit, and how far along.
+pub fn concern(cx: &App, concern: &Concern) -> SharedString {
+    match concern {
+        Concern::Limit {
+            limit,
+            current,
+            threshold,
+            estimated,
+        } => {
+            let (now, of) = match limit {
+                Limit::Runtime => (
+                    duration(cx, Duration::from_secs_f64(current.max(0.0))),
+                    duration(cx, Duration::from_secs_f64(threshold.max(0.0))),
+                ),
+                Limit::Spend | Limit::Balance => (cu(cx, *current), cu(cx, *threshold)),
+            };
+            let now = if *estimated { approx(cx, &now) } else { now };
+            let key = match limit {
+                Limit::Runtime => keys::GUARD_RUNTIME,
+                Limit::Spend => keys::GUARD_SPEND,
+                Limit::Balance => keys::GUARD_BALANCE,
+            };
+            tr_args(cx, key, &[("current", &now), ("limit", &of)])
+        }
+        Concern::UsageUnknown { limit } => {
+            let name = tr(cx, limit_key(*limit));
+            tr_args(cx, keys::GUARD_UNKNOWN, &[("limit", &name)])
+        }
+    }
+}
+
+/// Several concerns, joined.
+pub fn concerns(cx: &App, concerns: &[Concern]) -> SharedString {
+    let items: Vec<String> = concerns
+        .iter()
+        .map(|c| concern(cx, c).to_string())
+        .collect();
+    list(cx, &items).into()
+}
+
+/// The name of a guard limit.
+pub fn limit_key(limit: Limit) -> &'static str {
+    match limit {
+        Limit::Runtime => keys::LIMIT_RUNTIME,
+        Limit::Spend => keys::LIMIT_SPEND,
+        Limit::Balance => keys::LIMIT_BALANCE,
+    }
+}
+
+/// Bytes as MB or GB.
+pub fn bytes(cx: &App, bytes: u64) -> SharedString {
+    let mib = bytes as f64 / (1024.0 * 1024.0);
+    if mib >= 1024.0 {
+        tr_args(cx, keys::FMT_GB, &[("n", &number(cx, mib / 1024.0, 1))])
+    } else {
+        if mib >= 1.0 {
+            tr_args(cx, keys::FMT_MB, &[("n", &number(cx, mib, 1))])
+        } else {
+            let kib = (bytes as f64 / 1024.0).max(0.1);
+            tr_args(cx, keys::FMT_KB, &[("n", &number(cx, kib, 1))])
+        }
+    }
+}
+
+/// A short wait: whole seconds under a minute ("6 s"), otherwise as [`duration`].
+pub fn short_wait(cx: &App, secs: u64) -> SharedString {
+    if secs < 60 {
+        tr_args(cx, keys::FMT_SECONDS, &[("n", &secs.to_string())])
+    } else {
+        duration(cx, Duration::from_secs(secs))
     }
 }

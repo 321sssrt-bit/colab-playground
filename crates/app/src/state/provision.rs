@@ -1,0 +1,231 @@
+//! New session: the form (pre-filled from `Defaults`, every value overridable for this one
+//! session) and the live provisioning progress. Cancel is always available and leaves no
+//! billed runtime behind (core releases any VM it allocated).
+//!
+//! The same progress model serves a plugin run that provisions its own session.
+
+use colab_playground_core::{
+    Error, ErrorKind,
+    provision::{ProvisionEvent, ProvisionOutcome, ProvisionSpec},
+};
+use gpui::Context;
+
+use super::{AppState, InputSlot, Op, Overlay};
+use crate::i18n::{keys, tr_args};
+
+/// Where provisioning stands.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProvisionPhase {
+    /// The form is being filled in.
+    Editing,
+    /// Asking Colab for a runtime (see the events).
+    Running,
+    /// A runtime is ready.
+    Ready(ProvisionOutcome),
+    /// It gave up.
+    Failed(Error),
+    /// Cancelled; nothing is left running.
+    Cancelled,
+}
+
+/// What provisioning reported so far, folded into what the progress view shows.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ProvisionProgress {
+    /// Every event, in order.
+    pub events: Vec<ProvisionEvent>,
+}
+
+impl ProvisionProgress {
+    /// `(attempt, of)` of the latest attempt.
+    pub fn attempt(&self) -> Option<(u32, u32)> {
+        self.events.iter().rev().find_map(|event| match event {
+            ProvisionEvent::Allocating {
+                attempt,
+                max_attempts,
+            } => Some((*attempt, *max_attempts)),
+            _ => None,
+        })
+    }
+
+    /// The latest event.
+    pub fn last(&self) -> Option<&ProvisionEvent> {
+        self.events.last()
+    }
+}
+
+/// The new-session dialog.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NewSession {
+    /// What to ask for.
+    pub spec: ProvisionSpec,
+    /// Where it stands.
+    pub phase: ProvisionPhase,
+    /// Progress events.
+    pub progress: ProvisionProgress,
+}
+
+impl AppState {
+    /// The new-session dialog's state, while one exists (also while it is hidden and
+    /// provisioning continues).
+    pub fn new_session(&self) -> Option<&NewSession> {
+        self.new_session.as_ref()
+    }
+
+    /// Whether a runtime is being provisioned (by the dialog or a plugin run).
+    pub fn is_provisioning(&self) -> bool {
+        self.ops.is_running(Op::Provision)
+    }
+
+    /// Opens the new-session dialog pre-filled from `Defaults`, with a generated name.
+    pub fn open_new_session(&mut self, cx: &mut Context<Self>) {
+        if let Some(session) = &self.new_session
+            && session.phase == ProvisionPhase::Running
+        {
+            self.overlay = Some(Overlay::NewSession);
+            cx.notify();
+            return;
+        }
+        let defaults = self.defaults().clone();
+        let spec = defaults.provision_spec(String::new());
+        self.new_session = Some(NewSession {
+            spec,
+            phase: ProvisionPhase::Editing,
+            progress: ProvisionProgress::default(),
+        });
+        self.overlay = Some(Overlay::NewSession);
+        self.run_backend(
+            Op::SessionName,
+            cx,
+            |backend, _| Ok(backend.new_session_name(None)),
+            |state, result, cx| {
+                if let Ok(name) = result
+                    && let Some(session) = &mut state.new_session
+                    && session.phase == ProvisionPhase::Editing
+                {
+                    session.spec.name = name.clone();
+                    state.set_input(InputSlot::SessionName, name);
+                    cx.notify();
+                }
+            },
+        );
+        cx.notify();
+    }
+
+    /// Edits the form's spec.
+    pub fn edit_new_session(
+        &mut self,
+        edit: impl FnOnce(&mut ProvisionSpec),
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(session) = &mut self.new_session
+            && session.phase == ProvisionPhase::Editing
+        {
+            edit(&mut session.spec);
+            if !session.spec.accelerator.is_gpu() {
+                session.spec.min_vram_mib = None;
+            }
+            cx.notify();
+        }
+    }
+
+    /// Starts provisioning with `name` (the form's name field).
+    pub fn start_provision(&mut self, name: String, cx: &mut Context<Self>) {
+        let Some(session) = &mut self.new_session else {
+            return;
+        };
+        if session.phase != ProvisionPhase::Editing
+            && !matches!(
+                session.phase,
+                ProvisionPhase::Failed(_) | ProvisionPhase::Cancelled
+            )
+        {
+            return;
+        }
+        let name = name.trim().to_owned();
+        if !name.is_empty() {
+            session.spec.name = name;
+        }
+        if let Err(error) = session.spec.validate() {
+            session.phase = ProvisionPhase::Failed(error);
+            cx.notify();
+            return;
+        }
+        session.phase = ProvisionPhase::Running;
+        session.progress = ProvisionProgress::default();
+        let spec = session.spec.clone();
+        self.run_backend_streaming(
+            Op::Provision,
+            cx,
+            move |backend, events, cancel| backend.provision(spec, events, cancel),
+            |state, event, cx| {
+                if let Some(session) = &mut state.new_session {
+                    session.progress.events.push(event);
+                    cx.notify();
+                }
+            },
+            |state, result, cx| {
+                if let Ok(outcome) = &result {
+                    let name = outcome.name.clone();
+                    state.toast_done(
+                        tr_args(cx, keys::PROVISION_READY_TOAST, &[("name", &name)]),
+                        cx,
+                    );
+                }
+                let Some(session) = &mut state.new_session else {
+                    return;
+                };
+                session.phase = match result {
+                    Ok(outcome) => ProvisionPhase::Ready(outcome),
+                    Err(error) if error.is(ErrorKind::Cancelled) => ProvisionPhase::Cancelled,
+                    Err(error) => ProvisionPhase::Failed(error),
+                };
+                state.after_runtime_change(cx);
+                cx.notify();
+            },
+        );
+        cx.notify();
+    }
+
+    /// Asks provisioning to stop; it releases any VM it allocated before returning.
+    pub fn cancel_provision(&mut self, cx: &mut Context<Self>) {
+        self.ops.cancel(Op::Provision);
+        cx.notify();
+    }
+
+    /// Whether a cancel was asked and provisioning is still winding down.
+    pub fn is_cancelling_provision(&self) -> bool {
+        self.ops.is_cancelling(Op::Provision)
+    }
+
+    /// Closes the dialog. While provisioning runs it only hides (the Sessions page shows the
+    /// progress with Cancel); otherwise the form is dropped.
+    pub fn close_new_session(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.overlay, Some(Overlay::NewSession)) {
+            self.overlay = None;
+        }
+        let running = self
+            .new_session
+            .as_ref()
+            .is_some_and(|session| session.phase == ProvisionPhase::Running);
+        if !running {
+            self.new_session = None;
+        }
+        cx.notify();
+    }
+
+    /// Back to the form after a failure or cancel, with the same values.
+    pub fn edit_again(&mut self, cx: &mut Context<Self>) {
+        if let Some(session) = &mut self.new_session
+            && matches!(
+                session.phase,
+                ProvisionPhase::Failed(_) | ProvisionPhase::Cancelled
+            )
+        {
+            session.phase = ProvisionPhase::Editing;
+            session.progress = ProvisionProgress::default();
+            let name = session.spec.name.clone();
+            self.set_input(InputSlot::SessionName, name);
+            cx.notify();
+        }
+    }
+}

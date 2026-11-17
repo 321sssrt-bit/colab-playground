@@ -47,7 +47,7 @@ pub const INSTALL_LOG_SELECTOR: &str = "install-log";
 pub const SIGN_IN_SELECTOR: &str = "checklist-sign-in";
 /// Selector around "Check again".
 pub const CHECK_AGAIN_SELECTOR: &str = "checklist-check-again";
-/// Where batch 2 puts the quick-deploy cards.
+/// Selector around the quick-deploy cards.
 pub const QUICK_DEPLOY_SELECTOR: &str = "overview-quick-deploy";
 
 /// The selector of a checklist step, with its state: `step <name> <state>`.
@@ -107,8 +107,94 @@ pub fn render(state: &AppState, handle: &Entity<AppState>, cx: &App) -> Page {
         )
     };
     page.children(unmanaged_warning(state, handle, cx))
-        // TODO(batch 2): the quick-deploy cards for bundled plugins go in this slot.
-        .child(tagged(QUICK_DEPLOY_SELECTOR, div()))
+        .children(quick_deploy(state, handle, cx))
+}
+
+/// The selector of a quick-deploy card's button: `deploy <plugin id>`.
+pub fn deploy_selector(id: &str) -> String {
+    format!("deploy {id}")
+}
+
+/// Built-in plugins as "Deploy a model" cards; one click opens the run form. Shown once the
+/// checklist is complete.
+fn quick_deploy(state: &AppState, handle: &Entity<AppState>, cx: &App) -> Option<AnyElement> {
+    if !state.checklist().complete() {
+        return None;
+    }
+    let plugins = state.quick_deploys();
+    if plugins.is_empty() {
+        return None;
+    }
+    let theme = cx.theme();
+    let tag = state.language().tag();
+    let cards = plugins.into_iter().map(|info| {
+        let id = info.manifest.id.clone();
+        let open = handle.clone();
+        let open_id = id.clone();
+        Card::new()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Icon::new(IconName::Rocket)
+                            .size(IconSize::Sm)
+                            .color(theme.colors.accent),
+                    )
+                    .child(
+                        div()
+                            .text_size(theme.text_size(TextSize::Base))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(state.plugin_name(info)),
+                    ),
+            )
+            .children(
+                info.manifest
+                    .description
+                    .get(tag)
+                    .map(|d| Caption::new(d.to_owned())),
+            )
+            .child(
+                div().flex().child(tagged(
+                    deploy_selector(&id),
+                    Button::new(
+                        SharedString::from(format!("deploy-{id}")),
+                        tr(cx, keys::DEPLOY_ACTION),
+                    )
+                    .primary()
+                    .icon(IconName::Rocket)
+                    .on_click(move |_, _, cx| {
+                        open.update(cx, |state, cx| state.open_run_form(open_id.clone(), cx))
+                    }),
+                )),
+            )
+            .w_full()
+    });
+    Some(
+        tagged(
+            QUICK_DEPLOY_SELECTOR,
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .text_size(theme.text_size(TextSize::Lg))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(tr(cx, keys::DEPLOY_TITLE)),
+                        )
+                        .child(Caption::new(tr(cx, keys::DEPLOY_SUBTITLE))),
+                )
+                .children(cards),
+        )
+        .w_full()
+        .into_any_element(),
+    )
 }
 
 fn step_row(

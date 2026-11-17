@@ -12,6 +12,12 @@ mod accounts;
 mod defaults;
 mod environment;
 mod ops;
+mod plugins;
+mod provision;
+mod quit;
+mod runs;
+mod sessions;
+mod tunnels;
 mod usage;
 
 use std::sync::Arc;
@@ -36,7 +42,13 @@ pub use environment::{
     Checklist, EnvironmentStep, InstallPhase, InstallState, Step, StepState, checklist,
     install_methods,
 };
-pub use ops::Op;
+pub use ops::{Op, key_of};
+pub use plugins::{HF_TOKEN, InstallPrompt, RemovePrompt, is_git_source};
+pub use provision::{NewSession, ProvisionPhase, ProvisionProgress};
+pub use quit::{Billing, QuitPrompt};
+pub use runs::{HF_RESULTS, HfLookup, PluginRun, PluginView, RunForm, RunPhase};
+pub use sessions::{EndReason, Ended, StopPrompt, runtime_label};
+pub use tunnels::{FORWARD_START_PORT, ForwardForm, local_url};
 pub use usage::{
     POLL_CHECK, UsageSummary, is_stale as usage_is_stale, stale_note as usage_stale_note, summarize,
 };
@@ -62,7 +74,7 @@ pub struct StateOptions {
 }
 
 /// A value loaded from the backend.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub enum Load<T> {
     /// Not asked for (yet).
     #[default]
@@ -131,6 +143,51 @@ pub struct AppState {
     usage: usage::UsageCache,
     defaults_push: Option<Task<()>>,
     _poller: Option<Task<()>>,
+    overlay: Option<Overlay>,
+    sessions: sessions::SessionsState,
+    new_session: Option<NewSession>,
+    plugins: plugins::PluginsState,
+    plugin_view: PluginView,
+    run_form: Option<RunForm>,
+    plugin_run: Option<PluginRun>,
+    pending_inputs: Vec<(InputSlot, String)>,
+    quit: quit::QuitState,
+}
+
+/// A dialog other than the account ones (those are [`AccountDialog`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Overlay {
+    /// Stop and end billing, confirmed once.
+    Stop(StopPrompt),
+    /// The new-session form and its progress.
+    NewSession,
+    /// Forward a port.
+    Forward(ForwardForm),
+    /// Install a plugin, after checking it.
+    InstallPlugin(InstallPrompt),
+    /// Remove a plugin.
+    RemovePlugin(RemovePrompt),
+    /// Quit with runtimes still billing.
+    Quit(QuitPrompt),
+}
+
+/// A text field the root view owns, for state to fill (`AppState::set_input`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum InputSlot {
+    /// The new-session name.
+    SessionName,
+    /// The fresh session name in the run form.
+    RunSessionName,
+    /// The plugin folder or Git URL.
+    PluginSource,
+    /// The forward's port on the runtime.
+    ForwardRemote,
+    /// The forward's port on this computer.
+    ForwardLocal,
+    /// The forward's health path.
+    Health,
+    /// A run-form text, secret or model field, by input id.
+    Field(String),
 }
 
 struct GlobalAppState(Entity<AppState>);
@@ -205,6 +262,15 @@ impl AppState {
                 usage: usage::UsageCache::default(),
                 defaults_push: None,
                 _poller: None,
+                overlay: None,
+                sessions: sessions::SessionsState::default(),
+                new_session: None,
+                plugins: plugins::PluginsState::default(),
+                plugin_view: PluginView::default(),
+                run_form: None,
+                plugin_run: None,
+                pending_inputs: Vec::new(),
+                quit: quit::QuitState::default(),
             };
             state.font_fallbacks = platform::font_fallbacks(language, &state.cjk_fonts);
             state.apply_mode(true, cx);
@@ -236,6 +302,48 @@ impl AppState {
     /// The page on show.
     pub fn route(&self) -> Route {
         self.route
+    }
+
+    /// The open dialog other than the account ones.
+    pub fn overlay(&self) -> Option<&Overlay> {
+        self.overlay.as_ref()
+    }
+
+    /// Closes that dialog (the new-session dialog only hides while it provisions).
+    pub fn close_overlay(&mut self, cx: &mut Context<Self>) {
+        match self.overlay {
+            Some(Overlay::NewSession) => self.close_new_session(cx),
+            Some(_) => {
+                self.overlay = None;
+                cx.notify();
+            }
+            None => {}
+        }
+    }
+
+    /// Asks the root view to put `text` into a text field it owns.
+    pub(crate) fn set_input(&mut self, slot: InputSlot, text: String) {
+        self.pending_inputs.retain(|(pending, _)| pending != &slot);
+        self.pending_inputs.push((slot, text));
+    }
+
+    /// Text-field contents the root view still has to apply.
+    pub fn take_pending_inputs(&mut self) -> Vec<(InputSlot, String)> {
+        std::mem::take(&mut self.pending_inputs)
+    }
+
+    /// Whether at least one account is saved.
+    pub fn has_saved_accounts(&self) -> bool {
+        self.accounts
+            .ready()
+            .is_some_and(|view| !view.accounts.is_empty())
+    }
+
+    /// Why switching or adding an account must wait (a provision or plugin run is tied to
+    /// the active account), if it must.
+    pub fn account_change_block(&self) -> Option<&'static str> {
+        (self.ops.is_running(Op::Provision) || self.ops.is_running(Op::PluginRun))
+            .then_some(keys::ACCOUNT_CHANGE_BLOCKED)
     }
 
     /// Shows another page.

@@ -12,10 +12,11 @@ use colab_playground_core::{
     backend::{AccountUsageView, LoginFlow, SwitchImpact},
     host::ProbeReport,
 };
+use ely_gpui_component::{feedback::Toast, primitives::Severity};
 use gpui::{AppContext, Context};
 
 use super::{AppState, Load, Op};
-use crate::i18n::{keys, tr_args};
+use crate::i18n::{keys, tr, tr_args};
 
 /// Where adding an account stands.
 #[derive(Clone, Debug, PartialEq)]
@@ -246,7 +247,9 @@ impl AppState {
                     state.accounts = Load::Ready(view);
                     if has_accounts {
                         state.refresh_usage(true, cx);
+                        state.load_runtimes(cx);
                     }
+                    state.load_plugins(cx);
                 }
                 Err(error) => state.accounts = Load::Failed(error),
             },
@@ -272,6 +275,12 @@ impl AppState {
 
     /// Opens the add-account dialog (nothing starts until the user continues).
     pub fn open_add_account(&mut self, cx: &mut Context<Self>) {
+        if let Some(reason) = self.account_change_block() {
+            let toast = Toast::new(tr(cx, reason)).severity(Severity::Warning);
+            self.toast(toast, cx);
+            return;
+        }
+        self.overlay = None;
         if !matches!(self.dialog, Some(AccountDialog::Add(_))) {
             self.dialog = Some(AccountDialog::Add(AddPhase::Intro));
             cx.notify();
@@ -373,6 +382,12 @@ impl AppState {
 
     /// Opens the switch confirmation and asks what switching affects.
     pub fn request_switch(&mut self, to: AccountId, cx: &mut Context<Self>) {
+        if let Some(reason) = self.account_change_block() {
+            let toast = Toast::new(tr(cx, reason)).severity(Severity::Warning);
+            self.toast(toast, cx);
+            return;
+        }
+        self.overlay = None;
         let email = self.email_of(&to);
         self.dialog = Some(AccountDialog::Switch {
             to: to.clone(),
@@ -418,6 +433,7 @@ impl AppState {
                     state.accounts = Load::Ready(view);
                     state.toast_done(tr_args(cx, keys::SWITCH_DONE, &[("email", &email)]), cx);
                     state.refresh_usage(true, cx);
+                    state.load_runtimes(cx);
                 }
                 Err(error) => {
                     if let Some(AccountDialog::Switch { error: shown, .. }) = &mut state.dialog {

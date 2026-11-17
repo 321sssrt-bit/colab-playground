@@ -4,7 +4,8 @@
 pub mod accounts;
 pub mod defaults;
 pub mod overview;
-pub mod placeholder;
+pub mod plugins;
+pub mod sessions;
 pub mod settings;
 
 use ely_gpui_component::{
@@ -17,7 +18,7 @@ use crate::{
     i18n::tr,
     route::Route,
     state::AppState,
-    ui::{Inputs, pages::placeholder::Placeholder, tagged},
+    ui::{Inputs, tagged},
 };
 
 /// The page for the current route.
@@ -30,8 +31,8 @@ pub fn render(
     let route = state.route();
     let page = match route {
         Route::Overview => overview::render(state, handle, cx),
-        Route::Sessions => placeholder::render(Placeholder::Sessions, cx),
-        Route::Plugins => placeholder::render(Placeholder::Plugins, cx),
+        Route::Sessions => sessions::render(state, handle, cx),
+        Route::Plugins => plugins::render(state, handle, inputs, cx),
         Route::Accounts => accounts::render(state, handle, cx),
         Route::Settings => settings::render(state, handle, inputs, cx),
     };

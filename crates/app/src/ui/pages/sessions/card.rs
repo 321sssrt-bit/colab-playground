@@ -1,0 +1,449 @@
+//! One runtime: what it is, what it costs, when it stops, its forwards, and the actions it
+//! allows. Stop works for every runtime on every account. Extend, cancelling auto-stop and
+//! forwarding need the owning account to be active (the card offers to switch instead) and a
+//! named runtime (runtimes opened elsewhere show them disabled with the reason).
+
+use colab_playground_core::{
+    backend::Runtime,
+    guard::{Concern, Limit},
+    tunnel::{TunnelInfo, TunnelState},
+};
+use ely_gpui_component::{
+    buttons::{Button, ButtonVariant, CopyButton, IconButton},
+    data_display::{Badge, Tone},
+    feedback::{Alert, InlineMessage},
+    layout::Card,
+    primitives::{IconName, Severity, Tooltip},
+    theme::{ActiveTheme, ControlSize, TextSize},
+    typography::Caption,
+};
+use gpui::{
+    AnyElement, App, Entity, FontWeight, InteractiveElement, IntoElement, ParentElement,
+    SharedString, StatefulInteractiveElement, Styled, div,
+};
+
+use crate::{
+    errors, format,
+    i18n::{keys, tr, tr_args},
+    state::{AppState, Op, key_of, local_url, runtime_label},
+    ui::tagged,
+};
+
+/// Selector around a runtime's card: `runtime <label>`.
+pub fn runtime_selector(label: &str) -> String {
+    format!("runtime {label}")
+}
+/// Selector of a runtime's Stop button.
+pub fn stop_selector(label: &str) -> String {
+    format!("runtime-stop {label}")
+}
+/// Selector of a runtime's Extend button.
+pub fn extend_selector(label: &str) -> String {
+    format!("runtime-extend {label}")
+}
+/// Selector of a runtime's Forward button.
+pub fn forward_selector(label: &str) -> String {
+    format!("runtime-forward {label}")
+}
+/// Selector of a runtime's "Switch to this account" button.
+pub fn switch_selector(label: &str) -> String {
+    format!("runtime-switch {label}")
+}
+
+fn stat(label: SharedString, value: SharedString, cx: &App) -> impl IntoElement {
+    let theme = cx.theme();
+    div()
+        .flex_1()
+        .min_w(theme.label_width())
+        .flex()
+        .flex_col()
+        .gap_0p5()
+        .child(Caption::new(label))
+        .child(
+            div()
+                .text_size(theme.text_size(TextSize::Base))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(value),
+        )
+}
+
+pub(super) fn render(
+    runtime: &Runtime,
+    state: &AppState,
+    handle: &Entity<AppState>,
+    cx: &App,
+) -> AnyElement {
+    let theme = cx.theme();
+    let label = runtime_label(runtime);
+    let now = state.sessions_now();
+    let unknown = || tr(cx, keys::SUMMARY_UNKNOWN);
+    let tracked = runtime.tracked.as_ref();
+    let hardware = tracked
+        .and_then(|t| format::hardware(cx, t.gpu.as_deref(), t.vram_mib))
+        .unwrap_or_else(|| runtime.hardware.clone().into());
+    let uptime = match (tracked, now) {
+        (Some(t), Some(now)) => format::duration(
+            cx,
+            now.duration_since(t.spend.started_at).unwrap_or_default(),
+        ),
+        _ => unknown(),
+    };
+    let rate = runtime
+        .estimated_rate_cu_per_hour
+        .map_or_else(unknown, |r| format::approx(cx, &format::cu_rate(cx, r)));
+    let spend = runtime
+        .estimated_spend_cu
+        .map_or_else(unknown, |s| format::approx(cx, &format::cu(cx, s)));
+    let auto_stop = match (runtime.auto_stop_at, now) {
+        (Some(at), Some(now)) => tr_args(
+            cx,
+            keys::RUNTIME_AUTO_STOP_IN,
+            &[(
+                "time",
+                &format::duration(cx, at.duration_since(now).unwrap_or_default()),
+            )],
+        ),
+        (Some(_), None) => unknown(),
+        (None, _) if runtime.managed => tr(cx, keys::RUNTIME_AUTO_STOP_OFF),
+        (None, _) => tr(cx, keys::RUNTIME_AUTO_STOP_NONE),
+    };
+    let stopping = state.is_stopping(&runtime.id);
+    let mut badges = div().flex().flex_wrap().gap_1p5();
+    if !runtime.managed {
+        badges = badges.child(Badge::new(tr(cx, keys::RUNTIME_UNMANAGED)).tone(Tone::Warning));
+    }
+    if runtime.high_mem {
+        badges = badges.child(Badge::new(tr(cx, keys::RUNTIME_HIGH_MEM)));
+    }
+    if stopping {
+        badges = badges.child(Badge::new(tr(cx, keys::RUNTIME_STOPPING)).tone(Tone::Info));
+    }
+    let header = div()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap_2()
+        .child(
+            div()
+                .text_size(theme.text_size(TextSize::Lg))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(label.clone()),
+        )
+        .child(badges);
+    let stats = div()
+        .flex()
+        .flex_wrap()
+        .gap_4()
+        .child(stat(tr(cx, keys::RUNTIME_HARDWARE), hardware, cx))
+        .child(stat(tr(cx, keys::RUNTIME_UPTIME), uptime, cx))
+        .child(stat(tr(cx, keys::RUNTIME_RATE), rate, cx))
+        .child(stat(tr(cx, keys::RUNTIME_SPEND), spend, cx))
+        .child(stat(tr(cx, keys::RUNTIME_AUTO_STOP), auto_stop, cx));
+    let mut card = Card::new().child(header).child(stats);
+    if !runtime.managed {
+        card = card.child(Caption::new(tr(cx, keys::RUNTIME_UNMANAGED_HINT)));
+    }
+    if let Some(error) = state.guard_stop_failure(&runtime.id) {
+        let retry = handle.clone();
+        let target = runtime.id.clone();
+        card = card.child(tagged(
+            format!("guard-stop-failed {label}"),
+            Alert::new(
+                SharedString::from(format!("guard-stop-failed-{label}")),
+                Severity::Danger,
+                tr(cx, keys::GUARD_STILL_BILLING),
+            )
+            .body(errors::explain(error, false, cx).message)
+            .action(
+                Button::new(
+                    SharedString::from(format!("guard-retry-{label}")),
+                    tr(cx, keys::STOP_ACTION),
+                )
+                .size(ControlSize::Sm)
+                .on_click(move |_, _, cx| {
+                    retry.update(cx, |state, cx| state.request_stop(target.clone(), cx))
+                }),
+            ),
+        ));
+    }
+    let warnings = state.guard_warnings(&runtime.id);
+    if !warnings.is_empty() {
+        let near_auto_stop = warnings.iter().any(|c| {
+            matches!(
+                c,
+                Concern::Limit {
+                    limit: Limit::Runtime,
+                    ..
+                }
+            )
+        });
+        let unknown_only = warnings
+            .iter()
+            .all(|c| matches!(c, Concern::UsageUnknown { .. }));
+        let mut message = div().flex().flex_col().gap_1().child(InlineMessage::new(
+            if unknown_only {
+                Severity::Info
+            } else {
+                Severity::Warning
+            },
+            tr_args(
+                cx,
+                keys::GUARD_WARN_LINE,
+                &[("what", &format::concerns(cx, warnings))],
+            ),
+        ));
+        if near_auto_stop
+            && runtime.on_active_account
+            && let Some(by) = state.extension_for(runtime)
+        {
+            let extend = handle.clone();
+            let target = runtime.id.clone();
+            message = message.child(
+                div().child(
+                    Button::new(
+                        SharedString::from(format!("guard-extend-{label}")),
+                        tr_args(
+                            cx,
+                            keys::RUNTIME_EXTEND_BY,
+                            &[("time", &format::duration(cx, by))],
+                        ),
+                    )
+                    .size(ControlSize::Sm)
+                    .on_click(move |_, _, cx| {
+                        extend.update(cx, |state, cx| state.extend_session(target.clone(), cx))
+                    }),
+                ),
+            );
+        }
+        card = card.child(tagged(format!("guard-warning {label}"), message));
+    }
+    let tunnels = state.tunnels_for(&runtime.id);
+    if !tunnels.is_empty() {
+        card = card.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(Caption::new(tr(cx, keys::RUNTIME_FORWARDS)))
+                .children(
+                    tunnels
+                        .into_iter()
+                        .map(|tunnel| forward_row(tunnel, handle, cx)),
+                ),
+        );
+    }
+    card = card.child(actions(runtime, &label, stopping, state, handle, cx));
+    tagged(runtime_selector(&label), card)
+        .w_full()
+        .into_any_element()
+}
+
+fn actions(
+    runtime: &Runtime,
+    label: &str,
+    stopping: bool,
+    state: &AppState,
+    handle: &Entity<AppState>,
+    cx: &App,
+) -> AnyElement {
+    let target = runtime.id.clone();
+    let stop = {
+        let (handle, target) = (handle.clone(), target.clone());
+        tagged(
+            stop_selector(label),
+            Button::new(
+                SharedString::from(format!("stop-{label}")),
+                tr(cx, keys::STOP_ACTION),
+            )
+            .variant(ButtonVariant::Danger)
+            .icon(IconName::Square)
+            .size(ControlSize::Sm)
+            .loading(stopping)
+            .disabled(stopping)
+            .on_click(move |_, _, cx| {
+                handle.update(cx, |state, cx| state.request_stop(target.clone(), cx))
+            }),
+        )
+    };
+    let mut row = div().flex().flex_wrap().items_center().gap_2().child(stop);
+    if !runtime.on_active_account {
+        let (handle, account) = (handle.clone(), runtime.id.account.clone());
+        return row
+            .child(tagged(
+                switch_selector(label),
+                Button::new(
+                    SharedString::from(format!("switch-{label}")),
+                    tr(cx, keys::RUNTIME_SWITCH),
+                )
+                .size(ControlSize::Sm)
+                .icon(IconName::Link)
+                .on_click(move |_, _, cx| {
+                    handle.update(cx, |state, cx| state.request_switch(account.clone(), cx))
+                }),
+            ))
+            .child(Caption::new(tr(cx, keys::RUNTIME_SWITCH_HINT)))
+            .into_any_element();
+    }
+    let named = runtime.id.name.is_some();
+    let disabled_reason = (!named).then(|| tr(cx, keys::RUNTIME_UNNAMED_REASON));
+    let with_reason = |id: String, button: Button| -> AnyElement {
+        match &disabled_reason {
+            Some(reason) => div()
+                .id(SharedString::from(id))
+                .tooltip(Tooltip::text(reason.clone()))
+                .child(button.disabled(true))
+                .into_any_element(),
+            None => button.into_any_element(),
+        }
+    };
+    if runtime.managed || !named {
+        if let Some(by) = state
+            .extension_for(runtime)
+            .filter(|_| runtime.auto_stop_at.is_some() || !named)
+        {
+            let (handle, target) = (handle.clone(), target.clone());
+            let busy = state.is_busy(Op::Extend(key_of(&target)));
+            row = row.child(tagged(
+                extend_selector(label),
+                with_reason(
+                    format!("extend-wrap-{label}"),
+                    Button::new(
+                        SharedString::from(format!("extend-{label}")),
+                        tr_args(
+                            cx,
+                            keys::RUNTIME_EXTEND_BY,
+                            &[("time", &format::duration(cx, by))],
+                        ),
+                    )
+                    .size(ControlSize::Sm)
+                    .loading(busy)
+                    .on_click(move |_, _, cx| {
+                        handle.update(cx, |state, cx| state.extend_session(target.clone(), cx))
+                    }),
+                ),
+            ));
+        }
+        if runtime.auto_stop_at.is_some() || !named {
+            let (handle, target) = (handle.clone(), target.clone());
+            row = row.child(tagged(
+                format!("runtime-cancel-auto-stop {label}"),
+                with_reason(
+                    format!("cancel-wrap-{label}"),
+                    Button::new(
+                        SharedString::from(format!("cancel-auto-stop-{label}")),
+                        tr(cx, keys::RUNTIME_CANCEL_AUTO_STOP),
+                    )
+                    .variant(ButtonVariant::Ghost)
+                    .size(ControlSize::Sm)
+                    .on_click(move |_, _, cx| {
+                        handle.update(cx, |state, cx| state.cancel_auto_stop(target.clone(), cx))
+                    }),
+                ),
+            ));
+        }
+    }
+    let (forward_handle, forward_target) = (handle.clone(), target.clone());
+    row = row.child(tagged(
+        forward_selector(label),
+        with_reason(
+            format!("forward-wrap-{label}"),
+            Button::new(
+                SharedString::from(format!("forward-{label}")),
+                tr(cx, keys::FORWARD_TITLE),
+            )
+            .variant(ButtonVariant::Ghost)
+            .icon(IconName::Link)
+            .size(ControlSize::Sm)
+            .on_click(move |_, _, cx| {
+                forward_handle.update(cx, |state, cx| {
+                    state.open_forward_dialog(forward_target.clone(), cx)
+                })
+            }),
+        ),
+    ));
+    row.into_any_element()
+}
+
+/// One forward: state, address (copy, open) and close.
+pub fn forward_row(tunnel: &TunnelInfo, handle: &Entity<AppState>, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    let url = local_url(&tunnel.spec);
+    let (text, tone) = match &tunnel.state {
+        TunnelState::Starting => (tr(cx, keys::TUNNEL_STARTING), Tone::Info),
+        TunnelState::Up => match tunnel.healthy {
+            Some(false) => (tr(cx, keys::TUNNEL_UP_UNHEALTHY), Tone::Warning),
+            _ => (tr(cx, keys::TUNNEL_UP), Tone::Success),
+        },
+        TunnelState::Reconnecting { attempt, .. } => (
+            tr_args(
+                cx,
+                keys::TUNNEL_RECONNECTING,
+                &[("n", &attempt.to_string())],
+            ),
+            Tone::Warning,
+        ),
+        TunnelState::Failed { .. } => (tr(cx, keys::TUNNEL_FAILED), Tone::Danger),
+        TunnelState::Stopped => (tr(cx, keys::TUNNEL_STOPPED), Tone::Neutral),
+    };
+    let id = tunnel.id;
+    let close = handle.clone();
+    let open_url = url.clone();
+    let terminal = tunnel.state.is_terminal();
+    let mut row = div()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap_2()
+        .text_size(theme.text_size(TextSize::Sm))
+        .child(Badge::new(text).tone(tone))
+        .child(
+            div()
+                .font_family(theme.mono_family.clone())
+                .child(format!("{url} → {}", tunnel.spec.remote_port)),
+        );
+    if !terminal {
+        row = row
+            .child(CopyButton::new(
+                SharedString::from(format!("copy-tunnel-{}", id.0)),
+                url.clone(),
+            ))
+            .child(
+                IconButton::new(
+                    SharedString::from(format!("open-tunnel-{}", id.0)),
+                    IconName::ExternalLink,
+                )
+                .tooltip(tr(cx, keys::ACTION_OPEN_BROWSER))
+                .variant(ButtonVariant::Ghost)
+                .on_click(move |_, _, cx| cx.open_url(&open_url)),
+            );
+    }
+    if let TunnelState::Failed { error } = &tunnel.state {
+        row = row.child(Caption::new(errors::explain(error, false, cx).message));
+    }
+    row.child(tagged(
+        format!("tunnel-close {}", tunnel.spec.local_port),
+        IconButton::new(
+            SharedString::from(format!("close-tunnel-{}", id.0)),
+            IconName::X,
+        )
+        .tooltip(tr(
+            cx,
+            if terminal {
+                keys::ACTION_DISMISS
+            } else {
+                keys::FORWARD_CLOSE
+            },
+        ))
+        .variant(ButtonVariant::Ghost)
+        .on_click(move |_, _, cx| {
+            close.update(cx, |state, cx| {
+                if terminal {
+                    state.dismiss_forward(id, cx)
+                } else {
+                    state.close_forward(id, cx)
+                }
+            })
+        }),
+    ))
+    .into_any_element()
+}

@@ -3,7 +3,10 @@
 
 pub mod dialogs;
 pub mod error_view;
+pub mod overlays;
 pub mod pages;
+pub mod progress;
+pub mod provision_form;
 pub mod root;
 pub mod sidebar;
 pub mod titlebar;
@@ -21,7 +24,8 @@ pub fn tagged(selector: impl Into<String>, element: impl IntoElement) -> Div {
     div().debug_selector(move || selector).child(element)
 }
 
-/// Text fields the root view owns (a `TextInput` needs a window to be made).
+/// Text fields the root view owns (a `TextInput` needs a window to be made). State fills
+/// them through `AppState::set_input`; the root view applies that before drawing.
 #[derive(Clone)]
 pub struct Inputs {
     /// The pasted authorisation code.
@@ -30,4 +34,43 @@ pub struct Inputs {
     pub colab_path: Entity<TextInput>,
     /// Settings: path of its Python interpreter.
     pub colab_python: Entity<TextInput>,
+    /// New session: its name.
+    pub session_name: Entity<TextInput>,
+    /// Run form: the fresh session's name.
+    pub run_session_name: Entity<TextInput>,
+    /// Forward: the optional health path.
+    pub health: Entity<TextInput>,
+    /// Forward: the port on the runtime (digits only).
+    pub forward_remote: Entity<TextInput>,
+    /// Forward: the port on this computer (digits only).
+    pub forward_local: Entity<TextInput>,
+    /// Plugins: the folder or Git URL to install from.
+    pub plugin_source: Entity<TextInput>,
+    /// Plugins: the Hugging Face search query.
+    pub hf_query: Entity<TextInput>,
+    /// Plugins: the Hugging Face token (masked; cleared once saved).
+    pub hf_token: Entity<TextInput>,
+    /// Run form: text, secret and model fields by input id (made when a form opens).
+    pub fields: std::collections::BTreeMap<String, Entity<TextInput>>,
+}
+
+impl Inputs {
+    /// The run-form field for input `id`.
+    pub fn field(&self, id: &str) -> Option<Entity<TextInput>> {
+        self.fields.get(id).cloned()
+    }
+
+    /// The field behind `slot`.
+    pub fn slot(&self, slot: &crate::state::InputSlot) -> Option<Entity<TextInput>> {
+        use crate::state::InputSlot;
+        match slot {
+            InputSlot::SessionName => Some(self.session_name.clone()),
+            InputSlot::RunSessionName => Some(self.run_session_name.clone()),
+            InputSlot::PluginSource => Some(self.plugin_source.clone()),
+            InputSlot::ForwardRemote => Some(self.forward_remote.clone()),
+            InputSlot::ForwardLocal => Some(self.forward_local.clone()),
+            InputSlot::Health => Some(self.health.clone()),
+            InputSlot::Field(id) => self.field(id),
+        }
+    }
 }

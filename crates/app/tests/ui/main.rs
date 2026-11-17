@@ -11,6 +11,8 @@ mod fonts;
 mod harness;
 mod navigation;
 mod overview;
+mod plugins;
+mod sessions;
 mod settings_page;
 mod titlebar;
 mod usage;

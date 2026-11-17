@@ -24,7 +24,9 @@ use super::AppState;
 /// How often a streaming call's events are drained while it runs.
 const STREAM_TICK: Duration = Duration::from_millis(120);
 
-/// The kinds of backend call; one of each runs at a time.
+/// The kinds of backend call. One call per `Op` value runs at a time; calls aimed at one
+/// runtime, forward or plugin carry a key (see [`key_of`]) so acting on one never blocks
+/// acting on another.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Op {
     /// Probe, then accounts, then usage.
@@ -33,7 +35,7 @@ pub enum Op {
     Install,
     /// Listing accounts.
     Accounts,
-    /// Fetching usage.
+    /// Fetching usage (with a guard round while managed runtimes exist).
     Usage,
     /// Starting or finishing a sign-in.
     Login,
@@ -49,6 +51,68 @@ pub enum Op {
     Adopt,
     /// Rebuilding the backend after a host change.
     Rebuild,
+    /// Listing runtimes on every account.
+    Runtimes,
+    /// A generated session name.
+    SessionName,
+    /// Provisioning a new session.
+    Provision,
+    /// Stopping one runtime (keyed by runtime).
+    Stop(u64),
+    /// Moving one runtime's auto-stop (keyed by runtime).
+    Extend(u64),
+    /// Cancelling one runtime's auto-stop (keyed by runtime).
+    CancelAutoStop(u64),
+    /// Opening a forward (keyed by runtime and remote port).
+    Forward(u64),
+    /// Closing a forward (keyed by tunnel id).
+    CloseForward(u64),
+    /// Listing plugins.
+    Plugins,
+    /// Checking a plugin folder or Git URL before installing.
+    InspectPlugin,
+    /// Installing, enabling, disabling or removing a plugin (keyed by plugin id).
+    PluginChange(u64),
+    /// Running a plugin.
+    PluginRun,
+    /// A run form template.
+    RunTemplate,
+    /// Reading, saving or deleting a stored secret.
+    Secret,
+    /// Listing a Hugging Face repo's files (keyed by repo).
+    HfFiles(u64),
+    /// Stopping every runtime before quitting.
+    StopAll,
+}
+
+impl Op {
+    /// Whether the background usage poll should wait while this call runs: calls that change
+    /// accounts, the CLI or the backend itself. Provisioning, plugin runs, stops and forwards
+    /// do not pause it, since money is being spent while they run.
+    pub fn pauses_polling(self) -> bool {
+        matches!(
+            self,
+            Op::Environment
+                | Op::Install
+                | Op::Accounts
+                | Op::Usage
+                | Op::Login
+                | Op::LoginRollback
+                | Op::Switch
+                | Op::Remove
+                | Op::Adopt
+                | Op::Rebuild
+                | Op::StopAll
+        )
+    }
+}
+
+/// A stable key for `value`, for the keyed [`Op`] variants.
+pub fn key_of(value: &impl std::hash::Hash) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Calls under way, by kind, with their tokens.
@@ -71,6 +135,11 @@ impl Ops {
     /// Whether any call is under way.
     pub(crate) fn any(&self) -> bool {
         !self.running.is_empty()
+    }
+
+    /// Whether a call that pauses the usage poll is under way.
+    pub(crate) fn pausing_poll(&self) -> bool {
+        self.running.keys().any(|op| op.pauses_polling())
     }
 
     /// Asks the call of `op` to stop.

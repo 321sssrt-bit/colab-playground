@@ -1,0 +1,304 @@
+//! Plugins: the installed list, installing from a folder or a Git URL (checked and confirmed
+//! first), enabling, disabling and removing, and the stored Hugging Face token.
+//!
+//! A stored secret is never read back: the app only knows whether one is stored. The value
+//! lives in the masked field until it is saved, then the field is cleared.
+
+use std::path::PathBuf;
+
+use colab_playground_core::{
+    Error,
+    plugins::{Capability, PluginInfo, PluginPreview, PluginSource},
+};
+use gpui::Context;
+
+use super::{AppState, InputSlot, Load, Op, Overlay, ops::key_of};
+use crate::i18n::{keys, tr_args};
+
+/// The Hugging Face token's name in the vault.
+pub const HF_TOKEN: &str = "hf_token";
+
+/// The install confirmation.
+#[derive(Clone, Debug, PartialEq)]
+pub enum InstallPrompt {
+    /// Checking the folder or cloning the repository.
+    Checking,
+    /// What would be installed.
+    Preview(Box<PluginPreview>),
+    /// Checking or installing failed.
+    Failed(Error),
+}
+
+/// The remove confirmation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RemovePrompt {
+    /// Plugin id.
+    pub id: String,
+    /// Its name as shown.
+    pub name: String,
+    /// Why the last attempt failed.
+    pub error: Option<Error>,
+}
+
+/// Plugins and the token.
+#[derive(Default)]
+pub struct PluginsState {
+    pub(crate) list: Load<Vec<PluginInfo>>,
+    pub(crate) hf_token: Load<bool>,
+}
+
+/// Whether `text` names a Git repository rather than a local folder.
+pub fn is_git_source(text: &str) -> bool {
+    let text = text.trim();
+    text.contains("://") || text.starts_with("git@")
+}
+
+impl AppState {
+    /// Installed plugins.
+    pub fn plugins(&self) -> &Load<Vec<PluginInfo>> {
+        &self.plugins.list
+    }
+
+    /// One installed plugin.
+    pub fn plugin(&self, id: &str) -> Option<&PluginInfo> {
+        self.plugins
+            .list
+            .ready()?
+            .iter()
+            .find(|plugin| plugin.manifest.id == id)
+    }
+
+    /// Bundled, enabled plugins (the Overview's quick-deploy cards).
+    pub fn quick_deploys(&self) -> Vec<&PluginInfo> {
+        self.plugins
+            .list
+            .ready()
+            .map(|list| {
+                list.iter()
+                    .filter(|p| p.enabled && p.source == PluginSource::Bundled)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Whether a Hugging Face token is stored.
+    pub fn hf_token(&self) -> &Load<bool> {
+        &self.plugins.hf_token
+    }
+
+    /// Lists plugins and checks whether a token is stored.
+    pub fn load_plugins(&mut self, cx: &mut Context<Self>) {
+        self.plugins.list.begin();
+        self.run_backend(
+            Op::Plugins,
+            cx,
+            |backend, _| Ok(backend.plugins()),
+            |state, result, cx| {
+                state.plugins.list = match result {
+                    Ok(list) => Load::Ready(list),
+                    Err(error) => Load::Failed(error),
+                };
+                cx.notify();
+            },
+        );
+        self.check_hf_token(cx);
+    }
+
+    fn check_hf_token(&mut self, cx: &mut Context<Self>) {
+        self.plugins.hf_token.begin();
+        self.run_backend(
+            Op::Secret,
+            cx,
+            |backend, cancel| backend.has_secret(HF_TOKEN, cancel),
+            |state, result, cx| {
+                state.plugins.hf_token = match result {
+                    Ok(stored) => Load::Ready(stored),
+                    Err(error) => Load::Failed(error),
+                };
+                cx.notify();
+            },
+        );
+    }
+
+    /// Saves the token typed into the masked field. The caller clears the field.
+    pub fn save_hf_token(&mut self, value: String, cx: &mut Context<Self>) {
+        if value.trim().is_empty() {
+            return;
+        }
+        self.run_backend(
+            Op::Secret,
+            cx,
+            move |backend, cancel| backend.set_secret(HF_TOKEN, value.trim(), cancel),
+            |state, result, cx| {
+                match result {
+                    Ok(()) => {
+                        state.plugins.hf_token = Load::Ready(true);
+                        state.toast_done(crate::i18n::tr(cx, keys::HF_TOKEN_SAVED), cx);
+                    }
+                    Err(error) => state.toast_error(&error, cx),
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    /// Deletes the stored token.
+    pub fn delete_hf_token(&mut self, cx: &mut Context<Self>) {
+        self.run_backend(
+            Op::Secret,
+            cx,
+            |backend, cancel| backend.delete_secret(HF_TOKEN, cancel),
+            |state, result, cx| {
+                match result {
+                    Ok(()) => {
+                        state.plugins.hf_token = Load::Ready(false);
+                        state.toast_done(crate::i18n::tr(cx, keys::HF_TOKEN_DELETED), cx);
+                    }
+                    Err(error) => state.toast_error(&error, cx),
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    /// Checks a folder or Git URL and shows what would be installed.
+    pub fn inspect_plugin(&mut self, source: String, cx: &mut Context<Self>) {
+        let source = source.trim().to_owned();
+        if source.is_empty() {
+            return;
+        }
+        self.overlay = Some(Overlay::InstallPlugin(InstallPrompt::Checking));
+        self.run_backend(
+            Op::InspectPlugin,
+            cx,
+            move |backend, cancel| {
+                if is_git_source(&source) {
+                    backend.inspect_plugin_git(&source, cancel)
+                } else {
+                    backend.inspect_plugin_folder(&PathBuf::from(&source))
+                }
+            },
+            |state, result, cx| {
+                if let Some(Overlay::InstallPlugin(prompt)) = &mut state.overlay {
+                    *prompt = match result {
+                        Ok(preview) => InstallPrompt::Preview(Box::new(preview)),
+                        Err(error) => InstallPrompt::Failed(error),
+                    };
+                    cx.notify();
+                }
+            },
+        );
+        cx.notify();
+    }
+
+    /// Installs the previewed plugin.
+    pub fn confirm_install(&mut self, cx: &mut Context<Self>) {
+        let Some(Overlay::InstallPlugin(InstallPrompt::Preview(preview))) = &self.overlay else {
+            return;
+        };
+        let preview = preview.as_ref().clone();
+        let id = preview.manifest.id.clone();
+        self.run_backend(
+            Op::PluginChange(key_of(&id)),
+            cx,
+            move |backend, _| backend.install_plugin(&preview),
+            |state, result, cx| {
+                match result {
+                    Ok(info) => {
+                        if matches!(state.overlay, Some(Overlay::InstallPlugin(_))) {
+                            state.overlay = None;
+                        }
+                        state.set_input(InputSlot::PluginSource, String::new());
+                        let name = state.plugin_name(&info);
+                        state.toast_done(
+                            tr_args(cx, keys::PLUGIN_INSTALLED, &[("name", &name)]),
+                            cx,
+                        );
+                        state.load_plugins(cx);
+                    }
+                    Err(error) => {
+                        if let Some(Overlay::InstallPlugin(prompt)) = &mut state.overlay {
+                            *prompt = InstallPrompt::Failed(error);
+                        }
+                    }
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    /// Enables or disables a plugin.
+    pub fn set_plugin_enabled(&mut self, id: String, enabled: bool, cx: &mut Context<Self>) {
+        let work_id = id.clone();
+        self.run_backend(
+            Op::PluginChange(key_of(&id)),
+            cx,
+            move |backend, _| backend.set_plugin_enabled(&work_id, enabled),
+            |state, result, cx| {
+                if let Err(error) = result {
+                    state.toast_error(&error, cx);
+                }
+                state.load_plugins(cx);
+            },
+        );
+    }
+
+    /// Asks before removing a user plugin.
+    pub fn request_remove_plugin(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(info) = self.plugin(&id) else {
+            return;
+        };
+        let name = self.plugin_name(info);
+        self.overlay = Some(Overlay::RemovePlugin(RemovePrompt {
+            id,
+            name,
+            error: None,
+        }));
+        cx.notify();
+    }
+
+    /// Removes the plugin the confirmation is about.
+    pub fn confirm_remove_plugin(&mut self, cx: &mut Context<Self>) {
+        let Some(Overlay::RemovePlugin(prompt)) = &self.overlay else {
+            return;
+        };
+        let (id, name) = (prompt.id.clone(), prompt.name.clone());
+        let work_id = id.clone();
+        self.run_backend(
+            Op::PluginChange(key_of(&id)),
+            cx,
+            move |backend, _| backend.remove_plugin(&work_id),
+            move |state, result, cx| {
+                match result {
+                    Ok(()) => {
+                        if matches!(state.overlay, Some(Overlay::RemovePlugin(_))) {
+                            state.overlay = None;
+                        }
+                        state.toast_done(tr_args(cx, keys::PLUGIN_REMOVED, &[("name", &name)]), cx);
+                        state.load_plugins(cx);
+                    }
+                    Err(error) => {
+                        if let Some(Overlay::RemovePlugin(prompt)) = &mut state.overlay {
+                            prompt.error = Some(error);
+                        }
+                    }
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    /// A plugin's name in the display language.
+    pub fn plugin_name(&self, info: &PluginInfo) -> String {
+        info.manifest
+            .name
+            .get(self.language().tag())
+            .unwrap_or(&info.manifest.id)
+            .to_owned()
+    }
+
+    /// Whether `info` asks for the Hugging Face token.
+    pub fn wants_hf_token(info: &PluginInfo) -> bool {
+        info.manifest.needs.contains(&Capability::HfToken)
+    }
+}

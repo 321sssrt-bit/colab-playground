@@ -111,6 +111,8 @@ pub struct TestApp<'a> {
     pub mock: MockBackend,
     /// The mock's clock.
     pub clock: ManualClock,
+    /// Cancels a backend call at one of its later waits (see [`CancelSwitch`]).
+    pub cancel_switch: CancelSwitch,
     config: Option<TempDir>,
     config_dir: Option<PathBuf>,
 }
@@ -140,6 +142,11 @@ impl<'a> TestApp<'a> {
         let store = SettingsStore::new(config_dir.clone());
         let (mut mock_config, clock) = MockConfig::headless(options.scenario);
         mock_config.step_delay = Duration::ZERO;
+        let cancel_switch = CancelSwitch::default();
+        mock_config.clock = Arc::new(SwitchedClock {
+            inner: clock.clone(),
+            switch: cancel_switch.clone(),
+        });
         mock_config.failures = options.failures;
         let mock = MockBackend::new(mock_config);
         let source = BackendSource::Mock(Arc::new(mock.clone()) as Arc<dyn Backend>);
@@ -164,6 +171,7 @@ impl<'a> TestApp<'a> {
             state,
             mock,
             clock,
+            cancel_switch,
             config,
             config_dir,
         };
@@ -195,6 +203,12 @@ impl<'a> TestApp<'a> {
         self.cx
             .update(|_, cx| input.update(cx, |input, cx| input.set_text(text, cx)));
         self.settle();
+    }
+
+    /// Reads the root view (its text fields).
+    pub fn read_root<R>(&mut self, read: impl FnOnce(&RootView, &App) -> R) -> R {
+        let root = self.root.clone();
+        self.cx.update(|_, cx| read(root.read(cx), cx))
     }
 
     /// Resizes the window (logical pixels), then settles.
@@ -387,4 +401,47 @@ pub fn click_at(cx: &mut VisualTestContext, at: gpui::Point<Pixels>) {
 /// `debug_bounds` takes `&'static str`; selectors built at run time are leaked (tests only).
 fn leak(selector: &str) -> &'static str {
     Box::leak(selector.to_owned().into_boxed_str())
+}
+
+/// Cancels the backend call that makes the `n`th wait on the mock's clock after
+/// [`CancelSwitch::arm`], as if the user pressed Cancel at that moment. Headless backend calls
+/// run to completion in one go, so a click cannot land in the middle of one; the call's own
+/// token reaches `Clock::sleep`, which is where this flips it.
+#[derive(Clone, Default)]
+pub struct CancelSwitch(Arc<std::sync::atomic::AtomicUsize>);
+
+impl CancelSwitch {
+    /// Cancels at the `n`th wait from now (1 = the next one).
+    pub fn arm(&self, n: usize) {
+        self.0.store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The mock's manual clock, with the cancel switch.
+struct SwitchedClock {
+    inner: ManualClock,
+    switch: CancelSwitch,
+}
+
+impl colab_playground_core::clock::Clock for SwitchedClock {
+    fn now(&self) -> std::time::SystemTime {
+        colab_playground_core::clock::Clock::now(&self.inner)
+    }
+
+    fn sleep(
+        &self,
+        duration: Duration,
+        cancel: &colab_playground_core::CancelToken,
+    ) -> colab_playground_core::Result<()> {
+        use std::sync::atomic::Ordering;
+        let left = self.switch.0.load(Ordering::SeqCst);
+        if left > 0 {
+            self.switch.0.store(left - 1, Ordering::SeqCst);
+            if left == 1 {
+                cancel.cancel();
+                return Err(colab_playground_core::Error::cancelled());
+            }
+        }
+        colab_playground_core::clock::Clock::sleep(&self.inner, duration, cancel)
+    }
 }

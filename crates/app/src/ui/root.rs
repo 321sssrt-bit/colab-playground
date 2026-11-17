@@ -18,7 +18,7 @@ use crate::{
     i18n::keys,
     platform::{self, Chrome},
     state::AppState,
-    ui::{Inputs, dialogs, pages, sidebar, tagged, titlebar},
+    ui::{Inputs, dialogs, overlays, pages, sidebar, tagged, titlebar},
 };
 
 /// Selector of the scrolling page area.
@@ -29,6 +29,7 @@ pub struct RootView {
     focus: FocusHandle,
     state: Entity<AppState>,
     inputs: Inputs,
+    fields_plugin: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -43,6 +44,26 @@ impl RootView {
                 settings.colab_path.clone().unwrap_or_default(),
                 settings.colab_python.clone().unwrap_or_default(),
             )
+        };
+        let plain = |label: &'static str,
+                     placeholder: &'static str,
+                     masked: bool,
+                     window: &mut Window,
+                     cx: &mut Context<Self>| {
+            cx.new(|cx| {
+                let input = TextInput::new(window, cx)
+                    .label_key(label)
+                    .placeholder_key(placeholder);
+                if masked { input.masked() } else { input }
+            })
+        };
+        let port = |label: &'static str, window: &mut Window, cx: &mut Context<Self>| {
+            cx.new(|cx| {
+                TextInput::new(window, cx)
+                    .label_key(label)
+                    .filter(|c| c.is_ascii_digit())
+                    .max_len(5)
+            })
         };
         let field =
             |text: String, label: &'static str, window: &mut Window, cx: &mut Context<Self>| {
@@ -62,9 +83,64 @@ impl RootView {
             }),
             colab_path: field(colab_path, keys::HOST_COLAB_PATH, window, cx),
             colab_python: field(colab_python, keys::HOST_PYTHON_PATH, window, cx),
+            session_name: plain(
+                keys::NEW_NAME,
+                keys::NEW_NAME_PLACEHOLDER,
+                false,
+                window,
+                cx,
+            ),
+            run_session_name: plain(
+                keys::NEW_NAME,
+                keys::NEW_NAME_PLACEHOLDER,
+                false,
+                window,
+                cx,
+            ),
+            health: plain(
+                keys::FORWARD_HEALTH,
+                keys::FORWARD_HEALTH_PLACEHOLDER,
+                false,
+                window,
+                cx,
+            ),
+            forward_remote: port(keys::FORWARD_REMOTE, window, cx),
+            forward_local: port(keys::FORWARD_LOCAL, window, cx),
+            plugin_source: plain(
+                keys::PLUGIN_SOURCE,
+                keys::PLUGIN_SOURCE_PLACEHOLDER,
+                false,
+                window,
+                cx,
+            ),
+            hf_query: plain(
+                keys::HF_SEARCH,
+                keys::HF_SEARCH_PLACEHOLDER,
+                false,
+                window,
+                cx,
+            ),
+            hf_token: plain(
+                keys::HF_TOKEN_FIELD,
+                keys::HF_TOKEN_PLACEHOLDER,
+                true,
+                window,
+                cx,
+            ),
+            fields: Default::default(),
         };
+        // Closing with runtimes still billing asks first (system and drawn close alike).
+        let guard = state.clone();
+        ely_gpui_component::shell::guard_close(window, cx, move |_, cx| {
+            guard.update(cx, |state, cx| state.may_close(cx))
+        });
         let subscriptions = vec![
-            cx.observe(&state, |_, _, cx| cx.notify()),
+            cx.observe_in(&state, window, |_, state, window, cx| {
+                if state.read(cx).quit_approved() {
+                    window.remove_window();
+                }
+                cx.notify();
+            }),
             cx.observe_window_appearance(window, |this, window, cx| {
                 let mode = Mode::from(window.appearance());
                 this.state
@@ -77,6 +153,7 @@ impl RootView {
             focus,
             state,
             inputs,
+            fields_plugin: None,
             _subscriptions: subscriptions,
         }
     }
@@ -95,10 +172,72 @@ impl RootView {
     pub fn focus_handle(&self) -> &FocusHandle {
         &self.focus
     }
+
+    /// Makes the open run form's text, secret and model fields, then applies the text
+    /// state asked for (`AppState::set_input`).
+    fn sync_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use colab_playground_core::plugins::InputKind;
+        let (plugin, wanted) = {
+            let state = self.state.read(cx);
+            let tag = state.language().tag();
+            let info = state.run_form().and_then(|form| state.plugin(&form.plugin));
+            let wanted: Vec<(String, String, InputKind)> = info
+                .map(|info| {
+                    info.manifest
+                        .inputs
+                        .iter()
+                        .filter(|input| {
+                            matches!(
+                                input.kind,
+                                InputKind::Text
+                                    | InputKind::Secret
+                                    | InputKind::HfModel
+                                    | InputKind::Number
+                            )
+                        })
+                        .map(|input| {
+                            let label = input.label.get(tag).unwrap_or(&input.id).to_owned();
+                            (input.id.clone(), label, input.kind)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            (info.map(|info| info.manifest.id.clone()), wanted)
+        };
+        if plugin.is_some() && plugin != self.fields_plugin {
+            self.inputs.fields.clear();
+            self.fields_plugin = plugin;
+        }
+        for (id, label, kind) in wanted {
+            self.inputs.fields.entry(id).or_insert_with(|| {
+                cx.new(|cx| {
+                    let input = TextInput::new(window, cx).label(label);
+                    match kind {
+                        InputKind::Secret => input.masked(),
+                        // Numbers are typed as text: Ely's number field groups digits, and
+                        // a port must never read "8,000".
+                        InputKind::Number => {
+                            input.filter(|c| c.is_ascii_digit() || c == '.' || c == '-')
+                        }
+                        _ => input,
+                    }
+                })
+            });
+        }
+        let pending = self
+            .state
+            .update(cx, |state, _| state.take_pending_inputs());
+        for (slot, text) in pending {
+            if let Some(input) = self.inputs.slot(&slot) {
+                input.update(cx, |input, cx| input.set_text(text, cx));
+            }
+        }
+    }
 }
 
 impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_inputs(window, cx);
         let chrome = platform::chrome(window.window_decorations());
         let title_bar = titlebar::render(chrome, window, cx);
         let handle = self.state.clone();
@@ -139,6 +278,7 @@ impl Render for RootView {
                 ),
             )
             .children(dialogs::render(state, &handle, &self.inputs, cx))
+            .children(overlays::render(state, &handle, &self.inputs, cx))
             .child(ToastViewport::new("toasts", state.toaster()));
         ResizeBorder::new().child(root)
     }

@@ -159,25 +159,38 @@ impl AppState {
         if !self.cli_installed() {
             return;
         }
+        // While the app manages runtimes, each due poll is also a guard round (core's
+        // `guard_poll` fetches usage for their accounts and stops what crossed a limit).
+        let guard = self.has_managed_runtimes();
         self.run_backend(
             Op::Usage,
             cx,
             move |backend, cancel| {
-                let fetched = if manual || backend.usage_poll_due() {
-                    Some(backend.refresh_usage(&[], cancel)?)
-                } else {
-                    None
-                };
-                Ok((fetched, backend.now()))
+                if !(manual || backend.usage_poll_due()) {
+                    return Ok((None, None, backend.now()));
+                }
+                let report = guard.then(|| backend.guard_poll(cancel));
+                let views = backend.refresh_usage(&[], cancel)?;
+                Ok((Some(views), report, backend.now()))
             },
             move |state, result, cx| match result {
-                Ok((Some(views), now)) => {
+                Ok((Some(views), report, now)) => {
                     state.usage.views = views;
                     state.usage.now = Some(now);
                     state.usage.error = None;
+                    match report {
+                        Some(Ok(report)) => state.apply_guard(report, cx),
+                        Some(Err(error)) if error.is(ErrorKind::Busy) => {}
+                        Some(Err(error)) => {
+                            log::warn!("guard: the round failed: {error}");
+                            state.sessions.guard_error = Some(error);
+                        }
+                        None => {}
+                    }
+                    state.load_runtimes(cx);
                     cx.notify();
                 }
-                Ok((None, now)) => state.usage.now = Some(now),
+                Ok((None, _, now)) => state.usage.now = Some(now),
                 Err(error) if error.is(ErrorKind::Busy) && !manual => {
                     log::info!("usage: the account slot is busy; trying again later");
                 }
@@ -196,7 +209,7 @@ impl AppState {
             .accounts
             .ready()
             .is_some_and(|view| !view.accounts.is_empty());
-        if signing_in || !has_accounts || self.ops.any() {
+        if signing_in || !has_accounts || self.ops.pausing_poll() {
             return;
         }
         self.refresh_usage(false, cx);

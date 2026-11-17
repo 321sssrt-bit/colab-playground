@@ -1,0 +1,319 @@
+//! Port forwards: the dialog, opening and closing, and live state.
+//!
+//! `open_tunnel` returns at once and the forward keeps reporting (reconnects, failures,
+//! health), so its event receiver is kept and drained on a timer until the backend drops the
+//! sender. Closing a forward never stops billing, and the app says so when it closes.
+
+use std::{
+    sync::mpsc::{Receiver, TryRecvError},
+    time::Duration,
+};
+
+use colab_playground_core::{
+    Error,
+    backend::RuntimeRef,
+    tunnel::{TunnelEvent, TunnelId, TunnelInfo, TunnelSpec, TunnelState},
+};
+use ely_gpui_component::{feedback::Toast, primitives::Severity};
+use gpui::Context;
+
+use super::{AppState, InputSlot, Op, Overlay, ops::key_of};
+use crate::i18n::{keys, tr};
+
+/// How often a forward's events are drained.
+const TUNNEL_TICK: Duration = Duration::from_millis(250);
+
+/// Ports the forward dialog starts with (the bundled model server's port; the user changes
+/// them freely).
+pub const FORWARD_START_PORT: u16 = 8000;
+
+/// The forward dialog.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ForwardForm {
+    /// The runtime to forward to.
+    pub target: RuntimeRef,
+    /// Its session name.
+    pub session: String,
+    /// Port on the runtime.
+    pub remote: u16,
+    /// Port on this computer.
+    pub local: u16,
+    /// Why the last attempt failed.
+    pub error: Option<Error>,
+}
+
+impl ForwardForm {
+    /// The forward this form asks for, with an optional health path.
+    pub fn spec(&self, health: Option<String>) -> TunnelSpec {
+        TunnelSpec {
+            account: self.target.account.clone(),
+            session: self.session.clone(),
+            local_port: self.local,
+            remote_port: self.remote,
+            health_path: health,
+        }
+    }
+}
+
+/// The address a forward is reached at on this computer.
+pub fn local_url(spec: &TunnelSpec) -> String {
+    format!("http://localhost:{}", spec.local_port)
+}
+
+impl AppState {
+    /// Open forwards (and failed ones not yet dismissed).
+    pub fn tunnels(&self) -> impl Iterator<Item = &TunnelInfo> {
+        self.sessions.tunnels.values()
+    }
+
+    /// Forwards to `target`.
+    pub fn tunnels_for(&self, target: &RuntimeRef) -> Vec<&TunnelInfo> {
+        self.sessions
+            .tunnels
+            .values()
+            .filter(|tunnel| {
+                tunnel.spec.account == target.account
+                    && Some(&tunnel.spec.session) == target.name.as_ref()
+            })
+            .collect()
+    }
+
+    /// A forward by id.
+    pub fn tunnel(&self, id: TunnelId) -> Option<&TunnelInfo> {
+        self.sessions.tunnels.get(&id)
+    }
+
+    /// Opens the forward dialog for `target` (a named runtime on the active account).
+    pub fn open_forward_dialog(&mut self, target: RuntimeRef, cx: &mut Context<Self>) {
+        let Some(session) = target.name.clone() else {
+            return;
+        };
+        self.overlay = Some(Overlay::Forward(ForwardForm {
+            target,
+            session,
+            remote: FORWARD_START_PORT,
+            local: FORWARD_START_PORT,
+            error: None,
+        }));
+        self.set_input(InputSlot::ForwardRemote, FORWARD_START_PORT.to_string());
+        self.set_input(InputSlot::ForwardLocal, FORWARD_START_PORT.to_string());
+        self.set_input(InputSlot::Health, String::new());
+        cx.notify();
+    }
+
+    /// Changes the dialog's ports (tests; the dialog reads its fields on submit).
+    pub fn set_forward_ports(
+        &mut self,
+        remote: Option<u16>,
+        local: Option<u16>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(Overlay::Forward(form)) = &mut self.overlay {
+            if let Some(remote) = remote {
+                form.remote = remote;
+            }
+            if let Some(local) = local {
+                form.local = local;
+            }
+            form.error = None;
+            cx.notify();
+        }
+    }
+
+    /// Opens the forward the dialog describes (ports as typed); the dialog closes once it is
+    /// up and shows why otherwise. Port 8080 on the runtime is refused with the reason.
+    pub fn submit_forward(
+        &mut self,
+        remote: &str,
+        local: &str,
+        health: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(Overlay::Forward(form)) = &mut self.overlay else {
+            return;
+        };
+        let parse = |text: &str, field: &str| {
+            text.trim()
+                .parse::<u16>()
+                .ok()
+                .filter(|port| *port > 0)
+                .ok_or_else(|| {
+                    Error::invalid(field, "ports must be 1-65535").with("value", text.trim())
+                })
+        };
+        match (parse(remote, "remote_port"), parse(local, "local_port")) {
+            (Ok(remote), Ok(local)) => {
+                form.remote = remote;
+                form.local = local;
+            }
+            (Err(error), _) | (_, Err(error)) => {
+                form.error = Some(error);
+                cx.notify();
+                return;
+            }
+        }
+        let spec = form.spec(health);
+        if let Err(error) = spec.validate() {
+            form.error = Some(error);
+            cx.notify();
+            return;
+        }
+        self.open_tunnel(spec, true, cx);
+    }
+
+    /// Whether a forward to `spec`'s runtime and remote port is being opened.
+    pub fn is_opening_forward(&self, spec: &TunnelSpec) -> bool {
+        self.ops.is_running(Op::Forward(forward_key(spec)))
+    }
+
+    /// Opens a forward. `from_dialog`: the forward dialog shows the outcome.
+    pub(crate) fn open_tunnel(
+        &mut self,
+        spec: TunnelSpec,
+        from_dialog: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let work_spec = spec.clone();
+        self.run_backend(
+            Op::Forward(forward_key(&spec)),
+            cx,
+            move |backend, _| {
+                let (events, received) = std::sync::mpsc::channel();
+                let id = backend.open_tunnel(work_spec, events)?;
+                Ok((id, received))
+            },
+            move |state, result, cx| {
+                match result {
+                    Ok((id, received)) => {
+                        state.sessions.tunnels.insert(
+                            id,
+                            TunnelInfo {
+                                id,
+                                spec: spec.clone(),
+                                state: TunnelState::Starting,
+                                healthy: None,
+                            },
+                        );
+                        let open = state.drain_tunnel(&received);
+                        let failed = match state.sessions.tunnels.get(&id).map(|t| &t.state) {
+                            Some(TunnelState::Failed { error }) => Some(error.clone()),
+                            _ => None,
+                        };
+                        if let Some(error) = failed {
+                            // A forward that failed at once is not kept; the dialog or a toast
+                            // says why and it can be tried again.
+                            state.sessions.tunnels.remove(&id);
+                            state.discard_tunnel(id, cx);
+                            state.forward_failed(error, from_dialog, cx);
+                        } else {
+                            if from_dialog && matches!(state.overlay, Some(Overlay::Forward(_))) {
+                                state.overlay = None;
+                            }
+                            if open {
+                                watch_tunnel(received, cx);
+                            }
+                        }
+                    }
+                    Err(error) => state.forward_failed(error, from_dialog, cx),
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    fn forward_failed(&mut self, error: Error, from_dialog: bool, cx: &mut Context<Self>) {
+        log::warn!("tunnels: the forward failed: {error}");
+        match &mut self.overlay {
+            Some(Overlay::Forward(form)) if from_dialog => form.error = Some(error),
+            _ => self.toast_error(&error, cx),
+        }
+    }
+
+    /// Drains what `received` holds; false once the backend dropped the sender.
+    fn drain_tunnel(&mut self, received: &Receiver<TunnelEvent>) -> bool {
+        loop {
+            match received.try_recv() {
+                Ok(event) => self.apply_tunnel_event(event),
+                Err(TryRecvError::Empty) => return true,
+                Err(TryRecvError::Disconnected) => return false,
+            }
+        }
+    }
+
+    fn apply_tunnel_event(&mut self, event: TunnelEvent) {
+        match event {
+            TunnelEvent::State { id, state } => {
+                if let Some(tunnel) = self.sessions.tunnels.get_mut(&id) {
+                    tunnel.state = state;
+                }
+            }
+            TunnelEvent::Health { id, healthy } => {
+                if let Some(tunnel) = self.sessions.tunnels.get_mut(&id) {
+                    tunnel.healthy = Some(healthy);
+                }
+            }
+        }
+    }
+
+    /// Closes a forward; the runtime keeps running and billing, and the toast says so.
+    pub fn close_forward(&mut self, id: TunnelId, cx: &mut Context<Self>) {
+        self.run_backend(
+            Op::CloseForward(id.0),
+            cx,
+            move |backend, _| backend.close_tunnel(id),
+            move |state, result, cx| {
+                state.sessions.tunnels.remove(&id);
+                match result {
+                    Ok(()) => state.toast(
+                        Toast::new(tr(cx, keys::FORWARD_CLOSED))
+                            .body(tr(cx, keys::FORWARD_CLOSED_BILLING))
+                            .severity(Severity::Info),
+                        cx,
+                    ),
+                    Err(error) => log::warn!("tunnels: closing failed: {error}"),
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    /// Forgets a forward that already failed, telling the backend too.
+    fn discard_tunnel(&mut self, id: TunnelId, cx: &mut Context<Self>) {
+        self.run_backend(
+            Op::CloseForward(id.0),
+            cx,
+            move |backend, _| backend.close_tunnel(id),
+            |_, _, _| {},
+        );
+    }
+
+    /// Removes a failed forward from the list.
+    pub fn dismiss_forward(&mut self, id: TunnelId, cx: &mut Context<Self>) {
+        self.sessions.tunnels.remove(&id);
+        self.discard_tunnel(id, cx);
+        cx.notify();
+    }
+}
+
+/// The key of the call that opens a forward to `spec`'s runtime and remote port.
+pub fn forward_key(spec: &TunnelSpec) -> u64 {
+    key_of(&(&spec.account, &spec.session, spec.remote_port))
+}
+
+/// Keeps draining a live forward's events until the backend drops the sender.
+fn watch_tunnel(received: Receiver<TunnelEvent>, cx: &mut Context<AppState>) {
+    cx.spawn(async move |this, cx| {
+        loop {
+            cx.background_executor().timer(TUNNEL_TICK).await;
+            let open = this.update(cx, |state, cx| {
+                let open = state.drain_tunnel(&received);
+                cx.notify();
+                open
+            });
+            if !matches!(open, Ok(true)) {
+                break;
+            }
+        }
+    })
+    .detach();
+}
