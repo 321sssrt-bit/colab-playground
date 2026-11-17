@@ -8,7 +8,7 @@ use ely_gpui_component::{
     overlays::Dialog,
     primitives::Severity,
     theme::{ActiveTheme, TextSize},
-    typography::{Caption, Paragraph},
+    typography::Paragraph,
 };
 use gpui::{AnyElement, App, Entity, IntoElement, ParentElement, SharedString, Styled, div};
 
@@ -24,6 +24,10 @@ use crate::{
 pub const QUIT_STOP_ALL: &str = "quit-stop-all";
 /// Selector of "Leave running and quit".
 pub const QUIT_LEAVE: &str = "quit-leave";
+/// Selector of the line saying the app is still checking what runs.
+pub const QUIT_CHECKING: &str = "quit-checking";
+/// Selector of the line saying the app could not check every account.
+pub const QUIT_UNCHECKED: &str = "quit-unchecked";
 
 fn count(cx: &App, one: &str, many: &str, n: usize) -> SharedString {
     if n == 1 {
@@ -42,8 +46,17 @@ pub(super) fn render(
     // Live, not the snapshot taken when the prompt opened: the list may still be loading.
     let live = state.billing();
     let billing = &live;
-    let listed = matches!(state.runtimes(), crate::state::Load::Ready(_));
+    let list_failed = matches!(state.runtimes(), crate::state::Load::Failed(_));
     let stopping = state.is_stopping_all();
+    let title = if billing.known() {
+        keys::QUIT_TITLE
+    } else if billing.checking {
+        keys::QUIT_TITLE_CHECKING
+    } else if billing.unknown {
+        keys::QUIT_TITLE_UNCHECKED
+    } else {
+        keys::QUIT_TITLE
+    };
     let mut lines: Vec<(Severity, SharedString)> = Vec::new();
     if !billing.watched.is_empty() {
         lines.push((
@@ -73,19 +86,45 @@ pub(super) fn render(
     if billing.running_plugin {
         lines.push((Severity::Warning, tr(cx, keys::QUIT_RUNNING_PLUGIN)));
     }
-    if billing.unknown {
-        lines.push((Severity::Warning, tr(cx, keys::QUIT_UNKNOWN)));
-    }
-    let mut dialog = Dialog::new("quit", tr(cx, keys::QUIT_TITLE), close(handle))
+    let unchecked = billing.unknown.then(|| {
+        let text = if list_failed {
+            keys::QUIT_UNCHECKED
+        } else {
+            keys::QUIT_UNKNOWN
+        };
+        tagged(
+            QUIT_UNCHECKED,
+            InlineMessage::new(Severity::Warning, tr(cx, text)),
+        )
+    });
+    // While checking. A prompt waiting on the check closes by itself if it finds nothing; with
+    // nothing known to bill yet, the line says so.
+    let checking = billing.checking.then(|| {
+        let text = if prompt.waiting && !billing.known() {
+            keys::QUIT_CHECKING
+        } else {
+            keys::SESSIONS_LOADING
+        };
+        tagged(
+            QUIT_CHECKING,
+            InlineMessage::new(Severity::Info, tr(cx, text)),
+        )
+    });
+    let mut dialog = Dialog::new("quit", tr(cx, title), close(handle))
         .child(
-            div().flex().flex_col().gap_2().children(
-                lines
-                    .into_iter()
-                    .map(|(severity, text)| InlineMessage::new(severity, text)),
-            ),
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .children(
+                    lines
+                        .into_iter()
+                        .map(|(severity, text)| InlineMessage::new(severity, text)),
+                )
+                .children(unchecked)
+                .children(checking),
         )
         .child(runtime_list(billing, state, cx))
-        .children((!listed).then(|| Caption::new(tr(cx, keys::SESSIONS_LOADING))))
         .child(Paragraph::new(tr(cx, keys::QUIT_LEAVE_EXPLAINED)))
         .child(tagged(
             "quit-wipe",
@@ -93,16 +132,19 @@ pub(super) fn render(
         ));
     for (label, error) in &prompt.failures {
         let message = errors::explain(error, false, cx).message;
+        // No label: "Stop all" failed before it got to any runtime (listing them failed).
+        let text = if label.is_empty() {
+            tr_args(cx, keys::QUIT_STOP_ALL_FAILED, &[("why", &message)])
+        } else {
+            tr_args(
+                cx,
+                keys::QUIT_STOP_FAILED,
+                &[("name", label), ("why", &message)],
+            )
+        };
         dialog = dialog.child(tagged(
             "quit-failure",
-            InlineMessage::new(
-                Severity::Danger,
-                tr_args(
-                    cx,
-                    keys::QUIT_STOP_FAILED,
-                    &[("name", label), ("why", &message)],
-                ),
-            ),
+            InlineMessage::new(Severity::Danger, text),
         ));
     }
     if stopping {
@@ -114,6 +156,9 @@ pub(super) fn render(
         tr(cx, keys::QUIT_STOP_ALL),
     );
     let (leave_handle, stop_handle) = (handle.clone(), handle.clone());
+    // "Stop all" lists afresh before stopping, so it is offered once the check is over, even
+    // when it failed.
+    let still_checking = billing.checking;
     dialog
         .action({
             let handle = handle.clone();
@@ -135,7 +180,7 @@ pub(super) fn render(
                 Button::new(QUIT_STOP_ALL, stop)
                     .variant(ButtonVariant::Danger)
                     .loading(stopping)
-                    .disabled(stopping || !listed)
+                    .disabled(stopping || still_checking)
                     .on_click(move |_, _, cx| {
                         stop_handle.update(cx, |state, cx| state.quit_stopping_all(cx))
                     }),

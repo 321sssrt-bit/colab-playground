@@ -23,18 +23,25 @@ pub struct Billing {
     pub provisioning: bool,
     /// A plugin run is under way.
     pub running_plugin: bool,
-    /// The runtime list could not be loaded, so there may be more.
+    /// The runtime list, or an account in it, could not be loaded, so there may be more.
     pub unknown: bool,
+    /// The app is still finding out what runs (checking the CLI, listing accounts or
+    /// runtimes).
+    pub checking: bool,
 }
 
 impl Billing {
     /// Whether anything may be billing.
     pub fn any(&self) -> bool {
+        self.known() || self.unknown || self.checking
+    }
+
+    /// Whether something is known to bill or to be starting.
+    pub fn known(&self) -> bool {
         !self.watched.is_empty()
             || !self.unwatched.is_empty()
             || self.provisioning
             || self.running_plugin
-            || self.unknown
     }
 }
 
@@ -45,6 +52,9 @@ pub struct QuitPrompt {
     pub billing: Billing,
     /// Stops that failed during "Stop all".
     pub failures: Vec<(String, Error)>,
+    /// Waiting on the check (opened before the app knew what runs, or a listing started since):
+    /// once it is done, the app quits if nothing bills (the user already asked to close).
+    pub waiting: bool,
 }
 
 /// The close decision.
@@ -83,11 +93,41 @@ impl AppState {
                 billing.unknown = !view.errors.is_empty();
             }
             Load::Failed(_) => billing.unknown = self.has_saved_accounts(),
-            Load::Idle | Load::Loading => {
-                billing.unknown = self.has_saved_accounts() && self.cli_installed();
-            }
+            Load::Idle | Load::Loading => billing.checking = self.may_list_runtimes(),
         }
         billing
+    }
+
+    /// Whether runtimes may still turn up while the list is not loaded: the CLI or the
+    /// accounts are still being checked, or there are accounts to list.
+    fn may_list_runtimes(&self) -> bool {
+        match (&self.probe, &self.accounts) {
+            (Load::Idle | Load::Loading, _) => true,
+            _ if !self.cli_installed() => false,
+            (_, Load::Idle | Load::Loading) => true,
+            _ => self.has_saved_accounts(),
+        }
+    }
+
+    /// Settles a quit prompt waiting on the check once it is done: nothing billing quits;
+    /// otherwise the prompt stays and shows what bills, or that the app could not check.
+    /// Called after every backend call returns.
+    pub(crate) fn settle_waiting_quit(&mut self, cx: &mut Context<Self>) {
+        if !matches!(&self.overlay, Some(Overlay::Quit(prompt)) if prompt.waiting) {
+            return;
+        }
+        let billing = self.billing();
+        if billing.checking || self.ops.is_running(Op::Runtimes) {
+            return;
+        }
+        if !billing.any() {
+            self.approve_quit(cx);
+            return;
+        }
+        if let Some(Overlay::Quit(prompt)) = &mut self.overlay {
+            prompt.waiting = false;
+        }
+        cx.notify();
     }
 
     /// A close or Quit: with nothing billing the app quits, otherwise the quit prompt opens.
@@ -101,21 +141,35 @@ impl AppState {
             // Already asking (maybe mid "Stop all"): keep that prompt as it is.
             return;
         }
+        if !matches!(self.sessions.runtimes, Load::Ready(_)) {
+            // The prompt names every runtime: list them now if they are not known yet (or the
+            // last try failed).
+            self.load_runtimes(cx);
+        }
         let billing = self.billing();
         if !billing.any() {
             self.approve_quit(cx);
             return;
         }
-        if !matches!(self.sessions.runtimes, Load::Ready(_)) {
-            // The prompt names every runtime; list them now if they are not known yet.
-            self.load_runtimes(cx);
-        }
         self.close_dialog(cx);
         self.overlay = Some(Overlay::Quit(QuitPrompt {
+            waiting: billing.checking || self.ops.is_running(Op::Runtimes),
             billing,
             failures: Vec::new(),
         }));
         cx.notify();
+    }
+
+    /// A listing is starting: an open quit prompt waits for it, so that it quits if the
+    /// listing finds nothing billing (the user already asked to close). Not during "Stop all",
+    /// whose own result decides.
+    pub(crate) fn quit_waits_for_listing(&mut self) {
+        let stopping = self.is_stopping_all();
+        if let Some(Overlay::Quit(prompt)) = &mut self.overlay
+            && !stopping
+        {
+            prompt.waiting = true;
+        }
     }
 
     /// Whether the user approved quitting.

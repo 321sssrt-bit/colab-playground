@@ -93,6 +93,11 @@ pub struct MockFailures {
     pub update_available: bool,
     /// The update check fails (as if GitHub could not be reached).
     pub update_check_fails: bool,
+    /// Listing runtimes fails outright.
+    pub runtimes_listing_fails: bool,
+    /// Accounts (by email) whose runtimes cannot be listed: listings leave their runtimes out
+    /// and report each account in `RuntimesView::errors`.
+    pub unlisted_accounts: Vec<String>,
 }
 
 impl Default for MockFailures {
@@ -112,6 +117,8 @@ impl Default for MockFailures {
             watchdog_restart_fails: false,
             update_available: false,
             update_check_fails: false,
+            runtimes_listing_fails: false,
+            unlisted_accounts: vec![],
         }
     }
 }
@@ -1285,9 +1292,23 @@ impl Backend for MockBackend {
         self.step(cancel)?;
         let now = self.now_();
         let mut w = self.w();
+        if w.failures.runtimes_listing_fails {
+            return Err(Error::new(ErrorKind::Http).detail("simulated runtime listing failure"));
+        }
         w.settle(now);
         let mut view = RuntimesView::default();
+        for account in &w.accounts {
+            if w.failures.unlisted_accounts.contains(&account.email) {
+                view.errors.push(AccountError {
+                    account: account.id.clone(),
+                    error: Error::new(ErrorKind::Http).detail("simulated account listing failure"),
+                });
+            }
+        }
         for r in &w.runtimes {
+            if view.errors.iter().any(|failed| failed.account == r.account) {
+                continue;
+            }
             let tracked = r
                 .name
                 .as_ref()
@@ -2587,6 +2608,29 @@ mod tests {
         let same = m.switch_impact(&accts.accounts[0].id).unwrap();
         assert_eq!(same.unmanaged_count, 0);
         assert!(same.unmanaged_left_running.is_empty());
+    }
+
+    #[test]
+    fn listing_failure_switches() {
+        let (m, _) = mock(MockScenario::demo());
+        m.set_failures(MockFailures {
+            unlisted_accounts: vec!["lin@example.com".into()],
+            ..MockFailures::default()
+        });
+        let v = m.runtimes(&nc()).unwrap();
+        assert_eq!(v.errors.len(), 1, "the unlisted account is reported");
+        assert!(
+            v.runtimes
+                .iter()
+                .all(|r| r.account_email.as_deref() != Some("lin@example.com")),
+            "and its runtimes are left out"
+        );
+        assert_eq!(v.runtimes.len(), 3);
+        m.set_failures(MockFailures {
+            runtimes_listing_fails: true,
+            ..MockFailures::default()
+        });
+        assert!(m.runtimes(&nc()).is_err());
     }
 
     #[test]

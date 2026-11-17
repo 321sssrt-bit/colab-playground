@@ -1063,4 +1063,15 @@ pub(super) const MESSAGES: Messages = &[
     (UPDATE_BADGE, "New"),
     (SETTINGS_LICENSE_TITLE, "Licence"),
     (SETTINGS_PROJECT_TITLE, "Project page"),
+    (QUIT_TITLE_CHECKING, "Checking for running runtimes"),
+    (
+        QUIT_CHECKING,
+        "Looking for runtimes on your accounts. The app closes by itself if nothing is billing.",
+    ),
+    (QUIT_TITLE_UNCHECKED, "Couldn't check for running runtimes"),
+    (
+        QUIT_UNCHECKED,
+        "The app couldn't list the runtimes on your accounts, so some may still be billing.",
+    ),
+    (QUIT_STOP_ALL_FAILED, "Couldn't stop the runtimes: {why}"),
 ];

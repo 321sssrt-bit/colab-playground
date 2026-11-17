@@ -910,4 +910,15 @@ pub(super) const MESSAGES: Messages = &[
     (UPDATE_BADGE, "新版本"),
     (SETTINGS_LICENSE_TITLE, "授權條款"),
     (SETTINGS_PROJECT_TITLE, "專案首頁"),
+    (QUIT_TITLE_CHECKING, "正在檢查是否有執行階段在執行"),
+    (
+        QUIT_CHECKING,
+        "正在尋找各帳號上的執行階段。沒有任何計費時，應用程式會自動關閉。",
+    ),
+    (QUIT_TITLE_UNCHECKED, "無法檢查是否有執行階段在執行"),
+    (
+        QUIT_UNCHECKED,
+        "應用程式無法列出各帳號上的執行階段，可能仍有執行階段在計費。",
+    ),
+    (QUIT_STOP_ALL_FAILED, "無法停止執行階段：{why}"),
 ];

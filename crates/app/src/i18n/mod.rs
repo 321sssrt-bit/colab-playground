@@ -617,6 +617,11 @@ catalog_keys! {
     UPDATE_UP_TO_DATE => "app.b7.update_up_to_date",
     SETTINGS_LICENSE_TITLE => "app.b8.settings_license_title",
     SETTINGS_PROJECT_TITLE => "app.b8.settings_project_title",
+    QUIT_TITLE_CHECKING => "app.b9.quit_title_checking",
+    QUIT_CHECKING => "app.b9.quit_checking",
+    QUIT_TITLE_UNCHECKED => "app.b9.quit_title_unchecked",
+    QUIT_UNCHECKED => "app.b9.quit_unchecked",
+    QUIT_STOP_ALL_FAILED => "app.b9.quit_stop_all_failed",
 }
 
 /// A message table: `(key, message)` pairs; `{name}` marks an argument.

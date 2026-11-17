@@ -152,6 +152,7 @@ impl AppState {
             return;
         }
         self.sessions.runtimes.begin();
+        self.quit_waits_for_listing();
         self.run_backend(
             Op::Runtimes,
             cx,

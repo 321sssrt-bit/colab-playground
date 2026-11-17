@@ -12,6 +12,7 @@ mod harness;
 mod navigation;
 mod overview;
 mod plugins;
+mod quit;
 mod sessions;
 mod settings_page;
 mod titlebar;

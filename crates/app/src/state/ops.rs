@@ -214,6 +214,8 @@ impl AppState {
                 state.ops.finish(op);
                 log::debug!("ops: {op:?} finished ({})", outcome(&result));
                 done(state, result, cx);
+                // What this call found may settle a quit prompt waiting on the check.
+                state.settle_waiting_quit(cx);
                 cx.notify();
             })
             .ok();

@@ -123,44 +123,11 @@ impl<'a> TestApp<'a> {
         Self::with(cx, Options::default())
     }
 
-    /// The app built from `options`.
+    /// The app built from `options`, settled: what it loads on start has arrived.
     pub fn with(cx: &'a mut TestAppContext, options: Options) -> Self {
-        cx.update(ely_gpui_component::init_for_tests);
-        let config = match &options.config {
-            ConfigDir::None => None,
-            ConfigDir::Temp | ConfigDir::TempWith(_) | ConfigDir::TempNested(_) => {
-                Some(tempfile::tempdir().expect("a temporary config dir"))
-            }
-        };
-        if let (ConfigDir::TempWith(text), Some(dir)) = (&options.config, &config) {
-            std::fs::write(dir.path().join("settings.json"), text).expect("seeded settings");
-        }
-        let config_dir = config.as_ref().map(|dir| match &options.config {
-            ConfigDir::TempNested(sub) => dir.path().join(sub),
-            _ => dir.path().to_path_buf(),
-        });
-        let store = SettingsStore::new(config_dir.clone());
-        let (mut mock_config, clock) = MockConfig::headless(options.scenario);
-        mock_config.step_delay = Duration::ZERO;
-        let cancel_switch = CancelSwitch::default();
-        mock_config.clock = Arc::new(SwitchedClock {
-            inner: clock.clone(),
-            switch: cancel_switch.clone(),
-        });
-        mock_config.failures = options.failures;
-        let mock = MockBackend::new(mock_config);
-        let source = BackendSource::Mock(Arc::new(mock.clone()) as Arc<dyn Backend>);
-        let state = cx.update(|cx| {
-            AppState::init(
-                StateOptions {
-                    source,
-                    store,
-                    os_locale: options.os_locale,
-                },
-                cx,
-            )
-        });
-        let root_state = state.clone();
+        let started = start(cx, options);
+        let root_state = started.state.clone();
+        // Opening the window runs the executor, so the start-up loads arrive here.
         let (root, cx) =
             cx.add_window_view(move |window, cx| RootView::new(root_state, window, cx));
         cx.simulate_resize(size(px(WINDOW.0), px(WINDOW.1)));
@@ -168,12 +135,12 @@ impl<'a> TestApp<'a> {
         let mut app = TestApp {
             cx,
             root,
-            state,
-            mock,
-            clock,
-            cancel_switch,
-            config,
-            config_dir,
+            state: started.state,
+            mock: started.mock,
+            clock: started.clock,
+            cancel_switch: started.cancel_switch,
+            config: started.config,
+            config_dir: started.config_dir,
         };
         app.settle();
         app
@@ -380,6 +347,85 @@ impl<'a> TestApp<'a> {
         let file = self.settings_file()?;
         let text = std::fs::read_to_string(file).ok()?;
         Some(Settings::from_json(&text).expect("the app writes valid settings"))
+    }
+}
+
+/// The app's state started from `options`, with no window and nothing run yet.
+struct Started {
+    state: Entity<AppState>,
+    mock: MockBackend,
+    clock: ManualClock,
+    cancel_switch: CancelSwitch,
+    config: Option<TempDir>,
+    config_dir: Option<PathBuf>,
+}
+
+fn start(cx: &mut TestAppContext, options: Options) -> Started {
+    cx.update(ely_gpui_component::init_for_tests);
+    let config = match &options.config {
+        ConfigDir::None => None,
+        ConfigDir::Temp | ConfigDir::TempWith(_) | ConfigDir::TempNested(_) => {
+            Some(tempfile::tempdir().expect("a temporary config dir"))
+        }
+    };
+    if let (ConfigDir::TempWith(text), Some(dir)) = (&options.config, &config) {
+        std::fs::write(dir.path().join("settings.json"), text).expect("seeded settings");
+    }
+    let config_dir = config.as_ref().map(|dir| match &options.config {
+        ConfigDir::TempNested(sub) => dir.path().join(sub),
+        _ => dir.path().to_path_buf(),
+    });
+    let store = SettingsStore::new(config_dir.clone());
+    let (mut mock_config, clock) = MockConfig::headless(options.scenario);
+    mock_config.step_delay = Duration::ZERO;
+    let cancel_switch = CancelSwitch::default();
+    mock_config.clock = Arc::new(SwitchedClock {
+        inner: clock.clone(),
+        switch: cancel_switch.clone(),
+    });
+    mock_config.failures = options.failures;
+    let mock = MockBackend::new(mock_config);
+    let source = BackendSource::Mock(Arc::new(mock.clone()) as Arc<dyn Backend>);
+    let state = cx.update(|cx| {
+        AppState::init(
+            StateOptions {
+                source,
+                store,
+                os_locale: options.os_locale,
+            },
+            cx,
+        )
+    });
+    Started {
+        state,
+        mock,
+        clock,
+        cancel_switch,
+        config,
+        config_dir,
+    }
+}
+
+/// The app's state just after launch, without a window: the environment check, accounts and
+/// runtimes are all still pending until `cx.run_until_parked()`. For start-up behaviour a
+/// window would hide (opening one runs the executor).
+pub struct Launch {
+    /// The app state.
+    pub state: Entity<AppState>,
+    /// The simulated backend.
+    pub mock: MockBackend,
+    _config: Option<TempDir>,
+}
+
+impl Launch {
+    /// Starts the app's state from `options`.
+    pub fn new(cx: &mut TestAppContext, options: Options) -> Self {
+        let started = start(cx, options);
+        Launch {
+            state: started.state,
+            mock: started.mock,
+            _config: started.config,
+        }
     }
 }
 

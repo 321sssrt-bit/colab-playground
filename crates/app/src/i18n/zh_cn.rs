@@ -892,4 +892,15 @@ pub(super) const MESSAGES: Messages = &[
     (UPDATE_BADGE, "新版本"),
     (SETTINGS_LICENSE_TITLE, "许可证"),
     (SETTINGS_PROJECT_TITLE, "项目主页"),
+    (QUIT_TITLE_CHECKING, "正在检查是否有运行时在运行"),
+    (
+        QUIT_CHECKING,
+        "正在查找各账号上的运行时。没有任何计费时，应用会自动关闭。",
+    ),
+    (QUIT_TITLE_UNCHECKED, "无法检查是否有运行时在运行"),
+    (
+        QUIT_UNCHECKED,
+        "应用无法列出各账号上的运行时，可能仍有运行时在计费。",
+    ),
+    (QUIT_STOP_ALL_FAILED, "无法停止运行时：{why}"),
 ];

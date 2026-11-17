@@ -124,7 +124,7 @@ pub struct MockFlags {
 
 impl MockFlags {
     /// Names accepted by `--mock-fail` (comma-separated).
-    pub const FAILURES: [&'static str; 12] = [
+    pub const FAILURES: [&'static str; 13] = [
         "cli-missing",
         "install-fails",
         "keyring",
@@ -137,6 +137,7 @@ impl MockFlags {
         "watchdog-restart-fails",
         "update-available",
         "update-check-fails",
+        "runtimes-fail",
     ];
 
     /// Reads `--mock-scenario demo|single|signed-out` (default `demo`) and
@@ -175,6 +176,7 @@ impl MockFlags {
                     "plugin-fails" => flags.failures.plugin_fail_stage = Some("download".into()),
                     "update-available" => flags.failures.update_available = true,
                     "update-check-fails" => flags.failures.update_check_fails = true,
+                    "runtimes-fail" => flags.failures.runtimes_listing_fails = true,
                     "watchdog-restart-fails" => flags.failures.watchdog_restart_fails = true,
                     "login-invalid-code" => {
                         flags.failures.login = Some(MockLoginFailure::InvalidCode)
