@@ -143,11 +143,11 @@ Does not match (release-please's fixed format):
 - `.release-please-manifest.json` starts as `{}` (nothing released) and the config sets
   `initial-version` to `0.1.0`. With no earlier release, release-please uses that version instead
   of computing a bump, so the first release is 0.1.0 whatever the commit types.
-- `bootstrap-sha` is `77b6df6`, the last commit of the history before release preparation started.
-  release-please reads only the commits after it for the first entry (the commit itself is
-  excluded), so the 0.1.0 entry lists what was added to make the app releasable instead of every
-  commit since the project began; the README describes what the app does, and the full history
-  stays in `git log`. That commit must stay on `main` unrewritten.
+- `bootstrap-sha` is `61c92b2`, the commit just before `feat: initial release`. release-please reads
+  only the commits after it for the first entry (the commit itself is excluded), and that one
+  commit exists to give the entry its line. So the 0.1.0 entry reads "initial release" instead of
+  listing every commit since the project began; the README describes what the app does, and the
+  full history stays in `git log`. The `bootstrap-sha` commit must stay on `main` unrewritten.
 - Once a release exists, release-please counts from it and ignores `bootstrap-sha` and
   `initial-version`; both can stay in the config.
 - The first release is otherwise a normal one: do the one-time settings below, push, wait for the
