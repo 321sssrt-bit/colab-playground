@@ -1,0 +1,26 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+authors = ["ScarletKc"]
+license = "MIT"
+# The one project description; README, the About text and the GitHub repo use the same sentence.
+description = "A desktop app for the Google Colab CLI: accounts, GPU sessions with cost guards, port forwarding and plugins."
+repository = "https://github.com/scarletkc/colab-playground"
+publish = false
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
