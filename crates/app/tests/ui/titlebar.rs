@@ -169,3 +169,99 @@ fn a_long_email_stays_inside_the_account_slot(cx: &mut TestAppContext) {
         "the email is cut short, not widening the slot"
     );
 }
+
+/// Opens the "Cancel auto-stop?" confirmation on the demo's A100 session.
+fn open_a_dialog(app: &mut TestApp<'_>) {
+    app.click(Route::Sessions.nav_selector());
+    app.click(&colab_playground::ui::pages::sessions::cancel_auto_stop_selector("a100-7f3a"));
+    assert!(matches!(
+        app.read(|state, _| state.overlay().cloned()),
+        Some(colab_playground::state::Overlay::CancelAutoStop(_))
+    ));
+}
+
+fn quit_prompt_open(app: &mut TestApp<'_>) -> bool {
+    matches!(
+        app.read(|state, _| state.overlay().cloned()),
+        Some(colab_playground::state::Overlay::Quit(_))
+    )
+}
+
+// The drawn caption buttons are the Windows chrome; macOS keeps native traffic lights.
+#[cfg_attr(
+    not(target_os = "windows"),
+    ignore = "drawn caption buttons are Windows chrome"
+)]
+#[gpui::test]
+fn with_a_dialog_open_one_click_on_close_asks_before_quitting(cx: &mut TestAppContext) {
+    let mut app = TestApp::new(cx);
+    open_a_dialog(&mut app);
+    app.click("caption-Close");
+    assert!(
+        quit_prompt_open(&mut app),
+        "the first click runs the close check, not just dismissing the dialog"
+    );
+    app.click("caption-Close");
+    assert!(
+        quit_prompt_open(&mut app),
+        "a second click keeps the same prompt"
+    );
+    assert!(!app.read(|state, _| state.quit_approved()));
+}
+
+#[cfg_attr(
+    not(target_os = "windows"),
+    ignore = "drawn caption buttons are Windows chrome"
+)]
+#[gpui::test]
+fn with_a_dialog_open_and_nothing_billing_one_click_closes(cx: &mut TestAppContext) {
+    let mut app = TestApp::with(cx, Options::scenario(MockScenario::single()));
+    app.click(Route::Sessions.nav_selector());
+    app.click(colab_playground::ui::pages::sessions::NEW_SESSION_SELECTOR);
+    assert!(
+        app.read(|state, _| state.overlay().is_some()),
+        "a dialog is open"
+    );
+    let close = app.bounds("caption-Close").expect("the close button");
+    // The window goes away, so click without the harness's settle (which needs the window).
+    app.cx
+        .simulate_click(close.center(), gpui::Modifiers::none());
+    app.cx.run_until_parked();
+    let windows = (**app.cx).update(|cx| cx.windows().len());
+    assert_eq!(windows, 0, "one click closed the window");
+}
+
+/// Clicks `control` with a dialog open. The test platform does not implement minimising or
+/// maximising and panics when asked to, so that panic proves the click reached the control
+/// rather than the dialog's backdrop.
+fn reaches_the_control_over_a_dialog(cx: &mut TestAppContext, control: &str) {
+    let mut app = TestApp::new(cx);
+    open_a_dialog(&mut app);
+    let bounds = app.bounds(control).expect("the control");
+    let reached = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        app.cx
+            .simulate_click(bounds.center(), gpui::Modifiers::none());
+    }));
+    assert!(
+        reached.is_err(),
+        "{control} was swallowed by the dialog's backdrop"
+    );
+}
+
+#[cfg_attr(
+    not(target_os = "windows"),
+    ignore = "drawn caption buttons are Windows chrome"
+)]
+#[gpui::test]
+fn minimise_works_with_a_dialog_open(cx: &mut TestAppContext) {
+    reaches_the_control_over_a_dialog(cx, "caption-Minimize");
+}
+
+#[cfg_attr(
+    not(target_os = "windows"),
+    ignore = "drawn caption buttons are Windows chrome"
+)]
+#[gpui::test]
+fn maximise_works_with_a_dialog_open(cx: &mut TestAppContext) {
+    reaches_the_control_over_a_dialog(cx, "caption-Maximize");
+}

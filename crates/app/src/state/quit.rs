@@ -94,6 +94,10 @@ impl AppState {
         if self.quit == QuitState::Approved {
             return true;
         }
+        if matches!(self.overlay, Some(Overlay::Quit(_))) {
+            // Already asking (maybe mid "Stop all"): keep that prompt as it is.
+            return false;
+        }
         let billing = self.billing();
         if !billing.any() {
             return true;

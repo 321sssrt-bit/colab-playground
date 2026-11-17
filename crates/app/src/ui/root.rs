@@ -5,7 +5,7 @@ use ely_gpui_component::{
     feedback::ToastViewport,
     forms::TextInput,
     layout::{AppShell, ScrollArea},
-    primitives::FocusScope,
+    primitives::{FocusScope, raise},
     shell::ResizeBorder,
     theme::{ActiveTheme, Mode, TextSize},
 };
@@ -23,6 +23,9 @@ use crate::{
 
 /// Selector of the scrolling page area.
 pub const PAGE_SELECTOR: &str = "page-area";
+
+/// Draw order of the title strip: above Ely's dialog backdrops (priority 0).
+const TITLE_STRIP_PRIORITY: usize = 1;
 
 /// The main window's content.
 pub struct RootView {
@@ -264,7 +267,11 @@ impl Render for RootView {
         // Han characters come from the platform's CJK faces; see `platform`.
         root.text_style().font_fallbacks = state.font_fallbacks().cloned();
         let root = root
-            .child(title_bar)
+            // Raised over dialog backdrops (Ely draws them at priority 0, full window), so the
+            // title strip stays live while any dialog is open: one click on close runs the
+            // close check, and minimise, maximise and dragging keep working. It keeps its place
+            // in the layout; menus and toasts (also priority 1, raised later) still draw above it.
+            .child(raise("title-strip", title_bar).with_priority(TITLE_STRIP_PRIORITY))
             .child(
                 div().flex_1().min_h_0().w_full().child(
                     AppShell::new()
