@@ -210,7 +210,9 @@ Two independent layers, because an app-side timer dies with the app:
 1. **VM-side watchdog** (`assets/watchdog.py`), started detached right after provisioning. It
    enforces an absolute deadline and the optional idle rule, then releases the runtime with
    `POST http://$TBE_RUNTIME_ADDR/unassign` (what `google.colab.runtime.unassign()` does). The app
-   can extend or cancel the deadline by rewriting a small control file via `colab exec`.
+   can extend or cancel the deadline by rewriting a small control file via `colab exec`; setting
+   a deadline again after a cancel starts the watchdog again, so the stop is back on the runtime.
+   The app shows whether a runtime's stop is on the runtime or only enforced while the app is open.
    Plugins signal activity by touching a heartbeat file.
 2. **App-side guard**: evaluate a pure function
    `evaluate(policy, now, usage, session) -> Ok | Warn | Stop` on every usage sample.

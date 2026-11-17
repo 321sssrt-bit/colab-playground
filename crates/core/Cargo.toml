@@ -1,6 +1,6 @@
 [package]
 name = "colab-playground-core"
-description = "Logic crate of Colab Playground: drives the Google Colab CLI (no GUI dependency)"
+description.workspace = true
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
