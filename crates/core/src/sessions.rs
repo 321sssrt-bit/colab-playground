@@ -188,7 +188,9 @@ pub struct StopRecord {
 /// What the app knows about the VM-side watchdog of a session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WatchdogInfo {
-    /// Absolute deadline (local clock), if any.
+    /// Absolute deadline (local clock) the watchdog was given, if any. Empty
+    /// when a start of the watchdog failed, because nothing on the runtime
+    /// enforces a deadline then.
     #[serde(default, with = "serde_secs::option")]
     pub deadline: Option<SystemTime>,
     /// Idle rule, if any.
@@ -197,6 +199,22 @@ pub struct WatchdogInfo {
     /// The deadline was cancelled by the user.
     #[serde(default)]
     pub cancelled: bool,
+    /// The stop is armed on the runtime: the last reply from the VM (start,
+    /// extend, cancel or status) showed the watchdog running, not cancelled
+    /// and able to release the runtime. Only then is the runtime released at
+    /// `deadline` (or when idle) while the app is closed. A watchdog that
+    /// exits later still reads as armed until the next reply. `false` when not
+    /// confirmed, which includes entries saved before this field existed.
+    #[serde(default)]
+    pub armed: bool,
+}
+
+impl WatchdogInfo {
+    /// The deadline the runtime itself enforces: `deadline` while the
+    /// watchdog is armed and not cancelled.
+    pub fn enforced_deadline(&self) -> Option<SystemTime> {
+        self.deadline.filter(|_| self.armed && !self.cancelled)
+    }
 }
 
 /// A session the app provisioned (persisted in the ledger).
@@ -243,14 +261,14 @@ impl TrackedSession {
         end.duration_since(self.started_at()).unwrap_or_default()
     }
 
-    /// Earliest of the app-side runtime limit and the watchdog deadline.
+    /// Earliest of the app-side runtime limit and the deadline the runtime's
+    /// watchdog enforces.
     pub fn auto_stop_at(&self) -> Option<SystemTime> {
         let app = self.policy.max_runtime.map(|d| self.started_at() + d);
         let vm = self
             .watchdog
             .as_ref()
-            .filter(|w| !w.cancelled)
-            .and_then(|w| w.deadline);
+            .and_then(WatchdogInfo::enforced_deadline);
         match (app, vm) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -440,6 +458,7 @@ mod tests {
                     deadline: Some(t0 + Duration::from_secs(3600)),
                     idle_timeout: None,
                     cancelled: false,
+                    armed: true,
                 }),
                 stopped: None,
             })
@@ -451,5 +470,51 @@ mod tests {
             e.uptime(t0 + Duration::from_secs(10)),
             Duration::from_secs(10)
         );
+    }
+
+    #[test]
+    fn only_an_armed_watchdog_counts_as_a_stop_on_the_runtime() {
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let wd = WatchdogInfo {
+            deadline: Some(t0 + Duration::from_secs(600)),
+            idle_timeout: None,
+            cancelled: false,
+            armed: true,
+        };
+        assert_eq!(wd.enforced_deadline(), wd.deadline);
+        let dead = WatchdogInfo {
+            armed: false,
+            ..wd.clone()
+        };
+        assert_eq!(dead.enforced_deadline(), None);
+        let cancelled = WatchdogInfo {
+            cancelled: true,
+            ..wd.clone()
+        };
+        assert_eq!(cancelled.enforced_deadline(), None);
+
+        // The earlier watchdog deadline counts only while it is armed; the
+        // app-side limit (2 h by default) remains either way.
+        let mut s = TrackedSession {
+            name: "s".into(),
+            account: AccountId::new("a1").unwrap(),
+            endpoint: None,
+            accelerator: Accelerator::T4,
+            high_mem: false,
+            gpu: None,
+            vram_mib: None,
+            policy: GuardPolicy::default(),
+            spend: SpendMeter::new(t0),
+            watchdog: Some(wd),
+            stopped: None,
+        };
+        assert_eq!(s.auto_stop_at(), Some(t0 + Duration::from_secs(600)));
+        s.watchdog = Some(dead);
+        assert_eq!(s.auto_stop_at(), Some(t0 + Duration::from_secs(7200)));
+
+        // Ledgers written before `armed` existed load as not armed.
+        let old: WatchdogInfo =
+            serde_json::from_str(r#"{"deadline": 1000600, "cancelled": false}"#).unwrap();
+        assert!(!old.armed);
     }
 }

@@ -15,15 +15,17 @@ use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
 use colab_playground_core::accounts::{Account, AccountId, Helper};
-use colab_playground_core::backend::{Backend, PluginRunEvent, RunTarget, RuntimeRef, StopOptions};
+use colab_playground_core::backend::{
+    Backend, PluginRunEvent, RunTarget, Runtime, RuntimeRef, StopOptions,
+};
 use colab_playground_core::cli::Cli;
 use colab_playground_core::guard::GuardPolicy;
 use colab_playground_core::http::NoHttp;
 use colab_playground_core::paths::HostPath;
 use colab_playground_core::plugins::InputValue;
-use colab_playground_core::provision::{ProvisionEvent, ProvisionSpec};
+use colab_playground_core::provision::{ProvisionEvent, ProvisionSpec, WATCHDOG_ATTEMPTS};
 use colab_playground_core::real::{RealBackend, RealConfig};
-use colab_playground_core::sessions::{Accelerator, StopReason};
+use colab_playground_core::sessions::{Accelerator, StopReason, WatchdogInfo};
 use colab_playground_core::tunnel::{TunnelEvent, TunnelSpec, TunnelState};
 use colab_playground_core::vm::RunState;
 use colab_playground_core::{CancelToken, Defaults, ErrorKind, Host, ManualClock, Toolchain};
@@ -194,6 +196,33 @@ impl Fixture {
     fn add_bob(&self) -> Account {
         let flow = self.b.begin_add_account(&nc()).unwrap();
         flow.submit_code("good-code", &nc()).unwrap()
+    }
+
+    /// Every `colab exec` that started the watchdog (only the start sends hooks).
+    fn watchdog_starts(&self) -> Vec<Vec<String>> {
+        self.calls()
+            .into_iter()
+            .filter_map(|c| {
+                let argv: Vec<String> = serde_json::from_value(c["argv"].clone()).ok()?;
+                argv.iter()
+                    .any(|a| a.starts_with("CPG_WD_HOOKS="))
+                    .then_some(argv)
+            })
+            .collect()
+    }
+
+    /// The listed runtime `name` and the watchdog state its ledger entry carries.
+    fn listed_watchdog(&self, name: &str) -> (Runtime, WatchdogInfo) {
+        let rt = self
+            .b
+            .runtimes(&nc())
+            .unwrap()
+            .runtimes
+            .into_iter()
+            .find(|r| r.id.name.as_deref() == Some(name))
+            .unwrap();
+        let wd = rt.tracked.as_ref().unwrap().watchdog.clone().unwrap();
+        (rt, wd)
     }
 
     fn provision(
@@ -389,6 +418,99 @@ fn provision_retries_to_80_gb_and_enforces_entitlement_and_cap() {
         )
         .unwrap_err();
     assert!(err.is(ErrorKind::SessionLimitReached));
+}
+
+/// Setting an auto-stop after a cancel puts it back on the runtime: the
+/// watchdog is started again the way provisioning starts it.
+#[test]
+fn set_auto_stop_after_cancel_starts_the_watchdog_again() {
+    let f = fixture();
+    f.adopt_alice();
+    let mut spec = ProvisionSpec::new("wd", Accelerator::T4, &Defaults::default());
+    spec.guard.idle_timeout = Some(Duration::from_secs(900));
+    let (tx, _rx) = channel();
+    f.b.provision(spec, tx, &nc()).unwrap();
+    let vm = |f: &Fixture| f.assignments("alice").values().next().unwrap()["watchdog"].clone();
+    assert_eq!(f.watchdog_starts().len(), 1);
+    let (rt, wd) = f.listed_watchdog("wd");
+    assert!(wd.armed && !wd.cancelled);
+
+    // The cancel reply still shows the watchdog running (it exits at its
+    // next poll), yet it is not armed any more.
+    f.b.cancel_auto_stop(&rt.id, &nc()).unwrap();
+    let (rt, wd) = f.listed_watchdog("wd");
+    assert!(!wd.armed && wd.cancelled);
+    assert_eq!(rt.auto_stop_at, None);
+    assert_eq!(vm(&f)["running"], false);
+
+    let hour = Duration::from_secs(3600);
+    let info = f.b.extend_session(&rt.id, hour, &nc()).unwrap();
+    assert!(info.armed && !info.cancelled && info.deadline.is_some());
+    assert_eq!(info.idle_timeout, Some(Duration::from_secs(900)));
+    let starts = f.watchdog_starts();
+    assert_eq!(starts.len(), 2, "the watchdog was started again");
+    for env in [
+        "CPG_WD_DEADLINE_S=3600",
+        "CPG_WD_IDLE_S=900",
+        "CPG_WD_GRACE_S=300",
+    ] {
+        assert!(starts[1].contains(&env.to_owned()), "{:?}", starts[1]);
+    }
+    assert_eq!(vm(&f)["running"], true);
+    assert_eq!(vm(&f)["cancelled"], false);
+    assert_eq!(vm(&f)["idle_timeout_s"], 900.0);
+    let (rt, wd) = f.listed_watchdog("wd");
+    assert_eq!(wd, info, "the listing shows the last known state");
+    let tracked = rt.tracked.clone().unwrap();
+    assert_eq!(
+        tracked.started_at() + tracked.policy.max_runtime.unwrap(),
+        f.b.now() + hour
+    );
+    assert!(rt.auto_stop_at.is_some());
+
+    // A running watchdog only gets the new deadline.
+    assert!(f.b.extend_session(&rt.id, 2 * hour, &nc()).unwrap().armed);
+    assert_eq!(f.watchdog_starts().len(), 2);
+
+    // One that exited without a cancel is started again too.
+    f.edit_server(|s| {
+        for a in s["accounts"]["alice"]["assignments"]
+            .as_object_mut()
+            .unwrap()
+            .values_mut()
+        {
+            a["watchdog"]["running"] = json!(false);
+        }
+    });
+    assert!(f.b.extend_session(&rt.id, hour, &nc()).unwrap().armed);
+    assert_eq!(f.watchdog_starts().len(), 3);
+
+    // It cannot be started: the call says the stop is not on the runtime and
+    // the app-side limit still moves to the new time.
+    f.b.cancel_auto_stop(&rt.id, &nc()).unwrap();
+    f.knob("watchdog_start_fails", json!(true));
+    let half = hour / 2;
+    let info = f.b.extend_session(&rt.id, half, &nc()).unwrap();
+    assert!(!info.armed && !info.cancelled);
+    assert_eq!(info.deadline, None);
+    assert_eq!(
+        f.watchdog_starts().len(),
+        3 + WATCHDOG_ATTEMPTS as usize,
+        "tried like provisioning tries"
+    );
+    let (rt, wd) = f.listed_watchdog("wd");
+    assert_eq!(wd, info);
+    let tracked = rt.tracked.clone().unwrap();
+    assert_eq!(
+        tracked.started_at() + tracked.policy.max_runtime.unwrap(),
+        f.b.now() + half
+    );
+    assert_eq!(rt.auto_stop_at, Some(f.b.now() + half));
+
+    // Once it can start, trying again puts the stop back on the runtime.
+    f.knob("watchdog_start_fails", json!(false));
+    assert!(f.b.extend_session(&rt.id, hour, &nc()).unwrap().armed);
+    assert_eq!(vm(&f)["running"], true);
 }
 
 #[test]

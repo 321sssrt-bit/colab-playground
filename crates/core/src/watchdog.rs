@@ -182,7 +182,8 @@ _cpg_wd_status(_cfg, _cpg_wd_alive())
     )
 }
 
-/// Code that reports the watchdog state.
+/// Code that reports the watchdog state (a missing control file reads as
+/// cancelled, with no watchdog running).
 pub fn status_snippet() -> String {
     format!(
         r#"{header}
@@ -203,7 +204,9 @@ pub struct WatchdogReply {
     pub alive: bool,
     /// It knows `TBE_RUNTIME_ADDR` (without it the release cannot work).
     pub can_release: bool,
-    /// State mapped onto the local clock.
+    /// State mapped onto the local clock. `info.armed` is `alive`,
+    /// `can_release` and not cancelled: a cancelled watchdog keeps running
+    /// until its next poll, then exits without releasing.
     pub info: WatchdogInfo,
 }
 
@@ -223,24 +226,61 @@ pub fn parse_reply(v: &serde_json::Value, local_now: SystemTime) -> Result<Watch
                 .unwrap_or(local_now)
         }
     });
+    let alive = v.get("alive").and_then(|a| a.as_bool()).unwrap_or(false);
+    let can_release = v
+        .get("runtime_addr")
+        .and_then(|a| a.as_bool())
+        .unwrap_or(false);
+    let cancelled = v
+        .get("cancelled")
+        .and_then(|c| c.as_bool())
+        .unwrap_or(false);
     Ok(WatchdogReply {
-        alive: v.get("alive").and_then(|a| a.as_bool()).unwrap_or(false),
-        can_release: v
-            .get("runtime_addr")
-            .and_then(|a| a.as_bool())
-            .unwrap_or(false),
+        alive,
+        can_release,
         info: WatchdogInfo {
             deadline,
             idle_timeout: v
                 .get("idle_timeout_s")
                 .and_then(|i| i.as_f64())
                 .map(|s| Duration::from_secs_f64(s.max(0.0))),
-            cancelled: v
-                .get("cancelled")
-                .and_then(|c| c.as_bool())
-                .unwrap_or(false),
+            cancelled,
+            armed: alive && can_release && !cancelled,
         },
     })
+}
+
+/// The policy for starting a watchdog again with a deadline `runtime` from
+/// now: the tracked session's idle rule (or, for a session without a ledger
+/// entry, the idle rule the VM still has, `vm_idle`) and its other limits.
+/// The tracked `max_runtime` is not used: it counts from the session start,
+/// while the watchdog's deadline counts from its own start.
+pub fn restart_policy(
+    tracked: Option<&GuardPolicy>,
+    vm_idle: Option<Duration>,
+    runtime: Duration,
+) -> GuardPolicy {
+    let base = tracked.cloned().unwrap_or_else(|| GuardPolicy {
+        idle_timeout: vm_idle,
+        ..GuardPolicy::unlimited()
+    });
+    GuardPolicy {
+        max_runtime: Some(runtime),
+        ..base
+    }
+}
+
+/// What the app records when a watchdog could not be started for `policy`:
+/// not armed and without a deadline, so nothing reads as a stop on the
+/// runtime; the app-side limit in the session's policy still applies while
+/// the app runs.
+pub fn start_failed(policy: &GuardPolicy) -> WatchdogInfo {
+    WatchdogInfo {
+        deadline: None,
+        idle_timeout: policy.idle_timeout,
+        cancelled: false,
+        armed: false,
+    }
 }
 
 #[cfg(test)]
@@ -300,6 +340,68 @@ mod tests {
         let r = parse_reply(&v, local).unwrap();
         assert_eq!(r.info.deadline, Some(local + Duration::from_secs(3600)));
         assert!(r.alive && r.can_release);
+        assert!(r.info.armed);
         assert!(parse_reply(&serde_json::json!({}), local).is_err());
+    }
+
+    #[test]
+    fn armed_needs_a_running_releasing_uncancelled_watchdog() {
+        let local = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let armed = |alive: bool, addr: bool, cancelled: bool| {
+            let v = serde_json::json!({"now": 500.0, "deadline_epoch": 4100.0, "idle_timeout_s": 900.0,
+                                       "cancelled": cancelled, "runtime_addr": addr, "alive": alive});
+            parse_reply(&v, local).unwrap().info.armed
+        };
+        assert!(armed(true, true, false));
+        // Right after a cancel the watchdog still runs until its next poll.
+        assert!(!armed(true, true, true));
+        // Exited (cancelled earlier, crashed, or never started).
+        assert!(!armed(false, true, false));
+        assert!(!armed(false, true, true));
+        // Running but unable to release the runtime.
+        assert!(!armed(true, false, false));
+        // The status reply for a missing control file.
+        let v = serde_json::json!({"now": 500.0, "deadline_epoch": null, "idle_timeout_s": null,
+                                   "cancelled": true, "runtime_addr": false, "alive": false});
+        let r = parse_reply(&v, local).unwrap();
+        assert!(!r.info.armed && r.info.deadline.is_none());
+    }
+
+    #[test]
+    fn a_restart_counts_its_deadline_from_now_and_keeps_the_idle_rule() {
+        let tracked = GuardPolicy {
+            // Elapsed time since the session start plus the last extension.
+            max_runtime: Some(Duration::from_secs(5 * 3600)),
+            idle_timeout: Some(Duration::from_secs(900)),
+            max_spend_cu: Some(12.0),
+            ..GuardPolicy::unlimited()
+        };
+        let p = restart_policy(
+            Some(&tracked),
+            Some(Duration::from_secs(60)),
+            Duration::from_secs(3600),
+        );
+        assert_eq!(p.max_runtime, Some(Duration::from_secs(3600)));
+        assert_eq!(p.idle_timeout, Some(Duration::from_secs(900)));
+        assert_eq!(p.max_spend_cu, Some(12.0));
+        let env = start_env(&p, Duration::from_secs(300), &[]);
+        assert_eq!(env[0], (ENV_DEADLINE.to_owned(), "3600".to_owned()));
+        assert_eq!(env[1], (ENV_IDLE.to_owned(), "900".to_owned()));
+
+        // Without a ledger entry the VM's own idle rule is kept.
+        let p = restart_policy(
+            None,
+            Some(Duration::from_secs(60)),
+            Duration::from_secs(1800),
+        );
+        assert_eq!(p.max_runtime, Some(Duration::from_secs(1800)));
+        assert_eq!(p.idle_timeout, Some(Duration::from_secs(60)));
+        assert_eq!(p.max_spend_cu, None);
+
+        let failed = start_failed(&tracked);
+        assert!(!failed.armed && !failed.cancelled);
+        assert_eq!(failed.deadline, None);
+        assert_eq!(failed.enforced_deadline(), None);
+        assert_eq!(failed.idle_timeout, Some(Duration::from_secs(900)));
     }
 }

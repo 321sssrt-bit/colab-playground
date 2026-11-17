@@ -41,6 +41,7 @@ DEFAULT_KNOBS = {
     "plugin_fail_stage": None,      # plugin runs fail at this stage
     "plugin_stages": ["detect", "plan", "download", "server", "warmup"],
     "ssh_busy": False,              # proxy-mode answers HTTP 429
+    "watchdog_start_fails": False,  # a started watchdog exits at once
     "keyring_locked": False,        # keyring reads fail
     "cli_api_broken": False,        # colab_cli.client cannot be imported
 }

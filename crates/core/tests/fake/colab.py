@@ -182,6 +182,13 @@ def lookup(state_path, name, session):
     return s, rec["endpoint"], mine[rec["endpoint"]]
 
 
+def watchdog_reply(wd, now):
+    """What the watchdog snippets print for the simulated watchdog state `wd`."""
+    return {"now": now, "deadline_epoch": wd.get("deadline_epoch"), "idle_timeout_s": wd.get("idle_timeout_s"),
+            "cancelled": bool(wd.get("cancelled")), "runtime_addr": wd.get("runtime_addr", True),
+            "alive": bool(wd.get("running"))}
+
+
 def simulate(code, env, s, ep, a):
     """Answers for the core's known snippets."""
     now = time.time()
@@ -192,19 +199,32 @@ def simulate(code, env, s, ep, a):
             gpu = "NVIDIA A100-SXM4-80GB" if (a.get("vram") or 0) > 50000 else "NVIDIA A100-SXM4-40GB"
         return {"gpu": gpu, "vram_mib": a.get("vram")}
     if "--hooks-stdin" in code:
-        dl = env.get("CPG_WD_DEADLINE_S", "none")
-        a["watchdog"] = {"deadline_epoch": None if dl == "none" else now + float(dl), "cancelled": False,
+        # Start: replaces any watchdog; it keeps running unless the knob makes it exit at once.
+        dl, idle = env.get("CPG_WD_DEADLINE_S", "none"), env.get("CPG_WD_IDLE_S", "none")
+        a["watchdog_starts"] = a.get("watchdog_starts", 0) + 1
+        a["watchdog"] = {"deadline_epoch": None if dl == "none" else now + float(dl),
+                         "idle_timeout_s": None if idle == "none" else float(idle), "cancelled": False,
+                         "running": not s["knobs"]["watchdog_start_fails"],
                          "grace_s": float(env.get("CPG_WD_GRACE_S", "300")), "hooks": len(json.loads(env.get("CPG_WD_HOOKS", "[]")))}
-        return dict(a["watchdog"], now=now, idle_timeout_s=None, runtime_addr=True, alive=True)
+        return watchdog_reply(a["watchdog"], now)
     if "watchdog.json" in code:
-        wd = a.setdefault("watchdog", {"deadline_epoch": None, "cancelled": True})
-        if '_cfg["cancelled"] = True' in code:
-            wd["cancelled"] = True
-        elif '_cfg["cancelled"] = False' in code:
+        wd = a.get("watchdog")
+        cancel, extend = '_cfg["cancelled"] = True' in code, '_cfg["cancelled"] = False' in code
+        if cancel or extend:
+            if wd is None:
+                return None  # the control file is missing: json.load raises, no result line
+            if cancel:
+                # Like the real watchdog: still running when the reply is printed, it exits
+                # without releasing at its next poll (here: before the next command).
+                reply = watchdog_reply(dict(wd, cancelled=True), now)
+                wd["cancelled"], wd["running"] = True, False
+                return reply
             dl = env.get("CPG_WD_DEADLINE_S", "none")
             wd["deadline_epoch"] = None if dl == "none" else now + float(dl)
             wd["cancelled"] = False
-        return dict(wd, now=now, idle_timeout_s=None, runtime_addr=True, alive=not wd.get("cancelled"))
+            return watchdog_reply(wd, now)
+        # Status: a missing control file reads as cancelled, with nothing running.
+        return watchdog_reply(wd if wd is not None else {"cancelled": True, "runtime_addr": False}, now)
     if "PLUGIN_RUN_DIR" in code:
         run_id = env["CPG_RUN_ID"]
         s["runs"][run_id] = {"endpoint": ep, "polls": 0, "killed": False,

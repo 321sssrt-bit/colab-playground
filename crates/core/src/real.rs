@@ -648,10 +648,13 @@ impl ProvisionOps for RealOps<'_> {
         policy: &GuardPolicy,
         cancel: &CancelToken,
     ) -> Result<Option<WatchdogInfo>> {
+        // Read before the call: a state guard taken inside the argument list
+        // would stay locked for the whole remote execution.
+        let grace = self.inner.st().defaults.winddown_grace;
         let v = self.cli.exec_json(
             &self.state,
             name,
-            &watchdog::start_env(policy, self.inner.st().defaults.winddown_grace, &[]),
+            &watchdog::start_env(policy, grace, &[]),
             &watchdog::start_snippet(),
             120,
             cancel,
@@ -1277,20 +1280,48 @@ impl Backend for RealBackend {
             .clone()
             .ok_or_else(|| Error::invalid("name", "the session has no local name"))?;
         let (_g, cli, state) = self.inner.cli_for(&target.account, cancel)?;
-        let env = vec![(
-            watchdog::ENV_DEADLINE.to_owned(),
-            runtime.as_secs().to_string(),
-        )];
-        let v = cli.exec_json(&state, &name, &env, &watchdog::extend_snippet(), 60, cancel)?;
-        let reply = watchdog::parse_reply(&v, self.inner.now())?;
+        // The VM decides: a running watchdog only gets the new deadline; one
+        // that is not running (cancelled, exited, never started) is started
+        // the way provisioning starts it.
+        let v = cli.exec_json(&state, &name, &[], &watchdog::status_snippet(), 60, cancel)?;
+        let mut reply = watchdog::parse_reply(&v, self.inner.now())?;
+        if reply.info.armed {
+            let env = vec![(
+                watchdog::ENV_DEADLINE.to_owned(),
+                runtime.as_secs().to_string(),
+            )];
+            let v = cli.exec_json(&state, &name, &env, &watchdog::extend_snippet(), 60, cancel)?;
+            reply = watchdog::parse_reply(&v, self.inner.now())?;
+        }
+        let info = if reply.info.armed {
+            reply.info
+        } else {
+            let tracked = self
+                .inner
+                .st()
+                .ledger
+                .live(&target.account, &name)
+                .map(|e| e.policy.clone());
+            let policy =
+                watchdog::restart_policy(tracked.as_ref(), reply.info.idle_timeout, runtime);
+            let started = self.inner.layout(cancel).and_then(|layout| {
+                let ops = self
+                    .inner
+                    .ops(&cli, &target.account, &state, layout.host_scratch());
+                provision::start_watchdog(&ops, &name, &policy)
+            });
+            match started {
+                Ok(Some(info)) if info.armed => info,
+                _ => watchdog::start_failed(&policy),
+            }
+        };
         let now = self.inner.now();
-        let info = reply.info.clone();
         let _ = self.inner.st().ledger.update(&target.account, &name, |e| {
             e.watchdog = Some(info.clone());
             let elapsed = now.duration_since(e.spend.started_at).unwrap_or_default();
             e.policy.max_runtime = Some(elapsed + runtime);
         });
-        Ok(reply.info)
+        Ok(info)
     }
 
     fn cancel_auto_stop(&self, target: &RuntimeRef, cancel: &CancelToken) -> Result<()> {

@@ -84,6 +84,11 @@ pub struct MockFailures {
     /// it and reports `recovered_pending_add` once. Applied at construction and
     /// whenever the switch is turned on.
     pub interrupted_add: bool,
+    /// The VM watchdog cannot be started again: setting an auto-stop on a
+    /// runtime whose watchdog is not running (after a cancel) leaves the stop
+    /// app-side only (`WatchdogInfo::armed` is false). Watchdogs started by
+    /// provisioning, and extending one that runs, are not affected.
+    pub watchdog_restart_fails: bool,
 }
 
 impl Default for MockFailures {
@@ -100,6 +105,7 @@ impl Default for MockFailures {
             usage_fetch_fails: false,
             unadopted_slot: false,
             interrupted_add: false,
+            watchdog_restart_fails: false,
         }
     }
 }
@@ -301,6 +307,8 @@ struct MRuntime {
     accelerator: Accelerator,
     high_mem: bool,
     vram_mib: Option<u32>,
+    /// Its VM watchdog is running (a cancelled one exits).
+    watchdog_alive: bool,
 }
 
 struct World {
@@ -602,6 +610,16 @@ impl MockBackend {
             };
             let endpoint = world.endpoint();
             let started = now - Duration::from_secs(600 * (i as u64 + 1));
+            let policy = world.defaults.guard_policy();
+            let watchdog = match (r.managed, &r.name) {
+                (true, Some(_)) => policy.max_runtime.map(|d| WatchdogInfo {
+                    deadline: Some(started + d),
+                    idle_timeout: policy.idle_timeout,
+                    cancelled: false,
+                    armed: true,
+                }),
+                _ => None,
+            };
             world.runtimes.push(MRuntime {
                 account: account.clone(),
                 endpoint: endpoint.clone(),
@@ -609,9 +627,9 @@ impl MockBackend {
                 accelerator: r.accelerator,
                 high_mem: false,
                 vram_mib: mock_vram(r.accelerator),
+                watchdog_alive: watchdog.is_some(),
             });
             if let (true, Some(name)) = (r.managed, &r.name) {
-                let policy = world.defaults.guard_policy();
                 let _ = world.ledger.upsert(TrackedSession {
                     name: name.clone(),
                     account: account.clone(),
@@ -620,11 +638,7 @@ impl MockBackend {
                     high_mem: false,
                     gpu: mock_gpu(r.accelerator, mock_vram(r.accelerator)),
                     vram_mib: mock_vram(r.accelerator),
-                    watchdog: policy.max_runtime.map(|d| WatchdogInfo {
-                        deadline: Some(started + d),
-                        idle_timeout: None,
-                        cancelled: false,
-                    }),
+                    watchdog,
                     policy,
                     spend: SpendMeter::new(started),
                     stopped: None,
@@ -661,6 +675,7 @@ impl MockBackend {
             accelerator,
             high_mem: false,
             vram_mib: mock_vram(accelerator),
+            watchdog_alive: false,
         });
         endpoint
     }
@@ -754,6 +769,8 @@ impl MockBackend {
 struct MockOps<'a> {
     m: &'a MockBackend,
     account: AccountId,
+    /// Watchdog starts are restarts (`MockFailures::watchdog_restart_fails` applies).
+    restart: bool,
 }
 
 impl ProvisionOps for MockOps<'_> {
@@ -825,6 +842,7 @@ impl ProvisionOps for MockOps<'_> {
             accelerator,
             high_mem,
             vram_mib: vram,
+            watchdog_alive: false,
         });
         Ok(())
     }
@@ -867,16 +885,27 @@ impl ProvisionOps for MockOps<'_> {
 
     fn start_watchdog(
         &self,
-        _: &str,
+        name: &str,
         policy: &GuardPolicy,
         cancel: &CancelToken,
     ) -> Result<Option<WatchdogInfo>> {
         self.m.step(cancel)?;
         let now = self.m.now_();
+        let mut w = self.m.w();
+        if self.restart && w.failures.watchdog_restart_fails {
+            return Err(Error::new(ErrorKind::Other).detail("the watchdog process is not running"));
+        }
+        let rt = w
+            .runtimes
+            .iter_mut()
+            .find(|r| r.account == self.account && r.name.as_deref() == Some(name))
+            .ok_or_else(|| Error::new(ErrorKind::SessionGone))?;
+        rt.watchdog_alive = true;
         Ok(Some(WatchdogInfo {
             deadline: policy.max_runtime.map(|d| now + d),
             idle_timeout: policy.idle_timeout,
             cancelled: false,
+            armed: true,
         }))
     }
 }
@@ -1316,6 +1345,7 @@ impl Backend for MockBackend {
         let ops = MockOps {
             m: self,
             account: account.clone(),
+            restart: false,
         };
         let r = provision::provision(&ops, &spec, limit, self.cfg.clock.as_ref(), cancel, &|e| {
             let _ = events.send(e);
@@ -1367,20 +1397,50 @@ impl Backend for MockBackend {
             .clone()
             .ok_or_else(|| Error::invalid("name", "the session has no local name"))?;
         self.step(cancel)?;
-        let now = self.now_();
-        let info = WatchdogInfo {
-            deadline: Some(now + runtime),
-            idle_timeout: None,
-            cancelled: false,
+        let gone = || Error::new(ErrorKind::SessionGone).with("session", &name);
+        // Like the real backend: the runtime's own state decides between
+        // moving the deadline of a running watchdog and starting it again.
+        let (alive, tracked, vm_idle) = {
+            let w = self.w();
+            let rt = w
+                .runtimes
+                .iter()
+                .find(|r| r.account == target.account && r.name.as_deref() == Some(&name))
+                .ok_or_else(gone)?;
+            let e = w.ledger.live(&target.account, &name).ok_or_else(gone)?;
+            (
+                rt.watchdog_alive,
+                e.policy.clone(),
+                e.watchdog.as_ref().and_then(|wd| wd.idle_timeout),
+            )
         };
-        let mut w = self.w();
-        let found = w.ledger.update(&target.account, &name, |e| {
+        let info = if alive {
+            WatchdogInfo {
+                deadline: Some(self.now_() + runtime),
+                idle_timeout: vm_idle,
+                cancelled: false,
+                armed: true,
+            }
+        } else {
+            let policy = crate::watchdog::restart_policy(Some(&tracked), vm_idle, runtime);
+            let ops = MockOps {
+                m: self,
+                account: target.account.clone(),
+                restart: true,
+            };
+            match provision::start_watchdog(&ops, &name, &policy) {
+                Ok(Some(info)) if info.armed => info,
+                _ => crate::watchdog::start_failed(&policy),
+            }
+        };
+        let now = self.now_();
+        let found = self.w().ledger.update(&target.account, &name, |e| {
             let elapsed = now.duration_since(e.spend.started_at).unwrap_or_default();
             e.policy.max_runtime = Some(elapsed + runtime);
             e.watchdog = Some(info.clone());
         })?;
         if !found {
-            return Err(Error::new(ErrorKind::SessionGone).with("session", &name));
+            return Err(gone());
         }
         Ok(info)
     }
@@ -1392,10 +1452,20 @@ impl Backend for MockBackend {
             .clone()
             .ok_or_else(|| Error::invalid("name", "the session has no local name"))?;
         self.step(cancel)?;
-        self.w().ledger.update(&target.account, &name, |e| {
+        let mut w = self.w();
+        // The cancelled watchdog exits without releasing the runtime.
+        if let Some(rt) = w
+            .runtimes
+            .iter_mut()
+            .find(|r| r.account == target.account && r.name.as_deref() == Some(&name))
+        {
+            rt.watchdog_alive = false;
+        }
+        w.ledger.update(&target.account, &name, |e| {
             e.policy.max_runtime = None;
             if let Some(wd) = e.watchdog.as_mut() {
                 wd.cancelled = true;
+                wd.armed = false;
             }
         })?;
         Ok(())
@@ -2356,6 +2426,101 @@ mod tests {
             .provision(m.defaults().provision_spec("big"), tx, &nc())
             .unwrap();
         assert_eq!(out.hardware.vram_mib, Some(81_920));
+
+        // A cancelled watchdog cannot be started again while the switch is on.
+        let big = m
+            .runtimes(&nc())
+            .unwrap()
+            .runtimes
+            .into_iter()
+            .find(|r| r.id.name.as_deref() == Some("big"))
+            .unwrap()
+            .id;
+        let hour = Duration::from_secs(3600);
+        m.cancel_auto_stop(&big, &nc()).unwrap();
+        on(MockFailures {
+            watchdog_restart_fails: true,
+            ..d()
+        });
+        assert!(!m.extend_session(&big, hour, &nc()).unwrap().armed);
+        off();
+        assert!(m.extend_session(&big, hour, &nc()).unwrap().armed);
+    }
+
+    fn tracked_watchdog(m: &MockBackend, name: &str) -> (Runtime, WatchdogInfo) {
+        let rt = m
+            .runtimes(&nc())
+            .unwrap()
+            .runtimes
+            .into_iter()
+            .find(|r| r.id.name.as_deref() == Some(name))
+            .unwrap();
+        let wd = rt.tracked.as_ref().unwrap().watchdog.clone().unwrap();
+        (rt, wd)
+    }
+
+    #[test]
+    fn setting_an_auto_stop_after_a_cancel_starts_the_watchdog_again() {
+        let (m, _) = mock(MockScenario::single());
+        let mut d = m.defaults();
+        d.idle_timeout = Some(Duration::from_secs(900));
+        m.set_defaults(d);
+        let (tx, _rx) = mpsc::channel();
+        let spec = ProvisionSpec {
+            accelerator: Accelerator::T4,
+            ..m.defaults().provision_spec("t4-wd")
+        };
+        m.provision(spec, tx, &nc()).unwrap();
+        let (rt, wd) = tracked_watchdog(&m, "t4-wd");
+        assert!(wd.armed && !wd.cancelled && wd.deadline.is_some());
+        assert!(rt.auto_stop_at.is_some());
+
+        m.cancel_auto_stop(&rt.id, &nc()).unwrap();
+        let (rt, wd) = tracked_watchdog(&m, "t4-wd");
+        assert!(!wd.armed && wd.cancelled);
+        assert_eq!(rt.auto_stop_at, None, "it bills until stopped");
+
+        // "Set auto-stop": the watchdog runs on the runtime again.
+        let hour = Duration::from_secs(3600);
+        let info = m.extend_session(&rt.id, hour, &nc()).unwrap();
+        assert!(info.armed && !info.cancelled);
+        assert_eq!(info.idle_timeout, Some(Duration::from_secs(900)));
+        let (rt, wd) = tracked_watchdog(&m, "t4-wd");
+        assert_eq!(wd, info, "the listing shows the last known state");
+        assert_eq!(rt.auto_stop_at, info.deadline);
+
+        // The restart fails: the call reports it and keeps the app-side limit.
+        m.cancel_auto_stop(&rt.id, &nc()).unwrap();
+        m.set_failures(MockFailures {
+            watchdog_restart_fails: true,
+            ..MockFailures::default()
+        });
+        let before = m.now();
+        let info = m.extend_session(&rt.id, hour, &nc()).unwrap();
+        assert!(!info.armed && !info.cancelled);
+        assert_eq!(info.deadline, None);
+        assert_eq!(info.idle_timeout, Some(Duration::from_secs(900)));
+        let (rt, wd) = tracked_watchdog(&m, "t4-wd");
+        assert_eq!(wd, info);
+        let tracked = rt.tracked.as_ref().unwrap();
+        let app_stop = tracked.started_at() + tracked.policy.max_runtime.unwrap();
+        assert!(
+            app_stop >= before + hour,
+            "the app-side limit is the new time"
+        );
+        assert_eq!(rt.auto_stop_at, Some(app_stop));
+
+        // Trying again once it can start works; after that the running
+        // watchdog is only moved, so the switch no longer matters.
+        m.set_failures(MockFailures::default());
+        assert!(m.extend_session(&rt.id, hour, &nc()).unwrap().armed);
+        m.set_failures(MockFailures {
+            watchdog_restart_fails: true,
+            ..MockFailures::default()
+        });
+        let info = m.extend_session(&rt.id, hour * 2, &nc()).unwrap();
+        assert!(info.armed);
+        assert_eq!(info.deadline, Some(m.now() + hour * 2));
     }
 
     #[test]

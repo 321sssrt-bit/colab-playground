@@ -339,14 +339,34 @@ pub trait Backend: Send + Sync {
         options: StopOptions,
         cancel: &CancelToken,
     ) -> Result<()>;
-    /// Moves the auto-stop to `runtime` from now (active account only).
+    /// Moves the auto-stop to `runtime` from now (active account only); also
+    /// sets one again after [`Backend::cancel_auto_stop`].
+    ///
+    /// The stop is put on the runtime itself, so it holds with the app
+    /// closed. A running watchdog gets the new deadline. A watchdog that is
+    /// not running (cancelled, exited, or never started) is started again
+    /// the way provisioning starts it, with the new deadline and the
+    /// session's tracked idle rule, and the cancel is cleared. The returned
+    /// [`WatchdogInfo`] is also recorded in the ledger.
+    ///
+    /// If that start fails, the result is what provisioning reports when it
+    /// cannot start the watchdog: the call still succeeds, and the returned
+    /// info has `armed == false` and no deadline, meaning the stop is not on
+    /// the runtime. The app-side runtime limit is recorded in either case, so
+    /// the guard still stops the runtime at the new time while the app runs;
+    /// recording it never makes a runtime bill longer than not recording it.
+    ///
+    /// Errors (with nothing recorded) are those of reaching the runtime, e.g.
+    /// `AccountNotActive` or `SessionGone`.
     fn extend_session(
         &self,
         target: &RuntimeRef,
         runtime: Duration,
         cancel: &CancelToken,
     ) -> Result<WatchdogInfo>;
-    /// Cancels the VM watchdog's deadline (active account only).
+    /// Cancels the VM watchdog's deadline (active account only). The watchdog
+    /// exits without releasing the runtime; the ledger records it as
+    /// cancelled and not armed, and drops the app-side runtime limit.
     fn cancel_auto_stop(&self, target: &RuntimeRef, cancel: &CancelToken) -> Result<()>;
     /// One app-side guard round: usage, spend, decisions, automatic stops.
     fn guard_poll(&self, cancel: &CancelToken) -> Result<GuardReport>;

@@ -30,6 +30,9 @@ use crate::sessions::{Accelerator, ServerSession, WatchdogInfo, validate_session
 /// Hard cap on attempts (a safety limit, not a user default).
 pub const MAX_ATTEMPTS_CAP: u32 = 8;
 
+/// How many times [`start_watchdog`] tries to start the VM watchdog.
+pub const WATCHDOG_ATTEMPTS: u32 = 3;
+
 /// Caps how many sessions the app keeps on one account, so a retry loop can
 /// never fan out into many billed VMs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -271,6 +274,27 @@ fn aborts_immediately(kind: ErrorKind) -> bool {
     )
 }
 
+/// Starts the VM watchdog of `name` for `policy`, up to [`WATCHDOG_ATTEMPTS`]
+/// times; returns the last error when every attempt failed. Provisioning
+/// starts it this way, and so does setting an auto-stop on a runtime whose
+/// watchdog is not running. Not cancellable, so the caller always gets the
+/// start's own reply, the only word on whether the runtime has its stop.
+pub fn start_watchdog(
+    ops: &dyn ProvisionOps,
+    name: &str,
+    policy: &GuardPolicy,
+) -> Result<Option<WatchdogInfo>> {
+    let nc = CancelToken::new();
+    let mut last = Error::new(ErrorKind::Other);
+    for _ in 0..WATCHDOG_ATTEMPTS {
+        match ops.start_watchdog(name, policy, &nc) {
+            Ok(w) => return Ok(w),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
 /// Stops `name` and confirms it is gone from `colab sessions`.
 pub fn release(ops: &dyn ProvisionOps, name: &str) -> Result<()> {
     let nc = CancelToken::new();
@@ -490,14 +514,7 @@ fn run(
             return Err(Error::cancelled());
         }
         let watchdog = if spec.guard.needs_watchdog() {
-            let mut result = Err(Error::new(ErrorKind::Other));
-            for _ in 0..3 {
-                result = ops.start_watchdog(name, &spec.guard, &nc);
-                if result.is_ok() {
-                    break;
-                }
-            }
-            match result {
+            match start_watchdog(ops, name, &spec.guard) {
                 Ok(w) => {
                     events(ProvisionEvent::WatchdogStarted {
                         deadline: w.as_ref().and_then(|w| w.deadline),
@@ -552,6 +569,8 @@ mod tests {
         stop_fails: bool,
         cancel_on_probe: Option<CancelToken>,
         vram: RefCell<Option<u32>>,
+        /// The next N watchdog starts fail.
+        watchdog_failures: RefCell<u32>,
     }
 
     fn sess(name: Option<&str>, ep: &str) -> ServerSession {
@@ -625,10 +644,16 @@ mod tests {
             _: &CancelToken,
         ) -> Result<Option<WatchdogInfo>> {
             self.log.borrow_mut().push("watchdog".into());
+            let mut failures = self.watchdog_failures.borrow_mut();
+            if *failures > 0 {
+                *failures -= 1;
+                return Err(Error::new(ErrorKind::Other).detail("not running"));
+            }
             Ok(Some(WatchdogInfo {
                 deadline: None,
                 idle_timeout: None,
                 cancelled: false,
+                armed: true,
             }))
         }
     }
@@ -692,6 +717,44 @@ mod tests {
             "the retry delay used the injected clock"
         );
         assert!(f.log.borrow().contains(&"watchdog".to_owned()));
+    }
+
+    #[test]
+    fn the_watchdog_start_is_retried_then_reported() {
+        let watchdogs = |f: &Fake| f.log.borrow().iter().filter(|l| *l == "watchdog").count();
+        let f = Fake {
+            watchdog_failures: RefCell::new(2),
+            ..Default::default()
+        };
+        let policy = GuardPolicy::default();
+        let w = start_watchdog(&f, "s", &policy).unwrap();
+        assert!(w.is_some_and(|w| w.armed));
+        assert_eq!(watchdogs(&f), 3);
+
+        let f = Fake {
+            watchdog_failures: RefCell::new(WATCHDOG_ATTEMPTS),
+            ..Default::default()
+        };
+        let err = start_watchdog(&f, "s", &policy).unwrap_err();
+        assert_eq!(err.detail, "not running");
+        assert_eq!(watchdogs(&f), WATCHDOG_ATTEMPTS as usize);
+
+        // Provisioning keeps the session and reports that the stop is not on it.
+        let f = Fake {
+            creates: RefCell::new(VecDeque::from([Ok(15_360)])),
+            watchdog_failures: RefCell::new(WATCHDOG_ATTEMPTS),
+            ..Default::default()
+        };
+        let (r, ev, _) = run_fake(
+            &f,
+            &spec(None, 1, OnExhausted::StopAndFail),
+            &CancelToken::new(),
+        );
+        assert_eq!(r.unwrap().watchdog, None);
+        assert!(
+            ev.iter()
+                .any(|e| matches!(e, ProvisionEvent::WatchdogFailed { .. }))
+        );
     }
 
     #[test]
