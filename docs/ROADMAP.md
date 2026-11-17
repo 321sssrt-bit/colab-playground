@@ -1,0 +1,45 @@
+# Roadmap
+
+Colab Playground's core is deliberately small: **Colab accounts, starting and stopping runtimes,
+and switching between them**, with the cost guards and port forwarding that make that safe and
+useful. Everything else is a plugin. This file records what is planned but not built, so the
+ideas and the reasoning are not lost.
+
+## Recorded for later
+
+### Keeping data that must survive the runtime
+
+A stopped runtime is wiped, and the guards stop runtimes on their own. A session could carry a
+**keep plan**: VM paths plus one or more targets. Plugins would declare the paths that matter
+(`[[keep]] path = "/content/outputs"`); the user picks the targets.
+
+| Target | Runs where | Survives an app-closed stop | Notes |
+| --- | --- | --- | --- |
+| Local folder | App pulls (tar on the VM, `colab download`) | No | Small/medium files. |
+| Hugging Face repo | VM pushes (`hf upload`) | Yes | Fastest for checkpoints and trained models. |
+| Google Drive | VM copies into the mount | Yes | Needs browser consent per VM. |
+
+- Triggers: manual "Save now"; before every app-initiated stop; optionally every N minutes; and
+  VM-side during the watchdog's wind-down.
+- Drive: `colab drivemount` prints a consent URL and waits for Enter, so the app can drive it
+  like login. Mounting exposes the whole Drive to code on the VM, third-party plugins included:
+  off by default, per session, with a warning that says exactly that.
+- Tokens: the CLI already passes values to the VM with `colab exec --env KEY=VALUE` (in memory,
+  not on disk); that is how a Hugging Face token reaches a plugin. Colab's notebook "Secrets"
+  (`google.colab.userdata`) are not exposed by the CLI.
+- v1 ships only the hook points: the watchdog's wind-down phase, `[[keep]]` and `needs` in the
+  plugin manifest, secret slots in the keyring vault, and a stop path that can take a pre-stop step.
+
+### Plugins worth writing
+
+- Model training / fine-tuning that pushes checkpoints to a Hugging Face repo.
+- Image-generation UIs, notebooks-as-jobs, dataset preparation.
+- Other storage targets (S3, GCS) for the keep plan.
+
+### Platform and distribution
+
+- Installers, app icon, signed releases, auto-update, a release workflow.
+- A plugin index (discover and update plugins from inside the app).
+- Native-Windows CLI support (without WSL), ADC / gcloud authentication.
+- Operating sessions on a non-active account without switching (a per-operation account lock,
+  as `colab-account-changer`'s pool does).
