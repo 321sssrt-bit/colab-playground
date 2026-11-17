@@ -25,10 +25,10 @@ use crate::{
 };
 
 pub use forward::{FORWARD_SUBMIT, RESERVED_NOTE};
-pub use new_session::{NEW_SESSION_CANCEL_RUN, NEW_SESSION_START};
+pub use new_session::{NEW_SESSION_CANCEL_RUN, NEW_SESSION_LIMIT, NEW_SESSION_START};
 pub use plugin::{INSTALL_CONFIRM, REMOVE_CONFIRM};
 pub use quit::{QUIT_LEAVE, QUIT_STOP_ALL};
-pub use stop::STOP_CONFIRM;
+pub use stop::{CANCEL_AUTO_STOP_CONFIRM, STOP_CONFIRM};
 
 /// The open overlay, if any (an account dialog takes precedence).
 pub fn render(
@@ -42,6 +42,7 @@ pub fn render(
     }
     Some(match state.overlay()? {
         Overlay::Stop(prompt) => stop::render(prompt, state, handle, cx),
+        Overlay::CancelAutoStop(prompt) => stop::cancel_auto_stop(prompt, state, handle, cx),
         Overlay::NewSession => new_session::render(state, handle, inputs, cx)?,
         Overlay::Forward(form) => forward::render(form, state, handle, inputs, cx),
         Overlay::InstallPlugin(prompt) => plugin::install(prompt, state, handle, cx),

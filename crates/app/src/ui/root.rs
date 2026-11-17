@@ -30,6 +30,8 @@ pub struct RootView {
     state: Entity<AppState>,
     inputs: Inputs,
     fields_plugin: Option<String>,
+    page_scroll: gpui::ScrollHandle,
+    shown_route: crate::route::Route,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -135,12 +137,7 @@ impl RootView {
             guard.update(cx, |state, cx| state.may_close(cx))
         });
         let subscriptions = vec![
-            cx.observe_in(&state, window, |_, state, window, cx| {
-                if state.read(cx).quit_approved() {
-                    window.remove_window();
-                }
-                cx.notify();
-            }),
+            cx.observe(&state, |_, _, cx| cx.notify()),
             cx.observe_window_appearance(window, |this, window, cx| {
                 let mode = Mode::from(window.appearance());
                 this.state
@@ -154,6 +151,8 @@ impl RootView {
             state,
             inputs,
             fields_plugin: None,
+            page_scroll: gpui::ScrollHandle::new(),
+            shown_route: crate::route::Route::default(),
             _subscriptions: subscriptions,
         }
     }
@@ -238,6 +237,13 @@ impl RootView {
 impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_inputs(window, cx);
+        // A new page starts at its top, not at the previous page's scroll offset.
+        let route = self.state.read(cx).route();
+        if route != self.shown_route {
+            self.shown_route = route;
+            self.page_scroll
+                .set_offset(gpui::point(gpui::px(0.0), gpui::px(0.0)));
+        }
         let chrome = platform::chrome(window.window_decorations());
         let title_bar = titlebar::render(chrome, window, cx);
         let handle = self.state.clone();
@@ -268,6 +274,7 @@ impl Render for RootView {
                                 PAGE_SELECTOR,
                                 ScrollArea::new(PAGE_SELECTOR)
                                     .vertical()
+                                    .track_scroll(&self.page_scroll)
                                     .size_full()
                                     .child(pages::render(state, &handle, &self.inputs, cx)),
                             )

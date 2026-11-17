@@ -25,7 +25,8 @@ use crate::{
 };
 
 pub use card::{
-    extend_selector, forward_selector, runtime_selector, stop_selector, switch_selector,
+    cancel_auto_stop_selector, extend_selector, forward_selector, runtime_selector,
+    set_auto_stop_selector, stop_selector, switch_selector,
 };
 
 /// Selector of "New session".
@@ -154,7 +155,8 @@ pub fn render(state: &AppState, handle: &Entity<AppState>, cx: &App) -> Page {
                     ),
                 )
             } else {
-                page.children(groups(&view.runtimes, state, handle, cx))
+                page.child(Caption::new(tr(cx, keys::SESSIONS_ESTIMATE_NOTE)))
+                    .children(groups(&view.runtimes, state, handle, cx))
             }
         }
     };

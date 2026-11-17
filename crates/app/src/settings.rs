@@ -178,14 +178,18 @@ impl Settings {
         Ok((settings, reset))
     }
 
-    /// Where the real backend finds the CLI: a toolchain only when both paths are set.
+    /// Where the real backend finds the CLI: a toolchain when a `colab` path is set. The
+    /// interpreter path is optional; without it core derives the interpreter from `colab`'s
+    /// shebang (`Toolchain::from_colab_path`). An interpreter path alone is ignored.
     pub fn host_setup(&self) -> crate::backend::HostSetup {
+        // The interpreter may be left out: core then derives it from `colab`'s shebang.
         let toolchain = match (&self.colab_path, &self.colab_python) {
             (Some(colab), Some(python)) => Some(Toolchain {
                 colab: colab.clone(),
                 helper_python: python.clone(),
             }),
-            _ => None,
+            (Some(colab), None) => Some(Toolchain::from_colab_path(colab.clone())),
+            (None, _) => None,
         };
         crate::backend::HostSetup {
             wsl_distro: self.wsl_distro.clone(),

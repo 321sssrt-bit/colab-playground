@@ -44,7 +44,7 @@ pub use environment::{
 };
 pub use ops::{Op, key_of};
 pub use plugins::{HF_TOKEN, InstallPrompt, RemovePrompt, is_git_source};
-pub use provision::{NewSession, ProvisionPhase, ProvisionProgress};
+pub use provision::{LimitReached, NewSession, ProvisionPhase, ProvisionProgress};
 pub use quit::{Billing, QuitPrompt};
 pub use runs::{HF_RESULTS, HfLookup, PluginRun, PluginView, RunForm, RunPhase};
 pub use sessions::{EndReason, Ended, StopPrompt, runtime_label};
@@ -152,6 +152,8 @@ pub struct AppState {
     plugin_run: Option<PluginRun>,
     pending_inputs: Vec<(InputSlot, String)>,
     quit: quit::QuitState,
+    stop_all_pending: bool,
+    settings_focus: bool,
 }
 
 /// A dialog other than the account ones (those are [`AccountDialog`]).
@@ -159,6 +161,8 @@ pub struct AppState {
 pub enum Overlay {
     /// Stop and end billing, confirmed once.
     Stop(StopPrompt),
+    /// Cancel a runtime's auto-stop, confirmed once.
+    CancelAutoStop(StopPrompt),
     /// The new-session form and its progress.
     NewSession,
     /// Forward a port.
@@ -271,6 +275,8 @@ impl AppState {
                 plugin_run: None,
                 pending_inputs: Vec::new(),
                 quit: quit::QuitState::default(),
+                stop_all_pending: false,
+                settings_focus: false,
             };
             state.font_fallbacks = platform::font_fallbacks(language, &state.cjk_fonts);
             state.apply_mode(true, cx);
@@ -291,6 +297,15 @@ impl AppState {
             cx.theme().mode()
         );
         cx.set_global(GlobalAppState(state.clone()));
+        // Cmd+Q (bound with the app menu on macOS only) asks the same question as closing the
+        // window.
+        platform::install_quit(cx);
+        cx.on_action(|_: &platform::Quit, cx: &mut App| {
+            let state = AppState::global(cx);
+            if state.update(cx, |state, cx| state.may_close(cx)) {
+                cx.quit();
+            }
+        });
         state
     }
 
@@ -311,6 +326,9 @@ impl AppState {
 
     /// Closes that dialog (the new-session dialog only hides while it provisions).
     pub fn close_overlay(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.overlay, Some(Overlay::Quit(_))) {
+            self.stop_all_pending = false;
+        }
         match self.overlay {
             Some(Overlay::NewSession) => self.close_new_session(cx),
             Some(_) => {
@@ -351,8 +369,16 @@ impl AppState {
         if self.route != route {
             log::info!("app: route {:?} -> {route:?}", self.route);
             self.route = route;
+            if route != Route::Settings {
+                self.settings_focus = false;
+            }
             cx.notify();
         }
+    }
+
+    /// Whether Settings opens with the session limit called out at the top.
+    pub fn settings_focus(&self) -> bool {
+        self.settings_focus
     }
 
     /// The settings in effect.

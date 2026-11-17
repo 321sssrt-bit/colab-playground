@@ -4,9 +4,9 @@
 //!
 //! "Leave running" is only described as watched by a watchdog for runtimes that have one;
 //! runtimes opened elsewhere, or whose watchdog failed or was cancelled, have no automatic
-//! stop and the prompt says so. "Stop all" closes only after every stop returned.
+//! stop and the prompt says so, listing every runtime by name and account.
 
-use colab_playground_core::{Error, backend::RuntimeRef};
+use colab_playground_core::{Error, ErrorKind, backend::RuntimeRef};
 use gpui::Context;
 
 use super::{AppState, Load, Op, Overlay};
@@ -71,7 +71,8 @@ impl AppState {
                         .tracked
                         .as_ref()
                         .and_then(|t| t.watchdog.as_ref())
-                        .is_some_and(|w| w.deadline.is_some() && !w.cancelled);
+                        .is_some_and(|w| w.deadline.is_some() && !w.cancelled)
+                        && !self.sessions.rearmed.contains(&runtime.id);
                     if watched {
                         billing.watched.push(runtime.id.clone());
                     } else {
@@ -97,6 +98,10 @@ impl AppState {
         if !billing.any() {
             return true;
         }
+        if !matches!(self.sessions.runtimes, Load::Ready(_)) {
+            // The prompt names every runtime; list them now if they are not known yet.
+            self.load_runtimes(cx);
+        }
         self.close_dialog(cx);
         self.overlay = Some(Overlay::Quit(QuitPrompt {
             billing,
@@ -106,45 +111,104 @@ impl AppState {
         false
     }
 
-    /// Whether the user approved closing (the root view then closes the window).
+    /// Whether the user approved quitting.
     pub fn quit_approved(&self) -> bool {
         self.quit == QuitState::Approved
     }
 
-    /// Leaves everything running and closes.
+    /// Leaves everything running and quits.
     pub fn quit_leaving_running(&mut self, cx: &mut Context<Self>) {
+        self.approve_quit(cx);
+    }
+
+    /// The app quits (one window: quitting closes it). Quitting rather than removing the
+    /// window keeps the platform from delivering events to a window that is already gone.
+    fn approve_quit(&mut self, cx: &mut Context<Self>) {
         self.overlay = None;
         self.quit = QuitState::Approved;
         cx.notify();
+        cx.quit();
     }
 
-    /// Cancels provisioning and plugin runs (they release what they allocated), stops every
-    /// runtime, then closes; a failed stop keeps the prompt open and says which.
+    /// Stops everything, then quits. In order: cancel provisioning and plugin runs and wait
+    /// until they have returned (they release what they allocated); then list afresh and stop
+    /// every runtime (one already gone counts as stopped); then list once more and quit only
+    /// if nothing is left. Anything left, or any account that could not be listed, keeps the
+    /// prompt open and says which.
     pub fn quit_stopping_all(&mut self, cx: &mut Context<Self>) {
+        if self.stop_all_pending {
+            return;
+        }
+        self.stop_all_pending = true;
         self.ops.cancel(Op::Provision);
         self.ops.cancel(Op::PluginRun);
+        if let Some(Overlay::Quit(prompt)) = &mut self.overlay {
+            prompt.failures.clear();
+        }
+        self.continue_stop_all(cx);
+        cx.notify();
+    }
+
+    /// Runs the stopping part of "Stop all" once no cancelled provision or plugin run is still
+    /// unwinding. Called again when each of them returns.
+    pub(crate) fn continue_stop_all(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.overlay, Some(Overlay::Quit(_))) {
+            // The prompt was dismissed while cancelled work unwound: stop nothing.
+            self.stop_all_pending = false;
+            return;
+        }
+        if self.stop_all_pending
+            && !self.ops.is_running(Op::StopAll)
+            && !self.ops.is_running(Op::Provision)
+            && !self.ops.is_running(Op::PluginRun)
+        {
+            self.stop_everything(cx);
+        }
+    }
+
+    fn stop_everything(&mut self, cx: &mut Context<Self>) {
         self.run_backend(
             Op::StopAll,
             cx,
             move |backend, cancel| {
-                // List afresh: the cached list may be stale, still loading or incomplete.
                 let view = backend.runtimes(cancel)?;
-                let mut failures: Vec<(Failed, Error)> = view
-                    .errors
-                    .into_iter()
-                    .map(|failure| (Failed::Account(failure.account), failure.error))
-                    .collect();
-                for runtime in view.runtimes {
+                let mut failures: Vec<(Failed, Error)> = Vec::new();
+                for runtime in &view.runtimes {
+                    match backend.stop_session(&runtime.id, Default::default(), cancel) {
+                        Ok(()) => {}
+                        // Gone already (stopped by its watchdog, a cancelled run, elsewhere).
+                        Err(error) if error.is(ErrorKind::SessionGone) => {}
+                        Err(error) => {
+                            failures.push((Failed::Runtime(super::runtime_label(runtime)), error))
+                        }
+                    }
+                }
+                let after = backend.runtimes(cancel)?;
+                // The final listing decides: a stop that "failed" on a runtime that is gone now
+                // (already stopped by its watchdog, a cancelled run or elsewhere) is not a failure.
+                let still: Vec<String> = after.runtimes.iter().map(super::runtime_label).collect();
+                failures.retain(
+                    |(what, _)| matches!(what, Failed::Runtime(label) if still.contains(label)),
+                );
+                for failure in after.errors {
+                    failures.push((Failed::Account(failure.account), failure.error));
+                }
+                for runtime in after.runtimes {
                     let label = super::runtime_label(&runtime);
-                    if let Err(error) =
-                        backend.stop_session(&runtime.id, Default::default(), cancel)
+                    if !failures
+                        .iter()
+                        .any(|(what, _)| matches!(what, Failed::Runtime(l) if *l == label))
                     {
-                        failures.push((Failed::Runtime(label), error));
+                        failures.push((
+                            Failed::Runtime(label),
+                            Error::new(ErrorKind::Other).detail("still listed after stopping"),
+                        ));
                     }
                 }
                 Ok(failures)
             },
             |state, result, cx| {
+                state.stop_all_pending = false;
                 let failures: Vec<(String, Error)> = match result {
                     Ok(failures) => failures
                         .into_iter()
@@ -153,7 +217,7 @@ impl AppState {
                                 Failed::Runtime(label) => label,
                                 Failed::Account(account) => state
                                     .email_of(&account)
-                                    .unwrap_or_else(|| account.to_string()),
+                                    .unwrap_or_else(|| format!("{account:?}")),
                             };
                             (label, error)
                         })
@@ -162,52 +226,21 @@ impl AppState {
                 };
                 let asking = matches!(state.overlay, Some(Overlay::Quit(_)));
                 if failures.is_empty() && asking {
-                    state.wait_then_close(cx);
-                } else if let Some(Overlay::Quit(prompt)) = &mut state.overlay {
+                    state.approve_quit(cx);
+                    return;
+                }
+                if let Some(Overlay::Quit(prompt)) = &mut state.overlay {
                     prompt.failures = failures;
                 }
                 state.load_runtimes(cx);
                 cx.notify();
             },
         );
-        cx.notify();
     }
 
-    /// Closes once cancelled provisioning and runs have returned (they stop what they made).
-    fn wait_then_close(&mut self, cx: &mut Context<Self>) {
-        if self.ops.is_running(Op::Provision) || self.ops.is_running(Op::PluginRun) {
-            cx.spawn(async move |this, cx| {
-                loop {
-                    cx.background_executor()
-                        .timer(std::time::Duration::from_millis(100))
-                        .await;
-                    let busy = this
-                        .update(cx, |state, _| {
-                            state.ops.is_running(Op::Provision)
-                                || state.ops.is_running(Op::PluginRun)
-                        })
-                        .unwrap_or(false);
-                    if !busy {
-                        break;
-                    }
-                }
-                this.update(cx, |state, cx| {
-                    state.overlay = None;
-                    state.quit = QuitState::Approved;
-                    cx.notify();
-                })
-                .ok();
-            })
-            .detach();
-            return;
-        }
-        self.overlay = None;
-        self.quit = QuitState::Approved;
-    }
-
-    /// Whether "Stop all" is under way.
+    /// Whether "Stop all" is under way (waiting for cancelled work, or stopping).
     pub fn is_stopping_all(&self) -> bool {
-        self.ops.is_running(Op::StopAll)
+        self.stop_all_pending || self.ops.is_running(Op::StopAll)
     }
 }
 

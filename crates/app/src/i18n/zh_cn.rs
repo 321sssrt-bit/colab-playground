@@ -356,7 +356,7 @@ pub(super) const MESSAGES: Messages = &[
     (HOST_PYTHON_PATH, "对应的 Python 解释器"),
     (HOST_PATH_PLACEHOLDER, "自动查找"),
     (HOST_APPLY, "应用"),
-    (HOST_BOTH_NEEDED, "请同时填写两个路径，或都留空。"),
+    (HOST_BOTH_NEEDED, "请同时填写 colab 路径，或把解释器留空。"),
     (HOST_MOCK_NOTE, "演示数据不使用这些设置。"),
     (HOST_BUSY, "请等待当前任务完成。"),
     // 错误
@@ -801,4 +801,69 @@ pub(super) const MESSAGES: Messages = &[
     (DEPLOY_TITLE, "部署模型"),
     (DEPLOY_SUBTITLE, "一步启动运行时并提供模型服务。"),
     (DEPLOY_ACTION, "部署"),
+    // 修正轮
+    (FMT_HOURS, "{h} 小时"),
+    (FMT_DAYS, "{d} 天"),
+    (UNIT_HOURS, "小时"),
+    (UNIT_MINUTES, "分钟"),
+    (UNIT_SECONDS, "秒"),
+    (MENU_QUIT, "退出 Colab Playground"),
+    (HOST_PYTHON_HINT, "可选。留空时会根据 colab 文件自动查找。"),
+    (
+        SWITCH_UNMANAGED,
+        "非本应用启动的运行时会继续计费，且不会自动停止：",
+    ),
+    (SWITCH_UNMANAGED_ITEM, "{name}"),
+    (SWITCH_UNMANAGED_MORE, "另有 {count} 个无法列出"),
+    (RUNTIME_SET_AUTO_STOP, "设置 {time}后自动停止"),
+    (
+        AUTO_STOP_SET,
+        "已设置 {time}后自动停止，由本应用在打开期间执行。",
+    ),
+    (CANCEL_AUTO_STOP_TITLE, "取消自动停止？"),
+    (
+        CANCEL_AUTO_STOP_BODY,
+        "之后 {name} 会一直运行并计费，直到你手动停止它，即使关闭本应用也一样。",
+    ),
+    (
+        CANCEL_AUTO_STOP_REARM,
+        "之后可以在它的卡片上重新设置自动停止（从那时起 {time}），但届时只由本应用在打开期间执行：运行时上的自动停止无法重新启动。",
+    ),
+    (CANCEL_AUTO_STOP_KEEP, "保留自动停止"),
+    (
+        QUIT_STOP_WIPED,
+        "“全部停止”会结束上面列出的每个运行时的计费，包括其他账号上的和非本应用启动的，并清除它们上面的所有内容。",
+    ),
+    (
+        NEW_LIMIT_BODY,
+        "本应用在每个账号上最多启动 {limit} 个运行时，{email} 已达到上限。这个上限是本应用自己的设置，不是 Colab 的规则。",
+    ),
+    (NEW_LIMIT_COUNTED, "已计入：{names}。"),
+    (
+        NEW_LIMIT_HINT,
+        "只计入本应用启动的运行时，在浏览器中打开的不计入。请先停止一个，或在设置中调高上限。",
+    ),
+    (NEW_OPEN_SETTINGS, "打开设置"),
+    (
+        LIMIT_FOCUS_HINT,
+        "本应用在一个账号上最多启动多少个运行时。只计入本应用启动的运行时。",
+    ),
+    (
+        PROV_ALLOCATED,
+        "已向 Colab 申请运行时（第 {n} 次，共 {of} 次）",
+    ),
+    (PROV_RELEASED, "已停止这个运行时"),
+    (PROV_RETRIED, "等待 {time}后重试"),
+    (
+        QUANT_FITS_ASSUMED,
+        "{gpu} GPU：{quant}（≈ {estimate}，按 {ctx} 个 token 的上下文估算；实际运行时若放得下会使用模型自身的最大值）",
+    ),
+    (
+        SESSIONS_ESTIMATE_NOTE,
+        "带 ≈ 的数值是估算：Colab 只提供每个账号的总量，本应用把它分摊到该账号的各个运行时。",
+    ),
+    (
+        RUN_LIMIT_HINT,
+        "可以在上方选择一个已在运行的会话、先停止一个，或在设置中调高上限。",
+    ),
 ];

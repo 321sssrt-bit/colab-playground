@@ -42,9 +42,9 @@ en = "Quantisation"
 zh-CN = "量化"
 zh-TW = "量化"
 [inputs.help]
-en = "auto picks the highest quality that fits the GPU memory."
-zh-CN = "auto 会选择显存放得下的最高质量版本。"
-zh-TW = "auto 會選擇顯示記憶體放得下的最高品質版本。"
+en = "auto picks the highest-quality quantised file that fits the GPU memory. Full-precision files (F16, BF16, F32) are used only when the repository has nothing else."
+zh-CN = "auto 会选择显存放得下的最高质量量化文件；只有仓库里没有其他文件时才会使用全精度文件（F16、BF16、F32）。"
+zh-TW = "auto 會選擇顯示記憶體放得下的最高品質量化檔案；只有儲存庫裡沒有其他檔案時才會使用全精度檔案（F16、BF16、F32）。"
 
 [[inputs]]
 id = "ctx"

@@ -362,7 +362,7 @@ pub(super) const MESSAGES: Messages = &[
     (HOST_PYTHON_PATH, "對應的 Python 直譯器"),
     (HOST_PATH_PLACEHOLDER, "自動尋找"),
     (HOST_APPLY, "套用"),
-    (HOST_BOTH_NEEDED, "請同時填寫兩個路徑，或都留空。"),
+    (HOST_BOTH_NEEDED, "請同時填寫 colab 路徑，或將直譯器留空。"),
     (HOST_MOCK_NOTE, "示範資料不會使用這些設定。"),
     (HOST_BUSY, "請等目前的工作完成。"),
     // 錯誤
@@ -819,4 +819,69 @@ pub(super) const MESSAGES: Messages = &[
     (DEPLOY_TITLE, "部署模型"),
     (DEPLOY_SUBTITLE, "一步啟動執行階段並提供模型服務。"),
     (DEPLOY_ACTION, "部署"),
+    // 修正輪
+    (FMT_HOURS, "{h} 小時"),
+    (FMT_DAYS, "{d} 天"),
+    (UNIT_HOURS, "小時"),
+    (UNIT_MINUTES, "分鐘"),
+    (UNIT_SECONDS, "秒"),
+    (MENU_QUIT, "結束 Colab Playground"),
+    (HOST_PYTHON_HINT, "選填。留空時會依 colab 檔案自動尋找。"),
+    (
+        SWITCH_UNMANAGED,
+        "非本應用程式啟動的執行階段會繼續計費，且不會自動停止：",
+    ),
+    (SWITCH_UNMANAGED_ITEM, "{name}"),
+    (SWITCH_UNMANAGED_MORE, "另有 {count} 個無法列出"),
+    (RUNTIME_SET_AUTO_STOP, "設定 {time}後自動停止"),
+    (
+        AUTO_STOP_SET,
+        "已設定 {time}後自動停止，由本應用程式在開啟期間執行。",
+    ),
+    (CANCEL_AUTO_STOP_TITLE, "取消自動停止？"),
+    (
+        CANCEL_AUTO_STOP_BODY,
+        "之後 {name} 會持續執行並計費，直到你手動停止它，即使關閉本應用程式也一樣。",
+    ),
+    (
+        CANCEL_AUTO_STOP_REARM,
+        "之後可以在它的卡片上重新設定自動停止（從那時起 {time}），但屆時只由本應用程式在開啟期間執行：執行階段上的自動停止無法重新啟動。",
+    ),
+    (CANCEL_AUTO_STOP_KEEP, "保留自動停止"),
+    (
+        QUIT_STOP_WIPED,
+        "「全部停止」會結束上方列出的每個執行階段的計費，包括其他帳號上的與非本應用程式啟動的，並清除其上的所有內容。",
+    ),
+    (
+        NEW_LIMIT_BODY,
+        "本應用程式在每個帳號上最多啟動 {limit} 個執行階段，{email} 已達上限。這個上限是本應用程式自己的設定，不是 Colab 的規定。",
+    ),
+    (NEW_LIMIT_COUNTED, "已計入：{names}。"),
+    (
+        NEW_LIMIT_HINT,
+        "只計入本應用程式啟動的執行階段，在瀏覽器中開啟的不計入。請先停止一個，或在設定中調高上限。",
+    ),
+    (NEW_OPEN_SETTINGS, "開啟設定"),
+    (
+        LIMIT_FOCUS_HINT,
+        "本應用程式在一個帳號上最多啟動幾個執行階段。只計入本應用程式啟動的執行階段。",
+    ),
+    (
+        PROV_ALLOCATED,
+        "已向 Colab 申請執行階段（第 {n} 次，共 {of} 次）",
+    ),
+    (PROV_RELEASED, "已停止這個執行階段"),
+    (PROV_RETRIED, "等待 {time}後重試"),
+    (
+        QUANT_FITS_ASSUMED,
+        "{gpu} GPU：{quant}（≈ {estimate}，以 {ctx} 個 token 的上下文估算；實際執行時若放得下會使用模型本身的最大值）",
+    ),
+    (
+        SESSIONS_ESTIMATE_NOTE,
+        "帶 ≈ 的數值是估算：Colab 只提供每個帳號的總量，本應用程式將它分攤到該帳號的各個執行階段。",
+    ),
+    (
+        RUN_LIMIT_HINT,
+        "可以在上方選擇一個已在執行的工作階段、先停止一個，或在設定中調高上限。",
+    ),
 ];

@@ -387,6 +387,7 @@ impl AppState {
             },
             |state, result, cx| {
                 state.finish_run(result, cx);
+                state.continue_stop_all(cx);
                 cx.notify();
             },
         );

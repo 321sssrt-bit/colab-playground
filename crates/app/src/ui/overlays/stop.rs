@@ -63,3 +63,65 @@ pub(super) fn render(
         })
         .into_any_element()
 }
+
+/// Selector of the button that cancels the auto-stop.
+pub const CANCEL_AUTO_STOP_CONFIRM: &str = "cancel-auto-stop-confirm";
+
+/// Cancel auto-stop, confirmed once: afterwards the runtime bills until stopped by hand.
+pub(super) fn cancel_auto_stop(
+    prompt: &StopPrompt,
+    state: &AppState,
+    handle: &Entity<AppState>,
+    cx: &App,
+) -> AnyElement {
+    let busy = state.is_cancelling_auto_stop(&prompt.target);
+    let (keep, confirm) = (
+        tr(cx, keys::CANCEL_AUTO_STOP_KEEP),
+        tr(cx, keys::RUNTIME_CANCEL_AUTO_STOP),
+    );
+    let mut dialog = Dialog::new(
+        "cancel-auto-stop",
+        tr(cx, keys::CANCEL_AUTO_STOP_TITLE),
+        close(handle),
+    )
+    .child(InlineMessage::new(
+        Severity::Warning,
+        tr_args(cx, keys::CANCEL_AUTO_STOP_BODY, &[("name", &prompt.label)]),
+    ))
+    .children(state.rearm_duration().map(|by| {
+        Paragraph::new(tr_args(
+            cx,
+            keys::CANCEL_AUTO_STOP_REARM,
+            &[("time", &crate::format::duration(cx, by))],
+        ))
+    }));
+    if let Some(error) = &prompt.error {
+        dialog = dialog.child(error_view::alert(
+            "cancel-auto-stop",
+            None,
+            error,
+            None,
+            handle,
+            cx,
+        ));
+    }
+    let go = handle.clone();
+    dialog
+        .action({
+            let handle = handle.clone();
+            move |_| cancel_button(keep, handle)
+        })
+        .action(move |_| {
+            tagged(
+                CANCEL_AUTO_STOP_CONFIRM,
+                Button::new(CANCEL_AUTO_STOP_CONFIRM, confirm)
+                    .variant(ButtonVariant::Danger)
+                    .loading(busy)
+                    .disabled(busy)
+                    .on_click(move |_, _, cx| {
+                        go.update(cx, |state, cx| state.confirm_cancel_auto_stop(cx))
+                    }),
+            )
+        })
+        .into_any_element()
+}

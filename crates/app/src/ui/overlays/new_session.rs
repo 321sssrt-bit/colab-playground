@@ -11,7 +11,7 @@ use ely_gpui_component::{
     overlays::Dialog,
     primitives::{IconName, Severity},
     theme::{ActiveTheme, TextSize},
-    typography::Paragraph,
+    typography::{Caption, Paragraph},
 };
 use gpui::{AnyElement, App, Entity, FontWeight, IntoElement, ParentElement, Styled, div};
 
@@ -38,6 +38,9 @@ pub(super) fn render(
     let dialog = Dialog::new("new-session", tr(cx, keys::NEW_TITLE), close(handle));
     let theme = cx.theme();
     Some(match &session.phase {
+        ProvisionPhase::Editing if state.session_limit_reached().is_some() => {
+            limit_dialog(dialog, state, handle, cx)
+        }
         ProvisionPhase::Editing => {
             let edit: provision_form::SpecEdit = {
                 let handle = handle.clone();
@@ -171,7 +174,14 @@ pub(super) fn render(
                 ProvisionPhase::Failed(error) => Some(error),
                 _ => None,
             };
-            let mut dialog = dialog.child(progress::render(&session.progress, false, cx));
+            if failed.is_some_and(|e| e.is(ErrorKind::SessionLimitReached)) {
+                // The cap is this app's own setting: offer to change it or see what counts.
+                return Some(limit_dialog(dialog, state, handle, cx));
+            }
+            let mut dialog = dialog;
+            if progress::has_lines(&session.progress, cx) {
+                dialog = dialog.child(progress::render(&session.progress, false, cx));
+            }
             dialog = match failed {
                 Some(error) => dialog.child(error_view::alert(
                     "provision",
@@ -186,35 +196,13 @@ pub(super) fn render(
                     InlineMessage::new(Severity::Info, tr(cx, keys::NEW_CANCELLED)),
                 )),
             };
-            let limit = failed.is_some_and(|e| e.is(ErrorKind::SessionLimitReached));
-            let (close_label, again, sessions) = (
-                tr(cx, keys::ACTION_CLOSE),
-                tr(cx, keys::NEW_CHANGE),
-                tr(cx, keys::NEW_SHOW_SESSIONS),
-            );
-            let (again_handle, sessions_handle) = (handle.clone(), handle.clone());
-            let dialog = dialog.action({
-                let handle = handle.clone();
-                move |_| cancel_button(close_label, handle)
-            });
-            let dialog = if limit {
-                dialog.action(move |_| {
-                    tagged(
-                        "new-session-open-sessions",
-                        Button::new("new-session-open-sessions", sessions).on_click(
-                            move |_, _, cx| {
-                                sessions_handle.update(cx, |state, cx| {
-                                    state.close_overlay(cx);
-                                    state.navigate(Route::Sessions, cx);
-                                })
-                            },
-                        ),
-                    )
-                })
-            } else {
-                dialog
-            };
+            let (close_label, again) = (tr(cx, keys::ACTION_CLOSE), tr(cx, keys::NEW_CHANGE));
+            let again_handle = handle.clone();
             dialog
+                .action({
+                    let handle = handle.clone();
+                    move |_| cancel_button(close_label, handle)
+                })
                 .action(move |_| {
                     tagged(
                         "new-session-change",
@@ -228,4 +216,78 @@ pub(super) fn render(
                 .into_any_element()
         }
     })
+}
+
+/// Selector of the session-limit explanation.
+pub const NEW_SESSION_LIMIT: &str = "new-session-limit";
+
+/// The session cap is reached: what counts, that it is this app's own setting, and the way to
+/// change it or to see the runtimes that count.
+fn limit_dialog(
+    dialog: Dialog,
+    state: &AppState,
+    handle: &Entity<AppState>,
+    cx: &App,
+) -> AnyElement {
+    let limit = state.session_limit_reached();
+    let max = limit
+        .as_ref()
+        .map_or(state.defaults().max_concurrent_sessions, |l| l.limit);
+    let email = state
+        .active_email()
+        .unwrap_or_else(|| tr(cx, keys::ACCOUNTS_NO_EMAIL).to_string());
+    let counted = limit
+        .as_ref()
+        .map(|l| crate::format::list(cx, &l.counted))
+        .unwrap_or_default();
+    let mut body = div().flex().flex_col().gap_2().child(InlineMessage::new(
+        Severity::Warning,
+        tr_args(
+            cx,
+            keys::NEW_LIMIT_BODY,
+            &[("limit", &max.to_string()), ("email", &email)],
+        ),
+    ));
+    if !counted.is_empty() {
+        body = body.child(Paragraph::new(tr_args(
+            cx,
+            keys::NEW_LIMIT_COUNTED,
+            &[("names", &counted)],
+        )));
+    }
+    body = body.child(Caption::new(tr(cx, keys::NEW_LIMIT_HINT)));
+    let (close_label, sessions, settings) = (
+        tr(cx, keys::ACTION_CLOSE),
+        tr(cx, keys::NEW_SHOW_SESSIONS),
+        tr(cx, keys::NEW_OPEN_SETTINGS),
+    );
+    let (sessions_handle, settings_handle) = (handle.clone(), handle.clone());
+    dialog
+        .child(tagged(NEW_SESSION_LIMIT, body))
+        .action({
+            let handle = handle.clone();
+            move |_| cancel_button(close_label, handle)
+        })
+        .action(move |_| {
+            tagged(
+                "new-session-open-sessions",
+                Button::new("new-session-open-sessions", sessions).on_click(move |_, _, cx| {
+                    sessions_handle.update(cx, |state, cx| {
+                        state.close_overlay(cx);
+                        state.navigate(Route::Sessions, cx);
+                    })
+                }),
+            )
+        })
+        .action(move |_| {
+            tagged(
+                "new-session-open-settings",
+                Button::new("new-session-open-settings", settings)
+                    .primary()
+                    .on_click(move |_, _, cx| {
+                        settings_handle.update(cx, |state, cx| state.open_limit_setting(cx))
+                    }),
+            )
+        })
+        .into_any_element()
 }

@@ -416,7 +416,10 @@ pub(super) const MESSAGES: Messages = &[
     (HOST_PYTHON_PATH, "Its Python interpreter"),
     (HOST_PATH_PLACEHOLDER, "Found automatically"),
     (HOST_APPLY, "Apply"),
-    (HOST_BOTH_NEEDED, "Set both paths, or leave both empty."),
+    (
+        HOST_BOTH_NEEDED,
+        "Set the colab path too, or leave the interpreter empty.",
+    ),
     (HOST_MOCK_NOTE, "Demo data ignores these settings."),
     (HOST_BUSY, "Wait for the current task to finish."),
     // Errors
@@ -960,4 +963,75 @@ pub(super) const MESSAGES: Messages = &[
         "Start a runtime and serve a model in one go.",
     ),
     (DEPLOY_ACTION, "Deploy"),
+    // Fix round
+    (FMT_HOURS, "{h} h"),
+    (FMT_DAYS, "{d} d"),
+    (UNIT_HOURS, "h"),
+    (UNIT_MINUTES, "min"),
+    (UNIT_SECONDS, "s"),
+    (MENU_QUIT, "Quit Colab Playground"),
+    (
+        HOST_PYTHON_HINT,
+        "Optional. Left empty, it is found from the colab file.",
+    ),
+    (
+        SWITCH_UNMANAGED,
+        "Runtimes not started by this app keep billing, with no automatic stop:",
+    ),
+    (SWITCH_UNMANAGED_ITEM, "{name}"),
+    (
+        SWITCH_UNMANAGED_MORE,
+        "{count} more that could not be listed",
+    ),
+    (RUNTIME_SET_AUTO_STOP, "Set auto-stop in {time}"),
+    (
+        AUTO_STOP_SET,
+        "Auto-stop set for {time} from now. This app enforces it while it is open.",
+    ),
+    (CANCEL_AUTO_STOP_TITLE, "Cancel auto-stop?"),
+    (
+        CANCEL_AUTO_STOP_BODY,
+        "{name} will then keep running and billing until you stop it by hand, even if this app is closed.",
+    ),
+    (
+        CANCEL_AUTO_STOP_REARM,
+        "You can set an auto-stop again from its card ({time} from then), but only this app enforces it then, while it is open: the stop on the runtime itself cannot be restarted.",
+    ),
+    (CANCEL_AUTO_STOP_KEEP, "Keep auto-stop"),
+    (
+        QUIT_STOP_WIPED,
+        "Stop all ends billing for every runtime listed, including ones on other accounts and ones not started by this app, and wipes everything on them.",
+    ),
+    (
+        NEW_LIMIT_BODY,
+        "This app starts at most {limit} runtimes per account, and {email} is at that limit. The limit is this app's own setting, not a Colab rule.",
+    ),
+    (NEW_LIMIT_COUNTED, "Counted: {names}."),
+    (
+        NEW_LIMIT_HINT,
+        "Only runtimes started by this app count; ones opened in the browser do not. Stop one, or raise the limit in Settings.",
+    ),
+    (NEW_OPEN_SETTINGS, "Open settings"),
+    (
+        LIMIT_FOCUS_HINT,
+        "How many runtimes this app starts on one account at most. Only runtimes started by this app count.",
+    ),
+    (
+        PROV_ALLOCATED,
+        "Asked Colab for a runtime (attempt {n} of {of})",
+    ),
+    (PROV_RELEASED, "Stopped that runtime"),
+    (PROV_RETRIED, "Waited {time}, then tried again"),
+    (
+        QUANT_FITS_ASSUMED,
+        "{gpu} GPU: {quant} (≈ {estimate}, estimated for {ctx} tokens of context; the run uses the model's own maximum if it fits)",
+    ),
+    (
+        SESSIONS_ESTIMATE_NOTE,
+        "≈ values are estimates: Colab reports only each account's total, so the app divides it between that account's runtimes.",
+    ),
+    (
+        RUN_LIMIT_HINT,
+        "Choose a session that is already running above, stop one, or raise the limit in Settings.",
+    ),
 ];

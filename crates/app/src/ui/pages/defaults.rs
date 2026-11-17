@@ -12,7 +12,7 @@ use colab_playground_core::{
 };
 use ely_gpui_component::{
     buttons::{Button, ButtonVariant},
-    forms::{Choice, DurationPicker, Input, NumberInput, Select, Switch},
+    forms::{Choice, Input, NumberInput, Select, Switch},
     settings::{SettingsRow, SettingsSection},
     theme::{ActiveTheme, ControlSize},
     typography::Caption,
@@ -111,8 +111,8 @@ fn duration_field(
     seconds: bool,
     on_change: impl Fn(Duration, &mut gpui::Window, &mut App) + 'static,
 ) -> AnyElement {
-    let picker = DurationPicker::new(id, value).on_change(on_change);
-    if seconds { picker.seconds() } else { picker }.into_any_element()
+    let field = crate::ui::duration_field::DurationField::new(id, value, on_change);
+    if seconds { field.seconds() } else { field }.into_any_element()
 }
 
 fn cu_field(
@@ -483,7 +483,7 @@ pub fn host_section(
         .row(row(
             "colab_python",
             keys::HOST_PYTHON_PATH,
-            Some(tr(cx, keys::HOST_BOTH_NEEDED)),
+            Some(tr(cx, keys::HOST_PYTHON_HINT)),
             path(&inputs.colab_python),
             cx,
         ))
@@ -508,7 +508,7 @@ pub fn host_section(
                                 (!text.is_empty()).then_some(text)
                             };
                             let (colab, python) = (read(&colab, cx), read(&python, cx));
-                            if colab.is_some() != python.is_some() {
+                            if colab.is_none() && python.is_some() {
                                 apply.update(cx, |state, cx| state.warn_host_paths(cx));
                                 return;
                             }
@@ -517,4 +517,35 @@ pub fn host_section(
                 )),
         );
     section
+}
+
+/// Selector of the session-limit card shown at the top of Settings from the New session
+/// dialog.
+pub const LIMIT_FOCUS_SELECTOR: &str = "settings-limit-focus";
+
+/// The session limit, called out at the top of Settings when the New session dialog sends
+/// the user here.
+pub fn limit_focus(state: &AppState, handle: &Entity<AppState>, cx: &App) -> impl IntoElement {
+    let theme = cx.theme();
+    let d = state.defaults();
+    tagged(
+        LIMIT_FOCUS_SELECTOR,
+        ely_gpui_component::layout::Card::new()
+            .header(
+                ely_gpui_component::layout::CardHeader::new(tr(cx, keys::DEF_CONCURRENT))
+                    .description(tr(cx, keys::LIMIT_FOCUS_HINT)),
+            )
+            .child(
+                div().w(theme.menu_width()).child(
+                    NumberInput::new("def-concurrent-focus", f64::from(d.max_concurrent_sessions))
+                        .range(1.0, MAX_CONCURRENT_FIELD)
+                        .precision(0)
+                        .step(1.0)
+                        .on_change(edit(handle, |d, v: f64| {
+                            d.max_concurrent_sessions = v.round() as u32
+                        })),
+                ),
+            ),
+    )
+    .w_full()
 }

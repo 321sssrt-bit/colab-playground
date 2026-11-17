@@ -45,6 +45,14 @@ pub fn extend_selector(label: &str) -> String {
 pub fn forward_selector(label: &str) -> String {
     format!("runtime-forward {label}")
 }
+/// Selector of a runtime's "Cancel auto-stop" button.
+pub fn cancel_auto_stop_selector(label: &str) -> String {
+    format!("runtime-cancel-auto-stop {label}")
+}
+/// Selector of a runtime's "Set auto-stop" button.
+pub fn set_auto_stop_selector(label: &str) -> String {
+    format!("runtime-set-auto-stop {label}")
+}
 /// Selector of a runtime's "Switch to this account" button.
 pub fn switch_selector(label: &str) -> String {
     format!("runtime-switch {label}")
@@ -285,83 +293,91 @@ fn actions(
             .into_any_element();
     }
     let named = runtime.id.name.is_some();
-    let disabled_reason = (!named).then(|| tr(cx, keys::RUNTIME_UNNAMED_REASON));
-    let with_reason = |id: String, button: Button| -> AnyElement {
-        match &disabled_reason {
-            Some(reason) => div()
-                .id(SharedString::from(id))
-                .tooltip(Tooltip::text(reason.clone()))
-                .child(button.disabled(true))
-                .into_any_element(),
-            None => button.into_any_element(),
-        }
-    };
-    if runtime.managed || !named {
-        if let Some(by) = state
-            .extension_for(runtime)
-            .filter(|_| runtime.auto_stop_at.is_some() || !named)
-        {
+    // Actions that cannot apply are left out; only forwarding stays visible (disabled, with
+    // the reason) on runtimes this app cannot address by name.
+    if named && runtime.auto_stop_at.is_some() {
+        if let Some(by) = state.extension_for(runtime) {
             let (handle, target) = (handle.clone(), target.clone());
             let busy = state.is_busy(Op::Extend(key_of(&target)));
             row = row.child(tagged(
                 extend_selector(label),
-                with_reason(
-                    format!("extend-wrap-{label}"),
-                    Button::new(
-                        SharedString::from(format!("extend-{label}")),
-                        tr_args(
-                            cx,
-                            keys::RUNTIME_EXTEND_BY,
-                            &[("time", &format::duration(cx, by))],
-                        ),
-                    )
-                    .size(ControlSize::Sm)
-                    .loading(busy)
-                    .on_click(move |_, _, cx| {
-                        handle.update(cx, |state, cx| state.extend_session(target.clone(), cx))
-                    }),
-                ),
+                Button::new(
+                    SharedString::from(format!("extend-{label}")),
+                    tr_args(
+                        cx,
+                        keys::RUNTIME_EXTEND_BY,
+                        &[("time", &format::duration(cx, by))],
+                    ),
+                )
+                .size(ControlSize::Sm)
+                .loading(busy)
+                .on_click(move |_, _, cx| {
+                    handle.update(cx, |state, cx| state.extend_session(target.clone(), cx))
+                }),
             ));
         }
-        if runtime.auto_stop_at.is_some() || !named {
-            let (handle, target) = (handle.clone(), target.clone());
-            row = row.child(tagged(
-                format!("runtime-cancel-auto-stop {label}"),
-                with_reason(
-                    format!("cancel-wrap-{label}"),
-                    Button::new(
-                        SharedString::from(format!("cancel-auto-stop-{label}")),
-                        tr(cx, keys::RUNTIME_CANCEL_AUTO_STOP),
-                    )
-                    .variant(ButtonVariant::Ghost)
-                    .size(ControlSize::Sm)
-                    .on_click(move |_, _, cx| {
-                        handle.update(cx, |state, cx| state.cancel_auto_stop(target.clone(), cx))
-                    }),
-                ),
-            ));
-        }
-    }
-    let (forward_handle, forward_target) = (handle.clone(), target.clone());
-    row = row.child(tagged(
-        forward_selector(label),
-        with_reason(
-            format!("forward-wrap-{label}"),
+        let (handle, target) = (handle.clone(), target.clone());
+        row = row.child(tagged(
+            cancel_auto_stop_selector(label),
             Button::new(
-                SharedString::from(format!("forward-{label}")),
-                tr(cx, keys::FORWARD_TITLE),
+                SharedString::from(format!("cancel-auto-stop-{label}")),
+                tr(cx, keys::RUNTIME_CANCEL_AUTO_STOP),
             )
             .variant(ButtonVariant::Ghost)
-            .icon(IconName::Link)
             .size(ControlSize::Sm)
             .on_click(move |_, _, cx| {
-                forward_handle.update(cx, |state, cx| {
-                    state.open_forward_dialog(forward_target.clone(), cx)
+                handle.update(cx, |state, cx| {
+                    state.request_cancel_auto_stop(target.clone(), cx)
                 })
             }),
-        ),
-    ));
-    row.into_any_element()
+        ));
+    } else if named
+        && runtime.managed
+        && let Some(by) = state.rearm_duration()
+    {
+        let (handle, target) = (handle.clone(), target.clone());
+        let busy = state.is_busy(Op::Extend(key_of(&target)));
+        row = row.child(tagged(
+            set_auto_stop_selector(label),
+            Button::new(
+                SharedString::from(format!("set-auto-stop-{label}")),
+                tr_args(
+                    cx,
+                    keys::RUNTIME_SET_AUTO_STOP,
+                    &[("time", &format::duration(cx, by))],
+                ),
+            )
+            .size(ControlSize::Sm)
+            .loading(busy)
+            .on_click(move |_, _, cx| {
+                handle.update(cx, |state, cx| state.set_auto_stop(target.clone(), cx))
+            }),
+        ));
+    }
+    let (forward_handle, forward_target) = (handle.clone(), target.clone());
+    let forward = Button::new(
+        SharedString::from(format!("forward-{label}")),
+        tr(cx, keys::FORWARD_TITLE),
+    )
+    .variant(ButtonVariant::Ghost)
+    .icon(IconName::Link)
+    .size(ControlSize::Sm)
+    .on_click(move |_, _, cx| {
+        forward_handle.update(cx, |state, cx| {
+            state.open_forward_dialog(forward_target.clone(), cx)
+        })
+    });
+    let forward: AnyElement = if named {
+        forward.into_any_element()
+    } else {
+        div()
+            .id(SharedString::from(format!("forward-wrap-{label}")))
+            .tooltip(Tooltip::text(tr(cx, keys::RUNTIME_UNNAMED_REASON)))
+            .child(forward.disabled(true))
+            .into_any_element()
+    };
+    row.child(tagged(forward_selector(label), forward))
+        .into_any_element()
 }
 
 /// One forward: state, address (copy, open) and close.

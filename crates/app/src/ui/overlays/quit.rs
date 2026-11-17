@@ -3,10 +3,12 @@
 
 use ely_gpui_component::{
     buttons::{Button, ButtonVariant},
+    data_display::{Badge, Tone},
     feedback::InlineMessage,
     overlays::Dialog,
     primitives::Severity,
-    typography::Paragraph,
+    theme::{ActiveTheme, TextSize},
+    typography::{Caption, Paragraph},
 };
 use gpui::{AnyElement, App, Entity, IntoElement, ParentElement, SharedString, Styled, div};
 
@@ -37,7 +39,10 @@ pub(super) fn render(
     handle: &Entity<AppState>,
     cx: &App,
 ) -> AnyElement {
-    let billing = &prompt.billing;
+    // Live, not the snapshot taken when the prompt opened: the list may still be loading.
+    let live = state.billing();
+    let billing = &live;
+    let listed = matches!(state.runtimes(), crate::state::Load::Ready(_));
     let stopping = state.is_stopping_all();
     let mut lines: Vec<(Severity, SharedString)> = Vec::new();
     if !billing.watched.is_empty() {
@@ -79,7 +84,13 @@ pub(super) fn render(
                     .map(|(severity, text)| InlineMessage::new(severity, text)),
             ),
         )
-        .child(Paragraph::new(tr(cx, keys::QUIT_LEAVE_EXPLAINED)));
+        .child(runtime_list(billing, state, cx))
+        .children((!listed).then(|| Caption::new(tr(cx, keys::SESSIONS_LOADING))))
+        .child(Paragraph::new(tr(cx, keys::QUIT_LEAVE_EXPLAINED)))
+        .child(tagged(
+            "quit-wipe",
+            InlineMessage::new(Severity::Warning, tr(cx, keys::QUIT_STOP_WIPED)),
+        ));
     for (label, error) in &prompt.failures {
         let message = errors::explain(error, false, cx).message;
         dialog = dialog.child(tagged(
@@ -124,11 +135,52 @@ pub(super) fn render(
                 Button::new(QUIT_STOP_ALL, stop)
                     .variant(ButtonVariant::Danger)
                     .loading(stopping)
-                    .disabled(stopping)
+                    .disabled(stopping || !listed)
                     .on_click(move |_, _, cx| {
                         stop_handle.update(cx, |state, cx| state.quit_stopping_all(cx))
                     }),
             )
         })
+        .into_any_element()
+}
+
+/// Every runtime "Stop all" would stop, by name and account, marking the ones this app did
+/// not start.
+fn runtime_list(billing: &crate::state::Billing, state: &AppState, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    let rows = billing
+        .watched
+        .iter()
+        .chain(&billing.unwatched)
+        .filter_map(|target| state.runtime(target))
+        .map(|runtime| {
+            let label = crate::state::runtime_label(runtime);
+            let email = runtime
+                .account_email
+                .clone()
+                .unwrap_or_else(|| tr(cx, keys::ACCOUNTS_NO_EMAIL).to_string());
+            let mut row = div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_2()
+                .text_size(theme.text_size(TextSize::Sm))
+                .child(format!(
+                    "• {}",
+                    tr_args(cx, keys::ENDED_LINE, &[("name", &label), ("email", &email)])
+                ));
+            if !runtime.managed {
+                row = row.child(tagged(
+                    format!("quit-unmanaged {label}"),
+                    Badge::new(tr(cx, keys::RUNTIME_UNMANAGED)).tone(Tone::Warning),
+                ));
+            }
+            tagged(format!("quit-runtime {label}"), row)
+        });
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .children(rows)
         .into_any_element()
 }

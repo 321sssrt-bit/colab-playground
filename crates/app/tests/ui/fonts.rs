@@ -7,7 +7,7 @@
 //! app's root text style) still gets real Han glyphs from the platform's own fallback. It reads
 //! the host's fonts, so it runs by default only on Windows, where Microsoft YaHei UI and
 //! JhengHei UI always exist (this `cfg_attr` is the crate's one OS gate outside `platform`).
-//! On Linux, run it with `--ignored` where Noto Sans CJK is installed. It has never run on
+//! On Linux, run it with `--ignored` where Noto Sans CJK is installed. Leave it ignored on
 //! macOS, where creating gpui's windowed platform off the main thread may abort. gpui's
 //! headless Windows platform has no text system, so this creates the windowed platform (no
 //! window is opened).

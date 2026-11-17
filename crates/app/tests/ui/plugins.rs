@@ -329,3 +329,62 @@ fn cancelling_a_deployment_leaves_nothing_billing(cx: &mut TestAppContext) {
     let left = app.mock.runtimes(&CancelToken::new()).expect("listing");
     assert!(left.runtimes.is_empty(), "nothing bills: {left:?}");
 }
+
+#[gpui::test]
+fn accounts_cannot_change_while_a_deployment_runs(cx: &mut TestAppContext) {
+    let mut app = TestApp::new(cx);
+    let lin = app.read(|state, _| {
+        state.accounts().ready().and_then(|view| {
+            view.accounts
+                .iter()
+                .find(|a| a.email.as_deref() == Some("lin@example.com"))
+                .map(|a| a.id.clone())
+        })
+    });
+    let lin = lin.expect("the demo's second account");
+    app.click(Route::Plugins.nav_selector());
+    app.click("plugin-run llama-cpp");
+    app.update(|state, cx| {
+        // Pick an existing session so the run does not hit the session limit.
+        state.edit_run_form(|form| form.existing = Some("a100-7f3a".into()), cx);
+        state.start_run(vec![("repo".into(), REPO.into())], String::new(), cx);
+        assert!(state.is_running_plugin());
+        assert!(state.account_change_block().is_some());
+        state.request_switch(lin.clone(), cx);
+        state.open_add_account(cx);
+        assert!(
+            state.dialog().is_none(),
+            "neither a switch nor a sign-in starts"
+        );
+    });
+    let blocked = app.text(keys::ACCOUNT_CHANGE_BLOCKED);
+    assert!(app.toasts().contains(&blocked), "{:?}", app.toasts());
+}
+
+// Several iterations shuffle task scheduling, so the older search can finish last.
+#[gpui::test(iterations = 12)]
+fn only_the_latest_search_is_shown(cx: &mut TestAppContext) {
+    let mut app = TestApp::with(cx, Options::scenario(MockScenario::single()));
+    open_deploy_form(&mut app);
+    app.update(|state, cx| {
+        state.search_hf("qwen3".into(), cx);
+        state.search_hf("8b".into(), cx);
+    });
+    app.settle();
+    let results: Vec<String> = app.read(|state, _| {
+        state
+            .run_form()
+            .and_then(|form| form.hf.results.ready().cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|model| model.id)
+            .collect()
+    });
+    assert!(!results.is_empty());
+    assert!(
+        results
+            .iter()
+            .all(|id| id.to_ascii_lowercase().contains("8b")),
+        "results match the last query only: {results:?}"
+    );
+}

@@ -62,23 +62,31 @@ fn turning_on_a_limit_in_settings_saves_it(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn cli_paths_are_saved_together_or_not_at_all(cx: &mut TestAppContext) {
+fn a_colab_path_alone_is_enough_and_an_interpreter_alone_is_refused(cx: &mut TestAppContext) {
     let mut app = TestApp::new(cx);
     app.click(Route::Settings.nav_selector());
-    app.fill(|inputs| inputs.colab_path.clone(), "/opt/colab/bin/colab");
-    app.click("host-apply");
-    let warning = app.text(keys::HOST_BOTH_NEEDED);
-    assert!(app.toasts().contains(&warning), "{:?}", app.toasts());
-    assert_eq!(app.saved_settings().and_then(|s| s.colab_path), None);
-
     app.fill(
         |inputs| inputs.colab_python.clone(),
         "/opt/colab/bin/python",
     );
     app.click("host-apply");
+    let warning = app.text(keys::HOST_BOTH_NEEDED);
+    assert!(app.toasts().contains(&warning), "{:?}", app.toasts());
+    assert_eq!(app.saved_settings().and_then(|s| s.colab_python), None);
+
+    // The interpreter is derived from the colab file when left empty (core's
+    // `Toolchain::from_colab_path`).
+    app.fill(|inputs| inputs.colab_python.clone(), "");
+    app.fill(|inputs| inputs.colab_path.clone(), "/opt/colab/bin/colab");
+    app.click("host-apply");
     let saved = app.saved_settings().expect("saved");
     assert_eq!(saved.colab_path.as_deref(), Some("/opt/colab/bin/colab"));
-    assert_eq!(saved.colab_python.as_deref(), Some("/opt/colab/bin/python"));
+    assert_eq!(saved.colab_python, None);
+    let toolchain = saved.host_setup().toolchain.expect("a toolchain");
+    assert!(
+        toolchain.needs_resolution(),
+        "the interpreter is found later"
+    );
     assert!(
         app.read(|state, _| state.backend_error().is_none()),
         "the simulation ignores the paths and keeps running"

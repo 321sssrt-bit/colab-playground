@@ -276,3 +276,37 @@ mod tests {
         assert_eq!(fallbacks.fallback_list(), [(*last).to_owned()]);
     }
 }
+
+gpui::actions!(colab_playground, [Quit]);
+
+/// The app menu: the app's name with Quit. Built on every OS (so tests check it), installed
+/// only on macOS by [`install_quit`].
+pub fn app_menus(cx: &App) -> Vec<gpui::Menu> {
+    vec![gpui::Menu {
+        name: crate::i18n::tr(cx, crate::i18n::keys::APP_NAME),
+        items: vec![gpui::MenuItem::action(
+            crate::i18n::tr(cx, crate::i18n::keys::MENU_QUIT),
+            Quit,
+        )],
+        disabled: false,
+    }]
+}
+
+/// Cmd+Q for [`Quit`] (installed on macOS only; built everywhere so tests check it).
+pub fn quit_bindings() -> Vec<gpui::KeyBinding> {
+    vec![gpui::KeyBinding::new("cmd-q", Quit, None)]
+}
+
+/// macOS has no Cmd+Q without an app menu (gpui builds the menu bar only from `set_menus`),
+/// so bind it and install the minimal menu there. Windows and Linux quit by closing the
+/// window, which the close check already covers.
+pub fn install_quit(cx: &mut App) {
+    #[cfg(target_os = "macos")]
+    {
+        cx.bind_keys(quit_bindings());
+        let menus = app_menus(cx);
+        cx.set_menus(menus);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = cx;
+}

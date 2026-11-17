@@ -180,6 +180,7 @@ impl AppState {
                     Err(error) => ProvisionPhase::Failed(error),
                 };
                 state.after_runtime_change(cx);
+                state.continue_stop_all(cx);
                 cx.notify();
             },
         );
@@ -227,5 +228,46 @@ impl AppState {
             self.set_input(InputSlot::SessionName, name);
             cx.notify();
         }
+    }
+}
+
+/// The session cap on the active account, when it is reached.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LimitReached {
+    /// `max_concurrent_sessions` (this app's own setting).
+    pub limit: u32,
+    /// The active account's email.
+    pub email: Option<String>,
+    /// Runtimes that count: those this app can address by name (it started them).
+    pub counted: Vec<String>,
+}
+
+impl AppState {
+    /// The session cap, checked before anything is asked of Colab (core still enforces it).
+    /// Like core, it counts named runtimes on the active account; runtimes opened elsewhere do
+    /// not count.
+    pub fn session_limit_reached(&self) -> Option<LimitReached> {
+        let view = self.runtimes().ready()?;
+        let limit = self.defaults().max_concurrent_sessions.max(1);
+        let counted: Vec<String> = view
+            .runtimes
+            .iter()
+            .filter(|r| r.on_active_account)
+            .filter_map(|r| r.id.name.clone())
+            .collect();
+        (counted.len() as u32 >= limit).then(|| LimitReached {
+            limit,
+            email: self.active_email(),
+            counted,
+        })
+    }
+
+    /// Opens Settings with the session limit called out at the top.
+    pub fn open_limit_setting(&mut self, cx: &mut Context<Self>) {
+        self.close_overlay(cx);
+        self.new_session = None;
+        self.navigate(crate::route::Route::Settings, cx);
+        self.settings_focus = true;
+        cx.notify();
     }
 }

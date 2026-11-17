@@ -36,12 +36,16 @@ pub fn approx(cx: &App, value: &str) -> SharedString {
 pub fn duration(cx: &App, duration: Duration) -> SharedString {
     let minutes = duration.as_secs() / 60;
     let (days, hours, mins) = (minutes / 1440, minutes / 60 % 24, minutes % 60);
-    if days > 0 {
+    if days > 0 && hours == 0 {
+        tr_args(cx, keys::FMT_DAYS, &[("d", &days.to_string())])
+    } else if days > 0 {
         tr_args(
             cx,
             keys::FMT_DAYS_HOURS,
             &[("d", &days.to_string()), ("h", &hours.to_string())],
         )
+    } else if hours > 0 && mins == 0 {
+        tr_args(cx, keys::FMT_HOURS, &[("h", &hours.to_string())])
     } else if hours > 0 {
         tr_args(
             cx,

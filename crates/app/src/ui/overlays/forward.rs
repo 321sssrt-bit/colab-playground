@@ -13,7 +13,10 @@ use ely_gpui_component::{
     theme::{ActiveTheme, TextSize},
     typography::{Caption, Paragraph},
 };
-use gpui::{AnyElement, App, Entity, FontWeight, IntoElement, ParentElement, Styled, div};
+use gpui::{
+    AnyElement, App, Entity, FontWeight, InteractiveElement, IntoElement, ParentElement,
+    StatefulInteractiveElement, Styled, div,
+};
 
 use super::{cancel_button, close};
 use crate::{
@@ -89,26 +92,23 @@ pub(super) fn render(
             ),
             cx,
         ));
-    let mut dialog = Dialog::new("forward", tr(cx, keys::FORWARD_TITLE), close(handle))
+    let mut body = div()
+        .flex()
+        .flex_col()
+        .gap_3()
         .child(Paragraph::new(tr_args(
             cx,
             keys::FORWARD_INTRO,
             &[("name", &form.session)],
         )))
-        .child(ports)
-        .child(field(
-            tr(cx, keys::FORWARD_HEALTH),
-            div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(Input::new(&inputs.health))
-                .child(Caption::new(tr(cx, keys::FORWARD_HEALTH_HINT))),
-            cx,
+        .child(InlineMessage::new(
+            Severity::Info,
+            tr(cx, keys::FORWARD_BILLING_NOTE),
         ));
+    // The outcome of the last try goes first, so it is seen without scrolling.
     match &form.error {
         Some(error) if error.is(ErrorKind::PortReserved) => {
-            dialog = dialog.child(tagged(
+            body = body.child(tagged(
                 RESERVED_NOTE,
                 InlineMessage::new(
                     Severity::Danger,
@@ -126,7 +126,7 @@ pub(super) fn render(
                 Rc::new(move |_: &mut gpui::Window, cx: &mut App| submit(&handle, &inputs, cx))
                     as error_view::Retry
             };
-            dialog = dialog.child(error_view::alert(
+            body = body.child(error_view::alert(
                 "forward",
                 None,
                 error,
@@ -137,10 +137,25 @@ pub(super) fn render(
         }
         None => {}
     }
-    dialog = dialog.child(InlineMessage::new(
-        Severity::Info,
-        tr(cx, keys::FORWARD_BILLING_NOTE),
+    body = body.child(ports).child(field(
+        tr(cx, keys::FORWARD_HEALTH),
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(Input::new(&inputs.health))
+            .child(Caption::new(tr(cx, keys::FORWARD_HEALTH_HINT))),
+        cx,
     ));
+    // At the smallest window an error would push the dialog past the window: the body scrolls.
+    let dialog = Dialog::new("forward", tr(cx, keys::FORWARD_TITLE), close(handle)).child(
+        div()
+            .id("forward-body")
+            .max_h(gpui::rems(17.0))
+            .overflow_y_scroll()
+            .pr_2()
+            .child(body),
+    );
     let (cancel, label) = (tr(cx, keys::ACTION_CANCEL), tr(cx, keys::FORWARD_ACTION));
     let (go, fields) = (handle.clone(), inputs.clone());
     dialog

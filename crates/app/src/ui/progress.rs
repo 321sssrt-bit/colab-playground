@@ -33,7 +33,7 @@ pub fn headline(progress: &ProvisionProgress, cx: &App) -> SharedString {
 }
 
 /// One event as a sentence; `None` for events folded into others.
-pub fn sentence(event: &ProvisionEvent, cx: &App) -> Option<(SharedString, Tone)> {
+pub fn sentence(event: &ProvisionEvent, done: bool, cx: &App) -> Option<(SharedString, Tone)> {
     let hardware = |gpu: &Option<String>, vram: &Option<u32>| {
         format::hardware(cx, gpu.as_deref(), *vram).unwrap_or_else(|| tr(cx, keys::PROV_NO_GPU))
     };
@@ -44,7 +44,11 @@ pub fn sentence(event: &ProvisionEvent, cx: &App) -> Option<(SharedString, Tone)
         } => (
             tr_args(
                 cx,
-                keys::PROV_ALLOCATING,
+                if done {
+                    keys::PROV_ALLOCATED
+                } else {
+                    keys::PROV_ALLOCATING
+                },
                 &[
                     ("n", &attempt.to_string()),
                     ("of", &max_attempts.to_string()),
@@ -87,7 +91,17 @@ pub fn sentence(event: &ProvisionEvent, cx: &App) -> Option<(SharedString, Tone)
             ),
             Tone::Warn,
         ),
-        ProvisionEvent::Releasing { .. } => (tr(cx, keys::PROV_RELEASING), Tone::Info),
+        ProvisionEvent::Releasing { .. } => (
+            tr(
+                cx,
+                if done {
+                    keys::PROV_RELEASED
+                } else {
+                    keys::PROV_RELEASING
+                },
+            ),
+            Tone::Busy,
+        ),
         ProvisionEvent::OrphanDetected { released: true, .. } => {
             (tr(cx, keys::PROV_ORPHAN_RELEASED), Tone::Info)
         }
@@ -97,7 +111,11 @@ pub fn sentence(event: &ProvisionEvent, cx: &App) -> Option<(SharedString, Tone)
         ProvisionEvent::Retrying { delay_secs, .. } => (
             tr_args(
                 cx,
-                keys::PROV_RETRYING,
+                if done {
+                    keys::PROV_RETRIED
+                } else {
+                    keys::PROV_RETRYING
+                },
                 &[("time", &format::short_wait(cx, *delay_secs))],
             ),
             Tone::Busy,
@@ -132,11 +150,12 @@ pub fn sentence(event: &ProvisionEvent, cx: &App) -> Option<(SharedString, Tone)
 }
 
 /// How a line looks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Tone {
     /// Under way (spinner while it is the last line).
     Busy,
     /// Plain information.
+    #[default]
     Info,
     /// Went well.
     Good,
@@ -150,21 +169,26 @@ pub enum Tone {
 pub fn render(progress: &ProvisionProgress, live: bool, cx: &App) -> AnyElement {
     let theme = cx.theme();
     let colors = &theme.colors;
-    let lines: Vec<(SharedString, Tone)> = progress
+    // A step is finished once something came after it, or once provisioning has ended: it then
+    // reads as done ("Asked Colab…") with a check, never "…" with a bullet.
+    let shown: Vec<&ProvisionEvent> = progress
         .events
         .iter()
-        .filter_map(|event| sentence(event, cx))
+        .filter(|event| sentence(event, true, cx).is_some())
         .collect();
-    let count = lines.len();
-    let rows = lines.into_iter().enumerate().map(|(index, (text, tone))| {
+    let count = shown.len();
+    let rows = shown.into_iter().enumerate().map(|(index, event)| {
         let last = index + 1 == count;
-        let marker = if last && live && tone == Tone::Busy {
+        let current = last && live;
+        let (text, tone) = sentence(event, !current, cx).unwrap_or_default();
+        let marker = if current && tone == Tone::Busy {
             Spinner::new(("provision-line", index))
                 .size(IconSize::Sm)
                 .into_any_element()
         } else {
             let (icon, color) = match tone {
-                Tone::Busy | Tone::Info => (IconName::Dot, colors.fg_muted),
+                Tone::Busy | Tone::Info if current => (IconName::Dot, colors.fg_muted),
+                Tone::Busy | Tone::Info => (IconName::CircleCheck, colors.fg_muted),
                 Tone::Good => (IconName::CircleCheck, colors.success),
                 Tone::Warn => (IconName::TriangleAlert, colors.warning),
                 Tone::Bad => (IconName::CircleX, colors.danger),
@@ -187,4 +211,12 @@ pub fn render(progress: &ProvisionProgress, live: bool, cx: &App) -> AnyElement 
         div().flex().flex_col().gap_1p5().children(rows),
     )
     .into_any_element()
+}
+
+/// Whether the progress list would show anything.
+pub fn has_lines(progress: &ProvisionProgress, cx: &App) -> bool {
+    progress
+        .events
+        .iter()
+        .any(|event| sentence(event, true, cx).is_some())
 }

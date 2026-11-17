@@ -2,18 +2,11 @@
 
 use colab_playground::{
     app,
-    backend::{BACKEND_ENV, BackendError, BackendKind, BackendSource, MockFlags},
+    backend::{BACKEND_ENV, USAGE, source_from_args},
     platform,
     settings::{CONFIG_DIR_ENV, SettingsStore, config_dir},
     state::StateOptions,
 };
-
-fn source(args: &[String]) -> Result<BackendSource, BackendError> {
-    match BackendKind::resolve(args, std::env::var(BACKEND_ENV).ok().as_deref())? {
-        BackendKind::Mock => Ok(BackendSource::interactive_mock(MockFlags::parse(args)?)),
-        BackendKind::Real => Ok(BackendSource::Real),
-    }
-}
 
 fn main() {
     env_logger::Builder::from_env(
@@ -21,11 +14,12 @@ fn main() {
     )
     .init();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let source = match source(&args) {
+    // Every argument is checked before any backend exists: a typo never starts the real one.
+    let source = match source_from_args(&args, std::env::var(BACKEND_ENV).ok().as_deref()) {
         Ok(source) => source,
         Err(error) => {
             log::error!("{error}");
-            eprintln!("colab-playground: {error}");
+            eprintln!("colab-playground: {error}\n{USAGE}");
             std::process::exit(2);
         }
     };

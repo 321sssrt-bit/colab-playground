@@ -10,7 +10,7 @@ use std::{
 };
 
 use colab_playground_core::{
-    Error,
+    Error, ErrorKind,
     backend::{GuardReport, Runtime, RuntimeRef, RuntimesView, StopOptions},
     guard::{Concern, Decision},
     tunnel::{TunnelId, TunnelInfo},
@@ -37,6 +37,9 @@ pub struct SessionsState {
     pub(crate) stop_failures: HashMap<RuntimeRef, Error>,
     pub(crate) tunnels: BTreeMap<TunnelId, TunnelInfo>,
     pub(crate) guard_error: Option<Error>,
+    /// Runtimes whose auto-stop was set again after a cancel: core's watchdog exited on the
+    /// cancel, so only the app-side guard enforces it (while the app is open).
+    pub(crate) rearmed: std::collections::HashSet<RuntimeRef>,
 }
 
 /// A runtime that ended while the app watched, and why.
@@ -297,6 +300,34 @@ impl AppState {
         );
     }
 
+    /// Asks before cancelling `target`'s auto-stop: afterwards it bills until stopped by hand.
+    pub fn request_cancel_auto_stop(&mut self, target: RuntimeRef, cx: &mut Context<Self>) {
+        let Some(runtime) = self.runtime(&target) else {
+            return;
+        };
+        self.overlay = Some(Overlay::CancelAutoStop(StopPrompt {
+            label: runtime_label(runtime),
+            email: runtime.account_email.clone(),
+            target,
+            error: None,
+        }));
+        cx.notify();
+    }
+
+    /// Cancels the auto-stop the confirmation is about.
+    pub fn confirm_cancel_auto_stop(&mut self, cx: &mut Context<Self>) {
+        let Some(Overlay::CancelAutoStop(prompt)) = &self.overlay else {
+            return;
+        };
+        let target = prompt.target.clone();
+        self.cancel_auto_stop(target, cx);
+    }
+
+    /// Whether cancelling `target`'s auto-stop is under way.
+    pub fn is_cancelling_auto_stop(&self, target: &RuntimeRef) -> bool {
+        self.ops.is_running(Op::CancelAutoStop(key_of(target)))
+    }
+
     /// Cancels `target`'s auto-stop (it then runs until stopped).
     pub fn cancel_auto_stop(&mut self, target: RuntimeRef, cx: &mut Context<Self>) {
         let work_target = target.clone();
@@ -305,8 +336,13 @@ impl AppState {
             cx,
             move |backend, cancel| backend.cancel_auto_stop(&work_target, cancel),
             move |state, result, cx| {
+                let asking = matches!(&state.overlay, Some(Overlay::CancelAutoStop(p)) if p.target == target);
                 match result {
                     Ok(()) => {
+                        if asking {
+                            state.overlay = None;
+                        }
+                        state.sessions.warnings.remove(&target);
                         state.toast(
                             Toast::new(tr(cx, keys::AUTO_STOP_CANCELLED))
                                 .severity(Severity::Warning),
@@ -314,9 +350,56 @@ impl AppState {
                         );
                         state.load_runtimes(cx);
                     }
+                    Err(error) => {
+                        if asking && let Some(Overlay::CancelAutoStop(prompt)) = &mut state.overlay {
+                            prompt.error = Some(error);
+                        } else {
+                            state.toast_error(&error, cx);
+                        }
+                    }
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    /// How far ahead "Set auto-stop" puts the stop on a runtime that has none: the default
+    /// runtime limit (core's own default when Settings has none).
+    pub fn rearm_duration(&self) -> Option<Duration> {
+        self.defaults()
+            .max_runtime
+            .or(colab_playground_core::Defaults::default().max_runtime)
+    }
+
+    /// Sets an auto-stop again on `target` (after it was cancelled), [`Self::rearm_duration`]
+    /// from now. Core's `extend_session` rewrites the deadline, but the runtime's watchdog
+    /// exited on the cancel, so from then on only the app-side guard enforces it.
+    pub fn set_auto_stop(&mut self, target: RuntimeRef, cx: &mut Context<Self>) {
+        let Some(by) = self.rearm_duration() else {
+            return;
+        };
+        let work_target = target.clone();
+        self.run_backend(
+            Op::Extend(key_of(&target)),
+            cx,
+            move |backend, cancel| backend.extend_session(&work_target, by, cancel),
+            move |state, result, cx| {
+                match result {
+                    Ok(_) => {
+                        state.sessions.rearmed.insert(target.clone());
+                        state.toast_done(
+                            tr_args(
+                                cx,
+                                keys::AUTO_STOP_SET,
+                                &[("time", &format::duration(cx, by))],
+                            ),
+                            cx,
+                        );
+                        state.load_runtimes(cx);
+                    }
                     Err(error) => state.toast_error(&error, cx),
                 }
-                let _ = target;
+                let _ = &target;
                 cx.notify();
             },
         );
@@ -388,7 +471,13 @@ impl AppState {
                             self.usage_now(),
                         );
                         changed = true;
-                    } else if let Some(error) = decision.error {
+                    } else {
+                        // Not stopped: a failed stop, or (should core ever report neither) a
+                        // stop that did not happen. Either way it is still billing.
+                        let error = decision.error.unwrap_or_else(|| {
+                            Error::new(ErrorKind::Other)
+                                .detail("the cost guard decided to stop it but no stop was made")
+                        });
                         let first = !self.sessions.stop_failures.contains_key(&target);
                         if first {
                             self.toast(

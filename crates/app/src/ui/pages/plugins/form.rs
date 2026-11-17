@@ -117,12 +117,14 @@ pub(super) fn render(
             .map(|i| (i.id.clone(), i.kind == InputKind::Secret))
             .collect();
         let running = state.is_running_plugin();
+        // A new session would only fail at the cap: say so before Deploy, like New session.
+        let limited = form.existing.is_none() && state.session_limit_reached().is_some();
         tagged(
             RUN_START,
             Button::new(RUN_START, tr(cx, keys::RUN_START))
                 .primary()
                 .icon(IconName::Rocket)
-                .disabled(running)
+                .disabled(running || limited)
                 .on_click(move |_, _, cx| {
                     let mut texts = Vec::new();
                     for (id, secret) in &ids {
@@ -423,7 +425,13 @@ fn quant_preview(
         let line = match fit {
             Ok(choice) => tr_args(
                 cx,
-                keys::QUANT_FITS,
+                // With context 0 the run uses the model's own maximum, which is only known on
+                // the runtime; the preview assumes a context, and says so.
+                if ctx == 0 {
+                    keys::QUANT_FITS_ASSUMED
+                } else {
+                    keys::QUANT_FITS
+                },
                 &[
                     ("gpu", &gpu),
                     ("quant", &choice.quant),
@@ -482,6 +490,38 @@ fn target_card(
             CardHeader::new(tr(cx, keys::RUN_TARGET)).description(tr(cx, keys::RUN_TARGET_HINT)),
         )
         .child(tagged("run-target", target));
+    if form.existing.is_none()
+        && let Some(limit) = state.session_limit_reached()
+    {
+        let email = limit
+            .email
+            .clone()
+            .unwrap_or_else(|| tr(cx, keys::ACCOUNTS_NO_EMAIL).to_string());
+        let settings = handle.clone();
+        card = card.child(tagged(
+            "run-limit",
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(InlineMessage::new(
+                    Severity::Warning,
+                    tr_args(
+                        cx,
+                        keys::NEW_LIMIT_BODY,
+                        &[("limit", &limit.limit.to_string()), ("email", &email)],
+                    ),
+                ))
+                .child(Caption::new(tr(cx, keys::RUN_LIMIT_HINT)))
+                .child(div().flex().child(
+                    Button::new("run-limit-settings", tr(cx, keys::NEW_OPEN_SETTINGS)).on_click(
+                        move |_, _, cx| {
+                            settings.update(cx, |state, cx| state.open_limit_setting(cx))
+                        },
+                    ),
+                )),
+        ));
+    }
     if form.existing.is_none() {
         let edit: provision_form::SpecEdit = {
             let handle = handle.clone();

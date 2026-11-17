@@ -52,6 +52,11 @@ pub fn language_label(pref: LanguagePref, state: &AppState, cx: &App) -> gpui::S
 /// The settings page.
 pub fn render(state: &AppState, handle: &Entity<AppState>, inputs: &Inputs, cx: &App) -> Page {
     super::page(Route::Settings, keys::SETTINGS_SUBTITLE, cx)
+        .children(
+            state
+                .settings_focus()
+                .then(|| super::defaults::limit_focus(state, handle, cx)),
+        )
         .child(general(state, handle, cx))
         .child(super::defaults::defaults_section(state, handle, cx))
         .child(super::defaults::host_section(state, handle, inputs, cx))

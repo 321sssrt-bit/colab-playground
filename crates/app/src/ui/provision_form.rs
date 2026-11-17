@@ -10,7 +10,7 @@ use colab_playground_core::{
     sessions::Accelerator,
 };
 use ely_gpui_component::{
-    forms::{Choice, DurationPicker, NumberInput, Select, Switch},
+    forms::{Choice, NumberInput, Select, Switch},
     theme::{ActiveTheme, TextSize},
     typography::Caption,
 };
@@ -20,6 +20,7 @@ use crate::{
     format,
     i18n::{keys, tr},
     ui::{
+        duration_field::DurationField,
         pages::defaults::{
             MAX_CU_FIELD, MAX_VRAM_FIELD_GIB, START_IDLE, START_MIN_BALANCE_CU, START_MIN_VRAM_GIB,
             START_SPEND_CU,
@@ -132,9 +133,7 @@ fn duration_field(
     set: fn(&mut ProvisionSpec, Duration),
 ) -> AnyElement {
     let edit = edit.clone();
-    DurationPicker::new(id, value)
-        .on_change(move |v, _, cx| edit(cx, &|spec| set(spec, v)))
-        .into_any_element()
+    DurationField::new(id, value, move |v, _, cx| edit(cx, &|spec| set(spec, v))).into_any_element()
 }
 
 /// The options for `spec`; `prefix` keeps element ids apart when two forms exist.

@@ -276,7 +276,10 @@ fn switch(
 /// What switching affects: tunnels that close and runtimes that keep billing.
 fn impact_list(impact: &SwitchImpact, now: SystemTime, state: &AppState, cx: &App) -> AnyElement {
     let theme = cx.theme();
-    if impact.tunnels_closing.is_empty() && impact.sessions_left_running.is_empty() {
+    if impact.tunnels_closing.is_empty()
+        && impact.sessions_left_running.is_empty()
+        && impact.unmanaged_count == 0
+    {
         return Paragraph::new(tr(cx, keys::SWITCH_NOTHING)).into_any_element();
     }
     let item = |text: SharedString| {
@@ -329,7 +332,31 @@ fn impact_list(impact: &SwitchImpact, now: SystemTime, state: &AppState, cx: &Ap
                 })
             }));
     }
-    let _ = state;
+    if impact.unmanaged_count > 0 {
+        // Runtimes opened in the browser or elsewhere keep billing with no automatic stop.
+        list = list
+            .child(Paragraph::new(tr(cx, keys::SWITCH_UNMANAGED)))
+            .children(impact.unmanaged_left_running.iter().map(|runtime| {
+                let label = state
+                    .runtime(runtime)
+                    .map(crate::state::runtime_label)
+                    .or_else(|| runtime.name.clone())
+                    .unwrap_or_else(|| runtime.endpoint.clone());
+                item(tr_args(
+                    cx,
+                    keys::SWITCH_UNMANAGED_ITEM,
+                    &[("name", &label)],
+                ))
+            }));
+        let listed = impact.unmanaged_left_running.len() as u32;
+        if impact.unmanaged_count > listed {
+            list = list.child(item(tr_args(
+                cx,
+                keys::SWITCH_UNMANAGED_MORE,
+                &[("count", &(impact.unmanaged_count - listed).to_string())],
+            )));
+        }
+    }
     tagged("switch-impact", list).into_any_element()
 }
 

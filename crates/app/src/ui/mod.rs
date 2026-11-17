@@ -2,6 +2,7 @@
 //! functions of the app state (plus the few text fields the root view owns).
 
 pub mod dialogs;
+pub mod duration_field;
 pub mod error_view;
 pub mod overlays;
 pub mod pages;

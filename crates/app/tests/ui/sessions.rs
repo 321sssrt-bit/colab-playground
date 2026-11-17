@@ -8,7 +8,7 @@ use colab_playground::{
     route::Route,
     state::{EndReason, Overlay, ProvisionPhase},
     ui::{
-        overlays::{FORWARD_SUBMIT, NEW_SESSION_START, RESERVED_NOTE},
+        overlays::{FORWARD_SUBMIT, NEW_SESSION_LIMIT, NEW_SESSION_START, RESERVED_NOTE},
         pages::sessions::{NEW_SESSION_SELECTOR, forward_selector, stop_selector},
     },
 };
@@ -149,15 +149,52 @@ fn an_accelerator_the_account_cannot_use_says_so(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn the_session_limit_offers_the_sessions_page(cx: &mut TestAppContext) {
-    // The demo's active account already has two sessions the app started (the default cap).
+fn the_session_limit_is_explained_before_starting(cx: &mut TestAppContext) {
+    // The demo's active account already has two named sessions (the default cap is 2), plus a
+    // runtime opened in the browser that does not count.
     let mut app = TestApp::new(cx);
-    provision(&mut app, |_| {});
+    on_sessions(&mut app);
+    app.click(NEW_SESSION_SELECTOR);
+    let limit = app.read(|state, _| state.session_limit_reached());
+    let limit = limit.expect("checked when the dialog opens");
+    assert_eq!(limit.limit, 2);
+    assert_eq!(limit.counted, ["a100-7f3a", "t4-91c2"]);
+    assert!(
+        app.shown(NEW_SESSION_LIMIT),
+        "explained before anything is tried"
+    );
+    assert!(
+        !app.shown(NEW_SESSION_START),
+        "no Start that would only fail"
+    );
+
+    app.click("new-session-open-settings");
+    assert_eq!(app.route(), Route::Settings);
+    assert!(app.shown(colab_playground::ui::pages::defaults::LIMIT_FOCUS_SELECTOR));
+    app.update(|state, cx| state.update_defaults(|d| d.max_concurrent_sessions = 3, cx));
+    on_sessions(&mut app);
+    app.click(NEW_SESSION_SELECTOR);
+    assert!(app.read(|state, _| state.session_limit_reached().is_none()));
+    assert!(
+        app.shown(NEW_SESSION_START),
+        "with a higher limit the form is back"
+    );
+}
+
+#[gpui::test]
+fn the_limit_error_from_core_offers_settings_and_sessions(cx: &mut TestAppContext) {
+    // Core still enforces the cap (e.g. when the list was stale): the same explanation shows.
+    let mut app = TestApp::new(cx);
+    on_sessions(&mut app);
+    app.update(|state, cx| {
+        state.open_new_session(cx);
+        state.start_provision("extra-1".into(), cx);
+    });
     let Some(ProvisionPhase::Failed(error)) = phase(&mut app) else {
         panic!("expected a failure, got {:?}", phase(&mut app));
     };
     assert_eq!(error.kind, ErrorKind::SessionLimitReached);
-    assert!(app.shown("new-session-open-sessions"));
+    assert!(app.shown(NEW_SESSION_LIMIT));
     app.click("new-session-open-sessions");
     assert!(app.read(|state, _| state.overlay().is_none()));
     assert_eq!(app.route(), Route::Sessions);
@@ -401,24 +438,6 @@ fn closing_while_billing_asks_and_cancel_keeps_the_window(cx: &mut TestAppContex
 }
 
 #[gpui::test]
-fn stop_all_and_quit_stops_every_runtime_first(cx: &mut TestAppContext) {
-    let mut app = TestApp::new(cx);
-    let mock = app.mock.clone();
-    assert!(!app.cx.simulate_close());
-    app.settle();
-    // The window closes once every stop returned, so drive the state without the window.
-    app.state
-        .update(&mut **app.cx, |state, cx| state.quit_stopping_all(cx));
-    app.cx.run_until_parked();
-    let left = mock.runtimes(&CancelToken::new()).expect("listing");
-    assert!(left.runtimes.is_empty(), "{left:?}");
-    assert!(
-        app.state
-            .read_with(&*app.cx, |state, _| state.quit_approved())
-    );
-}
-
-#[gpui::test]
 fn leave_running_and_quit_keeps_them_billing(cx: &mut TestAppContext) {
     let mut app = TestApp::new(cx);
     let mock = app.mock.clone();
@@ -433,4 +452,131 @@ fn leave_running_and_quit_keeps_them_billing(cx: &mut TestAppContext) {
     );
     let left = mock.runtimes(&CancelToken::new()).expect("listing");
     assert_eq!(left.runtimes.len(), 4, "nothing was stopped");
+}
+
+#[gpui::test]
+fn cancelling_auto_stop_asks_first_and_it_can_be_set_again(cx: &mut TestAppContext) {
+    use colab_playground::ui::pages::sessions::{
+        cancel_auto_stop_selector, set_auto_stop_selector,
+    };
+    let mut app = TestApp::new(cx);
+    on_sessions(&mut app);
+    let auto_stop = |app: &mut TestApp<'_>| {
+        app.read(|state, _| {
+            state.runtimes().ready().and_then(|view| {
+                view.runtimes
+                    .iter()
+                    .find(|r| r.id.name.as_deref() == Some("a100-7f3a"))
+                    .map(|r| r.auto_stop_at)
+            })
+        })
+    };
+    assert!(matches!(auto_stop(&mut app), Some(Some(_))));
+    app.click(&cancel_auto_stop_selector("a100-7f3a"));
+    assert!(matches!(
+        app.read(|state, _| state.overlay().cloned()),
+        Some(Overlay::CancelAutoStop(_))
+    ));
+    assert!(
+        matches!(auto_stop(&mut app), Some(Some(_))),
+        "nothing changed yet"
+    );
+    app.click(colab_playground::ui::overlays::CANCEL_AUTO_STOP_CONFIRM);
+    assert!(app.read(|state, _| state.overlay().is_none()));
+    assert_eq!(
+        auto_stop(&mut app),
+        Some(None),
+        "it now bills until stopped"
+    );
+    assert!(
+        !app.shown(&cancel_auto_stop_selector("a100-7f3a")),
+        "nothing to cancel any more"
+    );
+
+    app.click(&set_auto_stop_selector("a100-7f3a"));
+    assert!(
+        matches!(auto_stop(&mut app), Some(Some(_))),
+        "an auto-stop is set again"
+    );
+}
+
+#[gpui::test]
+fn the_quit_prompt_names_what_stop_all_would_stop(cx: &mut TestAppContext) {
+    let mut app = TestApp::new(cx);
+    assert!(!app.cx.simulate_close());
+    app.settle();
+    for label in ["a100-7f3a", "t4-91c2", "L4", "cpu-0b5e"] {
+        assert!(
+            app.shown(&format!("quit-runtime {label}")),
+            "{label} is listed"
+        );
+    }
+    assert!(app.shown("quit-wipe"), "the data-wipe line is drawn");
+    assert!(
+        app.shown("quit-unmanaged L4"),
+        "marked as not started by this app"
+    );
+    assert!(!app.shown("quit-unmanaged a100-7f3a"));
+}
+
+#[gpui::test]
+fn stop_all_waits_for_a_provision_in_flight_and_leaves_nothing(cx: &mut TestAppContext) {
+    let mut app = TestApp::with(cx, Options::scenario(MockScenario::single()));
+    on_sessions(&mut app);
+    app.click(NEW_SESSION_SELECTOR);
+    app.update(|state, cx| {
+        state.start_provision(String::new(), cx);
+        assert!(state.is_provisioning());
+        assert!(!state.may_close(cx), "a provision in flight counts");
+        state.quit_stopping_all(cx);
+        assert!(
+            !state.is_busy(colab_playground::state::Op::StopAll),
+            "nothing is stopped while the cancelled provision is still unwinding"
+        );
+        assert!(state.is_stopping_all(), "but Stop all is under way");
+    });
+    app.settle();
+    let left = app.mock.runtimes(&CancelToken::new()).expect("listing");
+    assert!(left.runtimes.is_empty(), "nothing billed is left: {left:?}");
+    assert!(
+        app.read(|state, _| state.quit_approved()),
+        "quits once nothing is left"
+    );
+    assert_eq!(phase(&mut app), Some(ProvisionPhase::Cancelled));
+}
+
+#[gpui::test]
+fn stop_all_and_quit_closes_only_when_nothing_is_left(cx: &mut TestAppContext) {
+    let mut app = TestApp::new(cx);
+    assert!(!app.cx.simulate_close());
+    app.settle();
+    app.click(colab_playground::ui::overlays::QUIT_STOP_ALL);
+    let left = app.mock.runtimes(&CancelToken::new()).expect("listing");
+    assert!(left.runtimes.is_empty(), "{left:?}");
+    assert!(app.read(|state, _| state.quit_approved()));
+}
+
+#[gpui::test]
+fn the_quit_action_asks_like_closing_the_window(cx: &mut TestAppContext) {
+    let mut app = TestApp::new(cx);
+    let menus = app
+        .cx
+        .update(|_, cx| colab_playground::platform::app_menus(cx));
+    assert_eq!(menus.len(), 1, "the macOS app menu with Quit");
+    assert_eq!(
+        colab_playground::platform::quit_bindings().len(),
+        1,
+        "Cmd+Q"
+    );
+    app.cx.update(|window, cx| {
+        window.dispatch_action(Box::new(colab_playground::platform::Quit), cx)
+    });
+    app.settle();
+    assert!(
+        matches!(
+            app.read(|state, _| state.overlay().cloned()),
+            Some(Overlay::Quit(_))
+        ),
+        "Cmd+Q opens the same prompt"
+    );
 }

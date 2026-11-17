@@ -39,6 +39,12 @@ pub enum BackendError {
     UnknownScenario(String),
     /// `--mock-fail` names an unknown failure.
     UnknownFailure(String),
+    /// An argument this program does not know.
+    UnknownArgument(String),
+    /// A flag that takes a value was given none.
+    MissingValue(&'static str),
+    /// A simulation flag without the simulation (it would otherwise start the real backend).
+    MockFlagWithoutMock(&'static str),
 }
 
 impl fmt::Display for BackendError {
@@ -60,6 +66,11 @@ impl fmt::Display for BackendError {
                 "--mock-fail {value:?} is not one of {}",
                 MockFlags::FAILURES.join(", ")
             ),
+            BackendError::UnknownArgument(arg) => write!(f, "unknown argument {arg:?}"),
+            BackendError::MissingValue(flag) => write!(f, "{flag} needs a value"),
+            BackendError::MockFlagWithoutMock(flag) => {
+                write!(f, "{flag} only applies to the simulation; add --mock")
+            }
         }
     }
 }
@@ -170,6 +181,64 @@ impl MockFlags {
             }
         }
         Ok(flags)
+    }
+}
+
+/// How to call the program, printed with any argument error.
+pub const USAGE: &str = "usage: colab-playground [--real | --mock [--mock-scenario demo|single|signed-out] [--mock-fail NAME[,NAME...]]]";
+
+/// Flags that take a value.
+const VALUE_FLAGS: [&str; 2] = ["--mock-scenario", "--mock-fail"];
+
+/// Rejects anything but the known flags, and a value flag without a value. Runs before any
+/// backend is chosen, so a mistyped `--mock` can never start the real backend.
+pub fn check_args<S: AsRef<str>>(args: &[S]) -> Result<(), BackendError> {
+    let mut iter = args.iter().map(AsRef::as_ref);
+    while let Some(arg) = iter.next() {
+        if arg == "--mock" || arg == "--real" {
+            continue;
+        }
+        // Old macOS launchers append a process serial number; it is not ours to judge.
+        if cfg!(target_os = "macos") && arg.starts_with("-psn_") {
+            continue;
+        }
+        if let Some(&flag) = VALUE_FLAGS.iter().find(|flag| **flag == arg) {
+            match iter.next() {
+                Some(value) if !value.trim().is_empty() && !value.starts_with("--") => continue,
+                _ => return Err(BackendError::MissingValue(flag)),
+            }
+        }
+        if let Some(&flag) = VALUE_FLAGS
+            .iter()
+            .find(|flag| arg.starts_with(&format!("{flag}=")))
+        {
+            if arg[flag.len() + 1..].trim().is_empty() {
+                return Err(BackendError::MissingValue(flag));
+            }
+            continue;
+        }
+        return Err(BackendError::UnknownArgument(arg.to_owned()));
+    }
+    Ok(())
+}
+
+/// The backend the command line (and [`BACKEND_ENV`]) asks for, after checking every
+/// argument. Simulation flags without the simulation are an error.
+pub fn source_from_args<S: AsRef<str>>(
+    args: &[S],
+    env: Option<&str>,
+) -> Result<BackendSource, BackendError> {
+    check_args(args)?;
+    match BackendKind::resolve(args, env)? {
+        BackendKind::Mock => Ok(BackendSource::interactive_mock(MockFlags::parse(args)?)),
+        BackendKind::Real => {
+            for flag in VALUE_FLAGS {
+                if flag_value(args, flag).is_some() {
+                    return Err(BackendError::MockFlagWithoutMock(flag));
+                }
+            }
+            Ok(BackendSource::Real)
+        }
     }
 }
 
@@ -288,6 +357,60 @@ mod tests {
             BackendKind::resolve(&["--mock-scenario", "single", "--mock"], None),
             Ok(BackendKind::Mock)
         );
+    }
+
+    #[test]
+    fn unknown_arguments_and_missing_values_are_errors() {
+        use super::{BackendSource, check_args, source_from_args};
+        assert_eq!(
+            check_args(&["--mok"]),
+            Err(BackendError::UnknownArgument("--mok".into())),
+            "a typo of --mock is not ignored"
+        );
+        assert_eq!(
+            check_args(&["--mock", "stray"]),
+            Err(BackendError::UnknownArgument("stray".into()))
+        );
+        assert_eq!(
+            check_args(&["--mock", "--mock-scenario"]),
+            Err(BackendError::MissingValue("--mock-scenario"))
+        );
+        assert_eq!(
+            check_args(&["--mock-scenario", "--mock"]),
+            Err(BackendError::MissingValue("--mock-scenario")),
+            "a flag is not a value"
+        );
+        assert_eq!(
+            check_args(&["--mock", "--mock-fail="]),
+            Err(BackendError::MissingValue("--mock-fail"))
+        );
+        assert!(
+            check_args(&["--mock", "--mock-scenario", "single", "--mock-fail=keyring"]).is_ok()
+        );
+        assert!(check_args::<&str>(&[]).is_ok());
+        assert!(check_args(&["--real"]).is_ok());
+
+        // Simulation flags without the simulation would start the real backend.
+        assert!(matches!(
+            source_from_args(&["--mock-scenario", "single"], Some("real")),
+            Err(BackendError::MockFlagWithoutMock("--mock-scenario"))
+        ));
+        assert!(matches!(
+            source_from_args(&["--mok"], None),
+            Err(BackendError::UnknownArgument(_))
+        ));
+        assert!(matches!(
+            source_from_args(&["--mock", "--mock-scenario", "nope"], None),
+            Err(BackendError::UnknownScenario(_))
+        ));
+        assert!(matches!(
+            source_from_args(&["--real"], None),
+            Ok(BackendSource::Real)
+        ));
+        assert!(matches!(
+            source_from_args(&["--mock-scenario", "single"], Some("mock")),
+            Ok(BackendSource::Mock(_))
+        ));
     }
 
     #[test]
