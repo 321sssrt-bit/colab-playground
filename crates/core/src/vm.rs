@@ -45,6 +45,11 @@ pub const ENV_RUN_ID: &str = "CPG_RUN_ID";
 pub const ENV_SCRIPT_NAME: &str = "CPG_SCRIPT_NAME";
 /// Env var with the log byte offset for [`plugin_poll_snippet`].
 pub const ENV_LOG_OFFSET: &str = "CPG_LOG_OFFSET";
+/// Env var naming (comma-separated) the `PLUGIN_*` variables that hold
+/// secrets. The launcher keeps those values in kernel memory only, so that
+/// [`plugin_poll_snippet`] can scrub them from what it prints (and therefore
+/// from the CLI's local history of executed cells).
+pub const ENV_SECRET_KEYS: &str = "CPG_SECRET_KEYS";
 
 /// Run directory of a plugin run on the VM.
 pub fn run_dir(run_id: &str) -> String {
@@ -65,6 +70,9 @@ _path = _d + "/" + _name
 with open(_path, "wb") as _fh:
     _fh.write(base64.b64decode("{b64}"))
 _keys = [k for k in os.environ if k.startswith("PLUGIN_")]
+_seckeys = [k for k in os.environ.pop("{ENV_SECRET_KEYS}", "").split(",") if k]
+globals().setdefault("_cpg_redact", {{}})[_rid] = sorted(
+    {{os.environ[k] for k in _seckeys if len(os.environ.get(k, "")) >= 4}}, key=len, reverse=True)
 _env = dict(os.environ)
 _env.update({{"PLUGIN_RUN_DIR": _d, "PLUGIN_STATUS_FILE": _d + "/status.json",
              "PLUGIN_HEARTBEAT": "{HEARTBEAT_PATH}", "PYTHONUNBUFFERED": "1"}})
@@ -87,7 +95,8 @@ print("__CPG_RESULT__ " + json.dumps({{"pid": _p.pid, "run_dir": _d}}))
 pub fn plugin_poll_snippet() -> String {
     format!(
         r#"import json, os
-_d = "{VM_BASE}/runs/" + os.environ.pop("{ENV_RUN_ID}")
+_rid = os.environ.pop("{ENV_RUN_ID}")
+_d = "{VM_BASE}/runs/" + _rid
 _off = int(os.environ.pop("{ENV_LOG_OFFSET}", "0") or 0)
 try:
     with open(_d + "/status.json") as _fh:
@@ -116,7 +125,20 @@ try:
         _log = _chunk.decode("utf-8", "replace")
 except FileNotFoundError:
     pass
-print("__CPG_RESULT__ " + json.dumps({{"status": _st, "alive": _alive, "log": _log, "offset": _new}}))
+# Scrub the run's secrets (kept in kernel memory by the launcher) before
+# printing: printed output is recorded in the CLI's local history.
+_sec = globals().get("_cpg_redact", {{}}).get(_rid, [])
+def _cpg_scrub(v):
+    if isinstance(v, str):
+        for _s in _sec:
+            v = v.replace(_s, "***")
+        return v
+    if isinstance(v, list):
+        return [_cpg_scrub(x) for x in v]
+    if isinstance(v, dict):
+        return {{k: _cpg_scrub(x) for k, x in v.items()}}
+    return v
+print("__CPG_RESULT__ " + json.dumps({{"status": _cpg_scrub(_st), "alive": _alive, "log": _cpg_scrub(_log), "offset": _new}}))
 "#
     )
 }
@@ -248,6 +270,9 @@ mod tests {
         assert!(!s.contains("os.system"));
         assert!(s.contains("start_new_session=True"));
         assert!(s.contains("os.environ.pop(_k, None)"));
+        assert!(s.contains(ENV_SECRET_KEYS) && s.contains("_cpg_redact"));
+        let p = plugin_poll_snippet();
+        assert!(p.contains("_cpg_scrub(_log)") && p.contains("_cpg_scrub(_st)"));
     }
 
     #[test]

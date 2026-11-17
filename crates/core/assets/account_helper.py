@@ -557,12 +557,16 @@ def op_history_redact(args):
     values = [s for s in secrets if len(s) >= MIN_REDACT_LEN]
     # Decoded JSON strings hold the value as printed and as repr() wrote it
     # into the env prelude; undecodable lines hold their JSON-escaped forms.
+    # Forms a value can take inside a decoded history string: as printed, as
+    # repr() wrote it into the env prelude, and JSON-escaped inside printed
+    # JSON (the __CPG_RESULT__ line of a poll). Undecodable lines may hold any
+    # of these JSON-escaped once more.
     decoded = set()
     for s in values:
-        decoded.add(s)
-        decoded.add(repr(s)[1:-1])
+        r = repr(s)[1:-1]
+        decoded.update((s, r, json.dumps(s)[1:-1], json.dumps(r)[1:-1]))
     escaped = set(decoded)
-    for s in decoded:
+    for s in list(decoded):
         escaped.add(json.dumps(s)[1:-1])
     decoded = sorted(decoded, key=len, reverse=True)
     escaped = sorted(escaped, key=len, reverse=True)

@@ -32,8 +32,8 @@ use crate::hostfs::HostFs;
 use crate::http::HttpClient;
 use crate::paths::{DataLayout, HostPath};
 use crate::plugins::{
-    PluginInfo, PluginOrigin, PluginPreview, PluginStore, clone_git, redact, resolve_endpoints,
-    resolve_inputs,
+    PluginInfo, PluginOrigin, PluginPreview, PluginStore, clone_git, contains_secret, redact,
+    redact_json, resolve_endpoints, resolve_inputs,
 };
 use crate::provision::{
     self, Hardware, ProvisionEvent, ProvisionOps, ProvisionOutcome, ProvisionSpec,
@@ -1468,13 +1468,22 @@ impl Backend for RealBackend {
         let endpoints = resolve_endpoints(manifest, &resolved.values)?;
         let mut env = resolved.env.clone();
         let mut secrets = resolved.secrets.clone();
+        let mut secret_keys: Vec<String> = manifest
+            .inputs
+            .iter()
+            .filter(|i| i.kind == crate::plugins::InputKind::Secret)
+            .map(|i| i.env_key())
+            .collect();
         let helper = self.inner.helper()?;
         for need in &manifest.needs {
             if let Ok(Some(v)) = helper.secret_get(need.secret_name(), cancel) {
                 env.push((need.env_key().to_owned(), v.clone()));
+                secret_keys.push(need.env_key().to_owned());
                 secrets.push(v);
             }
         }
+        // Names only (no values): lets the VM-side poll scrub these values.
+        env.push((vm::ENV_SECRET_KEYS.to_owned(), secret_keys.join(",")));
         let account = self
             .inner
             .active(cancel)?
@@ -1584,8 +1593,44 @@ impl RealBackend {
             .flatten()
     }
 
+    /// [`RealBackend::redact_cli_history`], reporting a failure as a warning
+    /// line in the run log (never fatal).
+    fn scrub_history(&self, session: &str, secrets: &[String], events: &Events<PluginRunEvent>) {
+        if let Err(e) = self.redact_cli_history(session, secrets) {
+            let _ = events.send(PluginRunEvent::Log {
+                lines: vec![format!(
+                    "[colab-playground] warning: could not redact secrets from the Colab CLI history: {}",
+                    redact(&e.to_string(), secrets)
+                )],
+            });
+        }
+    }
+
+    /// Runs the plugin on `session`, then scrubs the CLI history once more,
+    /// however the run ended (ready, failed, cancelled or error).
     #[allow(clippy::too_many_arguments)]
     fn run_on(
+        &self,
+        plugin: &crate::plugins::LoadedPlugin,
+        account: &AccountId,
+        session: &str,
+        env: Vec<(String, String)>,
+        secrets: &[String],
+        endpoints: &[crate::plugins::ResolvedEndpoint],
+        events: &Events<PluginRunEvent>,
+        cancel: &CancelToken,
+    ) -> Result<PluginRunOutcome> {
+        let result = self.run_on_inner(
+            plugin, account, session, env, secrets, endpoints, events, cancel,
+        );
+        if !secrets.is_empty() {
+            self.scrub_history(session, secrets, events);
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_on_inner(
         &self,
         plugin: &crate::plugins::LoadedPlugin,
         account: &AccountId,
@@ -1625,14 +1670,7 @@ impl RealBackend {
             });
         // The CLI recorded the cell (with its --env prelude) in its local
         // history; scrub the secrets from it right away, success or not.
-        if let Err(e) = self.redact_cli_history(session, secrets) {
-            let _ = events.send(PluginRunEvent::Log {
-                lines: vec![format!(
-                    "[colab-playground] warning: could not redact secrets from the Colab CLI history: {}",
-                    redact(&e.to_string(), secrets)
-                )],
-            });
-        }
+        self.scrub_history(session, secrets, events);
         launched?;
         let _ = events.send(PluginRunEvent::Launched {
             session: session.to_owned(),
@@ -1688,6 +1726,17 @@ impl RealBackend {
                 Err(e) => return Err(e),
             };
             offset = poll.offset;
+            // The poll's printed output (log chunk, status) is recorded in the
+            // CLI's history too. The VM side normally scrubs it already; if a
+            // secret still came through, scrub the history again now.
+            let status_text = poll
+                .status
+                .as_ref()
+                .and_then(|s| serde_json::to_string(s).ok())
+                .unwrap_or_default();
+            if contains_secret(&poll.log, secrets) || contains_secret(&status_text, secrets) {
+                self.scrub_history(session, secrets, events);
+            }
             if !poll.log.is_empty() {
                 let lines: Vec<String> = redact(&poll.log, secrets)
                     .lines()
@@ -1698,6 +1747,12 @@ impl RealBackend {
             if let Some(mut s) = poll.status.clone() {
                 if let Some(m) = s.message.as_mut() {
                     *m = redact(m, secrets);
+                }
+                if let Some(st) = s.stage.as_mut() {
+                    *st = redact(st, secrets);
+                }
+                for v in s.outputs.values_mut() {
+                    redact_json(v, secrets);
                 }
                 if last.as_ref() != Some(&s) {
                     let _ = events.send(PluginRunEvent::Status(s.clone()));

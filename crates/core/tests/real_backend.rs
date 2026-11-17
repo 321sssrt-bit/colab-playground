@@ -428,14 +428,13 @@ fn plugin_run_passes_secrets_only_via_env_and_redacts_them() {
     assert_eq!(run["env"]["PLUGIN_HF_TOKEN"], "hf_SECRET123");
     assert_eq!(run["env"]["PLUGIN_INPUT_API_KEY"], "sk-SECRET456");
     assert_eq!(run["env"]["PLUGIN_INPUT_REPO"], "unsloth/Qwen3-0.6B-GGUF");
+    // Check the secret *values*: the env var name CPG_SECRET_KEYS legitimately
+    // appears in recorded cells.
+    let leaked = |text: &str| text.contains("hf_SECRET123") || text.contains("sk-SECRET456");
     for entry in walk(&f.cfg.local_dir) {
         let content = std::fs::read(&entry).unwrap_or_default();
         let content = String::from_utf8_lossy(&content);
-        assert!(
-            !content.contains("SECRET"),
-            "secret written to {}",
-            entry.display()
-        );
+        assert!(!leaked(&content), "secret written to {}", entry.display());
     }
     // The CLI recorded the launch cell with its --env prelude; it was scrubbed.
     let history = f.history(&out.session);
@@ -444,9 +443,12 @@ fn plugin_run_passes_secrets_only_via_env_and_redacts_them() {
         "{history}"
     );
     assert!(
-        !history.contains("SECRET"),
+        !leaked(&history),
         "secret left in the CLI history: {history}"
     );
+    // The status polls (whose printed log carried the secret) were recorded
+    // and scrubbed too, not dropped.
+    assert!(history.contains("poll 0 (debug secret=***)"), "{history}");
     assert!(
         history.contains("--query-gpu=name,memory.total"),
         "other cells kept"
@@ -472,7 +474,24 @@ fn plugin_run_passes_secrets_only_via_env_and_redacts_them() {
     let err = f.b.run_plugin(spec, tx, &nc()).unwrap_err();
     assert!(err.is(ErrorKind::PluginRunFailed));
     assert_eq!(err.param("stage"), Some("download"));
-    assert!(!err.param("message").unwrap_or_default().contains("SECRET"));
+    assert!(!leaked(err.param("message").unwrap_or_default()));
+    let failed_session = f
+        .calls()
+        .iter()
+        .rev()
+        .find_map(|c| {
+            let argv: Vec<String> = serde_json::from_value(c["argv"].clone()).ok()?;
+            let i = argv.iter().position(|a| a == "exec")?;
+            (argv.get(i + 1)? == "-s").then(|| argv[i + 2].clone())
+        })
+        .unwrap();
+    assert_ne!(failed_session, out.session);
+    let failed_history = f.history(&failed_session);
+    assert!(failed_history.contains("download"), "{failed_history}");
+    assert!(
+        !leaked(&failed_history),
+        "secret left after a failed run: {failed_history}"
+    );
     assert_eq!(
         f.assignments("alice").len(),
         before,
@@ -754,6 +773,76 @@ fn python_repr(s: &str) -> String {
     }
     out.push(quote);
     out
+}
+
+/// The real launch and poll snippets, run in one Python process standing in
+/// for the kernel (globals persist between cells, as in Colab): a secret the
+/// script prints or puts into status.json never appears in the poll output.
+#[test]
+fn poll_snippet_scrubs_secrets_kept_in_kernel_memory() {
+    use colab_playground_core::{vm, watchdog};
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("vm").to_string_lossy().into_owned();
+    let script = br#"import json, os, time
+secret = os.environ["PLUGIN_INPUT_API_KEY"]
+print("leaking " + secret, flush=True)
+st = os.environ["PLUGIN_STATUS_FILE"]
+with open(st + ".tmp", "w") as fh:
+    json.dump({"state": "running", "stage": "s", "message": "m " + secret, "outputs": {"k": [secret]}}, fh)
+os.replace(st + ".tmp", st)
+time.sleep(30)
+"#;
+    let write = |name: &str, text: String| {
+        let p = tmp.path().join(name);
+        std::fs::write(&p, text.replace(watchdog::VM_BASE, &base)).unwrap();
+        p.to_string_lossy().into_owned()
+    };
+    let launch = write("launch.py", vm::plugin_launch_snippet(script));
+    let poll = write("poll.py", vm::plugin_poll_snippet());
+    let kill = write("kill.py", vm::plugin_kill_snippet());
+    let driver = write(
+        "driver.py",
+        r#"import contextlib, io, json, os, sys, time
+g = {"__name__": "__main__"}
+os.environ.update({"PLUGIN_INPUT_API_KEY": "sk-VMSECRET789", "PLUGIN_INPUT_REPO": "a/b",
+                   "CPG_RUN_ID": "r1", "CPG_SCRIPT_NAME": "w.py", "CPG_SECRET_KEYS": "PLUGIN_INPUT_API_KEY"})
+exec(open(sys.argv[1]).read(), g)
+assert "PLUGIN_INPUT_API_KEY" not in os.environ, "secret left in the kernel env"
+result = None
+for _ in range(100):
+    time.sleep(0.1)
+    os.environ.update({"CPG_RUN_ID": "r1", "CPG_LOG_OFFSET": "0"})
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        exec(open(sys.argv[2]).read(), g)
+    result = buf.getvalue()
+    if "leaking" in result and '"message"' in result:
+        break
+os.environ["CPG_RUN_ID"] = "r1"
+with contextlib.redirect_stdout(io.StringIO()):
+    exec(open(sys.argv[3]).read(), g)
+print("POLL " + result.strip())
+"#
+        .to_owned(),
+    );
+    let out = Host::Local
+        .run_program(
+            "python3",
+            &["-B".to_owned(), driver, launch, poll, kill],
+            &[("PYTHONDONTWRITEBYTECODE".to_owned(), "1".to_owned())],
+            &nc(),
+            Some(Duration::from_secs(60)),
+        )
+        .unwrap();
+    assert!(out.success(), "{}\n{}", out.stdout, out.stderr);
+    let line = out.stdout.lines().find(|l| l.starts_with("POLL ")).unwrap();
+    assert!(!out.stdout.contains("sk-VMSECRET789"), "{}", out.stdout);
+    assert!(
+        line.contains("leaking ***") && line.contains("m ***"),
+        "{line}"
+    );
+    let v: Value = serde_json::from_str(line.trim_start_matches("POLL __CPG_RESULT__ ")).unwrap();
+    assert_eq!(v["status"]["outputs"]["k"][0], "***");
 }
 
 #[test]

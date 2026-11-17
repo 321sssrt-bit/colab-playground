@@ -1114,10 +1114,30 @@ fn write_plugin_files(dir: &Path, manifest: &Manifest, toml: &[u8], script: &[u8
     Ok(())
 }
 
+/// Applies [`redact`] to every string inside a JSON value.
+pub fn redact_json(value: &mut serde_json::Value, secrets: &[String]) {
+    match value {
+        serde_json::Value::String(s) => *s = redact(s, secrets),
+        serde_json::Value::Array(items) => items.iter_mut().for_each(|v| redact_json(v, secrets)),
+        serde_json::Value::Object(map) => map.values_mut().for_each(|v| redact_json(v, secrets)),
+        _ => {}
+    }
+}
+
+/// True when `text` contains a secret that [`redact`] would replace.
+pub fn contains_secret(text: &str, secrets: &[String]) -> bool {
+    secrets
+        .iter()
+        .any(|s| s.len() >= 4 && text.contains(s.as_str()))
+}
+
 /// Replaces every occurrence of a secret in `text` with `***`.
 pub fn redact(text: &str, secrets: &[String]) -> String {
+    let mut ordered: Vec<&String> = secrets.iter().filter(|s| s.len() >= 4).collect();
+    // Longest first, so a secret that contains another is replaced whole.
+    ordered.sort_by_key(|s| std::cmp::Reverse(s.len()));
     let mut out = text.to_owned();
-    for s in secrets.iter().filter(|s| s.len() >= 4) {
+    for s in ordered {
         out = out.replace(s.as_str(), "***");
     }
     out
@@ -1277,6 +1297,15 @@ kind = "openai"
         given.insert("bogus".into(), InputValue::Bool(true));
         assert!(resolve_inputs(&m, &given).is_err());
         assert_eq!(redact("key=sk-secret!", &r.secrets), "key=***!");
+        let mut v = serde_json::json!({"a": ["x sk-secret", {"b": "sk-secret"}], "n": 1});
+        redact_json(&mut v, &r.secrets);
+        assert_eq!(v, serde_json::json!({"a": ["x ***", {"b": "***"}], "n": 1}));
+        assert!(contains_secret("..sk-secret..", &r.secrets));
+        assert!(!contains_secret("nothing", &r.secrets));
+        assert!(
+            !contains_secret("ab", &["ab".to_owned()]),
+            "too short to redact"
+        );
     }
 
     #[test]
