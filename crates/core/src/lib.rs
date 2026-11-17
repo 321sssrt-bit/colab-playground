@@ -28,6 +28,7 @@ pub mod quant;
 pub mod real;
 pub mod sessions;
 pub mod tunnel;
+pub mod update;
 pub mod usage;
 pub mod vm;
 pub mod watchdog;

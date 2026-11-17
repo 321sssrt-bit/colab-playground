@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::accounts::{Account, AccountId, AccountsView};
 use crate::clock::CancelToken;
 use crate::defaults::Defaults;
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorKind, Result};
 use crate::guard::Decision;
 use crate::hf::HfModel;
 use crate::host::{Line, ProbeReport};
@@ -416,6 +416,13 @@ pub trait Backend: Send + Sync {
     fn hf_search(&self, query: &str, limit: u32, cancel: &CancelToken) -> Result<Vec<HfModel>>;
     /// Lists a repo's GGUF quantisations.
     fn hf_files(&self, repo: &str, cancel: &CancelToken) -> Result<GgufListing>;
+    // ---- updates
+    /// Whether a newer release of this app is published (one request to GitHub; nothing is
+    /// downloaded). Backends that cannot check say so.
+    fn check_for_update(&self, cancel: &CancelToken) -> Result<crate::update::UpdateStatus> {
+        let _ = cancel;
+        Err(Error::new(ErrorKind::Unsupported).detail("this backend cannot check for updates"))
+    }
 }
 
 /// `<prefix>-<4 hex>`, unique among `taken`. The prefix is reduced to

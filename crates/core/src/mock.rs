@@ -89,6 +89,10 @@ pub struct MockFailures {
     /// app-side only (`WatchdogInfo::armed` is false). Watchdogs started by
     /// provisioning, and extending one that runs, are not affected.
     pub watchdog_restart_fails: bool,
+    /// The update check finds a newer release (the next patch version).
+    pub update_available: bool,
+    /// The update check fails (as if GitHub could not be reached).
+    pub update_check_fails: bool,
 }
 
 impl Default for MockFailures {
@@ -106,6 +110,8 @@ impl Default for MockFailures {
             unadopted_slot: false,
             interrupted_add: false,
             watchdog_restart_fails: false,
+            update_available: false,
+            update_check_fails: false,
         }
     }
 }
@@ -335,6 +341,7 @@ struct World {
     pending_add: Option<Option<AccountId>>,
     /// A `LoginFlow` is alive.
     login_live: bool,
+    update_checks: u32,
 }
 
 /// Email of the credential `MockFailures::unadopted_slot` puts in the slot.
@@ -598,6 +605,7 @@ impl MockBackend {
             unadopted_email: None,
             pending_add: None,
             login_live: false,
+            update_checks: 0,
         };
         let off = MockFailures {
             cli_missing: cfg.failures.cli_missing,
@@ -649,6 +657,11 @@ impl MockBackend {
             cfg: Arc::new(cfg),
             world: Arc::new(Mutex::new(world)),
         }
+    }
+
+    /// How many update checks were made (the simulation never contacts GitHub).
+    pub fn update_checks(&self) -> u32 {
+        self.w().update_checks
     }
 
     /// Replaces the failure switches at runtime (UI tests flip them mid-test).
@@ -1882,6 +1895,42 @@ impl Backend for MockBackend {
         }
         self.step(cancel)?;
         Ok(mock_listing(repo))
+    }
+
+    fn check_for_update(&self, cancel: &CancelToken) -> Result<crate::update::UpdateStatus> {
+        cancel.check()?;
+        // Never touches the network: the answer comes from the failure switches.
+        let mut w = self.w();
+        w.update_checks += 1;
+        if w.failures.update_check_fails {
+            return Err(Error::new(ErrorKind::Http).detail("simulated update check failure"));
+        }
+        if !w.failures.update_available {
+            return Ok(crate::update::UpdateStatus::UpToDate);
+        }
+        let current = crate::update::Version::parse(crate::update::CURRENT_VERSION).unwrap_or(
+            crate::update::Version {
+                major: 0,
+                minor: 0,
+                patch: 0,
+                pre: Vec::new(),
+            },
+        );
+        let next = crate::update::Version {
+            major: current.major,
+            minor: current.minor,
+            patch: current.patch + 1,
+            pre: Vec::new(),
+        }
+        .to_string();
+        let page = crate::update::this_app_release_page(&next).unwrap_or_default();
+        Ok(crate::update::UpdateStatus::Available(
+            crate::update::Release {
+                tag: format!("v{next}"),
+                version: next,
+                page,
+            },
+        ))
     }
 }
 

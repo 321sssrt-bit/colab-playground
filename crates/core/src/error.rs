@@ -99,6 +99,8 @@ pub enum ErrorKind {
     Http,
     /// HTTP support was compiled out (`http` feature disabled).
     HttpUnavailable,
+    /// A service is limiting requests (e.g. GitHub's API rate limit). Params: `status`, `url`.
+    RateLimited,
     /// Output from the CLI or a remote script could not be parsed.
     Parse,
     /// Local file-system or process I/O failed.
@@ -154,6 +156,7 @@ impl ErrorKind {
             ErrorKind::InstallFailed => "install_failed",
             ErrorKind::Http => "http",
             ErrorKind::HttpUnavailable => "http_unavailable",
+            ErrorKind::RateLimited => "rate_limited",
             ErrorKind::Parse => "parse",
             ErrorKind::Io => "io",
             ErrorKind::Timeout => "timeout",
@@ -172,9 +175,12 @@ impl ErrorKind {
             }
             K::LoginInvalidCode | K::LoginCancelled | K::AddInProgress => NextStep::TryAgain,
             K::NotEntitled | K::ProvisionExhausted => NextStep::ChooseOtherAccelerator,
-            K::CapacityRefused | K::ConnectionLost | K::ExecTimeout | K::Busy | K::Timeout => {
-                NextStep::RetryLater
-            }
+            K::CapacityRefused
+            | K::ConnectionLost
+            | K::ExecTimeout
+            | K::Busy
+            | K::Timeout
+            | K::RateLimited => NextStep::RetryLater,
             K::SshBusy => NextStep::CloseOtherConnection,
             K::SessionGone | K::AccountNotFound | K::PluginNotFound => NextStep::Refresh,
             K::PortInUse | K::PortReserved => NextStep::ChooseOtherPort,

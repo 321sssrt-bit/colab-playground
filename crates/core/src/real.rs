@@ -1648,6 +1648,10 @@ impl Backend for RealBackend {
     fn hf_files(&self, repo: &str, cancel: &CancelToken) -> Result<GgufListing> {
         HfClient::new(self.inner.cfg.http.clone(), self.hf_token(cancel)).gguf_files(repo)
     }
+
+    fn check_for_update(&self, cancel: &CancelToken) -> Result<crate::update::UpdateStatus> {
+        crate::update::check_this_app(&*self.inner.cfg.http, cancel)
+    }
 }
 
 impl RealBackend {
