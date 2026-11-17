@@ -516,7 +516,7 @@ pub(super) const MESSAGES: Messages = &[
     ),
     (STOP_ACTION, "停止並結束計費"),
     (STOP_DONE, "{name} 已停止，計費已結束。"),
-    (EXTEND_DONE, "自動停止時間已改為從現在起 {time}後"),
+    (EXTEND_DONE, "已延長：現在將在 {time}後自動停止"),
     (
         AUTO_STOP_CANCELLED,
         "已關閉自動停止。執行階段會持續計費，直到你停止它。",

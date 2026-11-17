@@ -507,7 +507,7 @@ pub(super) const MESSAGES: Messages = &[
     ),
     (STOP_ACTION, "停止并结束计费"),
     (STOP_DONE, "{name} 已停止，计费已结束。"),
-    (EXTEND_DONE, "自动停止时间已改为从现在起 {time}后"),
+    (EXTEND_DONE, "已延长：现在将在 {time}后自动停止"),
     (
         AUTO_STOP_CANCELLED,
         "已关闭自动停止。运行时会一直计费，直到你停止它。",

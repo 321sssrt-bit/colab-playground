@@ -256,32 +256,46 @@ impl AppState {
         );
     }
 
-    /// How far ahead Extend puts `runtime`'s auto-stop, counted from now: the default runtime
-    /// limit (Settings, else core's own). The session's recorded limit is not used: it counts
-    /// from the session's start and grows with every extension.
+    /// How much time Extend adds to `runtime`'s auto-stop: the default runtime limit
+    /// (Settings, else core's own). The session's recorded limit is not used: it counts from
+    /// the session's start and grows with every extension.
     pub fn extension_for(&self, runtime: &Runtime) -> Option<Duration> {
         let _ = runtime;
         self.rearm_duration()
     }
 
-    /// Moves `target`'s auto-stop to [`Self::extension_for`] from now.
+    /// Adds [`Self::extension_for`] to `target`'s auto-stop; it never moves earlier. Core's
+    /// `extend_session` sets the stop a given time from now, so the time still left is measured
+    /// on the backend clock inside the call and the extension is added to it. A runtime without
+    /// an auto-stop gets one that far from now.
     pub fn extend_session(&mut self, target: RuntimeRef, cx: &mut Context<Self>) {
-        let Some(by) = self.runtime(&target).and_then(|r| self.extension_for(r)) else {
+        let Some(runtime) = self.runtime(&target) else {
             return;
         };
+        let Some(by) = self.extension_for(runtime) else {
+            return;
+        };
+        let stop_at = runtime.auto_stop_at;
         let work_target = target.clone();
         self.run_backend(
             Op::Extend(key_of(&target)),
             cx,
-            move |backend, cancel| backend.extend_session(&work_target, by, cancel),
+            move |backend, cancel| {
+                let left = stop_at
+                    .and_then(|at| at.duration_since(backend.now()).ok())
+                    .unwrap_or_default();
+                let total = left + by;
+                let info = backend.extend_session(&work_target, total, cancel)?;
+                Ok((info, total))
+            },
             move |state, result, cx| {
                 match result {
-                    Ok(info) => {
+                    Ok((info, total)) => {
                         state.sessions.warnings.remove(&target);
                         let title = tr_args(
                             cx,
                             keys::EXTEND_DONE,
-                            &[("time", &format::duration(cx, by))],
+                            &[("time", &format::duration(cx, total))],
                         );
                         state.toast_auto_stop(title, info.armed, cx);
                         state.load_runtimes(cx);

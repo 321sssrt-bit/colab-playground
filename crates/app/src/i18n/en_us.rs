@@ -621,7 +621,7 @@ pub(super) const MESSAGES: Messages = &[
     ),
     (STOP_ACTION, "Stop and end billing"),
     (STOP_DONE, "{name} is stopped. Its billing has ended."),
-    (EXTEND_DONE, "Auto-stop moved to {time} from now"),
+    (EXTEND_DONE, "Extended: it now stops in {time}"),
     (
         AUTO_STOP_CANCELLED,
         "Auto-stop is off. The runtime keeps billing until you stop it.",

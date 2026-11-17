@@ -651,3 +651,107 @@ fn the_quit_action_asks_like_closing_the_window(cx: &mut TestAppContext) {
         "Cmd+Q opens the same prompt"
     );
 }
+
+/// Time until `name`'s auto-stop, on the mock's clock.
+fn time_left(app: &mut TestApp<'_>, name: &str) -> Option<Duration> {
+    let now = Backend::now(&app.mock);
+    app.read(|state, _| {
+        state.runtimes().ready().and_then(|view| {
+            view.runtimes
+                .iter()
+                .find(|r| r.id.name.as_deref() == Some(name))
+                .and_then(|r| r.auto_stop_at)
+                .and_then(|at| at.duration_since(now).ok())
+        })
+    })
+}
+
+fn assert_close(actual: Duration, expected: Duration, what: &str) {
+    let diff = actual.abs_diff(expected);
+    assert!(
+        diff <= Duration::from_secs(60),
+        "{what}: {actual:?}, expected about {expected:?}"
+    );
+}
+
+#[gpui::test]
+fn extend_adds_to_the_time_left(cx: &mut TestAppContext) {
+    use colab_playground::ui::pages::sessions::extend_selector;
+    let mut app = TestApp::new(cx);
+    on_sessions(&mut app);
+    let before = time_left(&mut app, "a100-7f3a").expect("the demo session has an auto-stop");
+    assert_close(
+        before,
+        Duration::from_secs(109 * 60),
+        "the demo's time left",
+    );
+    app.click(&extend_selector("a100-7f3a"));
+    let after = time_left(&mut app, "a100-7f3a").expect("still an auto-stop");
+    assert_close(
+        after,
+        before + Duration::from_secs(2 * 3600),
+        "after Extend by 2 h",
+    );
+    let toast = app.cx.update(|_, cx| {
+        colab_playground::i18n::tr_args(
+            cx,
+            colab_playground::i18n::keys::EXTEND_DONE,
+            &[(
+                "time",
+                &colab_playground::format::duration(cx, before + Duration::from_secs(2 * 3600)),
+            )],
+        )
+    });
+    assert!(
+        app.toasts().contains(&toast),
+        "the toast gives the new time left: {:?}",
+        app.toasts()
+    );
+}
+
+#[gpui::test]
+fn extend_never_pulls_a_longer_auto_stop_in(cx: &mut TestAppContext) {
+    use colab_playground::ui::pages::sessions::extend_selector;
+    let mut app = TestApp::with(cx, Options::scenario(MockScenario::single()));
+    provision(&mut app, |spec| {
+        spec.accelerator = Accelerator::T4;
+        spec.min_vram_mib = None;
+        spec.guard.max_runtime = Some(Duration::from_secs(4 * 3600));
+    });
+    let Some(ProvisionPhase::Ready(outcome)) = phase(&mut app) else {
+        panic!("expected a ready runtime, got {:?}", phase(&mut app));
+    };
+    app.click("overlay-cancel");
+    let name = outcome.name;
+    let before = time_left(&mut app, &name).expect("a 4 h auto-stop");
+    assert_close(
+        before,
+        Duration::from_secs(4 * 3600),
+        "the session's own 4 h",
+    );
+    app.click(&extend_selector(&name));
+    let after = time_left(&mut app, &name).expect("still an auto-stop");
+    assert!(after >= before, "never earlier: {before:?} -> {after:?}");
+    assert_close(after, Duration::from_secs(6 * 3600), "4 h + 2 h");
+}
+
+#[gpui::test]
+fn extend_after_setting_an_auto_stop_again_adds_too(cx: &mut TestAppContext) {
+    use colab_playground::ui::pages::sessions::{
+        cancel_auto_stop_selector, extend_selector, set_auto_stop_selector,
+    };
+    let mut app = TestApp::new(cx);
+    on_sessions(&mut app);
+    app.click(&cancel_auto_stop_selector("a100-7f3a"));
+    app.click(colab_playground::ui::overlays::CANCEL_AUTO_STOP_CONFIRM);
+    app.click(&set_auto_stop_selector("a100-7f3a"));
+    let set = time_left(&mut app, "a100-7f3a").expect("set again");
+    assert_close(
+        set,
+        Duration::from_secs(2 * 3600),
+        "Set auto-stop counts from now",
+    );
+    app.click(&extend_selector("a100-7f3a"));
+    let after = time_left(&mut app, "a100-7f3a").expect("still an auto-stop");
+    assert_close(after, Duration::from_secs(4 * 3600), "2 h left + 2 h");
+}
