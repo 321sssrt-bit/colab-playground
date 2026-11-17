@@ -4,6 +4,32 @@ How to build the app, choose its backend, try it with demo data, and find what i
 What the app does is in the [README](../README.md); why it is built this way is in
 [DESIGN.md](DESIGN.md).
 
+## Install a release
+
+Download the file for your computer from the
+[latest release](https://github.com/scarletkc/colab-playground/releases/latest); there is no
+installer. When the app's update check finds a newer version it opens that version's release page,
+where you download it the same way and replace the old file or app (settings and data stay where
+they are, see [Where things are stored](#where-things-are-stored)).
+
+- **Windows x64:** `colab-playground-<version>-x86_64-pc-windows-msvc.exe` is the whole app; run it.
+  It is not code-signed, so SmartScreen may say "Windows protected your PC": click **More info**,
+  then **Run anyway**.
+- **Linux x64:** unpack `colab-playground-<version>-x86_64-unknown-linux-gnu.tar.gz`
+  (`tar -xzf <file>`) and run `colab-playground` in the folder it creates. It needs glibc 2.35 or
+  newer (for example Ubuntu 22.04 or Debian 12 and later) and libraries a desktop installation
+  already has, among them xkbcommon-x11 and fontconfig.
+- **macOS 11 or later on Apple silicon:** unzip `colab-playground-<version>-aarch64-apple-darwin.zip`
+  and move `Colab Playground.app` to Applications. It is not notarised by Apple, so macOS refuses
+  the first launch: try to open it once, then open System Settings → Privacy & Security and, under
+  Security, click **Open Anyway** (offered for about an hour after the attempt) and enter your login
+  password. After that it opens normally.
+- `SHA256SUMS` in the same release lists the SHA-256 of each file; compare it with the output of
+  `sha256sum <file>` (Linux), `shasum -a 256 <file>` (macOS) or `Get-FileHash <file>` (PowerShell).
+
+A download is a release build: it uses the real Colab CLI (see [Build and run](#build-and-run)), so
+the real-mode requirements below apply.
+
 ## Requirements
 
 - Rust: the version in `rust-version` under `[workspace.package]` in

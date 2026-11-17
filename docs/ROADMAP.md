@@ -47,7 +47,19 @@ A stopped runtime is wiped, and the guards stop runtimes on their own. A session
 
 ### Platform and distribution
 
-- Installers, app icon, signed releases, auto-update, a release workflow.
+- **Installers** (MSI or MSIX, a DMG, AppImage, Flatpak or `.deb`) are deliberately not planned for
+  now: releases ship portable files ([RELEASING.md](RELEASING.md#the-downloads)). Each format would
+  need its own step in `package.yml` (for example WiX for an MSI, `hdiutil` for a DMG) and a decision
+  on what uninstalling does with the settings and data.
+- **Code signing and notarisation** are deliberately not planned for now, so Windows SmartScreen and
+  macOS Gatekeeper ask users to confirm the first launch ([USAGE.md](USAGE.md#install-a-release)).
+  Windows would need an Authenticode certificate or a signing service and a `signtool` step; macOS
+  needs a paid Apple Developer ID, signing with the hardened runtime, notarisation with `notarytool`
+  and stapling. The keys would live in Actions secrets.
+- Downloading and installing an update from inside the app (the update check opens the release
+  page).
+- Downloads for more targets: Windows and Linux on Arm64, macOS on Intel. Linux desktop integration
+  (a `.desktop` file and icon in the archive).
 - A plugin index (discover and update plugins from inside the app).
 - Native-Windows CLI support (without WSL), ADC / gcloud authentication.
 - Operating sessions on a non-active account without switching (a per-operation account lock,
