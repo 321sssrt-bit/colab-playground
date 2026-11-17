@@ -1,0 +1,79 @@
+//! Bootstrap: Ely, the app state and the main window.
+
+use anyhow::Context as _;
+use ely_gpui_component::Assets;
+use gpui::{
+    App, AppContext, Bounds, Entity, TitlebarOptions, WindowBounds, WindowHandle, WindowOptions,
+    px, size,
+};
+
+use crate::{
+    i18n::{keys, tr},
+    platform,
+    state::{AppState, StateOptions},
+    ui::root::RootView,
+};
+
+/// Default window size, in logical pixels.
+pub const WINDOW_SIZE: (f32, f32) = (1180.0, 780.0);
+/// Smallest window size, in logical pixels.
+pub const WINDOW_MIN_SIZE: (f32, f32) = (880.0, 560.0);
+
+/// Runs the app until its last window closes.
+pub fn run(options: StateOptions) {
+    gpui_platform::application()
+        .with_assets(Assets)
+        .run(move |cx: &mut App| {
+            if let Err(error) = ely_gpui_component::init(cx) {
+                log::error!("app: Ely failed to start: {error:#}");
+                cx.quit();
+                return;
+            }
+            let state = AppState::init(options, cx);
+            if let Err(error) = open_main_window(state, cx) {
+                log::error!("app: {error:#}");
+                cx.quit();
+                return;
+            }
+            cx.on_window_closed(|cx, _| {
+                if cx.windows().is_empty() {
+                    cx.quit();
+                }
+            })
+            .detach();
+            cx.activate(true);
+        });
+}
+
+/// Options for the main window: centred, with a minimum size, and no OS title bar (the title
+/// is still set for the taskbar and window switcher; the app draws its own strip, see
+/// `ui::titlebar`). Decorations, background and traffic lights per OS come from `platform`.
+pub fn window_options(cx: &App) -> WindowOptions {
+    let bounds = Bounds::centered(None, size(px(WINDOW_SIZE.0), px(WINDOW_SIZE.1)), cx);
+    WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        window_min_size: Some(size(px(WINDOW_MIN_SIZE.0), px(WINDOW_MIN_SIZE.1))),
+        titlebar: Some(TitlebarOptions {
+            title: Some(tr(cx, keys::APP_NAME)),
+            appears_transparent: true,
+            traffic_light_position: platform::traffic_light_position(cx),
+        }),
+        window_decorations: platform::window_decorations(),
+        window_background: platform::window_background(),
+        app_id: Some("colab-playground".into()),
+        ..Default::default()
+    }
+}
+
+/// Opens the main window over `state`.
+pub fn open_main_window(
+    state: Entity<AppState>,
+    cx: &mut App,
+) -> anyhow::Result<WindowHandle<RootView>> {
+    let options = window_options(cx);
+    cx.open_window(options, |window, cx| {
+        window.on_next_frame(|_, _| log::info!("app: first frame drawn"));
+        cx.new(|cx| RootView::new(state, window, cx))
+    })
+    .context("the main window failed to open")
+}

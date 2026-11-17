@@ -1,0 +1,50 @@
+[package]
+name = "colab-playground"
+description.workspace = true
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+name = "colab_playground"
+path = "src/lib.rs"
+# Each doctest links gpui and Ely into its own binary; keep examples in tests instead.
+doctest = false
+
+[[bin]]
+name = "colab-playground"
+path = "src/main.rs"
+test = false
+
+[dependencies]
+# Ely GPUI Components, pinned to one commit of `main`. The umbrella crate re-exports every
+# chapter (`ely_gpui_component::{buttons, feedback, settings, account, terminal, ...}`).
+ely-gpui-component = { git = "https://github.com/ELY-Open-Source/Ely-GPUI-Components", rev = "c01a140e95deef8437c85aafd3617acfd798d58e" }
+gpui = { package = "gpui-pre", version = "=0.3.12" }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.12", features = ["font-kit", "wayland", "x11"] }
+colab-playground-core = { path = "../core" }
+anyhow = "1"
+dirs = "6"
+futures = "0.3"
+env_logger = "0.11"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sys-locale = "0.3"
+url = "2"
+
+[dev-dependencies]
+ely-gpui-component = { git = "https://github.com/ELY-Open-Source/Ely-GPUI-Components", rev = "c01a140e95deef8437c85aafd3617acfd798d58e", features = ["test-support"] }
+gpui = { package = "gpui-pre", version = "=0.3.12", features = ["test-support"] }
+tempfile = "3"
+
+[[test]]
+name = "ui"
+path = "tests/ui/main.rs"
+
+[lints]
+workspace = true

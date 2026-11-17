@@ -1,0 +1,463 @@
+//! User settings, persisted as JSON in the OS config dir.
+//!
+//! Loading never fails: a missing file gives defaults, an unreadable or malformed file is moved
+//! aside (`settings.json.corrupt`) and gives defaults, and a field with a bad value falls back
+//! to that field's default without touching the others. New fields must carry
+//! `#[serde(default, deserialize_with = "lenient")]` so old files keep loading.
+
+use std::{
+    ffi::OsString,
+    fs, io,
+    path::{Path, PathBuf},
+};
+
+use colab_playground_core::{Defaults, Toolchain};
+use serde::{Deserialize, Deserializer, Serialize};
+
+/// Environment variable that replaces the config directory (tests point it at a tempdir).
+pub const CONFIG_DIR_ENV: &str = "COLAB_PLAYGROUND_CONFIG_DIR";
+/// The app's folder under the OS config dir.
+pub const APP_DIR_NAME: &str = "colab-playground";
+/// The settings file inside the config directory.
+pub const SETTINGS_FILE: &str = "settings.json";
+/// Where an unreadable settings file is moved.
+pub const CORRUPT_SUFFIX: &str = ".corrupt";
+
+/// The language the user picked; `System` resolves through the OS locale.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum LanguagePref {
+    /// Follow the operating system's language.
+    #[default]
+    #[serde(rename = "system")]
+    System,
+    /// English (United States).
+    #[serde(rename = "en-US")]
+    EnUs,
+    /// Simplified Chinese.
+    #[serde(rename = "zh-CN")]
+    ZhCn,
+    /// Traditional Chinese (Taiwan).
+    #[serde(rename = "zh-TW")]
+    ZhTw,
+}
+
+impl LanguagePref {
+    /// Every choice, in the order the settings page offers them.
+    pub const ALL: [LanguagePref; 4] = [
+        LanguagePref::System,
+        LanguagePref::EnUs,
+        LanguagePref::ZhCn,
+        LanguagePref::ZhTw,
+    ];
+
+    /// The stable value used in the settings file and as the select's value.
+    pub fn value(self) -> &'static str {
+        match self {
+            LanguagePref::System => "system",
+            LanguagePref::EnUs => "en-US",
+            LanguagePref::ZhCn => "zh-CN",
+            LanguagePref::ZhTw => "zh-TW",
+        }
+    }
+
+    /// The choice with this [`Self::value`].
+    pub fn from_value(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|pref| pref.value() == value)
+    }
+}
+
+/// Light, dark, or as the operating system is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AppearancePref {
+    /// Follow the operating system, including live changes.
+    #[default]
+    System,
+    /// Always light.
+    Light,
+    /// Always dark.
+    Dark,
+}
+
+/// Everything the user can set. Add fields with `#[serde(default, deserialize_with = "lenient")]`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Settings {
+    /// Display language.
+    #[serde(default, deserialize_with = "lenient")]
+    pub language: LanguagePref,
+    /// Light, dark or system appearance.
+    #[serde(default, deserialize_with = "lenient")]
+    pub appearance: AppearancePref,
+    /// Policy defaults for new runtimes (core's `Defaults`; pushed to the backend). Read field by
+    /// field: a bad value resets only that field, and the reset is reported.
+    #[serde(default, skip_deserializing)]
+    pub defaults: Defaults,
+    /// WSL distribution the CLI runs in (Windows); `None` = the default distribution.
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub wsl_distro: Option<String>,
+    /// Path of `colab` on the host; `None` = found automatically.
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub colab_path: Option<String>,
+    /// Path of the CLI's Python interpreter (needed together with `colab_path`).
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub colab_python: Option<String>,
+}
+
+/// `defaults` from stored JSON, keeping every field that parses; returns the names of the
+/// fields that did not (they take their default).
+pub fn read_defaults(value: &serde_json::Value) -> (Defaults, Vec<String>) {
+    if let Ok(defaults) = Defaults::deserialize(value) {
+        return (defaults, Vec::new());
+    }
+    let serde_json::Value::Object(stored) = value else {
+        log::warn!("settings: `defaults` is not an object; using the defaults");
+        return (Defaults::default(), vec!["defaults".to_owned()]);
+    };
+    let mut kept = serde_json::Map::new();
+    let mut reset = Vec::new();
+    for (key, field) in stored {
+        let mut candidate = kept.clone();
+        candidate.insert(key.clone(), field.clone());
+        if Defaults::deserialize(&serde_json::Value::Object(candidate)).is_ok() {
+            kept.insert(key.clone(), field.clone());
+        } else {
+            log::warn!("settings: defaults.{key} = {field} is not valid; using its default");
+            reset.push(key.clone());
+        }
+    }
+    let defaults =
+        Defaults::deserialize(&serde_json::Value::Object(kept)).unwrap_or_else(|error| {
+            log::error!("settings: the kept defaults did not parse ({error})");
+            Defaults::default()
+        });
+    (defaults, reset)
+}
+
+/// A field's value, or its default when the stored value does not parse.
+fn lenient<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: serde::de::DeserializeOwned + Default,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(T::deserialize(&value).unwrap_or_else(|error| {
+        log::warn!("settings: ignoring {value} ({error}); using the default");
+        T::default()
+    }))
+}
+
+impl Settings {
+    /// Settings from a JSON document; fails only when it is not a JSON object.
+    pub fn from_json(text: &str) -> Result<Self, serde_json::Error> {
+        Self::from_json_reporting(text).map(|(settings, _)| settings)
+    }
+
+    /// Like [`Self::from_json`], also naming the `defaults` fields that were reset.
+    pub fn from_json_reporting(text: &str) -> Result<(Self, Vec<String>), serde_json::Error> {
+        let value: serde_json::Value = serde_json::from_str(text)?;
+        if !value.is_object() {
+            return Err(serde::de::Error::custom(
+                "the settings file is not a JSON object",
+            ));
+        }
+        let (defaults, reset) = value.get("defaults").map(read_defaults).unwrap_or_default();
+        let mut settings: Settings = serde_json::from_value(value)?;
+        settings.defaults = defaults;
+        Ok((settings, reset))
+    }
+
+    /// Where the real backend finds the CLI: a toolchain only when both paths are set.
+    pub fn host_setup(&self) -> crate::backend::HostSetup {
+        let toolchain = match (&self.colab_path, &self.colab_python) {
+            (Some(colab), Some(python)) => Some(Toolchain {
+                colab: colab.clone(),
+                helper_python: python.clone(),
+            }),
+            _ => None,
+        };
+        crate::backend::HostSetup {
+            wsl_distro: self.wsl_distro.clone(),
+            toolchain,
+        }
+    }
+
+    /// Pretty JSON with a trailing newline.
+    pub fn to_json(&self) -> String {
+        let mut text = serde_json::to_string_pretty(self).expect("settings serialize to JSON");
+        text.push('\n');
+        text
+    }
+}
+
+/// What loading found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LoadOutcome {
+    /// No config directory could be determined; nothing is read or saved.
+    NoConfigDir,
+    /// No settings file yet.
+    Missing,
+    /// The file was read.
+    Loaded,
+    /// The file could not be read or parsed; defaults are in use.
+    Corrupt {
+        /// What went wrong.
+        error: String,
+        /// Where the bad file was moved, if moving it worked.
+        backup: Option<PathBuf>,
+    },
+}
+
+/// Settings plus how they were obtained.
+#[derive(Clone, Debug)]
+pub struct Loaded {
+    /// The settings to use.
+    pub settings: Settings,
+    /// How they were obtained.
+    pub outcome: LoadOutcome,
+    /// `defaults` fields that held invalid values and went back to their default.
+    pub reset_defaults: Vec<String>,
+}
+
+impl Loaded {
+    fn fresh(outcome: LoadOutcome) -> Self {
+        Loaded {
+            settings: Settings::default(),
+            outcome,
+            reset_defaults: Vec::new(),
+        }
+    }
+}
+
+/// The config directory: `override_dir` (the value of [`CONFIG_DIR_ENV`]) when set and
+/// non-empty, otherwise `<OS config dir>/colab-playground`. Pure, so tests never read the
+/// process environment.
+pub fn config_dir(override_dir: Option<OsString>) -> Option<PathBuf> {
+    match override_dir {
+        Some(dir) if !dir.is_empty() => Some(PathBuf::from(dir)),
+        _ => dirs::config_dir().map(|dir| dir.join(APP_DIR_NAME)),
+    }
+}
+
+/// A `file://` URL for `dir`, which is created first if missing, for `App::open_url` to show in
+/// the system's file manager. Blocking: call it from a background task.
+pub fn folder_url(dir: &Path) -> Result<String, String> {
+    fs::create_dir_all(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
+    let absolute =
+        std::path::absolute(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
+    url::Url::from_directory_path(&absolute)
+        .map(String::from)
+        .map_err(|()| format!("{} cannot be written as a URL", absolute.display()))
+}
+
+/// Reads and writes `settings.json` in one directory.
+#[derive(Clone, Debug)]
+pub struct SettingsStore {
+    dir: Option<PathBuf>,
+}
+
+impl SettingsStore {
+    /// A store in `dir`; `None` keeps settings in memory only.
+    pub fn new(dir: Option<PathBuf>) -> Self {
+        Self { dir }
+    }
+
+    /// The config directory, if any.
+    pub fn dir(&self) -> Option<&Path> {
+        self.dir.as_deref()
+    }
+
+    /// The settings file, if there is a config directory.
+    pub fn file(&self) -> Option<PathBuf> {
+        self.dir.as_ref().map(|dir| dir.join(SETTINGS_FILE))
+    }
+
+    /// Reads the settings, tolerating a missing or corrupt file.
+    pub fn load(&self) -> Loaded {
+        let Some(file) = self.file() else {
+            log::warn!("settings: no config directory; settings will not be saved");
+            return Loaded::fresh(LoadOutcome::NoConfigDir);
+        };
+        let failure = match fs::read_to_string(&file) {
+            Ok(text) => match Settings::from_json_reporting(&text) {
+                Ok((settings, reset_defaults)) => {
+                    log::info!("settings: loaded {}", file.display());
+                    return Loaded {
+                        settings,
+                        outcome: LoadOutcome::Loaded,
+                        reset_defaults,
+                    };
+                }
+                Err(error) => error.to_string(),
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                log::info!("settings: {} does not exist yet", file.display());
+                return Loaded::fresh(LoadOutcome::Missing);
+            }
+            Err(error) => error.to_string(),
+        };
+        let mut backup_name = file.clone().into_os_string();
+        backup_name.push(CORRUPT_SUFFIX);
+        let backup = PathBuf::from(backup_name);
+        let backup = match fs::rename(&file, &backup) {
+            Ok(()) => Some(backup),
+            Err(error) => {
+                log::error!("settings: could not move {} aside: {error}", file.display());
+                None
+            }
+        };
+        log::warn!(
+            "settings: {} is unreadable ({failure}); using defaults",
+            file.display()
+        );
+        Loaded::fresh(LoadOutcome::Corrupt {
+            error: failure,
+            backup,
+        })
+    }
+
+    /// Writes the settings atomically (temp file, then rename). A store without a directory
+    /// writes nothing. Blocking: call it from a background task.
+    pub fn save(&self, settings: &Settings) -> io::Result<()> {
+        let (Some(dir), Some(file)) = (self.dir(), self.file()) else {
+            return Ok(());
+        };
+        fs::create_dir_all(dir)?;
+        let temp = dir.join(format!("{SETTINGS_FILE}.tmp"));
+        fs::write(&temp, settings.to_json())?;
+        fs::rename(&temp, &file)?;
+        log::info!("settings: saved {}", file.display());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::{
+        AppearancePref, LanguagePref, LoadOutcome, SETTINGS_FILE, Settings, SettingsStore,
+        config_dir,
+    };
+
+    fn store() -> (tempfile::TempDir, SettingsStore) {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let store = SettingsStore::new(Some(dir.path().join("nested")));
+        (dir, store)
+    }
+
+    #[test]
+    fn the_override_wins_and_empty_means_unset() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        assert_eq!(
+            config_dir(Some(dir.path().as_os_str().to_owned())),
+            Some(dir.path().to_path_buf())
+        );
+        assert_eq!(config_dir(Some("".into())), config_dir(None));
+    }
+
+    #[test]
+    fn a_missing_file_gives_defaults_and_a_save_round_trips() {
+        let (_dir, store) = store();
+        let loaded = store.load();
+        assert_eq!(loaded.outcome, LoadOutcome::Missing);
+        assert_eq!(loaded.settings, Settings::default());
+        let settings = Settings {
+            language: LanguagePref::ZhTw,
+            appearance: AppearancePref::Dark,
+            defaults: colab_playground_core::Defaults {
+                max_attempts: 5,
+                idle_timeout: Some(std::time::Duration::from_secs(900)),
+                ..Default::default()
+            },
+            wsl_distro: Some("Debian".into()),
+            ..Settings::default()
+        };
+        store.save(&settings).expect("saved");
+        let text = fs::read_to_string(store.file().expect("a file")).expect("written");
+        assert!(
+            text.contains("\"zh-TW\"") && text.contains("\"dark\"") && text.contains("Debian"),
+            "{text}"
+        );
+        let again = store.load();
+        assert_eq!(again.outcome, LoadOutcome::Loaded);
+        assert_eq!(again.settings, settings);
+        assert!(again.reset_defaults.is_empty());
+    }
+
+    #[test]
+    fn a_bad_default_resets_only_itself_and_is_reported() {
+        let text = r#"{"defaults": {"max_attempts": "lots", "retry_delay": 45, "high_mem": true}}"#;
+        let (settings, reset) = Settings::from_json_reporting(text).expect("an object");
+        assert_eq!(reset, ["max_attempts"]);
+        let core = colab_playground_core::Defaults::default();
+        assert_eq!(settings.defaults.max_attempts, core.max_attempts);
+        assert_eq!(
+            settings.defaults.retry_delay,
+            std::time::Duration::from_secs(45)
+        );
+        assert!(settings.defaults.high_mem);
+        let (_, reset) = Settings::from_json_reporting(r#"{"defaults": 3}"#).expect("an object");
+        assert_eq!(reset, ["defaults"]);
+    }
+
+    #[test]
+    fn a_corrupt_file_is_moved_aside_and_gives_defaults() {
+        let (_dir, store) = store();
+        let file = store.file().expect("a file");
+        fs::create_dir_all(file.parent().expect("a parent")).expect("dir");
+        fs::write(&file, "{ not json").expect("written");
+        let loaded = store.load();
+        assert_eq!(loaded.settings, Settings::default());
+        let LoadOutcome::Corrupt { backup, .. } = loaded.outcome else {
+            panic!("expected a corrupt outcome, got {:?}", loaded.outcome);
+        };
+        let backup = backup.expect("moved aside");
+        assert_eq!(fs::read_to_string(backup).expect("kept"), "{ not json");
+        assert!(
+            !file.exists(),
+            "the bad file no longer shadows the defaults"
+        );
+    }
+
+    #[test]
+    fn a_bad_field_falls_back_alone_and_unknown_fields_are_ignored() {
+        let settings = Settings::from_json(r#"{"language":"fr-FR","appearance":"dark","later":1}"#)
+            .expect("an object");
+        assert_eq!(settings.language, LanguagePref::System);
+        assert_eq!(settings.appearance, AppearancePref::Dark);
+        assert!(Settings::from_json("[1,2]").is_err());
+        assert_eq!(
+            Settings::from_json("{}").expect("an object"),
+            Settings::default()
+        );
+    }
+
+    #[test]
+    fn a_store_without_a_directory_keeps_settings_in_memory() {
+        let store = SettingsStore::new(None);
+        assert_eq!(store.load().outcome, LoadOutcome::NoConfigDir);
+        store.save(&Settings::default()).expect("nothing to write");
+        assert!(store.file().is_none());
+        assert_eq!(SETTINGS_FILE, "settings.json");
+    }
+
+    #[test]
+    fn language_values_round_trip() {
+        for pref in LanguagePref::ALL {
+            assert_eq!(LanguagePref::from_value(pref.value()), Some(pref));
+        }
+        assert_eq!(LanguagePref::from_value("de-DE"), None);
+    }
+}

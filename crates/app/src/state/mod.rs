@@ -1,0 +1,471 @@
+//! The app's root state: one entity, published as a global.
+//!
+//! Views read [`AppState`] in `render` and change it only through its methods; each method
+//! calls `cx.notify()` so observing views re-render. Every backend call goes through
+//! `AppState::run_backend` (see `ops`): it runs the blocking call on the background executor
+//! with a `CancelToken`, and applies the result on the foreground. The parts live in
+//! submodules: `environment` (probe, CLI install, the first-run checklist), `accounts` (list,
+//! sign-in, switch, remove), `usage` (polling and the cached usage) and `defaults` (policy
+//! defaults and where the CLI lives).
+
+mod accounts;
+mod defaults;
+mod environment;
+mod ops;
+mod usage;
+
+use std::sync::Arc;
+
+use colab_playground_core::{
+    Error, ErrorKind, accounts::AccountsView, backend::Backend, backend::BackendKind as Flavor,
+    backend::LoginFlow, host::ProbeReport,
+};
+use ely_gpui_component::{
+    feedback::{Toast, Toaster},
+    primitives::Severity,
+    settings::Appearance,
+    theme::{ActiveTheme, Mode, Theme},
+};
+use gpui::{App, AppContext, Context, Entity, FontFallbacks, Global, Task};
+
+pub use accounts::{
+    AccountDialog, AccountRow, AddPhase, RemoveBlock, SignInStatus, account_row, sign_in_status,
+};
+pub use defaults::{MIN_DURATION, sanitize};
+pub use environment::{
+    Checklist, EnvironmentStep, InstallPhase, InstallState, Step, StepState, checklist,
+    install_methods,
+};
+pub use ops::Op;
+pub use usage::{
+    POLL_CHECK, UsageSummary, is_stale as usage_is_stale, stale_note as usage_stale_note, summarize,
+};
+
+use crate::{
+    backend::{self, BackendSource},
+    i18n::{self, Language, keys, tr, tr_args},
+    platform,
+    route::Route,
+    settings::{AppearancePref, LanguagePref, LoadOutcome, Settings, SettingsStore, folder_url},
+};
+
+/// What the state is built from; `app::run` reads it from the process, tests build it by hand
+/// (always with a headless mock).
+#[derive(Clone)]
+pub struct StateOptions {
+    /// Where the backend comes from.
+    pub source: BackendSource,
+    /// Where settings live.
+    pub store: SettingsStore,
+    /// The OS locale, for the `System` language.
+    pub os_locale: Option<String>,
+}
+
+/// A value loaded from the backend.
+#[derive(Clone, Debug, Default)]
+pub enum Load<T> {
+    /// Not asked for (yet).
+    #[default]
+    Idle,
+    /// Being fetched for the first time.
+    Loading,
+    /// Fetched.
+    Ready(T),
+    /// Fetching failed.
+    Failed(Error),
+}
+
+impl<T> Load<T> {
+    /// The value, when fetched.
+    pub fn ready(&self) -> Option<&T> {
+        match self {
+            Load::Ready(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// The error, when fetching failed.
+    pub fn error(&self) -> Option<&Error> {
+        match self {
+            Load::Failed(error) => Some(error),
+            _ => None,
+        }
+    }
+
+    /// Whether a first fetch is under way.
+    pub fn is_loading(&self) -> bool {
+        matches!(self, Load::Loading)
+    }
+
+    /// `Loading` unless a value is already shown (a refresh keeps it on screen).
+    fn begin(&mut self) {
+        if !matches!(self, Load::Ready(_)) {
+            *self = Load::Loading;
+        }
+    }
+}
+
+/// Everything the shell shows. See the crate docs for the pattern.
+pub struct AppState {
+    route: Route,
+    settings: Settings,
+    store: SettingsStore,
+    os_locale: Option<String>,
+    language: Language,
+    system_mode: Mode,
+    /// Installed CJK families, looked up once at startup.
+    cjk_fonts: Vec<String>,
+    font_fallbacks: Option<FontFallbacks>,
+    toaster: Entity<Toaster>,
+    save: Option<Task<()>>,
+    open_folder: Option<Task<()>>,
+    source: BackendSource,
+    backend: Result<Arc<dyn Backend>, Error>,
+    pub(crate) ops: ops::Ops,
+    probe: Load<ProbeReport>,
+    install: InstallState,
+    accounts: Load<AccountsView>,
+    recovered_notice: bool,
+    dialog: Option<AccountDialog>,
+    login_flow: Option<Box<dyn LoginFlow>>,
+    usage: usage::UsageCache,
+    defaults_push: Option<Task<()>>,
+    _poller: Option<Task<()>>,
+}
+
+struct GlobalAppState(Entity<AppState>);
+
+impl Global for GlobalAppState {}
+
+/// How a [`AppearancePref`] reads as Ely's [`Appearance`].
+pub fn ely_appearance(pref: AppearancePref) -> Appearance {
+    match pref {
+        AppearancePref::System => Appearance::System,
+        AppearancePref::Light => Appearance::Light,
+        AppearancePref::Dark => Appearance::Dark,
+    }
+}
+
+/// How Ely's [`Appearance`] is stored.
+pub fn appearance_pref(appearance: Appearance) -> AppearancePref {
+    match appearance {
+        Appearance::System => AppearancePref::System,
+        Appearance::Light => AppearancePref::Light,
+        Appearance::Dark => AppearancePref::Dark,
+    }
+}
+
+impl AppState {
+    /// Loads settings, installs the i18n catalog and theme mode, builds the backend, creates the
+    /// state, publishes it as a global and starts checking the environment. Call once, after
+    /// Ely's `init`.
+    pub fn init(options: StateOptions, cx: &mut App) -> Entity<AppState> {
+        let loaded = options.store.load();
+        let language = i18n::resolve(loaded.settings.language, options.os_locale.as_deref());
+        i18n::install(language, cx);
+        let system_mode = Mode::from(cx.window_appearance());
+        let installed = cx.text_system().all_font_names();
+        let cjk_fonts: Vec<String> = Language::ALL
+            .into_iter()
+            .flat_map(platform::cjk_font_candidates)
+            .filter(|family| installed.iter().any(|name| name == family))
+            .map(str::to_owned)
+            .collect();
+        let backend = backend::build(
+            &options.source,
+            &loaded.settings.host_setup(),
+            &loaded.settings.defaults,
+        );
+        if let Err(error) = &backend {
+            log::error!("app: the backend failed to start: {error}");
+        }
+        let flavor = options.source.flavor();
+        let state = cx.new(|cx| {
+            let mut state = AppState {
+                route: Route::default(),
+                settings: loaded.settings.clone(),
+                store: options.store,
+                os_locale: options.os_locale,
+                language,
+                system_mode,
+                font_fallbacks: None,
+                cjk_fonts,
+                toaster: cx.new(|_| Toaster::default()),
+                save: None,
+                open_folder: None,
+                source: options.source,
+                backend,
+                ops: ops::Ops::default(),
+                probe: Load::Idle,
+                install: InstallState::default(),
+                accounts: Load::Idle,
+                recovered_notice: false,
+                dialog: None,
+                login_flow: None,
+                usage: usage::UsageCache::default(),
+                defaults_push: None,
+                _poller: None,
+            };
+            state.font_fallbacks = platform::font_fallbacks(language, &state.cjk_fonts);
+            state.apply_mode(true, cx);
+            if let LoadOutcome::Corrupt { backup, .. } = &loaded.outcome {
+                state.report_reset(backup.as_deref(), cx);
+            }
+            if !loaded.reset_defaults.is_empty() {
+                state.report_defaults_reset(&loaded.reset_defaults, cx);
+            }
+            state._poller = Some(usage::start_poller(cx));
+            state.check_environment(cx);
+            state
+        });
+        log::info!(
+            "app: backend {flavor:?}, language {}, appearance {:?} (system {system_mode:?}, showing {:?})",
+            language.tag(),
+            loaded.settings.appearance,
+            cx.theme().mode()
+        );
+        cx.set_global(GlobalAppState(state.clone()));
+        state
+    }
+
+    /// The app's state, from anywhere that has `&App`.
+    pub fn global(cx: &App) -> Entity<AppState> {
+        cx.global::<GlobalAppState>().0.clone()
+    }
+
+    /// The page on show.
+    pub fn route(&self) -> Route {
+        self.route
+    }
+
+    /// Shows another page.
+    pub fn navigate(&mut self, route: Route, cx: &mut Context<Self>) {
+        if self.route != route {
+            log::info!("app: route {:?} -> {route:?}", self.route);
+            self.route = route;
+            cx.notify();
+        }
+    }
+
+    /// The settings in effect.
+    pub fn settings(&self) -> &Settings {
+        &self.settings
+    }
+
+    /// Where settings are saved.
+    pub fn store(&self) -> &SettingsStore {
+        &self.store
+    }
+
+    /// Real or mock.
+    pub fn flavor(&self) -> Flavor {
+        self.source.flavor()
+    }
+
+    /// Why the backend could not be built, if it could not.
+    pub fn backend_error(&self) -> Option<&Error> {
+        self.backend.as_ref().err()
+    }
+
+    /// The OS locale the `System` language follows.
+    pub fn os_locale(&self) -> Option<&str> {
+        self.os_locale.as_deref()
+    }
+
+    /// The language on show (the preference resolved).
+    pub fn language(&self) -> Language {
+        self.language
+    }
+
+    /// The language `System` would show.
+    pub fn system_language(&self) -> Language {
+        i18n::resolve(LanguagePref::System, self.os_locale.as_deref())
+    }
+
+    /// The operating system's light or dark mode, as last reported by the window.
+    pub fn system_mode(&self) -> Mode {
+        self.system_mode
+    }
+
+    /// The mode the preference asks for right now.
+    pub fn wanted_mode(&self) -> Mode {
+        ely_appearance(self.settings.appearance).mode(self.system_mode)
+    }
+
+    /// The CJK font fallbacks the root text style carries.
+    pub fn font_fallbacks(&self) -> Option<&FontFallbacks> {
+        self.font_fallbacks.as_ref()
+    }
+
+    /// The toast host the root view draws.
+    pub fn toaster(&self) -> &Entity<Toaster> {
+        &self.toaster
+    }
+
+    /// Shows a toast.
+    pub fn toast(&self, toast: Toast, cx: &mut Context<Self>) {
+        self.toaster.update(cx, |toaster, cx| {
+            toaster.push(toast, cx);
+        });
+    }
+
+    /// Shows a success toast with `title`.
+    pub(crate) fn toast_done(&self, title: gpui::SharedString, cx: &mut Context<Self>) {
+        self.toast(Toast::new(title).severity(Severity::Success), cx);
+    }
+
+    /// Picks the display language, applies it at once and saves it.
+    pub fn set_language(&mut self, pref: LanguagePref, cx: &mut Context<Self>) {
+        if self.settings.language == pref {
+            return;
+        }
+        log::info!("app: language preference -> {pref:?}");
+        self.settings.language = pref;
+        self.apply_language(cx);
+        self.persist_settings(cx);
+        cx.notify();
+    }
+
+    /// Picks light, dark or system appearance, applies it and saves it.
+    pub fn set_appearance(&mut self, pref: AppearancePref, cx: &mut Context<Self>) {
+        if self.settings.appearance == pref {
+            return;
+        }
+        log::info!("app: appearance preference -> {pref:?}");
+        self.settings.appearance = pref;
+        self.apply_mode(false, cx);
+        self.persist_settings(cx);
+        cx.notify();
+    }
+
+    /// The window reported the OS appearance; follows it when the preference is `System`.
+    pub fn system_appearance_changed(&mut self, mode: Mode, cx: &mut Context<Self>) {
+        if self.system_mode == mode {
+            return;
+        }
+        log::info!("app: system appearance -> {mode:?}");
+        self.system_mode = mode;
+        self.apply_mode(false, cx);
+        cx.notify();
+    }
+
+    fn apply_language(&mut self, cx: &mut Context<Self>) {
+        let language = i18n::resolve(self.settings.language, self.os_locale.as_deref());
+        self.language = language;
+        self.font_fallbacks = platform::font_fallbacks(language, &self.cjk_fonts);
+        if i18n::current(cx) != language {
+            i18n::set_language(language, cx);
+        }
+    }
+
+    /// Puts the theme in the wanted mode: at once at startup, with Ely's fade afterwards.
+    fn apply_mode(&self, now: bool, cx: &mut Context<Self>) {
+        let mode = self.wanted_mode();
+        if cx.theme().mode() == mode {
+            return;
+        }
+        if now {
+            Theme::set_mode_now(mode, cx);
+        } else {
+            Theme::set_mode(mode, cx);
+        }
+    }
+
+    /// Writes the settings on the background executor. Saves run one after another, so the
+    /// file always ends with the latest settings; a failure shows a toast.
+    pub(crate) fn persist_settings(&mut self, cx: &mut Context<Self>) {
+        let store = self.store.clone();
+        let settings = self.settings.clone();
+        let previous = self.save.take();
+        self.save = Some(cx.spawn(async move |this, cx| {
+            if let Some(previous) = previous {
+                previous.await;
+            }
+            let saved = cx
+                .background_spawn(async move { store.save(&settings) })
+                .await;
+            if let Err(error) = saved {
+                log::error!("settings: save failed: {error}");
+                let detail = error.to_string();
+                this.update(cx, |state, cx| {
+                    let toast = Toast::new(tr(cx, keys::TOAST_SAVE_FAILED_TITLE))
+                        .body(detail)
+                        .severity(Severity::Danger);
+                    state.toast(toast, cx);
+                })
+                .ok();
+            }
+        }));
+    }
+
+    /// Opens the folder that holds the settings file in the system's file manager, creating it
+    /// first when nothing has been saved yet. A failure shows a toast.
+    pub fn open_config_folder(&mut self, cx: &mut Context<Self>) {
+        let Some(dir) = self.store.dir().map(std::path::Path::to_path_buf) else {
+            log::warn!("settings: no config directory to open");
+            return;
+        };
+        self.open_folder = Some(cx.spawn(async move |this, cx| {
+            let opened = cx.background_spawn(async move { folder_url(&dir) }).await;
+            match opened {
+                Ok(url) => {
+                    log::info!("settings: opening {url}");
+                    cx.update(|cx| cx.open_url(&url));
+                }
+                Err(error) => {
+                    log::error!("settings: cannot open the config folder: {error}");
+                    this.update(cx, |state, cx| {
+                        let toast = Toast::new(tr(cx, keys::TOAST_OPEN_FOLDER_FAILED_TITLE))
+                            .body(error)
+                            .severity(Severity::Danger);
+                        state.toast(toast, cx);
+                    })
+                    .ok();
+                }
+            }
+        }));
+    }
+
+    fn report_reset(&self, backup: Option<&std::path::Path>, cx: &mut Context<Self>) {
+        let body = match backup {
+            Some(path) => {
+                let file = path.display().to_string();
+                tr_args(cx, keys::TOAST_SETTINGS_RESET_BODY, &[("file", &file)])
+            }
+            None => tr(cx, keys::TOAST_SETTINGS_RESET_BODY_LOST),
+        };
+        let toast = Toast::new(tr(cx, keys::TOAST_SETTINGS_RESET_TITLE))
+            .body(body)
+            .severity(Severity::Warning);
+        self.toast(toast, cx);
+    }
+
+    fn report_defaults_reset(&self, fields: &[String], cx: &mut Context<Self>) {
+        let fields = fields.join(", ");
+        let toast = Toast::new(tr(cx, keys::TOAST_DEFAULTS_RESET_TITLE))
+            .body(tr_args(
+                cx,
+                keys::TOAST_DEFAULTS_RESET_BODY,
+                &[("fields", &fields)],
+            ))
+            .severity(Severity::Warning);
+        self.toast(toast, cx);
+    }
+
+    /// An error for "the CLI is not installed yet" (shown instead of calling the backend).
+    pub(crate) fn not_installed() -> Error {
+        Error::new(ErrorKind::NotInstalled)
+    }
+}
+
+impl Drop for AppState {
+    fn drop(&mut self) {
+        self.ops.cancel_all();
+        // Quitting mid sign-in: give the previous credential back before the process ends.
+        if let Some(flow) = self.login_flow.take()
+            && let Err(error) = flow.cancel()
+        {
+            log::error!("accounts: rolling back the sign-in on quit failed: {error}");
+        }
+    }
+}
