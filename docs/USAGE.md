@@ -30,6 +30,22 @@ they are, see [Where things are stored](#where-things-are-stored)).
 A download is a release build: it uses the real Colab CLI (see [Build and run](#build-and-run)), so
 the real-mode requirements below apply.
 
+## Updates
+
+The app checks GitHub for a newer release and never downloads or installs one itself.
+
+- **Automatic:** shortly after start-up, then at most once a day while the app runs. The time of the
+  last check is kept in the settings file, so restarting does not check again within the day. Turn
+  it off in Settings → About → "Check for updates automatically".
+- **By hand:** Settings → About → "Check for updates".
+- **What is sent:** one request for this repository's latest release. It carries the app's version
+  and nothing about you or your computer.
+- **When a newer version exists:** a notice appears once for that version, and the Settings entry
+  stays marked until you have updated. "Open download page" opens that release on GitHub, where you
+  download it as in [Install a release](#install-a-release).
+- A check that fails is reported in Settings → About (and in a message when you started it by hand).
+- Demo data never contacts GitHub.
+
 ## Requirements
 
 - Rust: the version in `rust-version` under `[workspace.package]` in
@@ -73,7 +89,8 @@ cargo run -p colab-playground -- --mock-scenario signed-out --mock-fail cli-miss
 - `--mock-fail a,b,…` injects failures: `cli-missing`, `install-fails`, `keyring`, `usage-fails`,
   `login-invalid-code`, `login-unverified`, `not-entitled` (A100 and H100), `ssh-busy` (the first
   forward gets HTTP 429), `plugin-fails` (at the download stage), `watchdog-restart-fails` (setting
-  an auto-stop again after cancelling it cannot put the stop back on the runtime).
+  an auto-stop again after cancelling it cannot put the stop back on the runtime), `runtimes-fail`
+  (runtimes cannot be listed), `update-available` and `update-check-fails` (the update check).
 - Both accept `--flag value` or `--flag=value` and apply only when the mock is selected (add
   `--mock` to a release build). A simulated A100 has 40 GB first and 80 GB on the next attempt:
   set a minimum GPU memory of 70 GB to watch the retry. Git plugin installs are not simulated.
