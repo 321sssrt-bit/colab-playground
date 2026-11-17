@@ -84,7 +84,10 @@ crates/core/                  colab-playground-core: no GPUI, all logic, fully t
   tests/fake/                 fake `colab` + fake helper used by unix integration tests
 crates/app/                   colab-playground: the GPUI + Ely binary
 plugins/llama-cpp/            bundled plugin: plugin.toml + worker.py (embedded at build time)
-docs/DESIGN.md  docs/PLUGINS.md  docs/COLAB_NOTES.md
+docs/DESIGN.md  docs/PLUGINS.md  docs/COLAB_NOTES.md  docs/ROADMAP.md
+docs/USAGE.md                 build/run, backend flags, demo data, where things are stored
+docs/TESTING.md               automated tests, manual smoke checklist for real mode
+README.md                     what it is, features, safety and cost; links into docs/
 .github/workflows/ci.yml
 ```
 
@@ -157,14 +160,15 @@ Mechanism follows github.com/mizorewww/colab-account-changer (MIT):
 - Add account = `begin-add` → spawn `colab whoami` → capture the URL → the UI opens the browser
   and shows a code field → write the code to stdin → `finish-add`. Any failure or cancel runs
   `rollback-add`. The active token is never dropped without a restorable backup.
-- Each account has its own session state file (`<data>/accounts/<id>/sessions.json`), passed with
-  `--config` everywhere, including inside the ssh `ProxyCommand`. Otherwise `colab sessions`
-  under account B prunes A's local entries. On adoption the CLI's default state file is copied,
+- Each account has its own session state file (`<host data>/accounts/<id>/sessions.json`, where
+  `<host data>` is the data directory on the host where the CLI runs, inside WSL on Windows),
+  passed with `--config` everywhere, including inside the ssh `ProxyCommand`. Otherwise
+  `colab sessions` under account B prunes A's local entries. On adoption the CLI's default state file is copied,
   never modified.
 - Non-secret metadata lives in `<data>/accounts.json`. A missing keyring backend is a visible,
   explained error state, not a crash.
 
-Known limits (document in README): switching changes the machine-wide CLI account; sessions on a
+Known limits (stated in the README's "Safety and cost"): switching changes the machine-wide CLI account; sessions on a
 non-active account keep running (and billing) and are only protected by their VM-side watchdog.
 
 ### 4.4 `sessions` and `provision` — hardware targeting with retry
@@ -237,7 +241,7 @@ balance, burn rate, per-session uptime, estimated spend and time to auto-stop.
 A stopped runtime is wiped. v1 says so wherever a stop is confirmed and ships only the hook
 points for saving data: the watchdog's wind-down phase (grace period, `winddown` marker, hook
 commands before unassign), `[[keep]]` and `needs` in the plugin manifest, secret slots in the
-keyring vault, and a stop path that accepts a pre-stop step. The full keep plan (local folder,
+keyring vault, and `StopOptions` on the stop path, where a pre-stop step will be added. The full keep plan (local folder,
 Hugging Face repo, Google Drive) is recorded in `docs/ROADMAP.md`.
 
 ### 4.6 `tunnel` — port forwarding
@@ -348,5 +352,5 @@ failure. It is the default in debug builds and the only backend used by UI tests
   plugin install from a fixture folder.
 - CI (light): Linux runs fmt, clippy and all tests; Windows and macOS run `cargo check
   --workspace --all-targets` and the core tests; Windows also runs the app's UI tests.
-- Not verifiable in development (must be stated in the README with a manual smoke checklist):
+- Not verifiable by automated tests (covered by the manual smoke checklist in `docs/TESTING.md`):
   real-account login/switch, real provisioning, the VM-side `unassign`, real tunnels.

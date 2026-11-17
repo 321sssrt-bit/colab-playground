@@ -130,7 +130,7 @@ so it survives dropped connections.
 
 | name | effect |
 |---|---|
-| `hf_token` | `PLUGIN_HF_TOKEN` is set when the user has saved a Hugging Face token in Settings. Treat it as optional. |
+| `hf_token` | `PLUGIN_HF_TOKEN` is set when the user has saved a Hugging Face token on the Plugins page. Treat it as optional. |
 
 Unknown capability names are rejected.
 
@@ -214,5 +214,6 @@ then whenever `/slots` reports a request in progress.
   reports the first rule broken (field and reason).
 - Run the script on a cheap CPU or T4 session first; `run.log` and
   `status.json` are in the run directory on the VM.
-- In mock mode (`--mock`) runs are simulated stage by stage from your manifest.
-  This checks the form and stage labels without a VM.
+- In mock mode (`--mock`, the default for debug builds) runs are simulated stage
+  by stage from your manifest. This checks the form and stage labels without a
+  VM. Install from a folder there; Git URLs are not simulated.

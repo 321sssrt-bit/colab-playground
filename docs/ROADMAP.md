@@ -28,13 +28,22 @@ A stopped runtime is wiped, and the guards stop runtimes on their own. A session
   not on disk); that is how a Hugging Face token reaches a plugin. Colab's notebook "Secrets"
   (`google.colab.userdata`) are not exposed by the CLI.
 - v1 ships only the hook points: the watchdog's wind-down phase, `[[keep]]` and `needs` in the
-  plugin manifest, secret slots in the keyring vault, and a stop path that can take a pre-stop step.
+  plugin manifest, secret slots in the keyring vault, and `StopOptions` on the stop path, where a
+  pre-stop step will be added.
 
 ### Plugins worth writing
 
 - Model training / fine-tuning that pushes checkpoints to a Hugging Face repo.
 - Image-generation UIs, notebooks-as-jobs, dataset preparation.
 - Other storage targets (S3, GCS) for the keep plan.
+
+### Plugin runs
+
+- Recover a plugin run's live view (stages, log, endpoint cards) after the app restarts. Today a
+  script that was already started keeps running on the runtime, and the runtime keeps billing and
+  still shows in Sessions (where it can be stopped or a port forwarded by hand), but the run view
+  is gone. A reattach
+  could read the run directory on the VM (`status.json`, `run.log`).
 
 ### Platform and distribution
 
