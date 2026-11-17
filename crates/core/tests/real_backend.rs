@@ -800,7 +800,10 @@ fn switch_impact_lists_unmanaged_runtimes_via_the_helper() {
 #[test]
 fn colab_path_override_derives_the_interpreter() {
     let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path();
+    // Canonical, because the launcher form resolves symlinks and macOS keeps its temp
+    // directories behind one (/var -> /private/var).
+    let root = tmp.path().canonicalize().unwrap();
+    let root = root.as_path();
     let s = |p: &Path| p.to_string_lossy().into_owned();
     let exe = |p: &Path, text: &str| {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
