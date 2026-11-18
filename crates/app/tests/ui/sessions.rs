@@ -1,28 +1,32 @@
 //! Sessions over the headless mock: provisioning (retry to an 80 GB A100, not entitled,
-//! session limit, cancel), stopping any runtime on any account, forwards, the cost guard and
-//! quitting with runtimes still billing.
+//! session limit, cancel), stopping any runtime on any account, sessions that can no longer be
+//! matched to a runtime, forwards, the cost guard and quitting with runtimes still billing.
 
 use std::time::{Duration, SystemTime};
 
 use colab_playground::{
-    i18n::{self, Language},
+    i18n::{self, Language, keys, tr_args},
     route::Route,
     state::{EndReason, Overlay, ProvisionPhase, ProvisionProgress},
     ui::{
         overlays::{
-            FORWARD_BODY, FORWARD_SUBMIT, NEW_SESSION_FORM, NEW_SESSION_LIMIT, NEW_SESSION_START,
-            RESERVED_NOTE,
+            FORGET_CONFIRM, FORWARD_BODY, FORWARD_SUBMIT, NEW_SESSION_FORM, NEW_SESSION_LIMIT,
+            NEW_SESSION_START, RESERVED_NOTE,
         },
-        pages::sessions::{NEW_SESSION_SELECTOR, forward_selector, stop_selector},
+        pages::sessions::{
+            EMPTY_SELECTOR, NEW_SESSION_SELECTOR, forget_selector, forward_selector,
+            runtime_selector, stop_selector, unmatched_selector,
+        },
         progress,
     },
 };
 use colab_playground_core::{
     CancelToken, ErrorKind,
+    accounts::AccountId,
     backend::Backend,
     guard::{Concern, Decision, Limit},
-    mock::{MockFailures, MockScenario},
-    provision::ProvisionEvent,
+    mock::{MockFailures, MockRuntime, MockScenario},
+    provision::{ProvisionEvent, ProvisionSpec},
     sessions::Accelerator,
 };
 use gpui::{
@@ -1146,5 +1150,196 @@ fn turning_on_a_limit_at_the_bottom_of_the_form_scrolls_its_value_into_view(
     assert!(
         control.top() >= form.top() - px(0.5) && control.bottom() <= form.bottom() + px(0.5),
         "the value {control:?} is inside the form {form:?}"
+    );
+}
+
+const LOST: &str = "t4-91c2";
+
+fn one_managed_session() -> MockScenario {
+    MockScenario {
+        runtimes: vec![MockRuntime {
+            account: 0,
+            name: Some(LOST.into()),
+            accelerator: Accelerator::T4,
+            managed: true,
+        }],
+        ..MockScenario::single()
+    }
+}
+
+fn active_account(app: &mut TestApp<'_>) -> AccountId {
+    app.read(|state, _| {
+        state
+            .accounts()
+            .ready()
+            .and_then(|view| view.active.clone())
+    })
+    .expect("an account is active")
+}
+
+fn unmatched_names(app: &mut TestApp<'_>) -> Vec<String> {
+    app.read(|state, _| {
+        state
+            .unmatched()
+            .iter()
+            .map(|session| session.name.clone())
+            .collect()
+    })
+}
+
+fn lose_track(app: &mut TestApp<'_>, running: bool) {
+    on_sessions(app);
+    let account = active_account(app);
+    app.mock.lose_session_record(&account, LOST, running);
+    app.click("sessions-refresh");
+    assert_eq!(unmatched_names(app), [LOST]);
+}
+
+#[gpui::test]
+fn a_lost_session_with_nothing_running_can_stop_being_tracked(cx: &mut TestAppContext) {
+    let mut app = TestApp::with(cx, Options::scenario(one_managed_session()));
+    lose_track(&mut app, false);
+    assert!(app.shown(&unmatched_selector(LOST)));
+    assert!(
+        app.shown(EMPTY_SELECTOR),
+        "the warning shows although nothing runs"
+    );
+
+    app.click(&forget_selector(LOST));
+    let Some(Overlay::Forget(prompt)) = app.read(|state, _| state.overlay().cloned()) else {
+        panic!("expected the confirmation to stop tracking {LOST}");
+    };
+    assert_eq!(prompt.name, LOST);
+    assert_eq!(prompt.email.as_deref(), Some("ada@example.com"));
+    app.click(FORGET_CONFIRM);
+    assert!(app.read(|state, _| state.overlay().is_none()));
+    assert!(unmatched_names(&mut app).is_empty());
+    assert!(!app.shown(&unmatched_selector(LOST)));
+    let done = app
+        .cx
+        .update(|_, cx| tr_args(cx, keys::FORGET_DONE, &[("name", LOST)]));
+    assert!(app.toasts().contains(&done), "{:?}", app.toasts());
+}
+
+#[gpui::test]
+fn stopping_tracking_a_lost_session_settles_ownership_and_stops_nothing(cx: &mut TestAppContext) {
+    let mut app = TestApp::new(cx);
+    let email = app.read(|state, _| state.active_email()).unwrap();
+    let ownership = |app: &mut TestApp<'_>| {
+        app.read(|state, _| {
+            state
+                .unmanaged()
+                .into_iter()
+                .find(|(each, _, _)| each.as_deref() == Some(email.as_str()))
+                .map(|(_, count, _)| count)
+        })
+    };
+    lose_track(&mut app, true);
+    // Its runtime runs on without a name, so it is shown by its hardware.
+    let mut listed = runtime_names(&mut app);
+    listed.sort();
+    assert!(listed.contains(&"T4".to_owned()), "{listed:?}");
+    assert_eq!(ownership(&mut app), Some(None), "ownership is unknown");
+    app.click(Route::Overview.nav_selector());
+    let unknown_title = app.text(keys::UNMANAGED_UNKNOWN_TITLE);
+    let unknown = app
+        .cx
+        .update(|_, cx| tr_args(cx, keys::UNMANAGED_UNKNOWN, &[("email", &email)]));
+    let unknown_warning = format!("unmanaged-warning {unknown_title} {unknown}");
+    assert!(app.shown(&unknown_warning));
+
+    on_sessions(&mut app);
+    app.click(&forget_selector(LOST));
+    app.click(FORGET_CONFIRM);
+    assert!(unmatched_names(&mut app).is_empty());
+    assert_eq!(
+        ownership(&mut app),
+        Some(Some(2)),
+        "the browser's L4 and the T4 are both not started by this app now"
+    );
+    assert!(
+        app.shown(&runtime_selector("T4")),
+        "its card is still shown"
+    );
+    let mut after = runtime_names(&mut app);
+    after.sort();
+    assert_eq!(after, listed, "nothing was stopped");
+    let t4_managed = app.read(|state, _| {
+        state.runtimes().ready().and_then(|view| {
+            view.runtimes
+                .iter()
+                .find(|runtime| colab_playground::state::runtime_label(runtime) == "T4")
+                .map(|runtime| runtime.managed)
+        })
+    });
+    assert_eq!(t4_managed, Some(false));
+
+    app.click(Route::Overview.nav_selector());
+    let title = app.text(keys::UNMANAGED_TITLE);
+    let counted = app.cx.update(|_, cx| {
+        tr_args(
+            cx,
+            keys::UNMANAGED_MANY,
+            &[("email", &email), ("count", "2")],
+        )
+    });
+    assert!(app.shown(&format!("unmanaged-warning {title} {counted}")));
+    assert!(!app.shown(&unknown_warning));
+}
+
+#[gpui::test]
+fn stopping_tracking_waits_until_the_account_can_be_listed(cx: &mut TestAppContext) {
+    let mut app = TestApp::with(cx, Options::scenario(one_managed_session()));
+    lose_track(&mut app, false);
+    app.click(&forget_selector(LOST));
+    app.set_failures(MockFailures {
+        runtimes_listing_fails: true,
+        ..MockFailures::default()
+    });
+    app.click(FORGET_CONFIRM);
+    let Some(Overlay::Forget(prompt)) = app.read(|state, _| state.overlay().cloned()) else {
+        panic!("the confirmation stays open with the error");
+    };
+    assert_eq!(prompt.error.map(|e| e.kind), Some(ErrorKind::Http));
+    assert!(app.shown("error-forget"));
+
+    app.click("overlay-cancel");
+    app.set_failures(MockFailures::default());
+    app.click("sessions-refresh");
+    assert_eq!(unmatched_names(&mut app), [LOST], "still tracked");
+    assert!(app.shown(&unmatched_selector(LOST)));
+}
+
+#[gpui::test]
+fn a_lost_session_whose_runtime_is_found_again_stays_tracked(cx: &mut TestAppContext) {
+    let mut app = TestApp::with(cx, Options::scenario(one_managed_session()));
+    lose_track(&mut app, false);
+    app.click(&forget_selector(LOST));
+    // The mock cannot give a lost runtime its name back; a runtime started under that name is
+    // identified the same way.
+    let spec = ProvisionSpec::new(
+        LOST,
+        Accelerator::T4,
+        &colab_playground_core::Defaults::default(),
+    );
+    let (events, _received) = std::sync::mpsc::channel();
+    app.mock
+        .provision(spec, events, &CancelToken::new())
+        .expect("a runtime under the lost name");
+    app.click(FORGET_CONFIRM);
+    assert!(app.read(|state, _| state.overlay().is_none()));
+    let found = app
+        .cx
+        .update(|_, cx| tr_args(cx, keys::FORGET_FOUND, &[("name", LOST)]));
+    assert!(
+        app.toasts_with_severity()
+            .contains(&(found, Some(ely_gpui_component::primitives::Severity::Info))),
+        "{:?}",
+        app.toasts_with_severity()
+    );
+    assert!(unmatched_names(&mut app).is_empty());
+    assert!(
+        app.shown(&stop_selector(LOST)),
+        "its card offers to stop it"
     );
 }

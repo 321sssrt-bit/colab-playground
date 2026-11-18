@@ -1,5 +1,6 @@
 //! Sessions: every runtime on every saved account, stopping (any runtime, any account),
-//! extending and cancelling auto-stop, what the cost guard decided, and runtimes that ended.
+//! extending and cancelling auto-stop, what the cost guard decided, runtimes that ended, and
+//! sessions the app can no longer match to a runtime.
 //!
 //! A runtime that ended drops out of `runtimes()`, so the app keeps its own short list of
 //! ended runtimes with the reason, for the reason to stay visible.
@@ -11,8 +12,10 @@ use std::{
 
 use colab_playground_core::{
     Error, ErrorKind,
+    accounts::AccountId,
     backend::{GuardReport, Runtime, RuntimeRef, RuntimesView, StopOptions},
     guard::{Concern, Decision},
+    sessions::TrackedSession,
     tunnel::{TunnelId, TunnelInfo},
 };
 use ely_gpui_component::{feedback::Toast, primitives::Severity};
@@ -63,6 +66,18 @@ pub struct StopPrompt {
     pub label: String,
     pub email: Option<String>,
     pub error: Option<Error>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ForgetPrompt {
+    pub account: AccountId,
+    pub name: String,
+    pub email: Option<String>,
+    pub error: Option<Error>,
+}
+
+fn forget_op(account: &AccountId, name: &str) -> Op {
+    Op::Forget(key_of(&(account, name)))
 }
 
 /// The name a runtime is shown by: its session name, or its hardware for runtimes opened
@@ -227,6 +242,98 @@ impl AppState {
                     Err(error) => {
                         log::warn!("sessions: stopping {label} failed: {error}");
                         if prompt_open && let Some(Overlay::Stop(prompt)) = &mut state.overlay {
+                            prompt.error = Some(error);
+                        } else {
+                            state.toast_error(&error, cx);
+                        }
+                    }
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    /// Sessions this app started that no runtime on a listed account can be matched to: each has
+    /// ended, or is one of that account's runtimes shown as not managed.
+    pub fn unmatched(&self) -> &[TrackedSession] {
+        self.sessions
+            .runtimes
+            .ready()
+            .map_or(&[], |view| view.unmatched.as_slice())
+    }
+
+    pub fn is_forgetting(&self, account: &AccountId, name: &str) -> bool {
+        self.ops.is_running(forget_op(account, name))
+    }
+
+    pub fn request_forget(&mut self, account: AccountId, name: String, cx: &mut Context<Self>) {
+        let listed = self
+            .unmatched()
+            .iter()
+            .any(|session| session.account == account && session.name == name);
+        if !listed {
+            return;
+        }
+        self.overlay = Some(Overlay::Forget(ForgetPrompt {
+            email: self.email_of(&account),
+            account,
+            name,
+            error: None,
+        }));
+        cx.notify();
+    }
+
+    pub fn confirm_forget(&mut self, cx: &mut Context<Self>) {
+        let Some(Overlay::Forget(prompt)) = &self.overlay else {
+            return;
+        };
+        let (account, name) = (prompt.account.clone(), prompt.name.clone());
+        self.stop_tracking(account, name, cx);
+    }
+
+    /// Drops `name` from the app's records (the caller has confirmed). Nothing is stopped.
+    fn stop_tracking(&mut self, account: AccountId, name: String, cx: &mut Context<Self>) {
+        let (work_account, work_name) = (account.clone(), name.clone());
+        self.run_backend(
+            forget_op(&account, &name),
+            cx,
+            move |backend, cancel| backend.forget_session(&work_account, &work_name, cancel),
+            move |state, result, cx| {
+                let prompt_open = matches!(
+                    &state.overlay,
+                    Some(Overlay::Forget(p)) if p.account == account && p.name == name
+                );
+                match result {
+                    Ok(()) => {
+                        if prompt_open {
+                            state.overlay = None;
+                        }
+                        if let Load::Ready(view) = &mut state.sessions.runtimes {
+                            view.unmatched.retain(|session| {
+                                !(session.account == account && session.name == name)
+                            });
+                        }
+                        state.toast_done(tr_args(cx, keys::FORGET_DONE, &[("name", &name)]), cx);
+                        // Whether an account's runtimes are all accounted for is judged with
+                        // its usage reading, so only a new reading clears that warning.
+                        state.after_runtime_change(cx);
+                    }
+                    // Core refuses this when its listing identifies the session's runtime again,
+                    // which then has a card to stop it from.
+                    Err(error) if error.is(ErrorKind::InvalidInput) => {
+                        if prompt_open {
+                            state.overlay = None;
+                        }
+                        state.toast(
+                            Toast::new(tr_args(cx, keys::FORGET_FOUND, &[("name", &name)]))
+                                .severity(Severity::Info),
+                            cx,
+                        );
+                        state.after_runtime_change(cx);
+                    }
+                    Err(error) => {
+                        log::warn!("sessions: forgetting {name} failed: {error}");
+                        if prompt_open && let Some(Overlay::Forget(prompt)) = &mut state.overlay {
                             prompt.error = Some(error);
                         } else {
                             state.toast_error(&error, cx);

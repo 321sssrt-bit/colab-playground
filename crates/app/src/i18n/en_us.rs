@@ -1110,4 +1110,24 @@ pub(super) const MESSAGES: Messages = &[
         PROV_NO_ANSWER,
         "Colab hasn't answered for {time}. Some requests take longer; you can also cancel now.",
     ),
+    (SESSIONS_UNMATCHED_TITLE, "Lost track of {name}"),
+    (
+        SESSIONS_UNMATCHED_BODY,
+        "This app started {name} on {email} but can no longer tell which runtime it is, so it can't stop it or apply its limits. If it is still running, it is listed under that account as “Not started by this app”; stop it there to end billing. If it has ended, stop tracking it.",
+    ),
+    (ACTION_STOP_TRACKING, "Stop tracking"),
+    (FORGET_TITLE, "Stop tracking this session?"),
+    (
+        FORGET_BODY,
+        "{name} on {email} will be removed from this app. Nothing is stopped.",
+    ),
+    (
+        FORGET_WARNING,
+        "If its runtime is still running, it keeps billing and this app no longer watches it or stops it for you. It stays listed as “Not started by this app” until you stop it there.",
+    ),
+    (FORGET_DONE, "No longer tracking {name}."),
+    (
+        FORGET_FOUND,
+        "Found the runtime of {name} again. You can stop it from its card.",
+    ),
 ];

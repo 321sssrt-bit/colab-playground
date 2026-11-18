@@ -950,4 +950,24 @@ pub(super) const MESSAGES: Messages = &[
         PROV_NO_ANSWER,
         "Colab 已有 {time}沒有回應。有些申請要等更久，也可以現在取消。",
     ),
+    (SESSIONS_UNMATCHED_TITLE, "已無法確認 {name} 是哪個執行階段"),
+    (
+        SESSIONS_UNMATCHED_BODY,
+        "本應用程式在 {email} 上啟動了 {name}，但現在無法確認它是哪個執行階段，因此無法停止它，也無法對它執行限額。如果它還在執行，它會在該帳號下顯示為「非本應用程式啟動」，請在那裡停止它以結束計費。如果它已經結束，請停止追蹤。",
+    ),
+    (ACTION_STOP_TRACKING, "停止追蹤"),
+    (FORGET_TITLE, "停止追蹤這個工作階段？"),
+    (
+        FORGET_BODY,
+        "{email} 上的 {name} 將從本應用程式中移除。不會停止任何執行階段。",
+    ),
+    (
+        FORGET_WARNING,
+        "如果它的執行階段還在執行，它會繼續計費，本應用程式不再監控它，也不會替你停止它。在你手動停止之前，它會一直顯示為「非本應用程式啟動」。",
+    ),
+    (FORGET_DONE, "已不再追蹤 {name}。"),
+    (
+        FORGET_FOUND,
+        "已重新找到 {name} 的執行階段，現在可以在它的卡片上停止它。",
+    ),
 ];

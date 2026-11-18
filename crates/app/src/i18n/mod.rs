@@ -638,6 +638,14 @@ catalog_keys! {
     PROV_RECONCILING => "app.b11.prov_reconciling",
     PROV_RECONCILED => "app.b11.prov_reconciled",
     PROV_NO_ANSWER => "app.b11.prov_no_answer",
+    SESSIONS_UNMATCHED_TITLE => "app.b11.sessions_unmatched_title",
+    SESSIONS_UNMATCHED_BODY => "app.b11.sessions_unmatched_body",
+    ACTION_STOP_TRACKING => "app.b11.action_stop_tracking",
+    FORGET_TITLE => "app.b11.forget_title",
+    FORGET_BODY => "app.b11.forget_body",
+    FORGET_WARNING => "app.b11.forget_warning",
+    FORGET_DONE => "app.b11.forget_done",
+    FORGET_FOUND => "app.b11.forget_found",
 }
 
 /// A message table: `(key, message)` pairs; `{name}` marks an argument.

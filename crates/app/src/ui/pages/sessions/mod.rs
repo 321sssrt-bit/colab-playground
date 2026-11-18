@@ -1,20 +1,22 @@
 //! The Sessions page: every runtime on every saved account, grouped by account, with the
-//! actions each allows; provisioning in progress; per-account listing errors; runtimes that
-//! ended and why.
+//! actions each allows; provisioning in progress; per-account listing errors; sessions the app
+//! can no longer match to a runtime; runtimes that ended and why.
 
 mod card;
 
-use colab_playground_core::backend::Runtime;
+use colab_playground_core::{backend::Runtime, sessions::TrackedSession};
 use ely_gpui_component::{
     buttons::{Button, ButtonVariant, IconButton},
-    feedback::{EmptyState, InlineMessage},
+    feedback::{Alert, EmptyState, InlineMessage},
     layout::{Card, CardHeader, Page},
     motion::Spinner,
     primitives::{IconName, Severity},
-    theme::{ActiveTheme, IconSize, TextSize},
+    theme::{ActiveTheme, ControlSize, IconSize, TextSize},
     typography::Caption,
 };
-use gpui::{AnyElement, App, Entity, FontWeight, IntoElement, ParentElement, Styled, div};
+use gpui::{
+    AnyElement, App, Entity, FontWeight, IntoElement, ParentElement, SharedString, Styled, div,
+};
 
 use crate::{
     errors, format,
@@ -138,6 +140,13 @@ pub fn render(state: &AppState, handle: &Entity<AppState>, cx: &App) -> Page {
                     cx,
                 ));
             }
+            // Ahead of the empty state too: such a session keeps its account from being removed
+            // even when nothing runs on it.
+            page = page.children(
+                view.unmatched
+                    .iter()
+                    .map(|session| unmatched(session, state, handle, cx)),
+            );
             if view.runtimes.is_empty() {
                 let new = handle.clone();
                 // "Nothing is running" only when every account was listed; otherwise it covers
@@ -166,6 +175,64 @@ pub fn render(state: &AppState, handle: &Entity<AppState>, cx: &App) -> Page {
         }
     };
     page.children(ended(state, handle, cx))
+}
+
+/// Selector around the warning about a session that cannot be matched to a runtime.
+pub fn unmatched_selector(name: &str) -> String {
+    format!("unmatched {name}")
+}
+pub fn forget_selector(name: &str) -> String {
+    format!("unmatched-forget {name}")
+}
+
+/// A session this app started that it can no longer match to a runtime: it cannot be stopped
+/// from here, so the warning says where it may still be billing and offers to stop tracking it.
+fn unmatched(
+    session: &TrackedSession,
+    state: &AppState,
+    handle: &Entity<AppState>,
+    cx: &App,
+) -> AnyElement {
+    let email = state
+        .email_of(&session.account)
+        .unwrap_or_else(|| tr(cx, keys::ACCOUNTS_NO_EMAIL).to_string());
+    let name = session.name.as_str();
+    let id = format!("{}-{name}", session.account);
+    let busy = state.is_forgetting(&session.account, name);
+    let (forget, account, forget_name) = (
+        handle.clone(),
+        session.account.clone(),
+        session.name.clone(),
+    );
+    tagged(
+        unmatched_selector(name),
+        Alert::new(
+            SharedString::from(format!("unmatched-{id}")),
+            Severity::Warning,
+            tr_args(cx, keys::SESSIONS_UNMATCHED_TITLE, &[("name", name)]),
+        )
+        .body(tr_args(
+            cx,
+            keys::SESSIONS_UNMATCHED_BODY,
+            &[("name", name), ("email", &email)],
+        ))
+        .action(tagged(
+            forget_selector(name),
+            Button::new(
+                SharedString::from(format!("unmatched-forget-{id}")),
+                tr(cx, keys::ACTION_STOP_TRACKING),
+            )
+            .size(ControlSize::Sm)
+            .disabled(busy)
+            .on_click(move |_, _, cx| {
+                forget.update(cx, |state, cx| {
+                    state.request_forget(account.clone(), forget_name.clone(), cx)
+                })
+            }),
+        )),
+    )
+    .w_full()
+    .into_any_element()
 }
 
 /// Runtimes grouped by account, the active account first.

@@ -12,7 +12,7 @@ use gpui::{AnyElement, App, Entity, IntoElement, ParentElement};
 use super::{cancel_button, close};
 use crate::{
     i18n::{keys, tr, tr_args},
-    state::{AppState, StopPrompt},
+    state::{AppState, ForgetPrompt, StopPrompt},
     ui::{error_view, tagged},
 };
 
@@ -117,6 +117,57 @@ pub(super) fn cancel_auto_stop(
                     .on_click(move |_, _, cx| {
                         go.update(cx, |state, cx| state.confirm_cancel_auto_stop(cx))
                     }),
+            )
+        })
+        .into_any_element()
+}
+
+pub const FORGET_CONFIRM: &str = "forget-confirm";
+
+/// Stop tracking a session that cannot be matched to a runtime, confirmed once: if that runtime
+/// still runs, it keeps billing with nothing in this app to stop it.
+pub(super) fn forget(
+    prompt: &ForgetPrompt,
+    state: &AppState,
+    handle: &Entity<AppState>,
+    cx: &App,
+) -> AnyElement {
+    let email = prompt
+        .email
+        .clone()
+        .unwrap_or_else(|| tr(cx, keys::ACCOUNTS_NO_EMAIL).to_string());
+    let busy = state.is_forgetting(&prompt.account, &prompt.name);
+    let (cancel, confirm) = (
+        tr(cx, keys::ACTION_CANCEL),
+        tr(cx, keys::ACTION_STOP_TRACKING),
+    );
+    let mut dialog = Dialog::new("forget-session", tr(cx, keys::FORGET_TITLE), close(handle))
+        .child(Paragraph::new(tr_args(
+            cx,
+            keys::FORGET_BODY,
+            &[("name", &prompt.name), ("email", &email)],
+        )))
+        .child(InlineMessage::new(
+            Severity::Warning,
+            tr(cx, keys::FORGET_WARNING),
+        ));
+    if let Some(error) = &prompt.error {
+        dialog = dialog.child(error_view::alert("forget", None, error, None, handle, cx));
+    }
+    let go = handle.clone();
+    dialog
+        .action({
+            let handle = handle.clone();
+            move |_| cancel_button(cancel, handle)
+        })
+        .action(move |_| {
+            tagged(
+                FORGET_CONFIRM,
+                Button::new(FORGET_CONFIRM, confirm)
+                    .variant(ButtonVariant::Danger)
+                    .loading(busy)
+                    .disabled(busy)
+                    .on_click(move |_, _, cx| go.update(cx, |state, cx| state.confirm_forget(cx))),
             )
         })
         .into_any_element()

@@ -930,4 +930,24 @@ pub(super) const MESSAGES: Messages = &[
         PROV_NO_ANSWER,
         "Colab 已有 {time}没有回应。有的申请要等更久，也可以现在取消。",
     ),
+    (SESSIONS_UNMATCHED_TITLE, "已无法确认 {name} 是哪个运行时"),
+    (
+        SESSIONS_UNMATCHED_BODY,
+        "本应用在 {email} 上启动了 {name}，但现在无法确认它是哪个运行时，因此无法停止它，也无法对它执行限额。如果它还在运行，它会在该账号下显示为“非本应用启动”，请在那里停止它以结束计费。如果它已经结束，请停止跟踪。",
+    ),
+    (ACTION_STOP_TRACKING, "停止跟踪"),
+    (FORGET_TITLE, "停止跟踪此会话？"),
+    (
+        FORGET_BODY,
+        "{email} 上的 {name} 将从本应用中移除。不会停止任何运行时。",
+    ),
+    (
+        FORGET_WARNING,
+        "如果它的运行时还在运行，它会继续计费，本应用不再监控它，也不会替你停止它。在你手动停止之前，它会一直显示为“非本应用启动”。",
+    ),
+    (FORGET_DONE, "已不再跟踪 {name}。"),
+    (
+        FORGET_FOUND,
+        "已重新找到 {name} 的运行时，现在可以在它的卡片上停止它。",
+    ),
 ];

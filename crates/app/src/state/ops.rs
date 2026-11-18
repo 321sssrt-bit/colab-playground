@@ -55,6 +55,8 @@ pub enum Op {
     Extend(u64),
     /// Cancelling one runtime's auto-stop (keyed by runtime).
     CancelAutoStop(u64),
+    /// Dropping a session that cannot be matched to a runtime (keyed by account and name).
+    Forget(u64),
     /// Opening a forward (keyed by runtime and remote port).
     Forward(u64),
     /// Closing a forward (keyed by tunnel id).

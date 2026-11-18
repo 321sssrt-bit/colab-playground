@@ -45,7 +45,7 @@ pub use plugins::{HF_TOKEN, InstallPrompt, RemovePrompt, is_git_source};
 pub use provision::{LimitReached, NewSession, ProvisionPhase, ProvisionProgress};
 pub use quit::{Billing, QuitPrompt};
 pub use runs::{HF_RESULTS, HfLookup, PluginRun, PluginView, RunForm, RunPhase};
-pub use sessions::{EndReason, Ended, StopPrompt, runtime_label};
+pub use sessions::{EndReason, Ended, ForgetPrompt, StopPrompt, runtime_label};
 pub use tunnels::{FORWARD_START_PORT, ForwardForm, local_url};
 pub use updates::{UPDATE_INTERVAL, UpdateCheck, is_newer};
 pub use usage::{
@@ -157,6 +157,8 @@ pub enum Overlay {
     Stop(StopPrompt),
     /// Cancel a runtime's auto-stop, confirmed once.
     CancelAutoStop(StopPrompt),
+    /// Stop tracking a session that cannot be matched to a runtime, confirmed once.
+    Forget(ForgetPrompt),
     NewSession,
     Forward(ForwardForm),
     /// Install a plugin, after checking it.
