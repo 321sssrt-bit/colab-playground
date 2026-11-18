@@ -69,6 +69,195 @@ pub struct RealConfig {
     pub run_poll_interval: Duration,
 }
 
+#[cfg(test)]
+mod reconciliation_tests {
+    use super::*;
+    use crate::sessions::Accelerator;
+
+    #[test]
+    fn entries_started_after_the_listing_sample_are_not_marked_vanished() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = RealConfig::for_app(Defaults::default()).unwrap();
+        config.local_dir = dir.path().to_owned();
+        let backend = RealBackend::new(config).unwrap();
+        let account = AccountId::new("alice").unwrap();
+        let entry = |name: &str| TrackedSession {
+            name: name.into(),
+            account: account.clone(),
+            endpoint: Some(format!("endpoint-{name}")),
+            accelerator: Accelerator::T4,
+            high_mem: false,
+            gpu: None,
+            vram_mib: None,
+            policy: GuardPolicy::default(),
+            spend: SpendMeter::new(SystemTime::UNIX_EPOCH),
+            watchdog: None,
+            stopped: None,
+        };
+        backend.inner.st().ledger.upsert(entry("old")).unwrap();
+        let sample = backend.inner.reconciliation_sample();
+        let listing = Vec::new();
+        backend.inner.st().ledger.upsert(entry("new")).unwrap();
+        let vanished = backend.inner.reconcile(&account, &listing, None, &sample);
+        assert_eq!(vanished.len(), 1);
+        assert_eq!(vanished[0].name.as_deref(), Some("old"));
+        assert!(backend.inner.st().ledger.live(&account, "new").is_some());
+    }
+
+    #[test]
+    fn a_session_that_ended_is_reported_even_when_the_ledger_cannot_be_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = RealConfig::for_app(Defaults::default()).unwrap();
+        config.local_dir = dir.path().to_owned();
+        let backend = RealBackend::new(config).unwrap();
+        let account = AccountId::new("alice").unwrap();
+        for name in ["first", "second"] {
+            backend
+                .inner
+                .st()
+                .ledger
+                .upsert(TrackedSession {
+                    name: name.into(),
+                    account: account.clone(),
+                    endpoint: Some(format!("endpoint-{name}")),
+                    accelerator: Accelerator::T4,
+                    high_mem: false,
+                    gpu: None,
+                    vram_mib: None,
+                    policy: GuardPolicy::default(),
+                    spend: SpendMeter::new(SystemTime::UNIX_EPOCH),
+                    watchdog: None,
+                    stopped: None,
+                })
+                .unwrap();
+        }
+        let sample = backend.inner.reconciliation_sample();
+        // A directory where the file was makes every save fail.
+        let ledger = dir.path().join("ledger.json");
+        std::fs::remove_file(&ledger).unwrap();
+        std::fs::create_dir(&ledger).unwrap();
+        assert!(backend.inner.st().ledger.save().is_err());
+
+        let vanished = backend.inner.reconcile(&account, &[], None, &sample);
+        let names: Vec<_> = vanished.iter().filter_map(|r| r.name.as_deref()).collect();
+        assert_eq!(names, ["first", "second"]);
+        assert!(backend.inner.st().ledger.live(&account, "first").is_none());
+        assert!(backend.inner.st().ledger.live(&account, "second").is_none());
+    }
+
+    #[test]
+    fn a_session_without_an_endpoint_takes_only_a_listed_one_and_is_never_ended() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = RealConfig::for_app(Defaults::default()).unwrap();
+        config.local_dir = dir.path().to_owned();
+        let backend = RealBackend::new(config).unwrap();
+        let account = AccountId::new("alice").unwrap();
+        backend
+            .inner
+            .st()
+            .ledger
+            .upsert(TrackedSession {
+                name: "reused".into(),
+                account: account.clone(),
+                endpoint: None,
+                accelerator: Accelerator::T4,
+                high_mem: false,
+                gpu: None,
+                vram_mib: None,
+                policy: GuardPolicy::default(),
+                spend: SpendMeter::new(SystemTime::UNIX_EPOCH),
+                watchdog: None,
+                stopped: None,
+            })
+            .unwrap();
+        let listing = |endpoint: &str| {
+            vec![RemoteAssignment {
+                endpoint: endpoint.into(),
+                accelerator: Some(Accelerator::T4),
+                accelerator_label: "T4".into(),
+                variant: "GPU".into(),
+                high_mem: false,
+            }]
+        };
+        let endpoint = |backend: &RealBackend| {
+            let st = backend.inner.st();
+            st.ledger.live(&account, "reused").unwrap().endpoint.clone()
+        };
+
+        // Only the record of an earlier session with this name: nothing to go by.
+        let stale = BTreeMap::from([("a-earlier".into(), "reused".into())]);
+        let sample = backend.inner.reconciliation_sample();
+        let vanished =
+            backend
+                .inner
+                .reconcile(&account, &listing("b-current"), Some(&stale), &sample);
+        assert!(vanished.is_empty());
+        assert_eq!(endpoint(&backend), None);
+
+        // Both records: the listed one is the session's.
+        let both = BTreeMap::from([
+            ("a-earlier".into(), "reused".into()),
+            ("b-current".into(), "reused".into()),
+        ]);
+        let vanished =
+            backend
+                .inner
+                .reconcile(&account, &listing("b-current"), Some(&both), &sample);
+        assert!(vanished.is_empty());
+        assert_eq!(endpoint(&backend).as_deref(), Some("b-current"));
+    }
+
+    #[test]
+    fn reused_session_names_do_not_reconcile_the_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = RealConfig::for_app(Defaults::default()).unwrap();
+        config.local_dir = dir.path().to_owned();
+        let backend = RealBackend::new(config).unwrap();
+        let account = AccountId::new("alice").unwrap();
+        let original = TrackedSession {
+            name: "reused".into(),
+            account: account.clone(),
+            endpoint: Some("old-endpoint".into()),
+            accelerator: Accelerator::T4,
+            high_mem: false,
+            gpu: None,
+            vram_mib: None,
+            policy: GuardPolicy::default(),
+            spend: SpendMeter::new(SystemTime::UNIX_EPOCH),
+            watchdog: None,
+            stopped: None,
+        };
+        for endpoint in [
+            None,
+            Some("old-endpoint".into()),
+            Some("new-endpoint".into()),
+        ] {
+            backend.inner.st().ledger.upsert(original.clone()).unwrap();
+            let sample = backend.inner.reconciliation_sample();
+            let mut replacement = original.clone();
+            replacement.endpoint = endpoint;
+            replacement.spend = SpendMeter::new(SystemTime::UNIX_EPOCH + Duration::from_secs(1));
+            backend
+                .inner
+                .st()
+                .ledger
+                .upsert(replacement.clone())
+                .unwrap();
+            let names = BTreeMap::from([("listed-endpoint".into(), "reused".into())]);
+            assert!(
+                backend
+                    .inner
+                    .reconcile(&account, &[], Some(&names), &sample)
+                    .is_empty()
+            );
+            assert_eq!(
+                backend.inner.st().ledger.live(&account, "reused"),
+                Some(&replacement)
+            );
+        }
+    }
+}
+
 impl RealConfig {
     /// A configuration for the real app: `Host::detect()`, the OS data
     /// directory, lazy toolchain discovery.
@@ -481,25 +670,134 @@ impl Inner {
     }
 
     /// Names recorded in an account's state file, by endpoint.
-    fn state_names(&self, account: &AccountId, cancel: &CancelToken) -> BTreeMap<String, String> {
-        let Ok(layout) = self.layout(cancel) else {
-            return BTreeMap::new();
-        };
+    fn state_names(
+        &self,
+        account: &AccountId,
+        cancel: &CancelToken,
+    ) -> Option<BTreeMap<String, String>> {
+        let layout = self.layout(cancel).ok()?;
         let text = self
             .fs()
             .read(&layout.account_state(account), cancel)
             .ok()
-            .flatten()
-            .unwrap_or_default();
-        let map: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_str(&text).unwrap_or_default();
-        map.into_iter()
-            .filter_map(|(name, rec)| {
-                rec.get("endpoint")
-                    .and_then(|e| e.as_str())
-                    .map(|e| (e.to_owned(), name))
+            .flatten()?;
+        let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&text).ok()?;
+        Some(
+            map.into_iter()
+                .filter_map(|(name, rec)| {
+                    rec.get("endpoint")
+                        .and_then(|e| e.as_str())
+                        .map(|e| (e.to_owned(), name))
+                })
+                .collect(),
+        )
+    }
+
+    fn reconciliation_sample(&self) -> BTreeMap<AccountId, Vec<TrackedSession>> {
+        let mut sample: BTreeMap<AccountId, Vec<TrackedSession>> = BTreeMap::new();
+        for entry in self
+            .st()
+            .ledger
+            .entries()
+            .iter()
+            .filter(|e| e.stopped.is_none())
+        {
+            sample
+                .entry(entry.account.clone())
+                .or_default()
+                .push(entry.clone());
+        }
+        sample
+    }
+
+    fn reconcile(
+        &self,
+        account: &AccountId,
+        list: &[RemoteAssignment],
+        names: Option<&BTreeMap<String, String>>,
+        sample: &BTreeMap<AccountId, Vec<TrackedSession>>,
+    ) -> Vec<RuntimeRef> {
+        let mut st = self.st();
+        let live: Vec<_> = st
+            .ledger
+            .entries()
+            .iter()
+            .filter(|e| {
+                &e.account == account
+                    && e.stopped.is_none()
+                    && sample.get(account).is_some_and(|entries| {
+                        entries.iter().any(|sampled| {
+                            sampled.name == e.name
+                                && sampled.started_at() == e.started_at()
+                                && sampled.endpoint == e.endpoint
+                        })
+                    })
             })
-            .collect()
+            .cloned()
+            .collect();
+        let mut vanished = Vec::new();
+        // A failed save keeps the change in memory and the next save writes it, so the
+        // round goes on: a session that ended is still reported.
+        for e in live {
+            let listed = |endpoint: &str| list.iter().any(|a| a.endpoint == endpoint);
+            let Some(endpoint) = e.endpoint.clone() else {
+                // The state file may still hold the record of an earlier session with this
+                // name, so only an endpoint the listing confirms is taken from it, and an
+                // unlisted one never ends the session.
+                let confirmed = names.and_then(|names| {
+                    names
+                        .iter()
+                        .find(|(endpoint, name)| *name == &e.name && listed(endpoint))
+                        .map(|(endpoint, _)| endpoint.clone())
+                });
+                if let Some(endpoint) = confirmed {
+                    let _ = st
+                        .ledger
+                        .update(account, &e.name, |e| e.endpoint = Some(endpoint));
+                }
+                continue;
+            };
+            if !listed(&endpoint) {
+                let _ = st.ledger.update(account, &e.name, |e| {
+                    e.stopped = Some(StopRecord {
+                        at: self.now(),
+                        reason: StopReason::Vanished,
+                    });
+                });
+                vanished.push(RuntimeRef {
+                    account: account.clone(),
+                    endpoint,
+                    name: Some(e.name),
+                });
+            }
+        }
+        vanished
+    }
+
+    fn reconcile_accounts(
+        &self,
+        ids: &[AccountId],
+        cancel: &CancelToken,
+    ) -> (BTreeSet<AccountId>, Vec<RuntimeRef>) {
+        let mut verified = BTreeSet::new();
+        let mut vanished = Vec::new();
+        let sample = self.reconciliation_sample();
+        if let Ok(helper) = self.helper()
+            && let Ok(listed) = helper.assignments(ids, cancel)
+        {
+            for (account, result) in listed {
+                if let Ok(list) = result {
+                    let names = self.state_names(&account, cancel);
+                    vanished.extend(self.reconcile(&account, &list, names.as_ref(), &sample));
+                    if !self.st().ledger.entries().iter().any(|e| {
+                        e.account == account && e.stopped.is_none() && e.endpoint.is_none()
+                    }) {
+                        verified.insert(account);
+                    }
+                }
+            }
+        }
+        (verified, vanished)
     }
 
     fn stop(&self, target: &RuntimeRef, opts: &StopOptions, cancel: &CancelToken) -> Result<()> {
@@ -565,7 +863,11 @@ impl Inner {
         Ok(())
     }
 
-    fn record_usage(&self, results: Vec<(AccountId, Result<crate::usage::Usage>)>) {
+    fn record_usage(
+        &self,
+        results: Vec<(AccountId, Result<crate::usage::Usage>)>,
+        verified: &BTreeSet<AccountId>,
+    ) {
         let now = self.now();
         for (id, res) in results {
             let live = self.live_names(&id);
@@ -574,6 +876,7 @@ impl Inner {
             match res {
                 Ok(u) => {
                     entry.record_success(u, now, &live);
+                    entry.ownership_verified = live.is_empty() || verified.contains(&id);
                     let snap = entry.snapshot;
                     if let Some(s) = snap {
                         let _ = st.accounts.set_usage(&id, s);
@@ -995,7 +1298,10 @@ impl Backend for RealBackend {
                 .and_then(|results| results.into_iter().find(|(a, _)| a == f))
                 .and_then(|(_, res)| res.ok());
             unmanaged_left_running = listed.map(|assignments| {
-                let names = self.inner.state_names(f, &CancelToken::new());
+                let names = self
+                    .inner
+                    .state_names(f, &CancelToken::new())
+                    .unwrap_or_default();
                 assignments
                     .into_iter()
                     .filter_map(|a| {
@@ -1073,11 +1379,13 @@ impl Backend for RealBackend {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
+        let (verified, _) = self.inner.reconcile_accounts(&ids, cancel);
         match self.inner.helper()?.usage_many(&ids, cancel) {
-            Ok(results) => self.inner.record_usage(results),
-            Err(e) => self
-                .inner
-                .record_usage(ids.iter().map(|i| (i.clone(), Err(e.clone()))).collect()),
+            Ok(results) => self.inner.record_usage(results, &verified),
+            Err(e) => self.inner.record_usage(
+                ids.iter().map(|i| (i.clone(), Err(e.clone()))).collect(),
+                &verified,
+            ),
         }
         Ok(self.inner.usage_views())
     }
@@ -1107,6 +1415,7 @@ impl Backend for RealBackend {
             return Ok(view);
         }
         let active = self.inner.active(cancel).ok().flatten();
+        let sample = self.inner.reconciliation_sample();
         let listed = self.inner.helper()?.assignments(&ids, cancel)?;
         let tunnels = self.inner.tunnels.list();
         for (account, res) in listed {
@@ -1118,25 +1427,9 @@ impl Backend for RealBackend {
                 }
             };
             let names = self.inner.state_names(&account, cancel);
-            let endpoints: BTreeSet<&str> = list.iter().map(|a| a.endpoint.as_str()).collect();
-            // Ledger sessions missing on the server have ended.
-            let gone: Vec<String> = {
-                let st = self.inner.st();
-                st.ledger
-                    .entries()
-                    .iter()
-                    .filter(|e| e.account == account && e.stopped.is_none())
-                    .filter(|e| {
-                        e.endpoint
-                            .as_deref()
-                            .is_some_and(|ep| !endpoints.contains(ep))
-                    })
-                    .map(|e| e.name.clone())
-                    .collect()
-            };
-            for n in gone {
-                self.inner.mark_stopped(&account, &n, StopReason::Vanished);
-            }
+            self.inner
+                .reconcile(&account, &list, names.as_ref(), &sample);
+            let names = names.unwrap_or_default();
             let st = self.inner.st();
             let email = st.accounts.get(&account).and_then(|a| a.email.clone());
             let usage = st.usage.get(&account);
@@ -1241,6 +1534,7 @@ impl Backend for RealBackend {
         let endpoint = self
             .inner
             .state_names(&account, &CancelToken::new())
+            .unwrap_or_default()
             .into_iter()
             .find(|(_, n)| n == &outcome.name)
             .map(|(e, _)| e);
@@ -1361,6 +1655,17 @@ impl Backend for RealBackend {
             return Ok(report);
         }
         let helper = self.inner.helper()?;
+        let (verified, vanished) = self.inner.reconcile_accounts(&ids, cancel);
+        report.vanished = vanished;
+        let live: Vec<TrackedSession> = self
+            .inner
+            .st()
+            .ledger
+            .entries()
+            .iter()
+            .filter(|e| e.stopped.is_none() && ids.contains(&e.account))
+            .cloned()
+            .collect();
         let fresh: BTreeSet<AccountId> = match helper.usage_many(&ids, cancel) {
             Ok(results) => {
                 let ok = results
@@ -1368,33 +1673,17 @@ impl Backend for RealBackend {
                     .filter(|(_, r)| r.is_ok())
                     .map(|(i, _)| i.clone())
                     .collect();
-                self.inner.record_usage(results);
+                self.inner.record_usage(results, &verified);
                 ok
             }
             Err(e) => {
-                self.inner
-                    .record_usage(ids.iter().map(|i| (i.clone(), Err(e.clone()))).collect());
+                self.inner.record_usage(
+                    ids.iter().map(|i| (i.clone(), Err(e.clone()))).collect(),
+                    &verified,
+                );
                 BTreeSet::new()
             }
         };
-        if let Ok(listed) = helper.assignments(&ids, cancel) {
-            for (account, res) in listed {
-                let Ok(list) = res else { continue };
-                for e in live.iter().filter(|e| e.account == account) {
-                    if let Some(ep) = &e.endpoint
-                        && !list.iter().any(|a| &a.endpoint == ep)
-                    {
-                        self.inner
-                            .mark_stopped(&account, &e.name, StopReason::Vanished);
-                        report.vanished.push(RuntimeRef {
-                            account: account.clone(),
-                            endpoint: ep.clone(),
-                            name: Some(e.name.clone()),
-                        });
-                    }
-                }
-            }
-        }
         let now = self.inner.now();
         let vanished: BTreeSet<(AccountId, String)> = report
             .vanished

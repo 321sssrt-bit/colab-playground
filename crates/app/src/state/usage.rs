@@ -78,6 +78,11 @@ pub fn stale_note(snapshot: &UsageSnapshot) -> &'static str {
     }
 }
 
+fn needs_unmanaged_warning(view: &AccountUsageView) -> bool {
+    view.snapshot.is_some_and(|s| s.assignments > 0)
+        && (!view.ownership_verified || view.unmanaged_runtimes > 0)
+}
+
 pub(crate) fn start_poller(cx: &mut Context<AppState>) -> Task<()> {
     cx.spawn(async move |this, cx| {
         loop {
@@ -153,15 +158,15 @@ impl AppState {
     }
 
     /// Accounts with runtimes this app does not manage, and how many.
-    pub fn unmanaged(&self) -> Vec<(Option<String>, u32, bool)> {
+    pub fn unmanaged(&self) -> Vec<(Option<String>, Option<u32>, bool)> {
         self.usage
             .views
             .iter()
-            .filter(|view| view.unmanaged_runtimes > 0)
+            .filter(|view| needs_unmanaged_warning(view))
             .map(|view| {
                 (
                     view.email.clone(),
-                    view.unmanaged_runtimes,
+                    view.ownership_verified.then_some(view.unmanaged_runtimes),
                     view.snapshot
                         .is_some_and(|s| is_stale(&s, self.usage_now())),
                 )
@@ -234,5 +239,39 @@ impl AppState {
             return;
         }
         self.refresh_usage(false, cx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use colab_playground_core::{backend::usage_view, usage::AccountUsage};
+
+    #[test]
+    fn unknown_ownership_only_warns_when_the_reading_has_runtimes() {
+        let mut view = usage_view(
+            &AccountId::new("account").unwrap(),
+            None,
+            &AccountUsage::default(),
+            0,
+        );
+        assert!(!needs_unmanaged_warning(&view));
+        for stale in [false, true] {
+            view.snapshot = Some(UsageSnapshot {
+                balance_cu: 10.0,
+                rate_cu_per_hour: 0.0,
+                assignments: 0,
+                fetched_at: SystemTime::UNIX_EPOCH,
+                stale,
+            });
+            assert!(!view.ownership_verified);
+            assert!(!needs_unmanaged_warning(&view));
+            view.snapshot.as_mut().unwrap().assignments = 1;
+            assert!(needs_unmanaged_warning(&view));
+        }
+        view.ownership_verified = true;
+        assert!(!needs_unmanaged_warning(&view));
+        view.unmanaged_runtimes = 1;
+        assert!(needs_unmanaged_warning(&view));
     }
 }
