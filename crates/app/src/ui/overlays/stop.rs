@@ -1,4 +1,6 @@
-//! Stop and end billing, confirmed once, stating that the runtime's data is wiped.
+//! The confirmations about one runtime or session, each asked once and stating the consequence:
+//! stop and end billing (the runtime's data is wiped), cancel auto-stop (it bills until stopped
+//! by hand), and stop tracking a session (nothing is stopped).
 
 use ely_gpui_component::{
     buttons::{Button, ButtonVariant},

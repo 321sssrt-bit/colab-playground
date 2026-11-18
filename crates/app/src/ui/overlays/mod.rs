@@ -1,5 +1,6 @@
-//! Dialogs other than the account ones: stop and end billing, new session (with its live
-//! progress), forward a port, install or remove a plugin, and quitting while runtimes bill.
+//! Dialogs other than the account ones: stop and end billing, cancel auto-stop, stop tracking a
+//! session, new session (with its live progress), forward a port, install or remove a plugin,
+//! and quitting while runtimes bill.
 //! Every button carries a selector (`overlay-cancel` for the dismissing one).
 
 mod forward;
