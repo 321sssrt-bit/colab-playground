@@ -320,8 +320,9 @@ failure. It is the default in debug builds and the only backend used by UI tests
   it follows the theme and blends with the sidebar: Windows gets themed minimise / maximise /
   close buttons with native behaviour (drag, double-click to maximise, edge resize, Aero Snap and
   the Windows 11 snap-layout flyout); macOS keeps the native traffic lights over a transparent
-  title bar; Linux uses client-side decorations where the compositor expects them. Platform
-  differences are `cfg`-isolated.
+  title bar and shows no app mark or name beside them (the menu bar names the app); Linux uses
+  client-side decorations where the compositor expects them. Platform differences are
+  `cfg`-isolated.
 - Shell: sidebar navigation (Overview, Sessions, Plugins, Accounts, Settings), account switcher,
   always-visible balance / burn-rate badge, toasts.
 - Overview: first-run checklist (environment → CLI installed → signed in) and quick actions;
@@ -354,6 +355,6 @@ failure. It is the default in debug builds and the only backend used by UI tests
   login flow, provision retry to an 80 GB A100, quick deploy to a ready endpoint, guard auto-stop,
   plugin install from a fixture folder.
 - CI (light): Linux runs fmt, clippy and all tests; Windows and macOS run `cargo check
-  --workspace --all-targets` and the core tests; Windows also runs the app's UI tests.
+  --workspace --all-targets`, the core tests and the app's UI tests.
 - Not verifiable by automated tests (covered by the manual smoke checklist in `docs/TESTING.md`):
   real-account login/switch, real provisioning, the VM-side `unassign`, real tunnels.
