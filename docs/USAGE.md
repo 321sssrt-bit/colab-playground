@@ -93,7 +93,9 @@ cargo run -p colab-playground -- --mock-scenario signed-out --mock-fail cli-miss
   got anyway), `ssh-busy` (the first
   forward gets HTTP 429), `plugin-fails` (at the download stage), `watchdog-restart-fails` (setting
   an auto-stop again after cancelling it cannot put the stop back on the runtime), `runtimes-fail`
-  (runtimes cannot be listed), `update-available` and `update-check-fails` (the update check).
+  (runtimes cannot be listed), `lost-session` (the first session on the active account can no
+  longer be matched to its runtime, which keeps running), `update-available` and
+  `update-check-fails` (the update check).
 - Both accept `--flag value` or `--flag=value` and apply only when the mock is selected (add
   `--mock` to a release build). A simulated A100 has 40 GB first and 80 GB on the next attempt:
   set a minimum GPU memory of 70 GB to watch the retry. Git plugin installs are not simulated.

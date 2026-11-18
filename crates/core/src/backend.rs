@@ -106,6 +106,10 @@ pub struct RuntimesView {
     pub runtimes: Vec<Runtime>,
     /// Accounts that could not be listed.
     pub errors: Vec<AccountError>,
+    /// Live tracked sessions on listed accounts that the app cannot match to a listed runtime.
+    /// Each may have ended, or be one of its account's runtimes shown as not managed.
+    #[serde(default)]
+    pub unmatched: Vec<TrackedSession>,
 }
 
 /// Options for stopping a runtime (more pre-stop steps will be added here).
@@ -291,6 +295,11 @@ pub trait Backend: Send + Sync {
         options: StopOptions,
         cancel: &CancelToken,
     ) -> Result<()>;
+    /// Drops one of [`RuntimesView::unmatched`] from the ledger. Nothing is stopped: a runtime
+    /// that still runs keeps billing and counts as unmanaged from then on. The account is listed
+    /// again first, and the call is refused when that listing fails or identifies the session's
+    /// runtime.
+    fn forget_session(&self, account: &AccountId, name: &str, cancel: &CancelToken) -> Result<()>;
     /// Moves the auto-stop to `runtime` from now (active account only); also
     /// sets one again after [`Backend::cancel_auto_stop`].
     ///

@@ -1018,6 +1018,53 @@ fn endpoint_backfill_is_persisted_and_missing_names_do_not_end_sessions() {
 }
 
 #[test]
+fn a_session_without_a_record_can_be_forgotten_and_its_runtime_stays_unmanaged() {
+    let mut f = fixture();
+    let account = f.adopt_alice();
+    f.provision("managed", Accelerator::T4);
+    let state_file = f.state_file(&account.id);
+    let ledger_file = f.cfg.local_dir.join("ledger.json");
+    let lose_endpoint = |f: &mut Fixture| {
+        let mut ledger: Value =
+            serde_json::from_str(&std::fs::read_to_string(&ledger_file).unwrap()).unwrap();
+        ledger[0]["endpoint"] = Value::Null;
+        std::fs::write(&ledger_file, ledger.to_string()).unwrap();
+        f.b = RealBackend::new(f.cfg.clone()).unwrap();
+    };
+
+    // The state file still names its runtime, so the session is matched again.
+    lose_endpoint(&mut f);
+    let err =
+        f.b.forget_session(&account.id, "managed", &nc())
+            .unwrap_err();
+    assert!(err.is(ErrorKind::InvalidInput));
+    let view = f.b.runtimes(&nc()).unwrap();
+    assert!(view.runtimes[0].managed);
+    assert!(view.unmatched.is_empty());
+
+    lose_endpoint(&mut f);
+    std::fs::remove_file(&state_file).unwrap();
+    let view = f.b.runtimes(&nc()).unwrap();
+    assert_eq!(view.unmatched.len(), 1);
+    assert_eq!(view.unmatched[0].name, "managed");
+    assert!(!view.runtimes[0].managed);
+
+    f.knob("cli_api_broken", json!(true));
+    assert!(f.b.forget_session(&account.id, "managed", &nc()).is_err());
+    f.knob("cli_api_broken", json!(false));
+    assert_eq!(f.b.runtimes(&nc()).unwrap().unmatched.len(), 1);
+
+    f.b.forget_session(&account.id, "managed", &nc()).unwrap();
+    let view = f.b.runtimes(&nc()).unwrap();
+    assert!(view.unmatched.is_empty());
+    assert_eq!(view.runtimes.len(), 1, "nothing was stopped");
+    assert!(!view.runtimes[0].managed);
+    let usage = f.b.refresh_usage(&[], &nc()).unwrap();
+    assert!(usage[0].ownership_verified);
+    assert_eq!(usage[0].unmanaged_runtimes, 1);
+}
+
+#[test]
 fn keyring_and_cli_api_failures_are_typed() {
     let f = fixture();
     f.adopt_alice();

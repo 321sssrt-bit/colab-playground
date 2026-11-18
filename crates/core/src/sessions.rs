@@ -350,6 +350,29 @@ impl Ledger {
         Ok(found)
     }
 
+    /// The entry is removed rather than marked stopped: nothing was stopped, and a new
+    /// [`StopReason`] would make the ledger unreadable for earlier versions of the app. One with
+    /// an endpoint is refused because its runtime is known and can be stopped.
+    pub fn forget_unmatched(&mut self, account: &AccountId, name: &str) -> Result<bool> {
+        let Some(i) = self
+            .entries
+            .iter()
+            .rposition(|e| &e.account == account && e.name == name && e.stopped.is_none())
+        else {
+            return Ok(false);
+        };
+        if self.entries[i].endpoint.is_some() {
+            return Err(Error::invalid(
+                "session",
+                "its runtime is known; stop the runtime instead",
+            )
+            .with("value", name));
+        }
+        self.entries.remove(i);
+        self.save()?;
+        Ok(true)
+    }
+
     /// Keeps at most 200 stopped entries.
     fn trim(&mut self) {
         let stopped = self.entries.iter().filter(|e| e.stopped.is_some()).count();
@@ -381,6 +404,7 @@ impl Ledger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ErrorKind;
 
     #[test]
     fn accelerator_labels_and_flags() {
@@ -443,6 +467,53 @@ mod tests {
         assert_eq!(
             e.uptime(t0 + Duration::from_secs(10)),
             Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn only_a_live_entry_without_an_endpoint_is_forgotten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        let acct = AccountId::new("a1").unwrap();
+        let entry = |name: &str, endpoint: Option<&str>| TrackedSession {
+            name: name.into(),
+            account: acct.clone(),
+            endpoint: endpoint.map(str::to_owned),
+            accelerator: Accelerator::T4,
+            high_mem: false,
+            gpu: None,
+            vram_mib: None,
+            policy: GuardPolicy::default(),
+            spend: SpendMeter::new(SystemTime::UNIX_EPOCH),
+            watchdog: None,
+            stopped: None,
+        };
+        let mut ledger = Ledger::load(&path).unwrap();
+        let earlier = TrackedSession {
+            stopped: Some(StopRecord {
+                at: SystemTime::UNIX_EPOCH,
+                reason: StopReason::User,
+            }),
+            ..entry("lost", Some("m-earlier"))
+        };
+        ledger.upsert(earlier.clone()).unwrap();
+        ledger.upsert(entry("lost", None)).unwrap();
+        ledger.upsert(entry("known", Some("m-known"))).unwrap();
+
+        assert!(!ledger.forget_unmatched(&acct, "absent").unwrap());
+        let err = ledger.forget_unmatched(&acct, "known").unwrap_err();
+        assert!(err.is(ErrorKind::InvalidInput));
+        assert!(ledger.live(&acct, "known").is_some());
+
+        assert!(ledger.forget_unmatched(&acct, "lost").unwrap());
+        assert!(ledger.live(&acct, "lost").is_none());
+        assert!(!ledger.forget_unmatched(&acct, "lost").unwrap());
+        let again = Ledger::load(&path).unwrap();
+        assert!(again.live(&acct, "lost").is_none());
+        assert!(again.live(&acct, "known").is_some());
+        assert!(
+            again.entries().contains(&earlier),
+            "the history of a stopped session with the same name stays"
         );
     }
 

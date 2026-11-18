@@ -145,40 +145,51 @@ mod reconciliation_tests {
         assert!(backend.inner.st().ledger.live(&account, "second").is_none());
     }
 
-    #[test]
-    fn a_session_without_an_endpoint_takes_only_a_listed_one_and_is_never_ended() {
+    /// The directory holds the ledger, so it must outlive the backend.
+    fn temp_backend() -> (tempfile::TempDir, RealBackend) {
         let dir = tempfile::tempdir().unwrap();
         let mut config = RealConfig::for_app(Defaults::default()).unwrap();
         config.local_dir = dir.path().to_owned();
         let backend = RealBackend::new(config).unwrap();
+        (dir, backend)
+    }
+
+    fn tracked(account: &AccountId, name: &str, endpoint: Option<&str>) -> TrackedSession {
+        TrackedSession {
+            name: name.into(),
+            account: account.clone(),
+            endpoint: endpoint.map(str::to_owned),
+            accelerator: Accelerator::T4,
+            high_mem: false,
+            gpu: None,
+            vram_mib: None,
+            policy: GuardPolicy::default(),
+            spend: SpendMeter::new(SystemTime::UNIX_EPOCH),
+            watchdog: None,
+            stopped: None,
+        }
+    }
+
+    fn listing(endpoint: &str) -> Vec<RemoteAssignment> {
+        vec![RemoteAssignment {
+            endpoint: endpoint.into(),
+            accelerator: Some(Accelerator::T4),
+            accelerator_label: "T4".into(),
+            variant: "GPU".into(),
+            high_mem: false,
+        }]
+    }
+
+    #[test]
+    fn a_session_without_an_endpoint_takes_only_a_listed_one_and_is_never_ended() {
+        let (_dir, backend) = temp_backend();
         let account = AccountId::new("alice").unwrap();
         backend
             .inner
             .st()
             .ledger
-            .upsert(TrackedSession {
-                name: "reused".into(),
-                account: account.clone(),
-                endpoint: None,
-                accelerator: Accelerator::T4,
-                high_mem: false,
-                gpu: None,
-                vram_mib: None,
-                policy: GuardPolicy::default(),
-                spend: SpendMeter::new(SystemTime::UNIX_EPOCH),
-                watchdog: None,
-                stopped: None,
-            })
+            .upsert(tracked(&account, "reused", None))
             .unwrap();
-        let listing = |endpoint: &str| {
-            vec![RemoteAssignment {
-                endpoint: endpoint.into(),
-                accelerator: Some(Accelerator::T4),
-                accelerator_label: "T4".into(),
-                variant: "GPU".into(),
-                high_mem: false,
-            }]
-        };
         let endpoint = |backend: &RealBackend| {
             let st = backend.inner.st();
             st.ledger.live(&account, "reused").unwrap().endpoint.clone()
@@ -205,6 +216,82 @@ mod reconciliation_tests {
                 .reconcile(&account, &listing("b-current"), Some(&both), &sample);
         assert!(vanished.is_empty());
         assert_eq!(endpoint(&backend).as_deref(), Some("b-current"));
+    }
+
+    #[test]
+    fn a_session_no_listing_can_identify_is_forgotten() {
+        let account = AccountId::new("alice").unwrap();
+        // Its runtime ended, or still runs and nothing names it (it is then unmanaged).
+        for list in [Vec::new(), listing("b-current")] {
+            let (_dir, backend) = temp_backend();
+            backend
+                .inner
+                .st()
+                .ledger
+                .upsert(tracked(&account, "lost", None))
+                .unwrap();
+            let sample = backend.inner.reconciliation_sample();
+            assert!(
+                backend
+                    .inner
+                    .reconcile(&account, &list, None, &sample)
+                    .is_empty()
+            );
+            assert!(
+                backend.inner.st().ledger.live(&account, "lost").is_some(),
+                "reconciling never resolves it"
+            );
+            backend
+                .inner
+                .forget_unmatched(&account, "lost", &list, None, &sample)
+                .unwrap();
+            assert!(backend.inner.live_names(&account).is_empty());
+        }
+    }
+
+    #[test]
+    fn a_session_whose_runtime_is_known_is_not_forgotten() {
+        let account = AccountId::new("alice").unwrap();
+
+        // The listing and the state file identify it now.
+        let (_dir, backend) = temp_backend();
+        backend
+            .inner
+            .st()
+            .ledger
+            .upsert(tracked(&account, "named", None))
+            .unwrap();
+        let sample = backend.inner.reconciliation_sample();
+        let names = BTreeMap::from([("b-current".into(), "named".into())]);
+        let err = backend
+            .inner
+            .forget_unmatched(
+                &account,
+                "named",
+                &listing("b-current"),
+                Some(&names),
+                &sample,
+            )
+            .unwrap_err();
+        assert!(err.is(ErrorKind::InvalidInput));
+        let live = backend.inner.st().ledger.live(&account, "named").cloned();
+        assert_eq!(live.unwrap().endpoint.as_deref(), Some("b-current"));
+
+        // It had its endpoint already.
+        let (_dir, backend) = temp_backend();
+        backend
+            .inner
+            .st()
+            .ledger
+            .upsert(tracked(&account, "known", Some("a-known")))
+            .unwrap();
+        let sample = backend.inner.reconciliation_sample();
+        let err = backend
+            .inner
+            .forget_unmatched(&account, "known", &listing("a-known"), None, &sample)
+            .unwrap_err();
+        assert!(err.is(ErrorKind::InvalidInput));
+        assert!(backend.inner.st().ledger.live(&account, "known").is_some());
     }
 
     #[test]
@@ -772,6 +859,20 @@ impl Inner {
             }
         }
         vanished
+    }
+
+    /// Reconciles first, so a session the listing can now identify gets its endpoint and is
+    /// refused instead of dropped.
+    fn forget_unmatched(
+        &self,
+        account: &AccountId,
+        name: &str,
+        list: &[RemoteAssignment],
+        names: Option<&BTreeMap<String, String>>,
+        sample: &BTreeMap<AccountId, Vec<TrackedSession>>,
+    ) -> Result<()> {
+        self.reconcile(account, list, names, sample);
+        self.st().ledger.forget_unmatched(account, name).map(|_| ())
     }
 
     fn reconcile_accounts(
@@ -1431,6 +1532,13 @@ impl Backend for RealBackend {
                 .reconcile(&account, &list, names.as_ref(), &sample);
             let names = names.unwrap_or_default();
             let st = self.inner.st();
+            view.unmatched.extend(
+                st.ledger
+                    .entries()
+                    .iter()
+                    .filter(|e| e.account == account && e.stopped.is_none() && e.endpoint.is_none())
+                    .cloned(),
+            );
             let email = st.accounts.get(&account).and_then(|a| a.email.clone());
             let usage = st.usage.get(&account);
             for a in list {
@@ -1561,6 +1669,28 @@ impl Backend for RealBackend {
         cancel: &CancelToken,
     ) -> Result<()> {
         self.inner.stop(target, &options, cancel)
+    }
+
+    fn forget_session(&self, account: &AccountId, name: &str, cancel: &CancelToken) -> Result<()> {
+        if self.inner.st().accounts.get(account).is_none() {
+            return Err(Error::new(ErrorKind::AccountNotFound).with("account", account));
+        }
+        let sample = self.inner.reconciliation_sample();
+        let list = self
+            .inner
+            .helper()?
+            .assignments(std::slice::from_ref(account), cancel)?
+            .into_iter()
+            .find(|(a, _)| a == account)
+            .map(|(_, listed)| listed)
+            .ok_or_else(|| {
+                Error::new(ErrorKind::Other)
+                    .with("account", account)
+                    .detail("the runtime listing left this account out")
+            })??;
+        let names = self.inner.state_names(account, cancel);
+        self.inner
+            .forget_unmatched(account, name, &list, names.as_ref(), &sample)
     }
 
     fn extend_session(

@@ -114,7 +114,7 @@ pub struct MockFlags {
 
 impl MockFlags {
     /// Names accepted by `--mock-fail` (comma-separated).
-    pub const FAILURES: [&'static str; 14] = [
+    pub const FAILURES: [&'static str; 15] = [
         "cli-missing",
         "install-fails",
         "keyring",
@@ -129,6 +129,7 @@ impl MockFlags {
         "update-available",
         "update-check-fails",
         "runtimes-fail",
+        "lost-session",
     ];
 
     /// Reads `--mock-scenario demo|single|signed-out` (default `demo`) and
@@ -172,6 +173,7 @@ impl MockFlags {
                     "update-available" => flags.failures.update_available = true,
                     "update-check-fails" => flags.failures.update_check_fails = true,
                     "runtimes-fail" => flags.failures.runtimes_listing_fails = true,
+                    "lost-session" => flags.failures.lost_session_record = true,
                     "watchdog-restart-fails" => flags.failures.watchdog_restart_fails = true,
                     "login-invalid-code" => {
                         flags.failures.login = Some(MockLoginFailure::InvalidCode)
@@ -396,6 +398,8 @@ mod tests {
         assert!(check_args(&["--real"]).is_ok());
         let flags = MockFlags::parse(&["--mock", "--mock-fail", "watchdog-restart-fails"]).unwrap();
         assert!(flags.failures.watchdog_restart_fails);
+        let flags = MockFlags::parse(&["--mock", "--mock-fail", "lost-session"]).unwrap();
+        assert!(flags.failures.lost_session_record);
         let flags =
             MockFlags::parse(&["--mock", "--mock-fail=update-available,update-check-fails"])
                 .unwrap();

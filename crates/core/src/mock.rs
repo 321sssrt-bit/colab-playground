@@ -96,6 +96,10 @@ pub struct MockFailures {
     /// and report each account in `RuntimesView::errors`. Leaving such an account affects
     /// `switch_impact` as `runtimes_listing_fails` does.
     pub unlisted_accounts: Vec<String>,
+    /// The first managed session on the active account loses its record, with its runtime still
+    /// running ([`MockBackend::lose_session_record`]). Applied at construction and whenever the
+    /// switch is turned on.
+    pub lost_session_record: bool,
 }
 
 impl Default for MockFailures {
@@ -118,6 +122,7 @@ impl Default for MockFailures {
             update_check_fails: false,
             runtimes_listing_fails: false,
             unlisted_accounts: vec![],
+            lost_session_record: false,
         }
     }
 }
@@ -357,6 +362,19 @@ impl World {
         if new.a100_vram_sequence != old.a100_vram_sequence {
             self.a100_attempt = 0;
         }
+        // Ahead of the switches that clear `active`, which picks the session.
+        if new.lost_session_record && !old.lost_session_record {
+            let first = self.active.as_ref().and_then(|account| {
+                self.ledger
+                    .entries()
+                    .iter()
+                    .find(|e| &e.account == account && e.stopped.is_none() && e.endpoint.is_some())
+                    .map(|e| (account.clone(), e.name.clone()))
+            });
+            if let Some((account, name)) = first {
+                self.lose_session_record(&account, &name, true);
+            }
+        }
         if new.unadopted_slot && !old.unadopted_slot {
             self.active = None;
             self.unadopted_email = Some(MOCK_UNADOPTED_EMAIL.to_owned());
@@ -367,6 +385,19 @@ impl World {
             let previous = self.active.take();
             self.pending_add = Some(previous);
             self.tunnels.clear();
+        }
+    }
+
+    fn lose_session_record(&mut self, account: &AccountId, name: &str, running: bool) {
+        let _ = self.ledger.update(account, name, |e| e.endpoint = None);
+        let carries_name = |r: &MRuntime| &r.account == account && r.name.as_deref() == Some(name);
+        if running {
+            for r in self.runtimes.iter_mut().filter(|r| carries_name(r)) {
+                r.name = None;
+            }
+        } else {
+            self.runtimes.retain(|r| !carries_name(r));
+            self.close_session_tunnels(account, name);
         }
     }
 
@@ -671,11 +702,6 @@ impl MockBackend {
             login_live: false,
             update_checks: 0,
         };
-        let off = MockFailures {
-            cli_missing: cfg.failures.cli_missing,
-            ..MockFailures::default()
-        };
-        world.apply_switches(&off);
         for (i, r) in cfg.scenario.runtimes.iter().enumerate() {
             let Some(account) = world.accounts.get(r.account).map(|a| a.id.clone()) else {
                 continue;
@@ -717,6 +743,12 @@ impl MockBackend {
                 });
             }
         }
+        // After the scenario, whose sessions the switches act on.
+        let off = MockFailures {
+            cli_missing: cfg.failures.cli_missing,
+            ..MockFailures::default()
+        };
+        world.apply_switches(&off);
         MockBackend {
             cfg: Arc::new(cfg),
             world: Arc::new(Mutex::new(world)),
@@ -731,8 +763,8 @@ impl MockBackend {
     /// Replaces the failure switches at runtime (UI tests flip them mid-test).
     /// Every switch takes effect immediately: switches read on use apply to
     /// the next call; state switches (`cli_missing`, `unadopted_slot`,
-    /// `interrupted_add`, `ssh_busy_attempts`, `a100_vram_sequence`) are
-    /// applied when they change.
+    /// `interrupted_add`, `lost_session_record`, `ssh_busy_attempts`,
+    /// `a100_vram_sequence`) are applied when they change.
     pub fn set_failures(&self, failures: MockFailures) {
         let mut w = self.w();
         let old = std::mem::replace(&mut w.failures, failures);
@@ -755,6 +787,16 @@ impl MockBackend {
             watchdog_alive: false,
         });
         endpoint
+    }
+
+    /// The managed session `name` can no longer be matched to a runtime, as when the CLI's record
+    /// of it is gone: its ledger entry loses its endpoint, and its runtime stays up without a name
+    /// when `running`, or ends otherwise.
+    pub fn lose_session_record(&self, account: &AccountId, name: &str, running: bool) {
+        let now = self.cfg.clock.now();
+        let mut w = self.w();
+        w.settle(now);
+        w.lose_session_record(account, name, running);
     }
 
     fn w(&self) -> MutexGuard<'_, World> {
@@ -1376,7 +1418,17 @@ impl Backend for MockBackend {
                     account: account.id.clone(),
                     error: Error::new(ErrorKind::Http).detail("simulated account listing failure"),
                 });
+                continue;
             }
+            view.unmatched.extend(
+                w.ledger
+                    .entries()
+                    .iter()
+                    .filter(|e| {
+                        e.account == account.id && e.stopped.is_none() && e.endpoint.is_none()
+                    })
+                    .cloned(),
+            );
         }
         for r in &w.runtimes {
             if view.errors.iter().any(|failed| failed.account == r.account) {
@@ -1490,6 +1542,21 @@ impl Backend for MockBackend {
         self.ready()?;
         self.step(cancel)?;
         self.stop_inner(target, options.reason)
+    }
+
+    fn forget_session(&self, account: &AccountId, name: &str, cancel: &CancelToken) -> Result<()> {
+        self.ready()?;
+        self.step(cancel)?;
+        let now = self.now_();
+        let mut w = self.w();
+        if !w.accounts.iter().any(|a| &a.id == account) {
+            return Err(Error::new(ErrorKind::AccountNotFound).with("account", account));
+        }
+        if w.listing_fails_for(account) {
+            return Err(Error::new(ErrorKind::Http).detail("simulated runtime listing failure"));
+        }
+        w.reconcile(account, now);
+        w.ledger.forget_unmatched(account, name).map(|_| ())
     }
 
     fn extend_session(
@@ -2105,6 +2172,164 @@ mod tests {
             .retain(|r| r.endpoint != entry.endpoint.as_deref().unwrap());
         assert!(!w.reconcile(&account, m.now_()).0);
         assert!(w.ledger.live(&account, &entry.name).is_some());
+    }
+
+    #[test]
+    fn a_session_that_lost_its_record_can_be_forgotten_and_unblocks_its_account() {
+        let (m, _) = mock(MockScenario::demo());
+        let accts = m.accounts(&nc()).unwrap();
+        let (ada, lin) = (accts.accounts[0].id.clone(), accts.accounts[1].id.clone());
+        let usage = |account: &AccountId| {
+            m.refresh_usage(&[], &nc())
+                .unwrap()
+                .into_iter()
+                .find(|v| &v.account == account)
+                .unwrap()
+        };
+        let unmatched = || -> Vec<(AccountId, String)> {
+            let view = m.runtimes(&nc()).unwrap();
+            view.unmatched
+                .into_iter()
+                .map(|t| (t.account, t.name))
+                .collect()
+        };
+
+        // Its runtime ended, and nothing tells the app which one it was.
+        m.lose_session_record(&ada, "t4-91c2", false);
+        let view = m.runtimes(&nc()).unwrap();
+        let names: Vec<_> = view.unmatched.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["t4-91c2"]);
+        assert!(
+            view.runtimes
+                .iter()
+                .all(|r| r.id.name.as_deref() != Some("t4-91c2"))
+        );
+        assert!(!usage(&ada).ownership_verified);
+        m.forget_session(&ada, "t4-91c2", &nc()).unwrap();
+        assert!(unmatched().is_empty());
+        assert!(usage(&ada).ownership_verified);
+
+        // The only session of an account that is not active: removing the account waits for it.
+        m.lose_session_record(&lin, "cpu-0b5e", false);
+        assert_eq!(unmatched(), [(lin.clone(), "cpu-0b5e".to_owned())]);
+        assert!(
+            m.remove_account(&lin, &nc())
+                .unwrap_err()
+                .is(ErrorKind::InvalidInput)
+        );
+        m.forget_session(&lin, "cpu-0b5e", &nc()).unwrap();
+        assert!(unmatched().is_empty());
+        assert!(usage(&lin).ownership_verified);
+        m.remove_account(&lin, &nc()).unwrap();
+    }
+
+    #[test]
+    fn forgetting_a_session_whose_runtime_runs_leaves_that_runtime_unmanaged() {
+        let (m, _) = mock(MockScenario::demo());
+        let ada = m.accounts(&nc()).unwrap().accounts[0].id.clone();
+        let usage = || {
+            m.refresh_usage(&[], &nc())
+                .unwrap()
+                .into_iter()
+                .find(|v| v.account == ada)
+                .unwrap()
+        };
+        let baseline = usage().unmanaged_runtimes;
+        assert_eq!(baseline, 1);
+        let endpoint = m
+            .runtimes(&nc())
+            .unwrap()
+            .runtimes
+            .into_iter()
+            .find(|r| r.id.name.as_deref() == Some("t4-91c2"))
+            .unwrap()
+            .id
+            .endpoint;
+
+        m.lose_session_record(&ada, "t4-91c2", true);
+        m.forget_session(&ada, "t4-91c2", &nc()).unwrap();
+        let view = usage();
+        assert!(view.ownership_verified);
+        assert_eq!(view.unmanaged_runtimes, baseline + 1);
+        let listed = m.runtimes(&nc()).unwrap();
+        let runtime = listed
+            .runtimes
+            .iter()
+            .find(|r| r.id.endpoint == endpoint)
+            .expect("nothing was stopped");
+        assert!(!runtime.managed);
+        assert!(listed.unmatched.is_empty());
+    }
+
+    #[test]
+    fn a_session_is_not_forgotten_while_its_runtime_is_known_or_unlisted() {
+        let (m, _) = mock(MockScenario::demo());
+        let ada = m.accounts(&nc()).unwrap().accounts[0].id.clone();
+        let live = |name: &str| m.w().ledger.live(&ada, name).cloned();
+
+        let err = m.forget_session(&ada, "a100-7f3a", &nc()).unwrap_err();
+        assert!(err.is(ErrorKind::InvalidInput));
+        assert!(live("a100-7f3a").is_some());
+
+        // Its runtime still carries the name, so the listing identifies it again.
+        let endpoint = live("a100-7f3a").unwrap().endpoint;
+        m.w()
+            .ledger
+            .update(&ada, "a100-7f3a", |e| e.endpoint = None)
+            .unwrap();
+        let err = m.forget_session(&ada, "a100-7f3a", &nc()).unwrap_err();
+        assert!(err.is(ErrorKind::InvalidInput));
+        assert_eq!(live("a100-7f3a").unwrap().endpoint, endpoint);
+
+        m.lose_session_record(&ada, "t4-91c2", false);
+        for failures in [
+            MockFailures {
+                runtimes_listing_fails: true,
+                ..MockFailures::default()
+            },
+            MockFailures {
+                unlisted_accounts: vec!["ada@example.com".into()],
+                ..MockFailures::default()
+            },
+        ] {
+            m.set_failures(failures);
+            let err = m.forget_session(&ada, "t4-91c2", &nc()).unwrap_err();
+            assert!(err.is(ErrorKind::Http));
+            assert!(live("t4-91c2").is_some());
+        }
+        m.set_failures(MockFailures::default());
+        m.forget_session(&ada, "t4-91c2", &nc()).unwrap();
+        assert!(live("t4-91c2").is_none());
+
+        let stranger = AccountId::new("stranger").unwrap();
+        assert!(
+            m.forget_session(&stranger, "t4-91c2", &nc())
+                .unwrap_err()
+                .is(ErrorKind::AccountNotFound)
+        );
+    }
+
+    #[test]
+    fn the_lost_session_record_switch_applies_at_construction_and_when_turned_on() {
+        let unmatched = |m: &MockBackend| -> Vec<String> {
+            let view = m.runtimes(&nc()).unwrap();
+            view.unmatched.into_iter().map(|t| t.name).collect()
+        };
+        let (mut cfg, _) = MockConfig::headless(MockScenario::demo());
+        cfg.failures.lost_session_record = true;
+        let m = MockBackend::new(cfg);
+        assert_eq!(unmatched(&m), ["a100-7f3a"]);
+        let view = m.runtimes(&nc()).unwrap();
+        assert_eq!(view.runtimes.len(), 4, "its runtime keeps running");
+        assert_eq!(view.runtimes.iter().filter(|r| !r.managed).count(), 2);
+
+        let (m, _) = mock(MockScenario::demo());
+        assert!(unmatched(&m).is_empty());
+        m.set_failures(MockFailures {
+            lost_session_record: true,
+            ..MockFailures::default()
+        });
+        assert_eq!(unmatched(&m), ["a100-7f3a"]);
     }
 
     #[test]
