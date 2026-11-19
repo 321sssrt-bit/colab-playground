@@ -142,8 +142,8 @@ impl AppState {
         }
         if !matches!(self.sessions.runtimes, Load::Ready(_)) {
             // The prompt names every runtime: list them now if they are not known yet (or the
-            // last try failed).
-            self.load_runtimes(cx);
+            // last try failed), unless a listing is already on its way.
+            self.poll_runtimes(cx);
         }
         let billing = self.billing();
         // The list shown was read before the listing under way began, so it can lack a runtime
