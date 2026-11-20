@@ -7,7 +7,9 @@ use colab_playground::{
     i18n::keys,
     route::Route,
     settings::LanguagePref,
-    state::{InstallPrompt, Load, Op, Overlay, PluginView, RunPhase, TargetLost},
+    state::{
+        InstallPrompt, Load, Op, Overlay, PluginView, RUN_LOG_LINES_KEPT, RunPhase, TargetLost,
+    },
     ui::{
         overlays::INSTALL_CONFIRM,
         pages::{
@@ -21,7 +23,7 @@ use colab_playground::{
 };
 use colab_playground_core::{
     CancelToken, ErrorKind,
-    backend::{Backend, RuntimeRef},
+    backend::{Backend, PluginRunEvent, RuntimeRef},
     mock::{MockFailures, MockRuntime, MockScenario},
     sessions::Accelerator,
     tunnel::TunnelState,
@@ -100,6 +102,52 @@ fn quick_deploy_runs_to_a_ready_endpoint(cx: &mut TestAppContext) {
         stages.map(|s| s.state),
         Some(colab_playground_core::vm::RunState::Ready)
     );
+}
+
+/// The run's log as the app keeps it: how many lines, the oldest and the newest.
+fn log_ends(app: &mut TestApp<'_>) -> (usize, String, String) {
+    app.read(|state, _| {
+        let log = &state.plugin_run().expect("a run").log;
+        let mut lines = log.lines();
+        let oldest = lines.next().unwrap_or_default().to_owned();
+        let newest = lines.next_back().unwrap_or_default().to_owned();
+        (log.len(), oldest, newest)
+    })
+}
+
+#[gpui::test]
+fn a_long_log_keeps_its_newest_lines_whatever_adds_them(cx: &mut TestAppContext) {
+    let mut app = TestApp::with(cx, Options::scenario(MockScenario::single()));
+    open_deploy_form(&mut app);
+    app.fill(|inputs| inputs.hf_query.clone(), "qwen3");
+    app.click("hf-search");
+    app.click(&hf_result_selector(REPO));
+    app.click(RUN_START);
+    assert!(matches!(run_phase(&mut app), Some(RunPhase::Ready(_))));
+
+    // One event with more lines than are kept, as a poll of short lines brings.
+    let batch = RUN_LOG_LINES_KEPT + 3;
+    app.update(|state, cx| {
+        let lines = (0..batch).map(|i| format!("line {i}")).collect();
+        state.apply_run_event(PluginRunEvent::Log { lines }, cx);
+    });
+    assert_eq!(
+        log_ends(&mut app),
+        (
+            RUN_LOG_LINES_KEPT,
+            "line 3".to_owned(),
+            format!("line {}", batch - 1)
+        )
+    );
+
+    // The line that says part of the log was left out takes the place of the oldest one.
+    app.update(|state, cx| {
+        let path = "/root/run.log".to_owned();
+        state.apply_run_event(PluginRunEvent::LogSkipped { path }, cx);
+    });
+    let (len, oldest, newest) = log_ends(&mut app);
+    assert_eq!((len, oldest.as_str()), (RUN_LOG_LINES_KEPT, "line 4"));
+    assert!(newest.contains("/root/run.log"), "{newest}");
 }
 
 #[gpui::test]

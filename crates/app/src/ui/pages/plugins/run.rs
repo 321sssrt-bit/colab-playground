@@ -486,7 +486,7 @@ fn log(run: &PluginRun, cx: &App) -> AnyElement {
     if run.log.is_empty() {
         return div().into_any_element();
     }
-    let lines = run.log.iter().map(|line| AnsiText::new(line.clone()));
+    let lines = run.log.lines().map(|line| AnsiText::new(line.to_owned()));
     Card::new()
         .header(CardHeader::new(tr(cx, keys::RUN_LOG)))
         .child(

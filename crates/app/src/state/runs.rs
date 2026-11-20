@@ -5,7 +5,7 @@
 //! Secret inputs never enter this state: they are read from their masked fields when the run
 //! starts, sent with that one request, and the fields are cleared (a second run asks again).
 
-use std::sync::Arc;
+use std::{collections::VecDeque, sync::Arc};
 
 use colab_playground_core::{
     Error, ErrorKind,
@@ -95,9 +95,39 @@ pub struct PluginRun {
     pub session: Option<String>,
     pub account: Option<AccountId>,
     pub status: Option<RunStatus>,
-    /// Log lines (secrets already redacted by core).
-    pub log: Vec<String>,
+    pub log: RunLog,
     pub phase: RunPhase,
+}
+
+/// Lines of a run's log the app keeps, the newest ones. The log view builds every line it has
+/// on each frame, and a frame of the run page costs about 0.8 ms plus 4.6 ms per 1,000 lines
+/// (release build, Apple M4 Pro), so this many leave about half of a 60 Hz frame. The whole log
+/// is a file on the runtime.
+pub const RUN_LOG_LINES_KEPT: usize = 2_000;
+
+/// The newest lines of a run's log (secrets already redacted by core).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RunLog(VecDeque<String>);
+
+impl RunLog {
+    fn extend(&mut self, lines: impl IntoIterator<Item = String>) {
+        self.0.extend(lines);
+        let extra = self.0.len().saturating_sub(RUN_LOG_LINES_KEPT);
+        self.0.drain(..extra);
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Oldest first.
+    pub fn lines(&self) -> impl DoubleEndedIterator<Item = &str> {
+        self.0.iter().map(String::as_str)
+    }
 }
 
 impl AppState {
@@ -425,7 +455,7 @@ impl AppState {
             session: None,
             account: None,
             status: None,
-            log: Vec::new(),
+            log: RunLog::default(),
             phase: RunPhase::Running,
         });
         self.plugin_view = PluginView::Run;
@@ -447,7 +477,7 @@ impl AppState {
         true
     }
 
-    fn apply_run_event(&mut self, event: PluginRunEvent, cx: &App) {
+    pub fn apply_run_event(&mut self, event: PluginRunEvent, cx: &App) {
         let at = self.backend_now();
         let Some(run) = &mut self.plugin_run else {
             return;
@@ -457,9 +487,10 @@ impl AppState {
             PluginRunEvent::Launched { session, .. } => run.session = Some(session),
             PluginRunEvent::Status(status) => run.status = Some(status),
             PluginRunEvent::Log { lines } => run.log.extend(lines),
-            PluginRunEvent::LogSkipped { path } => run
-                .log
-                .push(tr_args(cx, keys::RUN_LOG_SKIPPED, &[("path", &path)]).into()),
+            PluginRunEvent::LogSkipped { path } => {
+                run.log
+                    .extend([tr_args(cx, keys::RUN_LOG_SKIPPED, &[("path", &path)]).into()])
+            }
         }
     }
 
