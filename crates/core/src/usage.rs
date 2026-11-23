@@ -317,8 +317,9 @@ impl RateAttribution {
         self.last_rate = Some(rate);
     }
 
-    /// Hands the sessions left of the splits that lost one what the stopped
-    /// sessions were estimated at beyond the fall of the account rate.
+    /// The fall of the account rate is what the stopped sessions burned, so
+    /// what they were estimated at beyond it was burned by the sessions they
+    /// were split with.
     fn correct(&mut self, left: &BTreeSet<String>, freed: f64, rate: f64) {
         let fall = self.last_rate.map_or(0.0, |prev| prev - rate);
         if left.is_empty() || fall <= NO_RATE {
