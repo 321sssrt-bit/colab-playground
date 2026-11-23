@@ -244,7 +244,7 @@ impl RateAttribution {
     /// burns, nor to less when the account has no other runtime. The shares
     /// of the split that lost a session are then worked out again from what
     /// the other estimates leave; when no split lost one, those of every
-    /// split are.
+    /// split are. They take all of it, leaving none to the unmanaged runtimes.
     pub fn observe(&mut self, account_rate: f64, assignments: u32, live: &BTreeSet<String>) {
         let rate = account_rate.max(0.0);
         let mut freed = 0.0;
@@ -292,6 +292,7 @@ impl RateAttribution {
         let too_much = estimated - rate > NO_RATE;
         let too_little =
             unmanaged == 0 && rate - estimated > NO_RATE && !self.rates.values().any(is_unknown);
+        let mut contradicted = false;
         if too_much || too_little {
             // The only estimate there is cannot be right, share or not: a
             // runtime outside the app can change the rate a start is measured by.
@@ -302,6 +303,7 @@ impl RateAttribution {
             } else {
                 broken
             };
+            contradicted = !wrong.is_empty();
             for name in wrong {
                 self.rates.insert(name, None);
             }
@@ -315,7 +317,11 @@ impl RateAttribution {
         if !unknown.is_empty() {
             let known: f64 = self.rates.values().flatten().sum();
             let sharers = unknown.len() + unmanaged;
-            let share = (rate - known).max(0.0) / sharers as f64;
+            // What a reading contradicted comes down only as far as the reading
+            // proves, so that a runtime outside the app hides no spend from
+            // the cost guard.
+            let dividing = if contradicted { unknown.len() } else { sharers };
+            let share = (rate - known).max(0.0) / dividing as f64;
             if share > NO_RATE {
                 for name in &unknown {
                     self.rates.insert(name.clone(), Some(share));
@@ -652,6 +658,20 @@ mod tests {
         // An A100 (11.8) starts in the reading in which a T4 outside the app (1.76) does.
         a.observe(13.56, 2, &set(&["a100"]));
         assert_eq!(a.rate_of("a100"), Some(13.56));
+        a.observe(11.8, 1, &set(&["a100"]));
+        assert_eq!(a.rate_of("a100"), Some(11.8));
+    }
+
+    #[test]
+    fn an_estimate_above_the_account_rate_comes_down_to_it_beside_an_unmanaged_runtime() {
+        let mut a = RateAttribution::default();
+        a.observe(0.0, 0, &set(&[]));
+        // An A100 (11.8) starts in the reading in which a T4 (1.76) and a CPU
+        // (0.08) outside the app do.
+        a.observe(13.64, 3, &set(&["a100"]));
+        // The T4 stops: the A100 burns 11.88 at most, not half of it.
+        a.observe(11.88, 2, &set(&["a100"]));
+        assert_eq!(a.rate_of("a100"), Some(11.88));
         a.observe(11.8, 1, &set(&["a100"]));
         assert_eq!(a.rate_of("a100"), Some(11.8));
     }
