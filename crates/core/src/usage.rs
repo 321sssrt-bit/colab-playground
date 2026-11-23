@@ -9,7 +9,8 @@
 //!   sessions, 5 min otherwise by default; manual refresh is always allowed).
 //! * [`RateAttribution`] — an *estimated* per-session burn rate, taken from the
 //!   change of the account rate observed when sessions start or stop, split
-//!   evenly when ambiguous. All per-session figures are estimates (`≈`).
+//!   evenly when ambiguous and split again when a later reading contradicts
+//!   it. All per-session figures are estimates (`≈`).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, SystemTime};
@@ -220,6 +221,9 @@ impl BalanceHistory {
 pub struct RateAttribution {
     last_rate: Option<f64>,
     rates: BTreeMap<String, Option<f64>>,
+    /// Sessions whose estimate is an even share of a rate they burn together.
+    #[serde(default)]
+    shares: BTreeSet<String>,
 }
 
 impl RateAttribution {
@@ -232,6 +236,12 @@ impl RateAttribution {
     /// to be worked out again at the next reading: the account rate can lag
     /// behind a new runtime, and a zero kept for good would hide its spend
     /// from the cost guard.
+    ///
+    /// An even share is a guess, and a later reading can contradict it (one of
+    /// two sessions that started together stops, and the rate falls by more
+    /// than its share): the estimates cannot add up to more than the account
+    /// burns, nor to less when the account has no other runtime. The shares
+    /// are then worked out again from what the other estimates leave.
     pub fn observe(&mut self, account_rate: f64, assignments: u32, live: &BTreeSet<String>) {
         let rate = account_rate.max(0.0);
         let mut freed = 0.0;
@@ -243,6 +253,7 @@ impl RateAttribution {
                 false
             }
         });
+        self.shares.retain(|name| live.contains(name));
         let started: Vec<String> = live
             .iter()
             .filter(|n| !self.rates.contains_key(*n))
@@ -255,22 +266,47 @@ impl RateAttribution {
             }
             _ => None,
         };
+        if delta_share.is_some() && started.len() > 1 {
+            self.shares.extend(started.iter().cloned());
+        }
         for name in started {
             self.rates.insert(name, delta_share);
+        }
+        let unmanaged = (assignments as usize).saturating_sub(live.len());
+        // A cache written before zero shares were left unknown can hold one.
+        let is_unknown = |r: &Option<f64>| r.is_none_or(|r| r <= NO_RATE);
+        let estimated: f64 = self.rates.values().flatten().sum();
+        let too_much = estimated - rate > NO_RATE;
+        let too_little =
+            unmanaged == 0 && rate - estimated > NO_RATE && !self.rates.values().any(is_unknown);
+        if too_much || too_little {
+            // The only estimate there is cannot be right either, share or not.
+            let wrong: Vec<String> = if self.rates.len() == 1 {
+                self.rates.keys().cloned().collect()
+            } else {
+                self.shares.iter().cloned().collect()
+            };
+            for name in wrong {
+                self.rates.insert(name, None);
+            }
         }
         let unknown: Vec<String> = self
             .rates
             .iter()
-            // A cache written before zero shares were left unknown can hold one.
-            .filter(|(_, r)| r.is_none_or(|r| r <= NO_RATE))
+            .filter(|(_, r)| is_unknown(r))
             .map(|(n, _)| n.clone())
             .collect();
         if !unknown.is_empty() {
             let known: f64 = self.rates.values().flatten().sum();
-            let unmanaged = (assignments as usize).saturating_sub(live.len());
-            let share = (rate - known).max(0.0) / (unknown.len() + unmanaged) as f64;
+            let sharers = unknown.len() + unmanaged;
+            let share = (rate - known).max(0.0) / sharers as f64;
             if share > NO_RATE {
                 for name in unknown {
+                    if sharers > 1 {
+                        self.shares.insert(name.clone());
+                    } else {
+                        self.shares.remove(&name);
+                    }
                     self.rates.insert(name, Some(share));
                 }
             }
@@ -503,6 +539,72 @@ mod tests {
         b.observe(5.0, 1, &set(&[]));
         b.observe(5.0, 1, &set(&["late"]));
         assert_eq!(b.rate_of("late"), Some(5.0));
+    }
+
+    #[test]
+    fn a_split_is_worked_out_again_when_one_of_its_sessions_stops() {
+        let mut a = RateAttribution::default();
+        a.observe(0.0, 0, &set(&[]));
+        // An A100 (11.8) and a T4 (1.76) start in the same reading.
+        a.observe(13.56, 2, &set(&["a100", "t4"]));
+        assert_eq!(a.rate_of("t4"), Some(6.78));
+        a.observe(1.76, 1, &set(&["t4"]));
+        assert_eq!(a.rate_of("t4"), Some(1.76));
+    }
+
+    #[test]
+    fn a_stop_in_a_split_leaves_the_rate_of_a_session_outside_it() {
+        let mut a = RateAttribution::default();
+        a.observe(0.0, 0, &set(&[]));
+        a.observe(11.8, 1, &set(&["a100"]));
+        // A T4 (1.76) and a CPU (0.08) start in the same reading.
+        a.observe(13.64, 3, &set(&["a100", "cpu", "t4"]));
+        assert!((a.rate_of("cpu").unwrap() - 0.92).abs() < 1e-9);
+        a.observe(11.88, 2, &set(&["a100", "cpu"]));
+        assert!((a.rate_of("cpu").unwrap() - 0.08).abs() < 1e-9);
+        assert_eq!(a.rate_of("a100"), Some(11.8));
+    }
+
+    #[test]
+    fn the_sessions_left_of_a_split_share_what_the_account_still_burns() {
+        let mut a = RateAttribution::default();
+        a.observe(0.0, 0, &set(&[]));
+        // An A100 (11.8), a T4 (1.76) and a CPU (0.08) start in the same reading.
+        a.observe(13.64, 3, &set(&["a100", "cpu", "t4"]));
+        a.observe(1.84, 2, &set(&["cpu", "t4"]));
+        assert!((a.rate_of("cpu").unwrap() - 0.92).abs() < 1e-9);
+        assert!((a.rate_of("t4").unwrap() - 0.92).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_split_of_starts_the_rate_lagged_behind_is_worked_out_again_too() {
+        let mut a = RateAttribution::default();
+        a.observe(0.0, 0, &set(&[]));
+        a.observe(0.0, 2, &set(&["a100", "t4"]));
+        a.observe(13.56, 2, &set(&["a100", "t4"]));
+        assert_eq!(a.rate_of("a100"), Some(6.78));
+        a.observe(11.8, 1, &set(&["a100"]));
+        assert_eq!(a.rate_of("a100"), Some(11.8));
+    }
+
+    #[test]
+    fn a_share_from_an_older_cache_is_worked_out_again_once_alone() {
+        let mut a: RateAttribution =
+            serde_json::from_value(serde_json::json!({"last_rate": 13.56, "rates": {"t4": 6.78}}))
+                .unwrap();
+        a.observe(1.76, 1, &set(&["t4"]));
+        assert_eq!(a.rate_of("t4"), Some(1.76));
+    }
+
+    #[test]
+    fn estimates_below_the_account_rate_stand_beside_an_unmanaged_runtime() {
+        let mut a = RateAttribution::default();
+        a.observe(0.0, 0, &set(&[]));
+        a.observe(3.52, 2, &set(&["a", "b"]));
+        // A runtime the app does not manage starts: the rate above the estimates is its own.
+        a.observe(15.32, 3, &set(&["a", "b"]));
+        assert_eq!(a.rate_of("a"), Some(1.76));
+        assert_eq!(a.rate_of("b"), Some(1.76));
     }
 
     #[test]
