@@ -221,9 +221,10 @@ impl BalanceHistory {
 pub struct RateAttribution {
     last_rate: Option<f64>,
     rates: BTreeMap<String, Option<f64>>,
-    /// Sessions whose estimate is an even share of a rate they burn together.
+    /// Sessions whose estimates only add up to a rate they burn together, a
+    /// set for each such rate.
     #[serde(default)]
-    shares: BTreeSet<String>,
+    splits: Vec<BTreeSet<String>>,
 }
 
 impl RateAttribution {
@@ -241,7 +242,9 @@ impl RateAttribution {
     /// two sessions that started together stops, and the rate falls by more
     /// than its share): the estimates cannot add up to more than the account
     /// burns, nor to less when the account has no other runtime. The shares
-    /// are then worked out again from what the other estimates leave.
+    /// of the split that lost a session are then worked out again from what
+    /// the other estimates leave; when no split lost one, those of every
+    /// split are.
     pub fn observe(&mut self, account_rate: f64, assignments: u32, live: &BTreeSet<String>) {
         let rate = account_rate.max(0.0);
         let mut freed = 0.0;
@@ -253,7 +256,14 @@ impl RateAttribution {
                 false
             }
         });
-        self.shares.retain(|name| live.contains(name));
+        let mut broken = BTreeSet::new();
+        for split in &mut self.splits {
+            let before = split.len();
+            split.retain(|name| live.contains(name));
+            if split.len() < before {
+                broken.extend(split.iter().cloned());
+            }
+        }
         let started: Vec<String> = live
             .iter()
             .filter(|n| !self.rates.contains_key(*n))
@@ -266,8 +276,11 @@ impl RateAttribution {
             }
             _ => None,
         };
-        if delta_share.is_some() && started.len() > 1 {
-            self.shares.extend(started.iter().cloned());
+        // A start beside a stop in a split is measured against that split's
+        // guess of what stopped, so it is only as good as the guess.
+        if delta_share.is_some() && (started.len() > 1 || !broken.is_empty()) {
+            let together: BTreeSet<String> = started.iter().chain(&broken).cloned().collect();
+            self.regroup(together);
         }
         for name in started {
             self.rates.insert(name, delta_share);
@@ -280,11 +293,10 @@ impl RateAttribution {
         let too_little =
             unmanaged == 0 && rate - estimated > NO_RATE && !self.rates.values().any(is_unknown);
         if too_much || too_little {
-            // The only estimate there is cannot be right either, share or not.
-            let wrong: Vec<String> = if self.rates.len() == 1 {
-                self.rates.keys().cloned().collect()
+            let wrong = if broken.is_empty() {
+                self.splits.iter().flatten().cloned().collect()
             } else {
-                self.shares.iter().cloned().collect()
+                broken
             };
             for name in wrong {
                 self.rates.insert(name, None);
@@ -301,17 +313,30 @@ impl RateAttribution {
             let sharers = unknown.len() + unmanaged;
             let share = (rate - known).max(0.0) / sharers as f64;
             if share > NO_RATE {
-                for name in unknown {
-                    if sharers > 1 {
-                        self.shares.insert(name.clone());
-                    } else {
-                        self.shares.remove(&name);
-                    }
-                    self.rates.insert(name, Some(share));
+                for name in &unknown {
+                    self.rates.insert(name.clone(), Some(share));
+                }
+                let together = unknown.into_iter().collect();
+                if sharers > 1 {
+                    self.regroup(together);
+                } else {
+                    self.ungroup(&together);
                 }
             }
         }
         self.last_rate = Some(rate);
+    }
+
+    fn ungroup(&mut self, names: &BTreeSet<String>) {
+        for split in &mut self.splits {
+            split.retain(|name| !names.contains(name));
+        }
+        self.splits.retain(|split| !split.is_empty());
+    }
+
+    fn regroup(&mut self, together: BTreeSet<String>) {
+        self.ungroup(&together);
+        self.splits.push(together);
     }
 
     /// Estimated rate of a session (CU/h).
@@ -588,12 +613,32 @@ mod tests {
     }
 
     #[test]
-    fn a_share_from_an_older_cache_is_worked_out_again_once_alone() {
-        let mut a: RateAttribution =
-            serde_json::from_value(serde_json::json!({"last_rate": 13.56, "rates": {"t4": 6.78}}))
-                .unwrap();
-        a.observe(1.76, 1, &set(&["t4"]));
-        assert_eq!(a.rate_of("t4"), Some(1.76));
+    fn a_stop_in_one_split_leaves_the_shares_of_another() {
+        let mut a = RateAttribution::default();
+        a.observe(0.0, 0, &set(&[]));
+        // Two CPUs (0.08 and 0.32), then an A100 (18.0) and a T4 (2.0).
+        a.observe(0.4, 2, &set(&["cpu1", "cpu2"]));
+        a.observe(20.4, 4, &set(&["a100", "cpu1", "cpu2", "t4"]));
+        assert_eq!(a.rate_of("t4"), Some(10.0));
+        a.observe(2.4, 3, &set(&["cpu1", "cpu2", "t4"]));
+        assert!((a.rate_of("t4").unwrap() - 2.0).abs() < 1e-9);
+        assert_eq!(a.rate_of("cpu1"), Some(0.2));
+        assert_eq!(a.rate_of("cpu2"), Some(0.2));
+    }
+
+    #[test]
+    fn a_start_beside_a_stop_in_a_split_is_worked_out_again_with_it() {
+        let mut a = RateAttribution::default();
+        a.observe(0.0, 0, &set(&[]));
+        a.observe(11.8, 1, &set(&["a100"]));
+        // A T4 (1.76) and a CPU (0.08) start in the same reading.
+        a.observe(13.64, 3, &set(&["a100", "cpu", "t4"]));
+        // The CPU stops and an L4 (1.54) starts: it is taken for 1.54 - 0.08 + 0.92.
+        a.observe(15.1, 3, &set(&["a100", "l4", "t4"]));
+        assert!((a.rate_of("l4").unwrap() - 2.38).abs() < 1e-9);
+        a.observe(13.34, 2, &set(&["a100", "l4"]));
+        assert!((a.rate_of("l4").unwrap() - 1.54).abs() < 1e-9);
+        assert_eq!(a.rate_of("a100"), Some(11.8));
     }
 
     #[test]
