@@ -293,7 +293,11 @@ impl RateAttribution {
         let too_little =
             unmanaged == 0 && rate - estimated > NO_RATE && !self.rates.values().any(is_unknown);
         if too_much || too_little {
-            let wrong = if broken.is_empty() {
+            // The only estimate there is cannot be right, share or not: a
+            // runtime outside the app can change the rate a start is measured by.
+            let wrong = if self.rates.len() == 1 {
+                self.rates.keys().cloned().collect()
+            } else if broken.is_empty() {
                 self.splits.iter().flatten().cloned().collect()
             } else {
                 broken
@@ -638,6 +642,17 @@ mod tests {
         assert!((a.rate_of("l4").unwrap() - 2.38).abs() < 1e-9);
         a.observe(13.34, 2, &set(&["a100", "l4"]));
         assert!((a.rate_of("l4").unwrap() - 1.54).abs() < 1e-9);
+        assert_eq!(a.rate_of("a100"), Some(11.8));
+    }
+
+    #[test]
+    fn the_only_estimate_gives_way_to_an_account_rate_below_it() {
+        let mut a = RateAttribution::default();
+        a.observe(0.0, 0, &set(&[]));
+        // An A100 (11.8) starts in the reading in which a T4 outside the app (1.76) does.
+        a.observe(13.56, 2, &set(&["a100"]));
+        assert_eq!(a.rate_of("a100"), Some(13.56));
+        a.observe(11.8, 1, &set(&["a100"]));
         assert_eq!(a.rate_of("a100"), Some(11.8));
     }
 
