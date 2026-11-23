@@ -282,6 +282,8 @@ impl TrackedSession {
 pub struct Ledger {
     path: Option<PathBuf>,
     entries: Vec<TrackedSession>,
+    /// The entries differ from the file: [`Ledger::save_changes`] writes them.
+    unsaved: bool,
 }
 
 impl Ledger {
@@ -295,6 +297,7 @@ impl Ledger {
         Ok(Ledger {
             path: Some(path.to_owned()),
             entries,
+            unsaved: false,
         })
     }
 
@@ -303,6 +306,7 @@ impl Ledger {
         Ledger {
             path: None,
             entries: Vec::new(),
+            unsaved: false,
         }
     }
 
@@ -385,17 +389,35 @@ impl Ledger {
         name: &str,
         f: impl FnOnce(&mut TrackedSession),
     ) -> Result<bool> {
-        let found = match self.live_mut(account, name) {
-            Some(e) => {
-                f(e);
-                true
-            }
-            None => false,
-        };
+        let found = self.change(account, name, f);
         if found {
             self.save()?;
         }
         Ok(found)
+    }
+
+    /// [`Ledger::update`] without the write, for a round that changes several entries:
+    /// it ends with [`Ledger::save_changes`] and so writes the ledger once, or not at all
+    /// when `f` left every entry as it was.
+    pub fn change(
+        &mut self,
+        account: &AccountId,
+        name: &str,
+        f: impl FnOnce(&mut TrackedSession),
+    ) -> bool {
+        let Some(e) = self.live_mut(account, name) else {
+            return false;
+        };
+        let before = e.clone();
+        f(e);
+        let changed = *e != before;
+        self.unsaved |= changed;
+        true
+    }
+
+    /// Writes the ledger if a [`Ledger::change`], or a write that failed, is waiting for it.
+    pub fn save_changes(&mut self) -> Result<()> {
+        if self.unsaved { self.save() } else { Ok(()) }
     }
 
     pub fn mark_stopped(
@@ -456,13 +478,16 @@ impl Ledger {
     }
 
     /// Writes the ledger (atomic replace).
-    pub fn save(&self) -> Result<()> {
+    pub fn save(&mut self) -> Result<()> {
+        // A write that fails leaves the entries unsaved, whoever asked for it.
+        self.unsaved = true;
         if let Some(path) = &self.path {
             crate::paths::write_atomic(
                 path,
                 serde_json::to_string_pretty(&self.entries)?.as_bytes(),
             )?;
         }
+        self.unsaved = false;
         Ok(())
     }
 }
@@ -617,6 +642,28 @@ mod tests {
             stopped: None,
             measured_rate: None,
         }
+    }
+
+    #[test]
+    fn a_failed_write_is_made_by_the_next_round_that_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        // The ledger's folder cannot be created while a file has its name.
+        let folder = dir.path().join("local");
+        let path = folder.join("ledger.json");
+        let mut ledger = Ledger::load(&path).unwrap();
+        std::fs::write(&folder, "").unwrap();
+        assert!(ledger.upsert(live("s", None)).is_err());
+
+        std::fs::remove_file(&folder).unwrap();
+        let account = AccountId::new("a1").unwrap();
+        assert!(ledger.change(&account, "s", |_| {}));
+        ledger.save_changes().unwrap();
+        assert!(Ledger::load(&path).unwrap().live(&account, "s").is_some());
+
+        std::fs::remove_file(&path).unwrap();
+        assert!(ledger.change(&account, "s", |_| {}));
+        ledger.save_changes().unwrap();
+        assert!(!path.exists(), "written with nothing to save");
     }
 
     fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {

@@ -1133,6 +1133,120 @@ fn usage_guard_stop_and_vanished_sessions() {
     let _ = StopReason::Vanished;
 }
 
+/// Keeps the ledger's next write in the returned file. The ledger is replaced through a
+/// temporary file: as a link it sends that write to the returned file, and the ledger is
+/// that link until a second write replaces it.
+fn keep_next_ledger_write(f: &Fixture, to: &str) -> (PathBuf, PathBuf) {
+    let ledger = f.root.join("local").join("ledger.json");
+    let write = f.root.join(to);
+    let temporary = ledger.with_file_name(format!(".ledger.json.{}.tmp", std::process::id()));
+    std::os::unix::fs::symlink(&write, &temporary).unwrap();
+    (ledger, write)
+}
+
+fn ledger_entries(file: &Path) -> Vec<serde_json::Value> {
+    serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap()
+}
+
+#[test]
+fn a_usage_round_writes_the_ledger_once() {
+    // What runs, whether it ended before the round, whether the round is the guard's,
+    // and how many rates the round measures: only a session running alone is measured.
+    for (sessions, ended, guard, measured) in [
+        (&["alone"][..], false, true, 1),
+        (&["first", "second"][..], false, true, 0),
+        (&["alone"][..], true, true, 0),
+        (&["alone"][..], false, false, 1),
+    ] {
+        let f = fixture();
+        f.adopt_alice();
+        for name in sessions {
+            f.provision(name, Accelerator::T4);
+        }
+        if ended {
+            f.edit_server(|s| s["accounts"]["alice"]["assignments"] = json!({}));
+        }
+        let round = || {
+            if guard {
+                f.b.guard_poll(&nc()).unwrap();
+            } else {
+                f.b.refresh_usage(&[], &nc()).unwrap();
+            }
+        };
+        let case = format!("{sessions:?}, ended: {ended}, guard round: {guard}");
+
+        let (ledger, write) = keep_next_ledger_write(&f, "write.json");
+        round();
+        assert!(write.exists(), "nothing was written ({case})");
+        assert!(ledger.is_symlink(), "written more than once ({case})");
+        let saved = RealBackend::new(f.cfg.clone()).unwrap().measured_rates();
+        assert_eq!(saved.len(), measured, "{saved:?} ({case})");
+        if guard && !ended {
+            let entries = ledger_entries(&write);
+            assert_eq!(entries.len(), sessions.len(), "{entries:?} ({case})");
+            for e in &entries {
+                assert_eq!(e["spend"]["rate_known"], true, "{e} ({case})");
+            }
+        }
+
+        // The backend's clock stands still, so the same round again reads what is saved.
+        let (_, again) = keep_next_ledger_write(&f, "again.json");
+        round();
+        assert!(!again.exists(), "written with nothing new ({case})");
+    }
+}
+
+/// Starts a session the guard stops in its next round: the balance is under its floor.
+fn session_under_its_floor(f: &Fixture) {
+    f.adopt_alice();
+    let mut spec = ProvisionSpec::new("floor", Accelerator::T4, &Defaults::default());
+    spec.guard = GuardPolicy {
+        min_balance_cu: Some(40.0),
+        ..GuardPolicy::unlimited()
+    };
+    let (tx, _rx) = channel();
+    f.b.provision(spec, tx, &nc()).unwrap();
+    f.edit_server(|s| s["accounts"]["alice"]["balance"] = json!(30.0));
+}
+
+#[test]
+fn a_guard_stop_saves_what_the_round_read_before_it_stops() {
+    let f = fixture();
+    session_under_its_floor(&f);
+
+    let (ledger, write) = keep_next_ledger_write(&f, "write.json");
+    let r = f.b.guard_poll(&nc()).unwrap();
+    assert!(r.decisions[0].stopped, "{:?}", r.decisions);
+    let before = &ledger_entries(&write)[0];
+    assert!(before["stopped"].is_null(), "{before}");
+    assert_eq!(before["spend"]["rate_known"], true, "{before}");
+    assert!(!before["measured_rate"].is_null(), "{before}");
+    assert!(!ledger.is_symlink());
+    let after = &ledger_entries(&ledger)[0];
+    assert!(!after["stopped"].is_null(), "{after}");
+}
+
+#[test]
+fn a_failed_stop_record_write_is_made_by_the_next_guard_round() {
+    let f = fixture();
+    session_under_its_floor(&f);
+    let ledger = f.cfg.local_dir.join("ledger.json");
+    let before = std::fs::read_to_string(&ledger).unwrap();
+    // A folder where the file was makes every write fail.
+    std::fs::remove_file(&ledger).unwrap();
+    std::fs::create_dir(&ledger).unwrap();
+    let r = f.b.guard_poll(&nc()).unwrap();
+    assert!(r.decisions[0].stopped, "{:?}", r.decisions);
+    std::fs::remove_dir(&ledger).unwrap();
+    std::fs::write(&ledger, &before).unwrap();
+
+    // No session is left for this round to read.
+    assert!(f.b.guard_poll(&nc()).unwrap().decisions.is_empty());
+    let e = &ledger_entries(&ledger)[0];
+    assert!(!e["stopped"].is_null(), "{e}");
+    assert_eq!(e["spend"]["rate_known"], true, "{e}");
+}
+
 #[test]
 fn usage_reconciles_before_counting_managed_sessions() {
     for guard in [false, true] {
