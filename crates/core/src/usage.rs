@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::clock::serde_secs;
 use crate::defaults::Defaults;
 use crate::error::Error;
+use crate::sessions::Accelerator;
 /// Default capacity of [`BalanceHistory`] (one hour at 30 s).
 pub const HISTORY_CAPACITY: usize = 120;
 
@@ -32,6 +33,54 @@ pub struct Usage {
     pub rate_cu_per_hour: f64,
     /// Active assignments (runtimes) on the account, managed or not.
     pub assignments: u32,
+}
+
+impl Usage {
+    /// The session this reading measures: the only managed session of an
+    /// account with a single runtime burns the whole account rate. `None`
+    /// while nothing burns (the account rate can lag behind a new runtime).
+    pub fn sole_session<'a>(&self, live: &'a BTreeSet<String>) -> Option<&'a str> {
+        let burning = self.rate_cu_per_hour.is_finite() && self.rate_cu_per_hour > NO_RATE;
+        if self.assignments != 1 || live.len() != 1 || !burning {
+            return None;
+        }
+        live.first().map(String::as_str)
+    }
+}
+
+/// What users who measured this hardware published as its burn rate (CU/h),
+/// for hardware the app has not measured itself. Colab publishes no rates and
+/// changes them, so this is only where the figure starts: a reading of the
+/// app's own replaces it ([`Usage::sole_session`]).
+///
+/// From the table measured at
+/// <https://mcp-tool-shop-org.github.io/rnd/handbook/colab-golden-path/>; the
+/// TPUs from <https://note.com/okakutech/n/nfb368939d8d4>, the high-RAM T4 and
+/// the H100 from <https://www.gkbrk.com/google-colab>. The G4 and the H100
+/// were published for one machine shape, which stands for both.
+pub fn published_rate(accelerator: Accelerator, high_mem: bool) -> f64 {
+    let high_mem = high_mem && accelerator.supports_high_mem();
+    match (accelerator, high_mem) {
+        (Accelerator::None, false) => 0.08,
+        (Accelerator::None, true) => 0.26,
+        (Accelerator::T4, false) => 1.07,
+        (Accelerator::T4, true) => 1.41,
+        (Accelerator::L4, _) => 1.54,
+        (Accelerator::G4, _) => 8.90,
+        (Accelerator::A100, false) => 5.30,
+        (Accelerator::A100, true) => 6.77,
+        (Accelerator::H100, _) => 18.05,
+        (Accelerator::TpuV5e1, _) => 2.92,
+        (Accelerator::TpuV6e1, _) => 4.08,
+    }
+}
+
+/// A burn rate Colab reported, and when.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RateReading {
+    pub cu_per_hour: f64,
+    #[serde(with = "serde_secs")]
+    pub at: SystemTime,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -355,6 +404,28 @@ mod tests {
             ..Defaults::default()
         };
         assert!(poll_due(Some(t(0)), t(5), true, &fast));
+    }
+
+    #[test]
+    fn a_reading_measures_the_only_runtime_of_an_account() {
+        let one = set(&["s1"]);
+        assert_eq!(u(50.0, 4.82, 1).sole_session(&one), Some("s1"));
+        // A runtime the app does not manage, a second session, or no rate yet.
+        assert_eq!(u(50.0, 6.58, 2).sole_session(&one), None);
+        assert_eq!(u(50.0, 6.58, 2).sole_session(&set(&["s1", "s2"])), None);
+        assert_eq!(u(50.0, 0.0, 1).sole_session(&one), None);
+        assert_eq!(u(50.0, 4.82, 1).sole_session(&set(&[])), None);
+    }
+
+    #[test]
+    fn published_rates_follow_the_machine_shape() {
+        assert_eq!(published_rate(Accelerator::A100, false), 5.30);
+        assert_eq!(published_rate(Accelerator::A100, true), 6.77);
+        // An L4 has one machine shape, so the high-RAM option changes nothing.
+        assert_eq!(
+            published_rate(Accelerator::L4, true),
+            published_rate(Accelerator::L4, false)
+        );
     }
 
     #[test]

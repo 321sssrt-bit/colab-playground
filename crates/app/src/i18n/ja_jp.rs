@@ -1369,4 +1369,12 @@ pub(super) const MESSAGES: Messages = &[
         SETTINGS_FEEDBACK_DESCRIPTION,
         "GitHub で問題を報告したり、アイデアを提案したりできます。開くフォームには、アプリのバージョンとお使いのオペレーティング システムがあらかじめ入力されています。",
     ),
+    (
+        PROV_RATE_MEASURED,
+        "同じハードウェアのランタイムで測定（{age}）。",
+    ),
+    (
+        PROV_RATE_PUBLISHED,
+        "ほかのユーザーが公開した値です。アプリが測定すると置き換わります。",
+    ),
 ];

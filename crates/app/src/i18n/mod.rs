@@ -687,6 +687,8 @@ catalog_keys! {
     FEEDBACK_ALSO_IN_ABOUT => "app.b12.feedback_also_in_about",
     SETTINGS_FEEDBACK_TITLE => "app.b12.settings_feedback_title",
     SETTINGS_FEEDBACK_DESCRIPTION => "app.b12.settings_feedback_description",
+    PROV_RATE_MEASURED => "app.b13.prov_rate_measured",
+    PROV_RATE_PUBLISHED => "app.b13.prov_rate_published",
 }
 
 /// A message table: `(key, message)` pairs; `{name}` marks an argument.

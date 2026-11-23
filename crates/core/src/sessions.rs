@@ -14,6 +14,7 @@ use crate::accounts::AccountId;
 use crate::clock::serde_secs;
 use crate::error::{Error, Result};
 use crate::guard::{Concern, GuardPolicy, SpendMeter};
+use crate::usage::RateReading;
 
 /// Hardware that can be requested from `colab new`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
@@ -204,6 +205,23 @@ impl WatchdogInfo {
     }
 }
 
+/// What a runtime with this hardware burned when it was last measured.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct HardwareRate {
+    pub accelerator: Accelerator,
+    /// False where the accelerator has a single machine shape.
+    pub high_mem: bool,
+    pub reading: RateReading,
+}
+
+impl HardwareRate {
+    /// Whether a runtime requested with these options gets this hardware.
+    pub fn matches(&self, accelerator: Accelerator, high_mem: bool) -> bool {
+        self.accelerator == accelerator
+            && self.high_mem == (high_mem && accelerator.supports_high_mem())
+    }
+}
+
 /// A session the app provisioned (persisted in the ledger).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TrackedSession {
@@ -227,6 +245,10 @@ pub struct TrackedSession {
     pub watchdog: Option<WatchdogInfo>,
     #[serde(default)]
     pub stopped: Option<StopRecord>,
+    /// The account's burn rate at the last reading where this session was
+    /// the account's only runtime: what its hardware burns, not an estimate.
+    #[serde(default)]
+    pub measured_rate: Option<RateReading>,
 }
 
 impl TrackedSession {
@@ -287,6 +309,30 @@ impl Ledger {
     /// All entries, oldest first.
     pub fn entries(&self) -> &[TrackedSession] {
         &self.entries
+    }
+
+    /// The latest rate measured for each hardware, over running and stopped
+    /// sessions of every account.
+    pub fn measured_rates(&self) -> Vec<HardwareRate> {
+        let mut latest: Vec<HardwareRate> = Vec::new();
+        for e in &self.entries {
+            let Some(reading) = e.measured_rate else {
+                continue;
+            };
+            match latest
+                .iter_mut()
+                .find(|r| r.matches(e.accelerator, e.high_mem))
+            {
+                Some(r) if reading.at > r.reading.at => r.reading = reading,
+                Some(_) => {}
+                None => latest.push(HardwareRate {
+                    accelerator: e.accelerator,
+                    high_mem: e.high_mem && e.accelerator.supports_high_mem(),
+                    reading,
+                }),
+            }
+        }
+        latest
     }
 
     pub fn names(&self) -> Vec<String> {
@@ -386,13 +432,20 @@ impl Ledger {
         outcome
     }
 
-    /// Keeps at most 200 stopped entries.
+    /// Keeps at most 200 stopped entries, the one holding a hardware's latest
+    /// measured rate among them however old it is.
     fn trim(&mut self) {
         let stopped = self.entries.iter().filter(|e| e.stopped.is_some()).count();
         if stopped > 200 {
+            let latest = self.measured_rates();
             let mut drop = stopped - 200;
             self.entries.retain(|e| {
-                if drop > 0 && e.stopped.is_some() {
+                let holds_rate = e.measured_rate.is_some_and(|reading| {
+                    latest
+                        .iter()
+                        .any(|r| r.matches(e.accelerator, e.high_mem) && r.reading == reading)
+                });
+                if drop > 0 && e.stopped.is_some() && !holds_rate {
                     drop -= 1;
                     false
                 } else {
@@ -537,6 +590,7 @@ mod tests {
                     armed: true,
                 }),
                 stopped: None,
+                measured_rate: None,
             })
             .unwrap();
         let again = Ledger::load(&path).unwrap();
@@ -561,6 +615,7 @@ mod tests {
             spend: SpendMeter::new(SystemTime::UNIX_EPOCH),
             watchdog: None,
             stopped: None,
+            measured_rate: None,
         }
     }
 
@@ -569,6 +624,76 @@ mod tests {
             .iter()
             .map(|(a, b)| ((*a).to_owned(), (*b).to_owned()))
             .collect()
+    }
+
+    #[test]
+    fn measured_rates_keep_the_latest_reading_of_each_hardware() {
+        let t = |s: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(s);
+        let entry = |name: &str, accelerator, high_mem, rate: Option<(f64, u64)>| TrackedSession {
+            accelerator,
+            high_mem,
+            measured_rate: rate.map(|(cu_per_hour, at)| RateReading {
+                cu_per_hour,
+                at: t(at),
+            }),
+            ..live(name, None)
+        };
+        let mut ledger = Ledger::in_memory();
+        for e in [
+            entry("old", Accelerator::T4, false, Some((1.9, 10))),
+            entry("new", Accelerator::T4, false, Some((1.76, 20))),
+            entry("big", Accelerator::T4, true, Some((2.0, 5))),
+            entry("l4", Accelerator::L4, true, Some((4.82, 30))),
+            entry("never", Accelerator::A100, false, None),
+        ] {
+            ledger.upsert(e).unwrap();
+        }
+        let a1 = AccountId::new("a1").unwrap();
+        ledger
+            .mark_stopped(&a1, "new", t(40), StopReason::User)
+            .unwrap();
+        let rates = ledger.measured_rates();
+        let rate = |accelerator, high_mem| {
+            rates
+                .iter()
+                .find(|r| r.matches(accelerator, high_mem))
+                .map(|r| r.reading.cu_per_hour)
+        };
+        assert_eq!(rates.len(), 3);
+        assert_eq!(rate(Accelerator::T4, false), Some(1.76));
+        assert_eq!(rate(Accelerator::T4, true), Some(2.0));
+        // An L4 has one machine shape: the high-RAM option changes nothing.
+        assert_eq!(rate(Accelerator::L4, false), Some(4.82));
+        assert_eq!(rate(Accelerator::L4, true), Some(4.82));
+        assert_eq!(rate(Accelerator::A100, false), None);
+    }
+
+    #[test]
+    fn a_measured_rate_outlives_the_trimming_of_old_sessions() {
+        let a1 = AccountId::new("a1").unwrap();
+        let mut ledger = Ledger::in_memory();
+        let mut stop = |entry: TrackedSession| {
+            let name = entry.name.clone();
+            ledger.upsert(entry).unwrap();
+            ledger
+                .mark_stopped(&a1, &name, SystemTime::UNIX_EPOCH, StopReason::User)
+                .unwrap();
+        };
+        stop(TrackedSession {
+            accelerator: Accelerator::T4,
+            measured_rate: Some(RateReading {
+                cu_per_hour: 1.76,
+                at: SystemTime::UNIX_EPOCH,
+            }),
+            ..live("measured", None)
+        });
+        for i in 0..250 {
+            stop(live(&format!("s{i}"), None));
+        }
+        assert!(ledger.entries().iter().all(|e| e.name != "s0"), "trimmed");
+        let rates = ledger.measured_rates();
+        assert_eq!(rates.len(), 1);
+        assert!(rates[0].matches(Accelerator::T4, false));
     }
 
     #[test]
@@ -661,6 +786,7 @@ mod tests {
             spend: SpendMeter::new(t0),
             watchdog: Some(wd),
             stopped: None,
+            measured_rate: None,
         };
         assert_eq!(s.auto_stop_at(), Some(t0 + Duration::from_secs(600)));
         s.watchdog = Some(dead);
