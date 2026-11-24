@@ -12,6 +12,7 @@ use colab_playground_shared::i18n::{self, CATALOGS};
 
 pub(crate) const HEADLESS_KEYRING: &str = "web.keyring.headless";
 pub(crate) const UNMANAGED_UNKNOWN: &str = "web.runtimes.unmanaged_unknown";
+pub(crate) const SWITCH_IMPACT_CHANGED: &str = "web.accounts.switch_impact_changed";
 pub(crate) const INVALID_REQUEST: &str = "web.error.invalid_request";
 pub(crate) const LOCALE_NOT_FOUND: &str = "web.error.locale_not_found";
 pub(crate) const PLUGIN_RUN_NOT_FOUND: &str = "web.error.plugin_run_not_found";

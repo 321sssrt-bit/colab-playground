@@ -1,3 +1,4 @@
+mod accounts;
 mod forwards;
 mod plugins;
 
@@ -111,7 +112,7 @@ async fn exercise_with_policy(
     let settings = WebSettings::load(store.clone());
     config.defaults = settings.initial_settings().defaults;
     let backend = Arc::new(MockBackend::new(config));
-    exercise_backend(dir, store, settings, backend, policy, trusted, run).await;
+    exercise_backend(dir, store, settings, backend, (policy, None), trusted, run).await;
 }
 
 async fn exercise_backend<B: Backend + 'static>(
@@ -119,16 +120,18 @@ async fn exercise_backend<B: Backend + 'static>(
     store: SettingsStore,
     settings: WebSettings,
     backend: Arc<B>,
-    policy: Option<ForwardPolicy>,
+    (policy, login_inactivity): (Option<ForwardPolicy>, Option<Duration>),
     trusted: Vec<TrustedHost>,
     run: impl FnOnce(Client, Arc<B>, SettingsStore) + Send + 'static,
 ) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let policy = policy.unwrap_or_else(|| crate::platform::forward_policy(addr));
-    let web = WebState::start_with_forward_policy(backend.clone(), policy)
-        .await
-        .unwrap();
+    let web = match login_inactivity {
+        Some(timeout) => WebState::start_with_timeout(backend.clone(), timeout, policy).await,
+        None => WebState::start_with_forward_policy(backend.clone(), policy).await,
+    }
+    .unwrap();
     tokio::time::timeout(
         TIMEOUT,
         web.subscribe().wait_for(|snapshot| {

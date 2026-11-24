@@ -1,3 +1,4 @@
+mod accounts;
 mod forwards;
 mod login;
 pub mod plugins;
@@ -28,6 +29,7 @@ use tokio::{
     task::{JoinHandle, spawn_blocking},
 };
 
+pub use accounts::AccountSwitchPreview;
 pub use forwards::ForwardPolicy;
 pub use login::LoginPrompt;
 pub use shutdown::{Billing, ShutdownReport};
@@ -162,7 +164,8 @@ impl WebState {
         Self::start_with_timeout(backend, LOGIN_INACTIVITY, forward_policy).await
     }
 
-    async fn start_with_timeout(
+    /// Starts the state with a custom OAuth prompt inactivity deadline.
+    pub async fn start_with_timeout(
         backend: Arc<dyn Backend>,
         login_inactivity: Duration,
         forward_policy: ForwardPolicy,
@@ -319,24 +322,6 @@ impl WebState {
         )
     }
 
-    pub fn switch_account(
-        &self,
-        account: AccountContext,
-        to: AccountId,
-    ) -> Result<Submission<AccountsView>> {
-        let state = self.clone();
-        self.start_job(
-            Operation::SwitchAccount { to: to.clone() },
-            Access::AccountWrite(account),
-            false,
-            move |_, backend, cancel| {
-                let result = backend.switch_account(&to, cancel);
-                state.record_accounts(result.clone());
-                result
-            },
-        )
-    }
-
     pub fn cancel(&self, id: u64) -> bool {
         let control = self.lock();
         let cancelled = control
@@ -478,11 +463,23 @@ impl WebState {
     }
 
     fn record_accounts(&self, result: Result<AccountsView>) {
+        let now = self.0.backend.now();
         self.update(|snapshot| match result {
-            Ok(view) => {
+            Ok(mut view) => {
+                for account in &mut view.accounts {
+                    if let Some(sample) = &mut account.usage {
+                        polling::expire_sample(sample, now);
+                    }
+                }
                 if snapshot.account.active != view.active {
                     snapshot.account.revision += 1;
                     snapshot.account.active.clone_from(&view.active);
+                    if let Some(runtimes) = &mut snapshot.runtimes {
+                        for runtime in &mut runtimes.runtimes {
+                            runtime.on_active_account =
+                                Some(&runtime.id.account) == view.active.as_ref();
+                        }
+                    }
                 }
                 let changed = snapshot.accounts_error.take().is_some()
                     || snapshot.accounts.as_ref() != Some(&view);

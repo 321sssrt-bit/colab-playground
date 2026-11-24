@@ -84,4 +84,8 @@ pub(super) const MESSAGES: colab_playground_shared::i18n::Messages = &[
         super::FORWARD_EXTERNAL_HOST,
         "포워딩 링크를 받으려면 접근할 수 있는 IPv4 주소나 해당 주소로 확인되는 호스트 이름으로 웹 서버에 접속하세요.",
     ),
+    (
+        super::SWITCH_IMPACT_CHANGED,
+        "계정 전환의 영향이 달라졌습니다. 전환하기 전에 다시 확인하세요.",
+    ),
 ];

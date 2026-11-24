@@ -1,4 +1,6 @@
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, time::SystemTime};
+
+use colab_playground_core::{guard::USAGE_STALE_AFTER, usage::UsageSnapshot};
 
 use tokio::time::{MissedTickBehavior, interval};
 
@@ -42,22 +44,66 @@ impl WebState {
             return;
         }
 
-        let usage = backend.refresh_usage(&[], cancel).unwrap_or_else(|error| {
-            let mut usage = backend.usage();
-            for view in &mut usage {
-                if let Some(snapshot) = &mut view.snapshot {
-                    snapshot.stale = true;
+        self.refresh_account_usage(backend, &[], cancel);
+        self.record_runtimes(backend.runtimes(cancel));
+    }
+
+    pub(super) fn refresh_account_usage(
+        &self,
+        backend: &dyn Backend,
+        accounts: &[AccountId],
+        cancel: &CancelToken,
+    ) {
+        let usage = backend
+            .refresh_usage(accounts, cancel)
+            .unwrap_or_else(|error| {
+                let mut usage = backend.usage();
+                for view in &mut usage {
+                    if accounts.is_empty() || accounts.contains(&view.account) {
+                        if let Some(snapshot) = &mut view.snapshot {
+                            snapshot.stale = true;
+                        }
+                        view.last_error = Some(error.clone());
+                    }
                 }
-                view.last_error = Some(error.clone());
-            }
-            usage
-        });
+                usage
+            });
+        self.record_usage(usage);
+    }
+
+    pub(super) fn record_usage(&self, usage: Vec<AccountUsageView>) {
+        let now = self.0.backend.now();
         self.update(|snapshot| {
-            let changed = snapshot.usage != usage;
+            let mut usage = usage;
+            let _ = expire_usage(&mut usage, now);
+            let mut changed = snapshot.usage != usage;
+            if let Some(accounts) = &mut snapshot.accounts {
+                for account in &mut accounts.accounts {
+                    if let Some(view) = usage.iter().find(|view| view.account == account.id) {
+                        changed |= account.usage != view.snapshot;
+                        account.usage = view.snapshot;
+                    }
+                }
+            }
             snapshot.usage = usage;
             changed
         });
-        self.record_runtimes(backend.runtimes(cancel));
+    }
+
+    pub(super) fn mark_usage_age(&self) {
+        let now = self.0.backend.now();
+        self.update(|snapshot| {
+            let mut changed = expire_usage(&mut snapshot.usage, now);
+            if let Some(accounts) = &mut snapshot.accounts {
+                for account in &mut accounts.accounts {
+                    changed |= account
+                        .usage
+                        .as_mut()
+                        .is_some_and(|sample| expire_sample(sample, now));
+                }
+            }
+            changed
+        });
     }
 
     pub(super) fn clear_overview(&self) {
@@ -133,9 +179,10 @@ fn poll_backend(job: &Job, refresh: bool) {
             .filter(|account| !covered.contains(account))
             .collect();
         if !uncovered.is_empty() && (refresh || backend.usage_poll_due()) {
-            let _ = backend.refresh_usage(&uncovered, cancel);
+            state.refresh_account_usage(backend, &uncovered, cancel);
+        } else {
+            state.record_usage(backend.usage());
         }
-        let usage = backend.usage();
         state.update(|snapshot| {
             match guard {
                 Ok(report) => {
@@ -144,13 +191,31 @@ fn poll_backend(job: &Job, refresh: bool) {
                 }
                 Err(error) => snapshot.guard_error = Some(error.kind),
             }
-            snapshot.usage = usage;
             true
         });
+    } else {
+        state.mark_usage_age();
     }
 
     if refresh || due || snapshot.runtimes.is_none() {
         state.record_runtimes(backend.runtimes(cancel));
     }
     state.sync_forwards();
+}
+
+fn expire_usage(usage: &mut [AccountUsageView], now: SystemTime) -> bool {
+    let mut changed = false;
+    for view in usage {
+        changed |= view
+            .snapshot
+            .as_mut()
+            .is_some_and(|sample| expire_sample(sample, now));
+    }
+    changed
+}
+
+pub(super) fn expire_sample(sample: &mut UsageSnapshot, now: SystemTime) -> bool {
+    let expired = !sample.is_fresh(now, USAGE_STALE_AFTER) && !sample.stale;
+    sample.stale |= expired;
+    expired
 }

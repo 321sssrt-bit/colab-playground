@@ -9,6 +9,7 @@ pub(super) struct PendingLogin {
     pub(super) flow: Box<dyn LoginFlow>,
 }
 
+#[derive(Serialize)]
 pub struct LoginPrompt {
     pub id: u64,
     pub auth_url: String,
@@ -22,12 +23,18 @@ impl WebState {
             Access::AccountWrite(account),
             false,
             move |id, backend, cancel| {
-                let flow = backend.begin_add_account(cancel)?;
+                let result = backend.begin_add_account(cancel);
+                state.sync_forwards();
+                let flow = result.inspect_err(|_| {
+                    state.record_accounts(backend.accounts(&CancelToken::new()));
+                })?;
                 let auth_url = flow.auth_url().to_owned();
                 let mut control = state.lock();
                 if control.shutting_down || cancel.commit().is_err() {
                     drop(control);
-                    flow.cancel()?;
+                    let result = flow.cancel();
+                    state.record_accounts(backend.accounts(&CancelToken::new()));
+                    result?;
                     return Err(Error::cancelled());
                 }
                 let expires = Instant::now() + state.0.login_inactivity;
@@ -75,6 +82,9 @@ impl WebState {
             let backend = &job.state.0.backend;
             job.state
                 .record_accounts(backend.accounts(&CancelToken::new()));
+            if matches!(&result, Ok(Some(_))) {
+                job.state.record_usage(backend.usage());
+            }
             result
         });
         Ok(Submission::Started { id, job })
