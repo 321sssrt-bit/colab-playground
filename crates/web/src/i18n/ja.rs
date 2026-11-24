@@ -87,4 +87,8 @@ pub(super) const MESSAGES: colab_playground_shared::i18n::Messages = &[
         super::FORWARD_EXTERNAL_HOST,
         "転送リンクを取得するには、到達可能な IPv4 アドレスか、そのアドレスに解決されるホスト名で Web サーバーにアクセスしてください。",
     ),
+    (
+        super::SWITCH_IMPACT_CHANGED,
+        "アカウント切り替えの影響が変わりました。切り替える前に、もう一度確認してください。",
+    ),
 ];

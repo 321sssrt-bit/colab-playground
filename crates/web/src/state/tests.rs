@@ -2,7 +2,7 @@ use std::sync::mpsc;
 
 use colab_playground_core::{
     backend::{Backend, RunTarget},
-    mock::{MockBackend, MockConfig, MockScenario},
+    mock::{MockBackend, MockConfig, MockFailures, MockScenario},
     plugins::InputValue,
     provision::ProvisionEvent,
     sessions::Accelerator,
@@ -72,6 +72,83 @@ async fn wait_event<T: Send + 'static>(
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn first_account_snapshot_marks_disk_usage_stale_before_a_live_read() {
+    use colab_playground_core::{accounts::AccountStore, guard::USAGE_STALE_AFTER};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("accounts.json");
+    let (config, _) = MockConfig::headless(MockScenario::single());
+    let before_restart = MockBackend::new(config.clone());
+    before_restart
+        .refresh_usage(&[], &CancelToken::new())
+        .unwrap();
+    let mut accounts = before_restart.accounts(&CancelToken::new()).unwrap();
+    AccountStore::load(&path)
+        .unwrap()
+        .upsert(accounts.accounts.remove(0))
+        .unwrap();
+    accounts.accounts = AccountStore::load(&path).unwrap().all().to_vec();
+    let disk_sample = accounts.accounts[0].usage.unwrap();
+    assert!(disk_sample.is_fresh(before_restart.now(), USAGE_STALE_AFTER));
+
+    let new_backend = MockBackend::new(MockConfig {
+        scenario: MockScenario::signed_out(),
+        ..config
+    });
+    let state = WebState::start(Arc::new(new_backend)).await.unwrap();
+    assert!(ready(&state).await.usage.is_empty());
+    let mut snapshots = state.subscribe();
+    state.record_accounts(Ok(accounts));
+    snapshots.changed().await.unwrap();
+    let snapshot = snapshots.borrow_and_update().clone();
+    let reading = snapshot.usage[0].snapshot.unwrap();
+    assert!(reading.stale);
+    assert_eq!(reading.balance_cu, disk_sample.balance_cu);
+    assert_eq!(
+        snapshot.accounts.as_ref().unwrap().accounts[0].usage,
+        Some(reading)
+    );
+    assert!(state.shutdown(TEST_TIMEOUT).await.completed);
+}
+
+#[tokio::test]
+async fn account_metadata_cannot_replace_a_stale_usage_sample_with_a_fresh_copy() {
+    let (config, _) = MockConfig::headless(MockScenario::single());
+    let backend = Arc::new(MockBackend::new(config));
+    let state = WebState::start(backend.clone()).await.unwrap();
+    ready(&state).await;
+    let cached = backend.accounts(&CancelToken::new()).unwrap();
+    assert!(!cached.accounts[0].usage.unwrap().stale);
+
+    backend.set_failures(MockFailures {
+        usage_fetch_fails: true,
+        ..Default::default()
+    });
+    assert!(
+        state.refresh_accounts().await.unwrap().usage[0]
+            .snapshot
+            .unwrap()
+            .stale
+    );
+
+    // The real account store keeps the last successful sample when a refresh fails.
+    state.record_accounts(Ok(cached));
+    let snapshot = state.snapshot();
+    assert_eq!(
+        snapshot.accounts.as_ref().unwrap().accounts[0].usage,
+        snapshot.usage[0].snapshot
+    );
+    let mut missing = snapshot.usage.clone();
+    missing[0].snapshot = None;
+    state.record_usage(missing);
+    assert_eq!(
+        state.snapshot().usage[0].snapshot,
+        snapshot.usage[0].snapshot
+    );
+    assert!(state.shutdown(TEST_TIMEOUT).await.completed);
 }
 
 #[tokio::test]
@@ -360,7 +437,7 @@ impl colab_playground_core::clock::Clock for HoldStep {
                 .recv_timeout(TEST_TIMEOUT)
                 .unwrap();
         }
-        Ok(())
+        cancel.check()
     }
 }
 
@@ -411,6 +488,29 @@ async fn an_account_write_is_accepted_while_a_background_poll_finishes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_switch_rechecks_accounts_without_marking_the_list_failed() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let (state, _, step, at_step, resume) = demo_with_held_step().await;
+    let initial = state.snapshot();
+    let to = initial.accounts.as_ref().unwrap().accounts[1].id.clone();
+    step.steps.store(2, SeqCst);
+    let (id, switch) = started(state.switch_account(initial.account.clone(), to).unwrap());
+    at_step.recv_timeout(TEST_TIMEOUT).unwrap();
+    assert!(state.cancel(id));
+
+    step.steps.store(1, SeqCst);
+    resume.send(()).unwrap();
+    at_step.recv_timeout(TEST_TIMEOUT).unwrap();
+    let after = state.snapshot();
+    assert!(after.accounts_error.is_none());
+    assert_eq!(after.account, initial.account);
+    resume.send(()).unwrap();
+    assert!(switch.await.unwrap().unwrap_err().is(ErrorKind::Cancelled));
+    assert!(state.shutdown(TEST_TIMEOUT).await.completed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn login_keeps_its_job_id_and_rolls_back_if_cancelled_while_opening() {
     use std::sync::atomic::Ordering::SeqCst;
 
@@ -431,7 +531,7 @@ async fn login_keeps_its_job_id_and_rolls_back_if_cancelled_while_opening() {
     let prompt = login.await.unwrap().unwrap();
     assert_eq!(prompt.id, id);
     assert_eq!(state.snapshot().login_id, Some(id));
-    let (_, rollback) = started(state.cancel_login(prompt.id).unwrap());
+    let (_, rollback) = started(state.cancel_login(prompt.id).unwrap().unwrap());
     rollback.await.unwrap().unwrap();
     ready(&state).await;
 

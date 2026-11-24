@@ -78,4 +78,8 @@ pub(super) const MESSAGES: colab_playground_shared::i18n::Messages = &[
         super::FORWARD_EXTERNAL_HOST,
         "請用可連線的 IPv4 位址或解析至該位址的主機名稱存取 Web 伺服器，以取得轉送連結。",
     ),
+    (
+        super::SWITCH_IMPACT_CHANGED,
+        "切換帳號的影響已變更，請重新查看後再切換。",
+    ),
 ];

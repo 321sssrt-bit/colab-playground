@@ -87,4 +87,8 @@ pub(super) const MESSAGES: colab_playground_shared::i18n::Messages = &[
         super::FORWARD_EXTERNAL_HOST,
         "Reach the Web Server through an IPv4 address or a hostname that resolves to a reachable IPv4 address to get Forward links.",
     ),
+    (
+        super::SWITCH_IMPACT_CHANGED,
+        "The impact of switching accounts changed. Review it again before switching.",
+    ),
 ];

@@ -1,3 +1,4 @@
+mod accounts;
 mod forwards;
 mod overview;
 mod plugins;
@@ -36,6 +37,7 @@ pub(crate) fn routes() -> Router<StateData> {
         .route("/api/settings", get(settings::get).patch(settings::patch))
         .route("/api/updates", get(updates::get))
         .route("/api/i18n/{locale}", get(dictionary))
+        .merge(accounts::routes())
         .merge(plugins::routes())
 }
 
@@ -124,7 +126,21 @@ impl From<Error> for ApiError {
         use ErrorKind as K;
 
         let status = match error.kind {
-            K::InvalidInput | K::ManifestInvalid | K::PortReserved => {
+            K::InvalidInput if error.param("remove_active").is_some() => {
+                return Self::new(
+                    StatusCode::CONFLICT,
+                    "active_account",
+                    colab_playground_shared::i18n::keys::ACCOUNTS_REMOVE_ACTIVE,
+                );
+            }
+            K::Busy if error.param("switch_impact_changed").is_some() => {
+                return Self::new(
+                    StatusCode::CONFLICT,
+                    "switch_impact_changed",
+                    i18n::SWITCH_IMPACT_CHANGED,
+                );
+            }
+            K::LoginInvalidCode | K::InvalidInput | K::ManifestInvalid | K::PortReserved => {
                 StatusCode::UNPROCESSABLE_ENTITY
             }
             K::Unsupported if error.param("forward_bind_restriction").is_some() => {
@@ -134,7 +150,9 @@ impl From<Error> for ApiError {
                 };
                 return Self::new(StatusCode::CONFLICT, "unsupported", key);
             }
-            K::PluginExists
+            K::AuthRequired
+            | K::LoginCancelled
+            | K::PluginExists
             | K::PortInUse
             | K::SshBusy
             | K::Busy
@@ -146,7 +164,7 @@ impl From<Error> for ApiError {
             | K::AddInProgress => StatusCode::CONFLICT,
             K::AccountNotFound | K::SessionGone | K::PluginNotFound => StatusCode::NOT_FOUND,
             K::RateLimited | K::HttpUnavailable => StatusCode::SERVICE_UNAVAILABLE,
-            K::Http | K::GitFailed => StatusCode::BAD_GATEWAY,
+            K::Http | K::GitFailed | K::LoginVerificationFailed => StatusCode::BAD_GATEWAY,
             K::Timeout => StatusCode::GATEWAY_TIMEOUT,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };

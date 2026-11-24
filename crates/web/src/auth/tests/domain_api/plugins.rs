@@ -378,7 +378,7 @@ async fn git_fixture_runs_on_existing_session_with_redacted_replay_and_loopback_
         store,
         settings,
         backend,
-        None,
+        (None, None),
         vec![TrustedHost::parse("https://remote.example.test").unwrap()],
         move |client, _, _| {
             let p = preview(

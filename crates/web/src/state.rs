@@ -1,3 +1,4 @@
+mod accounts;
 mod forwards;
 mod login;
 pub mod plugins;
@@ -28,6 +29,7 @@ use tokio::{
     task::{JoinHandle, spawn_blocking},
 };
 
+pub use accounts::{AccountSwitchApproval, AccountSwitchPreview};
 pub use forwards::ForwardPolicy;
 pub use login::LoginPrompt;
 pub use shutdown::{Billing, ShutdownReport};
@@ -43,11 +45,24 @@ pub struct AccountContext {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Operation {
-    Provision { session: String },
-    PluginRun { plugin: String, session: String },
-    SwitchAccount { to: AccountId },
-    Login,
-    Domain { name: &'static str, key: String },
+    Provision {
+        session: String,
+    },
+    PluginRun {
+        plugin: String,
+        session: String,
+    },
+    SwitchAccount {
+        to: AccountId,
+    },
+    Login {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        login_id: Option<u64>,
+    },
+    Domain {
+        name: &'static str,
+        key: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -162,7 +177,8 @@ impl WebState {
         Self::start_with_timeout(backend, LOGIN_INACTIVITY, forward_policy).await
     }
 
-    async fn start_with_timeout(
+    /// Starts the state with a custom OAuth prompt inactivity deadline.
+    pub async fn start_with_timeout(
         backend: Arc<dyn Backend>,
         login_inactivity: Duration,
         forward_policy: ForwardPolicy,
@@ -319,24 +335,6 @@ impl WebState {
         )
     }
 
-    pub fn switch_account(
-        &self,
-        account: AccountContext,
-        to: AccountId,
-    ) -> Result<Submission<AccountsView>> {
-        let state = self.clone();
-        self.start_job(
-            Operation::SwitchAccount { to: to.clone() },
-            Access::AccountWrite(account),
-            false,
-            move |_, backend, cancel| {
-                let result = backend.switch_account(&to, cancel);
-                state.record_accounts(result.clone());
-                result
-            },
-        )
-    }
-
     pub fn cancel(&self, id: u64) -> bool {
         let control = self.lock();
         let cancelled = control
@@ -478,15 +476,51 @@ impl WebState {
     }
 
     fn record_accounts(&self, result: Result<AccountsView>) {
+        let now = self.0.backend.now();
         self.update(|snapshot| match result {
-            Ok(view) => {
+            Ok(mut view) => {
+                let usage = view
+                    .accounts
+                    .iter_mut()
+                    .map(|account| {
+                        let mut usage = snapshot
+                            .usage
+                            .iter()
+                            .find(|usage| usage.account == account.id)
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                colab_playground_core::backend::usage_view(
+                                    &account.id,
+                                    account.email.clone(),
+                                    &colab_playground_core::usage::AccountUsage {
+                                        snapshot: account.usage.map(polling::stale_sample),
+                                        ..Default::default()
+                                    },
+                                    0,
+                                )
+                            });
+                        if let Some(sample) = &mut usage.snapshot {
+                            polling::expire_sample(sample, now);
+                        }
+                        account.usage = usage.snapshot;
+                        usage
+                    })
+                    .collect();
                 if snapshot.account.active != view.active {
                     snapshot.account.revision += 1;
                     snapshot.account.active.clone_from(&view.active);
+                    if let Some(runtimes) = &mut snapshot.runtimes {
+                        for runtime in &mut runtimes.runtimes {
+                            runtime.on_active_account =
+                                Some(&runtime.id.account) == view.active.as_ref();
+                        }
+                    }
                 }
                 let changed = snapshot.accounts_error.take().is_some()
-                    || snapshot.accounts.as_ref() != Some(&view);
+                    || snapshot.accounts.as_ref() != Some(&view)
+                    || snapshot.usage != usage;
                 snapshot.accounts = Some(view);
+                snapshot.usage = usage;
                 changed
             }
             Err(error) => {
