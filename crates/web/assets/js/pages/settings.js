@@ -45,6 +45,7 @@ export function createSettingsPage() {
   // Isolated form state: background SSE snapshot pushes never overwrite draft edits.
   let draft = null;
   let dirty = false;
+  let editVersion = 0;
   let saving = false;
   let saveError = null;
   let saveStatus = null;
@@ -167,6 +168,7 @@ export function createSettingsPage() {
 
   function markDirty() {
     dirty = true;
+    editVersion += 1;
     saveError = null;
     saveStatus = null;
     updateDefaultsFooter();
@@ -317,7 +319,7 @@ export function createSettingsPage() {
             type: "number",
             min: "0",
             max: String(MAX_CU_FIELD),
-            step: "0.5",
+            step: "any",
             className: "input input-sm input-num",
             "aria-label": t("app.def.max_spend"),
             value: String(draft.max_spend_cu ?? START_SPEND_CU),
@@ -347,7 +349,7 @@ export function createSettingsPage() {
             type: "number",
             min: "0",
             max: String(MAX_CU_FIELD),
-            step: "0.5",
+            step: "any",
             className: "input input-sm input-num",
             "aria-label": t("app.def.min_balance"),
             value: String(draft.min_balance_cu ?? START_MIN_BALANCE_CU),
@@ -526,14 +528,19 @@ export function createSettingsPage() {
           saving = true;
           saveError = null;
           saveStatus = null;
+          const submittedVersion = editVersion;
+          const payload = cloneDefaults(draft);
           updateDefaultsFooter();
           try {
-            const updated = await patchSettings({ defaults: draft });
-            draft = cloneDefaults(updated.defaults);
-            dirty = false;
-            saveStatus = t("web.settings.saved");
-            announce(saveStatus);
-            renderDefaultsSection();
+            const updated = await patchSettings({ defaults: payload });
+            // Keep newer user edits made while the save request was in flight.
+            if (editVersion === submittedVersion) {
+              draft = cloneDefaults(updated.defaults);
+              dirty = false;
+              saveStatus = t("web.settings.saved");
+              announce(saveStatus);
+              renderDefaultsSection();
+            }
           } catch (err) {
             if (err && err.status === 401) return;
             const formatted = formatApiError(err?.payload);
@@ -802,6 +809,7 @@ export function createSettingsPage() {
       aboutEl = null;
       draft = null;
       dirty = false;
+      editVersion = 0;
       saveError = null;
       saveStatus = null;
       copiedFeedback = false;

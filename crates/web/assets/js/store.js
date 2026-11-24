@@ -9,11 +9,21 @@ const listeners = new Set();
 let sseController = null;
 let reconnectTimer = null;
 let sseGeneration = 0;
+let pendingLoginLanguage = null;
+let pendingLoginAppearance = null;
+
+export function recordLoginLanguageChoice(pref) {
+  pendingLoginLanguage = pref;
+}
+
+export function recordLoginAppearanceChoice(pref) {
+  pendingLoginAppearance = pref;
+}
 
 export const state = {
   authenticated: false,
   sessionExpired: false,
-  connection: "idle", // idle | connected | reconnecting
+  connection: "idle", // idle | connecting | connected | reconnecting
   snapshot: null,
   overview: null,
   overviewLoading: false,
@@ -94,20 +104,18 @@ setUnauthorizedHandler(() => {
 export async function enterAuthenticatedSession() {
   state.authenticated = true;
   state.sessionExpired = false;
-  state.connection = "reconnecting";
+  state.connection = "connecting";
   emit("auth");
 
-  await Promise.allSettled([
+  // Start SSE immediately so slow startup probes or update checks never block live snapshots.
+  startSseLoop();
+  void Promise.allSettled([
     fetchInitialSnapshot(),
     loadSettings({ applyPrefs: true }),
     loadOverview(),
     loadPlugins(),
     loadUpdates(),
   ]);
-
-  if (state.authenticated) {
-    startSseLoop();
-  }
 }
 
 export async function fetchInitialSnapshot() {
@@ -233,17 +241,38 @@ export async function loadSettings({ applyPrefs = false } = {}) {
   state.settingsLoading = true;
   emit("settings");
   try {
-    const data = await apiRequest("/api/settings");
-    state.settings = data;
+    let data = await apiRequest("/api/settings");
     if (applyPrefs && data) {
-      if (data.appearance) {
+      const loginLang = pendingLoginLanguage;
+      const loginAppearance = pendingLoginAppearance;
+      pendingLoginLanguage = null;
+      pendingLoginAppearance = null;
+
+      const patch = {};
+      if (loginLang && loginLang !== data.language) {
+        patch.language = loginLang;
+      }
+      if (loginAppearance && loginAppearance !== data.appearance) {
+        patch.appearance = loginAppearance;
+      }
+      if (Object.keys(patch).length > 0) {
+        try {
+          data = await apiRequest("/api/settings", { method: "PATCH", body: patch });
+        } catch {
+          data = { ...data, ...patch };
+        }
+      }
+      state.settings = data;
+      if (!loginAppearance && data.appearance) {
         setAppearancePreference(data.appearance, { persist: true });
       }
-      if (data.language) {
+      if (!loginLang && data.language) {
         await setLanguagePreference(data.language, { persist: true });
       }
+    } else {
+      state.settings = data;
     }
-    return data;
+    return state.settings;
   } catch {
     return null;
   } finally {

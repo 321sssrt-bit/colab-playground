@@ -34,6 +34,7 @@ class AppShellController {
     this.shellMounted = false;
 
     this.shellEl = null;
+    this.skipLinkEl = null;
     this.sidebarEl = null;
     this.topbarEl = null;
     this.bannerEl = null;
@@ -169,7 +170,7 @@ class AppShellController {
       className: "drawer-backdrop",
       onClick: () => this.closeDrawer({ restoreFocus: true }),
     });
-    const skipLink = el(
+    this.skipLinkEl = el(
       "a",
       { href: "#main-content", className: "skip-link visually-hidden" },
       t("web.shell.skip_to_content")
@@ -178,7 +179,7 @@ class AppShellController {
     this.shellEl = el(
       "div",
       { className: "shell" },
-      skipLink,
+      this.skipLinkEl,
       backdrop,
       this.sidebarEl,
       el("div", { className: "shell-main" }, this.topbarEl, this.bannerEl, this.pageHostEl)
@@ -224,6 +225,9 @@ class AppShellController {
 
   renderChrome() {
     if (!this.shellMounted) return;
+    if (this.skipLinkEl) {
+      this.skipLinkEl.textContent = t("web.shell.skip_to_content");
+    }
     const isMock = state.snapshot?.backend === "mock";
     const activeEmail = getActiveEmail();
     const accountLabel = activeEmail

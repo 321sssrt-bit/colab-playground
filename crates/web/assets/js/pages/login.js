@@ -2,7 +2,12 @@ import { login } from "../api.js";
 import { alertBox, announce, appearanceSegmented, clear, el, languageSelect } from "../components.js";
 import { getLanguagePreference, setLanguagePreference, t } from "../i18n.js";
 import { icon } from "../icons.js";
-import { enterAuthenticatedSession, state } from "../store.js";
+import {
+  enterAuthenticatedSession,
+  recordLoginAppearanceChoice,
+  recordLoginLanguageChoice,
+  state,
+} from "../store.js";
 import { getAppearancePreference, setAppearancePreference } from "../theme.js";
 
 export function createLoginPage() {
@@ -155,6 +160,7 @@ export function createLoginPage() {
           ariaLabel: t("app.settings.language.title"),
           compact: true,
           onChange: (next) => {
+            recordLoginLanguageChoice(next);
             void setLanguagePreference(next, { persist: true });
           },
         }),
@@ -162,6 +168,7 @@ export function createLoginPage() {
           name: "login-appearance",
           value: getAppearancePreference(),
           onChange: (next) => {
+            recordLoginAppearanceChoice(next);
             setAppearancePreference(next, { persist: true });
           },
         })

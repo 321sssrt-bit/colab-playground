@@ -1,5 +1,6 @@
 // Strictly in-memory Bearer token: never written to cookies, localStorage, or sessionStorage.
 let bearerToken = null;
+let sessionGeneration = 0;
 let unauthorizedHandler = null;
 
 export function setUnauthorizedHandler(fn) {
@@ -12,6 +13,21 @@ export function hasToken() {
 
 export function clearToken() {
   bearerToken = null;
+  sessionGeneration += 1;
+}
+
+function expireIfCurrent(requestToken, requestGeneration) {
+  if (
+    requestToken !== null &&
+    requestToken === bearerToken &&
+    requestGeneration === sessionGeneration
+  ) {
+    bearerToken = null;
+    sessionGeneration += 1;
+    if (unauthorizedHandler) {
+      unauthorizedHandler();
+    }
+  }
 }
 
 export async function login(accessKey) {
@@ -23,6 +39,7 @@ export async function login(accessKey) {
   if (response.ok) {
     const data = await response.json();
     bearerToken = data.token;
+    sessionGeneration += 1;
     return { ok: true, status: response.status, expiresIn: data.expires_in };
   }
   return { ok: false, status: response.status };
@@ -37,9 +54,11 @@ export class ApiError extends Error {
 }
 
 export async function apiRequest(path, { method = "GET", body = undefined, signal = undefined } = {}) {
+  const requestToken = bearerToken;
+  const requestGeneration = sessionGeneration;
   const headers = { Accept: "application/json" };
-  if (bearerToken) {
-    headers.Authorization = `Bearer ${bearerToken}`;
+  if (requestToken) {
+    headers.Authorization = `Bearer ${requestToken}`;
   }
   const init = { method, headers, signal };
   if (method !== "GET" && method !== "HEAD") {
@@ -48,10 +67,7 @@ export async function apiRequest(path, { method = "GET", body = undefined, signa
   }
   const response = await fetch(path, init);
   if (response.status === 401) {
-    bearerToken = null;
-    if (unauthorizedHandler) {
-      unauthorizedHandler();
-    }
+    expireIfCurrent(requestToken, requestGeneration);
     throw new ApiError(401, null);
   }
   if (response.status === 204) {
@@ -74,12 +90,14 @@ export async function apiRequest(path, { method = "GET", body = undefined, signa
 
 // Consumes Server-Sent Events via authenticated JSON POST fetch (never browser cookies).
 export async function streamSse(path, body, { onEvent, onOpen, signal } = {}) {
+  const requestToken = bearerToken;
+  const requestGeneration = sessionGeneration;
   const headers = {
     Accept: "text/event-stream",
     "Content-Type": "application/json",
   };
-  if (bearerToken) {
-    headers.Authorization = `Bearer ${bearerToken}`;
+  if (requestToken) {
+    headers.Authorization = `Bearer ${requestToken}`;
   }
   let response;
   try {
@@ -97,10 +115,7 @@ export async function streamSse(path, body, { onEvent, onOpen, signal } = {}) {
   }
 
   if (response.status === 401) {
-    bearerToken = null;
-    if (unauthorizedHandler) {
-      unauthorizedHandler();
-    }
+    expireIfCurrent(requestToken, requestGeneration);
     return { outcome: "unauthorized" };
   }
   if (!response.ok) {

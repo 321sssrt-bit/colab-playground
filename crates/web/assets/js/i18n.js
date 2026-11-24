@@ -16,6 +16,7 @@ const listeners = new Set();
 let preference = readStoredPreference();
 let currentLocale = resolveLocale(preference);
 let messages = {};
+let loadGeneration = 0;
 
 function readStoredPreference() {
   try {
@@ -125,8 +126,13 @@ async function fetchDictionary(locale) {
 }
 
 export async function initI18n() {
+  const gen = ++loadGeneration;
   const locale = resolveLocale(preference);
-  messages = await fetchDictionary(locale);
+  const dict = await fetchDictionary(locale);
+  if (gen !== loadGeneration) {
+    return;
+  }
+  messages = dict;
   currentLocale = locale;
   document.documentElement.lang = locale;
   window.addEventListener("languagechange", () => {
@@ -145,6 +151,7 @@ export async function initI18n() {
 }
 
 export async function setLanguagePreference(pref, { persist = true } = {}) {
+  const gen = ++loadGeneration;
   const normalized = LANGUAGE_PREFS.includes(pref) ? pref : "system";
   preference = normalized;
   if (persist) {
@@ -152,9 +159,15 @@ export async function setLanguagePreference(pref, { persist = true } = {}) {
   }
   const nextLocale = resolveLocale(normalized);
   if (nextLocale !== currentLocale || Object.keys(messages).length === 0) {
-    messages = await fetchDictionary(nextLocale);
+    const dict = await fetchDictionary(nextLocale);
+    if (gen !== loadGeneration) {
+      return;
+    }
+    messages = dict;
     currentLocale = nextLocale;
     document.documentElement.lang = nextLocale;
+  } else if (gen !== loadGeneration) {
+    return;
   }
   for (const fn of listeners) {
     fn(currentLocale, preference);
