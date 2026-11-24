@@ -58,3 +58,48 @@ fn browser_command(url: &str) -> (&'static str, Vec<String>) {
         ("", Vec::new())
     }
 }
+
+#[cfg(unix)]
+pub struct ShutdownSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+    hangup: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl ShutdownSignals {
+    pub fn install() -> io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+            hangup: signal(SignalKind::hangup())?,
+        })
+    }
+
+    pub async fn recv(&mut self) {
+        tokio::select! {
+            _ = self.interrupt.recv() => {}
+            _ = self.terminate.recv() => {}
+            _ = self.hangup.recv() => {}
+        }
+    }
+}
+
+#[cfg(windows)]
+pub struct ShutdownSignals(tokio::signal::windows::CtrlC);
+
+#[cfg(windows)]
+impl ShutdownSignals {
+    pub fn install() -> io::Result<Self> {
+        tokio::signal::windows::ctrl_c().map(Self)
+    }
+
+    pub async fn recv(&mut self) {
+        self.0.recv().await;
+    }
+}
+
+pub fn force_exit(code: u8) -> ! {
+    std::process::exit(i32::from(code))
+}

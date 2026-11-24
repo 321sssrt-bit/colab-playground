@@ -1,5 +1,4 @@
 use std::{
-    convert::Infallible,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
     time::Duration,
@@ -13,6 +12,7 @@ use axum::{
     response::{IntoResponse, Response, Sse, sse::Event},
     routing::{get, post},
 };
+use colab_playground_web::state::WebState;
 use futures_util::stream;
 use serde::{Deserialize, Serialize, de::IgnoredAny};
 use tokio::sync::watch;
@@ -186,15 +186,23 @@ fn unique_header(headers: &HeaderMap, name: HeaderName) -> Option<&str> {
 struct StateData {
     auth: Arc<Auth>,
     key_changes: watch::Receiver<()>,
+    web: WebState,
 }
 
-pub fn router(auth: Auth, key_changes: watch::Receiver<()>, origins: Origins) -> Router {
+pub fn router(
+    auth: Auth,
+    key_changes: watch::Receiver<()>,
+    origins: Origins,
+    web: WebState,
+) -> Router {
     let state = StateData {
         auth: Arc::new(auth),
         key_changes,
+        web,
     };
     let protected = Router::new()
         .route("/api/session", get(|| async { StatusCode::NO_CONTENT }))
+        .route("/api/snapshot", get(snapshot))
         // Same-origin browser fetches omit Origin on GET, so subscriptions use JSON POST.
         .route(
             EVENTS,
@@ -295,6 +303,10 @@ async fn login(
     }
 }
 
+async fn snapshot(State(state): State<StateData>) -> Response {
+    Json(&*state.web.snapshot()).into_response()
+}
+
 async fn events(
     State(state): State<StateData>,
     Extension(session): Extension<Session>,
@@ -303,31 +315,41 @@ async fn events(
     if let Err(rejection) = payload {
         return rejection.status().into_response();
     }
+    let snapshots = state.web.subscribe();
     let stream = stream::unfold(
-        (state, None),
-        move |(mut state, next_heartbeat)| async move {
+        (state, snapshots, None),
+        move |(mut state, mut snapshots, next_heartbeat)| async move {
+            let mut send_snapshot = next_heartbeat.is_none();
             loop {
-                if let Some(next_heartbeat) = next_heartbeat {
+                if !send_snapshot {
+                    let next_heartbeat = next_heartbeat.expect("stream started");
                     tokio::select! {
+                        Ok(()) = snapshots.changed() => send_snapshot = true,
                         Ok(()) = state.key_changes.changed() => {}
                         _ = tokio::time::sleep(WATCH_FALLBACK) => {}
                         _ = tokio::time::sleep_until(next_heartbeat) => {}
                         _ = tokio::time::sleep_until(session.expires) => return None,
                     }
                 }
-                if !state.auth.is_live(session).await {
+                if !state.auth.is_live(session).await || snapshots.borrow().shutting_down {
                     return None;
                 }
                 let now = tokio::time::Instant::now();
-                if next_heartbeat.is_none_or(|deadline| now >= deadline) {
-                    let comment = if next_heartbeat.is_none() {
-                        "connected"
-                    } else {
-                        "keep-alive"
-                    };
+                if send_snapshot {
+                    let snapshot = snapshots.borrow_and_update().clone();
+                    if snapshot.shutting_down {
+                        return None;
+                    }
+                    let event = Event::default()
+                        .event("snapshot")
+                        .id(snapshot.version.to_string())
+                        .json_data(&*snapshot);
+                    return Some((event, (state, snapshots, Some(now + HEARTBEAT))));
+                }
+                if next_heartbeat.is_some_and(|deadline| now >= deadline) {
                     return Some((
-                        Ok::<_, Infallible>(Event::default().comment(comment)),
-                        (state, Some(now + HEARTBEAT)),
+                        Ok::<_, axum::Error>(Event::default().comment("keep-alive")),
+                        (state, snapshots, Some(now + HEARTBEAT)),
                     ));
                 }
             }

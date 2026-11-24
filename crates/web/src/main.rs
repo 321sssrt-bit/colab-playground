@@ -3,15 +3,25 @@ mod cli;
 mod http;
 mod platform;
 
-use std::{env, io, path::PathBuf, process::ExitCode};
+use std::{
+    env, future::IntoFuture as _, io, path::PathBuf, process::ExitCode, sync::Arc, time::Duration,
+};
 
-use colab_playground_core::{Error, ErrorKind, InstanceLock, paths::default_local_data_dir};
+use colab_playground_core::{
+    Error, ErrorKind, Host, InstanceLock,
+    backend::Backend,
+    mock::{MockBackend, MockConfig},
+    paths::default_local_data_dir,
+    real::{RealBackend, RealConfig},
+};
 use colab_playground_shared::{
     backend::{BACKEND_ENV, BackendSelection},
     errors,
     i18n::{Language, fill_lenient, template},
-    settings::{CONFIG_DIR_ENV, config_dir},
+    settings::{CONFIG_DIR_ENV, SettingsStore, config_dir},
 };
+
+use colab_playground_web::state::WebState;
 
 use crate::{
     auth::{Auth, KeyStore},
@@ -25,6 +35,34 @@ fn data_dir(backend: &BackendSelection) -> io::Result<PathBuf> {
         BackendSelection::Real => default_local_data_dir(),
     }
     .ok_or_else(|| io::Error::other("No data directory is available for the selected backend."))
+}
+
+const MOCK_STEP_DELAY: Duration = Duration::from_millis(600);
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(120);
+const INTERRUPTED: u8 = 130;
+
+fn build_backend(selection: BackendSelection) -> colab_playground_core::Result<Arc<dyn Backend>> {
+    let settings = SettingsStore::new(config_dir(env::var_os(CONFIG_DIR_ENV)))
+        .load()
+        .settings;
+    match selection {
+        BackendSelection::Mock(flags) => {
+            let mut config = MockConfig::interactive(MOCK_STEP_DELAY);
+            config.scenario = flags.scenario;
+            config.failures = flags.failures;
+            config.defaults = settings.defaults;
+            Ok(Arc::new(MockBackend::new(config)))
+        }
+        BackendSelection::Real => {
+            let host = settings.host_setup();
+            let mut config = RealConfig::for_app(settings.defaults)?;
+            if let Host::Wsl { distro } = &mut config.host {
+                *distro = host.wsl_distro;
+            }
+            config.toolchain = host.toolchain;
+            Ok(Arc::new(RealBackend::new(config)?))
+        }
+    }
 }
 
 async fn serve(options: Serve) -> Result<(), Box<dyn std::error::Error>> {
@@ -44,10 +82,13 @@ async fn serve(options: Serve) -> Result<(), Box<dyn std::error::Error>> {
     let keys = KeyStore::new(&data_dir);
     keys.initialize()?;
     let (_key_watcher, key_changes) = keys.watch();
+    let mut signals = platform::ShutdownSignals::install()?;
     let mode = match options.backend {
         BackendSelection::Mock(_) => "Demo data",
         BackendSelection::Real => "Real",
     };
+    let backend = tokio::task::spawn_blocking(move || build_backend(options.backend)).await??;
+    let state = WebState::start(backend).await?;
     eprintln!("Web Server listening on {addr} ({mode})");
     if !options.no_open
         && let Some(url) = origins.browser_url(addr)
@@ -55,11 +96,51 @@ async fn serve(options: Serve) -> Result<(), Box<dyn std::error::Error>> {
         platform::open_browser(url);
     }
 
-    axum::serve(
+    let mut snapshots = state.subscribe();
+    let server = axum::serve(
         listener,
-        http::router(Auth::new(keys), key_changes, origins),
+        http::router(Auth::new(keys), key_changes, origins, state.clone()),
     )
-    .await?;
+    .with_graceful_shutdown(async move {
+        let _ = snapshots.wait_for(|snapshot| snapshot.shutting_down).await;
+    })
+    .into_future();
+    tokio::pin!(server);
+    let server_error = tokio::select! {
+        result = &mut server => Some(result),
+        () = signals.recv() => None,
+    };
+
+    let shutdown = state.shutdown(SHUTDOWN_GRACE);
+    tokio::pin!(shutdown);
+    let mut server_done = server_error.is_some();
+    let report = loop {
+        tokio::select! {
+            biased;
+            () = signals.recv() => platform::force_exit(INTERRUPTED),
+            report = &mut shutdown => break report,
+            _ = &mut server, if !server_done => server_done = true,
+        }
+    };
+    let billing = report.billing;
+    eprintln!(
+        "Last known billing: {} managed ({} without an enforced watchdog), {} unmanaged \
+         (no watchdog), status {}. Closed {} Forward(s).",
+        billing.managed,
+        billing.managed_without_watchdog,
+        billing.unmanaged,
+        if billing.unknown {
+            "unknown or incomplete"
+        } else {
+            "known"
+        },
+        report.forwards_closed,
+    );
+    if !report.completed {
+        eprintln!("Web Server shutdown cleanup did not complete.");
+        platform::force_exit(1);
+    }
+    server_error.unwrap_or(Ok(()))?;
     Ok(())
 }
 

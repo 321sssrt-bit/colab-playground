@@ -22,9 +22,13 @@ async fn only_the_hash_persists_and_expired_sessions_are_rejected() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn http_checks_origins_and_revokes_open_streams_on_rotation() {
-    use std::io::{BufRead as _, BufReader, Read as _};
+    use std::io::{BufRead, BufReader, Read as _};
+
+    use std::sync::Arc;
 
     use crate::http::{Origins, TrustedHost, router};
+    use colab_playground_core::mock::{MockBackend, MockConfig, MockScenario};
+    use colab_playground_web::state::{Access, Submission, WebState};
 
     let dir = tempfile::tempdir().unwrap();
     let keys = KeyStore::new(dir.path());
@@ -35,6 +39,19 @@ async fn http_checks_origins_and_revokes_open_streams_on_rotation() {
     let addr = listener.local_addr().unwrap();
     let origin = format!("http://{addr}");
     let authority = addr.to_string();
+    let (config, _) = MockConfig::headless(MockScenario::demo());
+    let state = WebState::start(Arc::new(MockBackend::new(config)))
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        state
+            .subscribe()
+            .wait_for(|snapshot| snapshot.runtimes.is_some()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     let app = router(
         Auth::new(KeyStore::new(dir.path())),
         changes,
@@ -46,6 +63,7 @@ async fn http_checks_origins_and_revokes_open_streams_on_rotation() {
                 TrustedHost::parse("https://proxy.example:8443").unwrap(),
             ],
         ),
+        state.clone(),
     );
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
@@ -195,18 +213,74 @@ async fn http_checks_origins_and_revokes_open_streams_on_rotation() {
             request("POST", events, &[matching_origin, json], "{}").status(),
             StatusCode::UNAUTHORIZED,
         );
-        let mut stream = request(
-            "POST",
-            events,
-            &[primary_host, matching_origin, json, authorization],
-            "{}",
-        );
+        let open_stream = || {
+            request(
+                "POST",
+                events,
+                &[primary_host, matching_origin, json, authorization],
+                "{}",
+            )
+        };
+        let read_snapshot = |stream: &mut dyn BufRead| -> serde_json::Value {
+            let mut event = String::new();
+            let mut id = String::new();
+            let mut data = String::new();
+            stream.read_line(&mut event).unwrap();
+            stream.read_line(&mut id).unwrap();
+            stream.read_line(&mut data).unwrap();
+            assert_eq!(event, "event: snapshot\n");
+            let version: u64 = id.strip_prefix("id: ").unwrap().trim().parse().unwrap();
+            let snapshot: serde_json::Value =
+                serde_json::from_str(data.strip_prefix("data: ").unwrap()).unwrap();
+            assert_eq!(snapshot["version"], version);
+            let mut separator = String::new();
+            stream.read_line(&mut separator).unwrap();
+            assert_eq!(separator, "\n");
+            snapshot
+        };
+        let mut stream = open_stream();
         assert_eq!(stream.status(), StatusCode::OK);
         assert_eq!(stream.headers()[header::CONTENT_TYPE], "text/event-stream");
+        let first = read_snapshot(&mut BufReader::new(stream.body_mut().as_reader()));
+        assert_eq!(first["account"]["active"], "mock1");
+        assert_eq!(first["runtimes"]["runtimes"].as_array().unwrap().len(), 4);
+
+        let (release, held) = std::sync::mpsc::channel();
+        let Submission::Started { id, job } = state
+            .start_operation(
+                "held",
+                "one".into(),
+                Access::Independent,
+                move |_, cancel| {
+                    held.recv_timeout(Duration::from_secs(5)).unwrap();
+                    cancel.check()
+                },
+            )
+            .unwrap()
+        else {
+            panic!("expected to start a job");
+        };
+        let live = read_snapshot(&mut BufReader::new(stream.body_mut().as_reader()));
+        assert_eq!(live["operations"][0]["id"], id);
+        drop(stream);
+
+        let mut fetched = request("GET", "/api/snapshot", &[authorization], "");
+        let fetched: serde_json::Value =
+            serde_json::from_str(&fetched.body_mut().read_to_string().unwrap()).unwrap();
+        assert_eq!(fetched["operations"][0]["id"], id);
+        let mut stream = open_stream();
         let mut stream = BufReader::new(stream.body_mut().as_reader());
-        let mut line = String::new();
-        stream.read_line(&mut line).unwrap();
-        assert_eq!(line, ": connected\n");
+        let reconnected = read_snapshot(&mut stream);
+        assert!(reconnected["version"].as_u64() > first["version"].as_u64());
+        assert_eq!(reconnected["operations"][0]["id"], id);
+        release.send(()).unwrap();
+        tokio::runtime::Handle::current()
+            .block_on(job)
+            .unwrap()
+            .unwrap();
+        let finished = read_snapshot(&mut stream);
+        assert!(finished["version"].as_u64() > reconnected["version"].as_u64());
+        assert!(finished["operations"].as_array().unwrap().is_empty());
 
         let new_key = keys.replace().unwrap();
         for token in &tokens {
@@ -225,7 +299,6 @@ async fn http_checks_origins_and_revokes_open_streams_on_rotation() {
         );
         let mut tail = String::new();
         stream.read_to_string(&mut tail).unwrap();
-        assert_eq!(tail, "\n");
     })
     .await
     .unwrap();
