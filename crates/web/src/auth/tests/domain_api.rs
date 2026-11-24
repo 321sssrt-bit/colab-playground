@@ -197,19 +197,33 @@ async fn overview_updates_and_all_dictionaries() {
         assert_eq!(overview["environment"]["colab_version"], "0.8.0");
         assert!(overview["environment"]["helper_python"].is_string());
         assert_eq!(overview["keyring"]["status"], "ready");
-        assert_eq!(overview["accounts"]["accounts"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            overview["accounts"]["accounts"].as_array().unwrap().len(),
+            2
+        );
         assert!(overview["accounts"]["active"].is_string());
         assert_eq!(overview["unmanaged_runtimes"]["count"], 1);
         assert_eq!(overview["unmanaged_runtimes"]["incomplete"], false);
 
         let update = client.get("/api/updates");
-        assert_eq!(update, serde_json::json!({
-            "current_version": env!("CARGO_PKG_VERSION"),
-            "update_available": true,
-            "releases_url": "https://github.com/321sssrt-bit/colab-playground/releases",
-        }));
-        assert_eq!(client.request("POST", "/api/updates", "{}").status(), StatusCode::METHOD_NOT_ALLOWED);
-        assert_eq!(client.request("POST", "/api/updates/install", "{}").status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            update,
+            serde_json::json!({
+                "current_version": env!("CARGO_PKG_VERSION"),
+                "update_available": true,
+                "releases_url": "https://github.com/321sssrt-bit/colab-playground/releases",
+            })
+        );
+        assert_eq!(
+            client.request("POST", "/api/updates", "{}").status(),
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+        assert_eq!(
+            client
+                .request("POST", "/api/updates/install", "{}")
+                .status(),
+            StatusCode::NOT_FOUND
+        );
         assert_eq!(backend.update_checks(), 1);
         assert_eq!(backend.update_installs(), 0);
         assert_eq!(backend.update_relaunches(), 0);
@@ -227,9 +241,13 @@ async fn overview_updates_and_all_dictionaries() {
             assert!(dictionary["dialog.cancel"].is_string());
             assert!(dictionary["theme.system"].is_string());
         }
-        let bad_locale = json(client.request("GET", "/api/i18n/fr-FR", ""), StatusCode::NOT_FOUND);
+        let bad_locale = json(
+            client.request("GET", "/api/i18n/fr-FR", ""),
+            StatusCode::NOT_FOUND,
+        );
         assert_eq!(bad_locale["error"]["kind"], "locale_not_found");
-    }).await;
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -249,12 +267,21 @@ async fn settings_recover_per_field_and_keep_desktop_metadata() {
         let settings = client.get("/api/settings");
         assert_eq!(settings["language"], "system");
         assert_eq!(settings["appearance"], "dark");
-        assert_eq!(settings["reset_defaults"], serde_json::json!(["max_attempts"]));
+        assert_eq!(
+            settings["reset_defaults"],
+            serde_json::json!(["max_attempts"])
+        );
         assert_eq!(settings["defaults"]["retry_delay"], 45);
         assert_eq!(settings["config_dir"], path.to_string_lossy().as_ref());
 
-        let updated = json(client.request("PATCH", "/api/settings",
-            r#"{"language":"ja-JP","defaults":{"max_attempts":5,"idle_timeout":0}}"#), StatusCode::OK);
+        let updated = json(
+            client.request(
+                "PATCH",
+                "/api/settings",
+                r#"{"language":"ja-JP","defaults":{"max_attempts":5,"idle_timeout":0}}"#,
+            ),
+            StatusCode::OK,
+        );
         assert_eq!(updated["language"], "ja-JP");
         assert_eq!(updated["defaults"]["idle_timeout"], 1);
         assert_eq!(updated["defaults"]["retry_delay"], 45);
@@ -264,12 +291,19 @@ async fn settings_recover_per_field_and_keep_desktop_metadata() {
         assert_eq!(saved.update_latest.as_deref(), Some("9.0.0"));
         assert_eq!(updated, client.get("/api/settings"));
 
-        let invalid = json(client.request("PATCH", "/api/settings",
-            r#"{"appearance":"light","defaults":{"high_mem":"yes"}}"#), StatusCode::UNPROCESSABLE_ENTITY);
+        let invalid = json(
+            client.request(
+                "PATCH",
+                "/api/settings",
+                r#"{"appearance":"light","defaults":{"high_mem":"yes"}}"#,
+            ),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        );
         assert_eq!(invalid["error"]["kind"], "invalid_input");
         assert_eq!(store.load().settings, saved);
         assert_eq!(client.get("/api/settings"), updated);
-    }).await;
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -285,18 +319,28 @@ async fn corrupt_settings_survive_and_failed_writes_do_not_change_defaults() {
 
         let file = store.file().unwrap();
         fs::create_dir(&file).unwrap();
-        let error = json(client.request("PATCH", "/api/settings", r#"{"defaults":{"max_attempts":5}}"#),
-            StatusCode::INTERNAL_SERVER_ERROR);
+        let error = json(
+            client.request(
+                "PATCH",
+                "/api/settings",
+                r#"{"defaults":{"max_attempts":5}}"#,
+            ),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        );
         assert_eq!(error["error"]["kind"], "io");
         assert_eq!(backend.defaults(), Default::default());
         assert_eq!(client.get("/api/settings"), settings);
         fs::remove_dir(file).unwrap();
 
-        let saved = json(client.request("PATCH", "/api/settings", r#"{"appearance":"light"}"#), StatusCode::OK);
+        let saved = json(
+            client.request("PATCH", "/api/settings", r#"{"appearance":"light"}"#),
+            StatusCode::OK,
+        );
         assert_eq!(saved["load_status"], "loaded");
         assert_eq!(saved["appearance"], "light");
         assert_eq!(fs::read_to_string(backup).unwrap(), "{ invalid");
-    }).await;
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -309,20 +353,44 @@ async fn cli_install_streams_deduplicates_cancels_and_can_be_retried() {
         let mut reader = client.install();
         let id = event(&mut reader, "started")["id"].as_u64().unwrap();
         assert_eq!(event(&mut reader, "line")["stream"], "stdout");
-        let duplicate = json(client.request("POST", INSTALL, r#"{"method":"pip_user"}"#), StatusCode::CONFLICT);
+        let duplicate = json(
+            client.request("POST", INSTALL, r#"{"method":"pip_user"}"#),
+            StatusCode::CONFLICT,
+        );
         assert_eq!(duplicate["error"]["operation_id"], id);
-        assert_eq!(client.request("POST", &format!("{INSTALL}/{id}/cancel"), "{}").status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            client
+                .request("POST", &format!("{INSTALL}/{id}/cancel"), "{}")
+                .status(),
+            StatusCode::ACCEPTED
+        );
         assert_eq!(event(&mut reader, "finished")["status"], "cancelled");
         assert_eq!(client.get("/api/overview")["cli_installed"], false);
 
         let mut reader = client.install();
         let detached = event(&mut reader, "started")["id"].as_u64().unwrap();
         drop(reader);
-        assert!(client.get("/api/snapshot")["operations"].as_array().unwrap().iter().any(|job| job["id"] == detached));
-        assert_eq!(client.request("POST", &format!("{INSTALL}/{detached}/cancel"), "{}").status(), StatusCode::ACCEPTED);
+        assert!(
+            client.get("/api/snapshot")["operations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|job| job["id"] == detached)
+        );
+        assert_eq!(
+            client
+                .request("POST", &format!("{INSTALL}/{detached}/cancel"), "{}")
+                .status(),
+            StatusCode::ACCEPTED
+        );
         // The first cancel request returns before cleanup releases the install slot.
         let deadline = std::time::Instant::now() + TIMEOUT;
-        while client.get("/api/snapshot")["operations"].as_array().unwrap().iter().any(|job| job["id"] == detached) {
+        while client.get("/api/snapshot")["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|job| job["id"] == detached)
+        {
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -334,7 +402,8 @@ async fn cli_install_streams_deduplicates_cancels_and_can_be_retried() {
         }
         assert_eq!(event(&mut reader, "finished")["status"], "succeeded");
         assert_eq!(client.get("/api/overview")["cli_installed"], true);
-    }).await;
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -356,9 +425,17 @@ async fn keyring_update_and_install_failures_have_localizable_diagnostics() {
         let dictionary = client.get("/api/i18n/en-US");
         assert!(dictionary[hint].as_str().unwrap().contains("keyring"));
         if crate::platform::headless_secret_service() {
-            assert!(dictionary[hint].as_str().unwrap().contains("Secret Service"));
+            assert!(
+                dictionary[hint]
+                    .as_str()
+                    .unwrap()
+                    .contains("Secret Service")
+            );
         }
-        let error = json(client.request("GET", "/api/updates", ""), StatusCode::BAD_GATEWAY);
+        let error = json(
+            client.request("GET", "/api/updates", ""),
+            StatusCode::BAD_GATEWAY,
+        );
         assert_eq!(error["error"]["kind"], "http");
         let mut reader = client.install();
         event(&mut reader, "started");
@@ -376,13 +453,17 @@ async fn keyring_update_and_install_failures_have_localizable_diagnostics() {
         assert_eq!(recovered["usage"].as_array().unwrap().len(), 2);
         assert_eq!(recovered["unmanaged_runtimes"]["count"], 1);
 
-        backend.set_failures(MockFailures { cli_missing: true, ..Default::default() });
+        backend.set_failures(MockFailures {
+            cli_missing: true,
+            ..Default::default()
+        });
         let missing = client.get("/api/overview");
         assert_eq!(missing["cli_installed"], false);
         assert!(missing["accounts"].is_null());
         assert_eq!(missing["usage"], serde_json::json!([]));
         assert!(missing["unmanaged_runtimes"]["warning_key"].is_null());
-    }).await;
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -398,13 +479,20 @@ async fn overview_reports_which_accounts_could_not_be_checked() {
         let runtimes = &overview["unmanaged_runtimes"];
         assert!(runtimes["count"].is_null());
         assert_eq!(runtimes["incomplete"], true);
-        assert_eq!(runtimes["unverified_accounts"], serde_json::json!([overview["accounts"]["active"]]));
+        assert_eq!(
+            runtimes["unverified_accounts"],
+            serde_json::json!([overview["accounts"]["active"]])
+        );
         assert_eq!(runtimes["warning_key"], "web.runtimes.unmanaged_unknown");
         backend.set_failures(MockFailures::default());
         let recovered = client.get("/api/overview");
         assert_eq!(recovered["unmanaged_runtimes"]["count"], 1);
-        assert_eq!(recovered["unmanaged_runtimes"]["unverified_accounts"], serde_json::json!([]));
-    }).await;
+        assert_eq!(
+            recovered["unmanaged_runtimes"]["unverified_accounts"],
+            serde_json::json!([])
+        );
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -450,7 +538,8 @@ async fn overview_retries_failed_usage_within_the_poll_cooldown() {
         assert!(recovered["usage"][0]["last_error"].is_null());
         assert_eq!(recovered["usage"][0]["snapshot"]["stale"], false);
         assert!(recovered["usage"][0]["snapshot"]["balance_cu"].is_number());
-    }).await;
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -464,8 +553,15 @@ async fn overview_refreshes_usage_and_runtime_counts_after_login() {
             panic!("expected login to start");
         };
         let prompt = runtime.block_on(job).unwrap().unwrap();
-        assert_eq!(client.request("GET", "/api/overview", "").status(), StatusCode::CONFLICT);
-        let Submission::Started { job, .. } = client.web.submit_login(prompt.id, "demo-code".into()).unwrap() else {
+        assert_eq!(
+            client.request("GET", "/api/overview", "").status(),
+            StatusCode::CONFLICT
+        );
+        let Submission::Started { job, .. } = client
+            .web
+            .submit_login(prompt.id, "demo-code".into())
+            .unwrap()
+        else {
             panic!("expected login to complete");
         };
         let account = runtime.block_on(job).unwrap().unwrap().unwrap();
@@ -473,11 +569,16 @@ async fn overview_refreshes_usage_and_runtime_counts_after_login() {
 
         let overview = client.get("/api/overview");
         assert_eq!(overview["accounts"]["active"], account.id.as_str());
-        let usage = overview["usage"].as_array().unwrap().iter()
-            .find(|view| view["account"] == account.id.as_str()).unwrap();
+        let usage = overview["usage"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|view| view["account"] == account.id.as_str())
+            .unwrap();
         assert_eq!(usage["snapshot"]["assignments"], 1);
         assert_eq!(overview["unmanaged_runtimes"]["count"], 2);
-    }).await;
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -489,16 +590,29 @@ async fn overview_refreshes_even_after_background_poll_recovers_accounts() {
         assert_eq!(overview["unmanaged_runtimes"]["count"], 1);
         let active = client.web.snapshot().account.active.clone().unwrap();
         let listed = backend.runtime_listings();
-        backend.set_failures(MockFailures { keyring_unavailable: true, ..Default::default() });
-        assert_eq!(client.get("/api/overview")["keyring"]["status"], "unavailable");
+        backend.set_failures(MockFailures {
+            keyring_unavailable: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            client.get("/api/overview")["keyring"]["status"],
+            "unavailable"
+        );
         backend.add_unmanaged_runtime(&active, Accelerator::None);
         backend.set_failures(MockFailures::default());
         assert!(!backend.usage_poll_due());
 
         tokio::runtime::Handle::current().block_on(async {
-            tokio::time::timeout(TIMEOUT, client.web.subscribe().wait_for(|snapshot| {
-                snapshot.accounts_error.is_none()
-            })).await.unwrap().unwrap();
+            tokio::time::timeout(
+                TIMEOUT,
+                client
+                    .web
+                    .subscribe()
+                    .wait_for(|snapshot| snapshot.accounts_error.is_none()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
         });
         assert_eq!(backend.runtime_listings(), listed);
 
@@ -506,5 +620,6 @@ async fn overview_refreshes_even_after_background_poll_recovers_accounts() {
         assert_eq!(recovered["keyring"]["status"], "ready");
         assert_eq!(recovered["usage"][0]["snapshot"]["assignments"], 4);
         assert_eq!(recovered["unmanaged_runtimes"]["count"], 2);
-    }).await;
+    })
+    .await;
 }
