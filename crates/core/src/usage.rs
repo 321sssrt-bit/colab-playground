@@ -247,7 +247,8 @@ pub struct RateAttribution {
     /// next change of the rate holds what that runtime burns too.
     #[serde(default)]
     unshown: bool,
-    /// A rise since then came with a start, so it may hold part of that.
+    /// The rate moved since then beside a start, or while a session stayed
+    /// without an estimate, so part of what is yet to show may have shown.
     #[serde(default)]
     mixed: bool,
     /// What the last session of a split burns, once the fall of the account
