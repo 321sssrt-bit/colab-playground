@@ -8,12 +8,12 @@ use axum::{
 };
 use colab_playground_core::{
     Error, ErrorKind,
-    accounts::AccountsView,
+    accounts::{AccountId, AccountsView},
     backend::{AccountUsageView, InstallMethod},
     host::{Line, ProbeReport},
 };
 use colab_playground_shared::i18n::keys;
-use colab_playground_web::state::{Access, Operation, Submission};
+use colab_playground_web::state::{Access, Operation, Snapshot, Submission};
 use futures_util::{StreamExt as _, stream};
 use serde::{Deserialize, Serialize, de::IgnoredAny};
 
@@ -44,6 +44,26 @@ pub(super) struct Overview {
 struct HostCheck {
     kind: &'static str,
     ready: bool,
+    hint_key: Option<&'static str>,
+}
+
+impl HostCheck {
+    fn from_probe(environment: &ProbeReport, uses_wsl: bool) -> Self {
+        if uses_wsl {
+            Self {
+                kind: "wsl",
+                ready: environment.wsl_installed && !environment.wsl_distros.is_empty(),
+                hint_key: None,
+            }
+        } else {
+            let ready = environment.bash.is_some();
+            Self {
+                kind: "shell_tools",
+                ready,
+                hint_key: (ready && environment.ssh.is_none()).then_some(keys::STEP_SHELL_NO_SSH),
+            }
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -56,23 +76,59 @@ struct KeyringCheck {
 struct UnmanagedRuntimes {
     count: Option<usize>,
     incomplete: bool,
+    unverified_accounts: Vec<AccountId>,
     warning_key: Option<&'static str>,
 }
 
+impl UnmanagedRuntimes {
+    fn summarize(snapshot: &Snapshot, can_list: bool) -> Self {
+        let runtimes = snapshot.runtimes.as_ref();
+        let incomplete = snapshot.runtimes_error.is_some()
+            || runtimes.is_none_or(|view| !view.errors.is_empty());
+        let count = if can_list && !incomplete {
+            runtimes.map(|view| {
+                view.runtimes
+                    .iter()
+                    .filter(|runtime| !runtime.managed)
+                    .count()
+            })
+        } else {
+            None
+        };
+        let unverified_accounts = if !can_list {
+            Vec::new()
+        } else if snapshot.runtimes_error.is_some() || runtimes.is_none() {
+            snapshot
+                .accounts
+                .iter()
+                .flat_map(|view| view.accounts.iter())
+                .map(|account| account.id.clone())
+                .collect()
+        } else {
+            runtimes
+                .iter()
+                .flat_map(|view| view.errors.iter())
+                .map(|failure| failure.account.clone())
+                .collect()
+        };
+        let warning_key = match count {
+            Some(1) => Some(keys::QUIT_UNWATCHED_ONE),
+            Some(count) if count > 1 => Some(keys::QUIT_UNWATCHED_MANY),
+            None if can_list => Some(i18n::UNMANAGED_UNKNOWN),
+            _ => None,
+        };
+        Self {
+            count,
+            incomplete: can_list && incomplete,
+            unverified_accounts,
+            warning_key,
+        }
+    }
+}
+
 pub(super) async fn get(State(state): State<StateData>) -> Result<Json<Overview>, ApiError> {
-    let environment = state.web.probe_environment().await?;
-    let snapshot = state.web.snapshot();
-    let host = if platform::uses_wsl() {
-        HostCheck {
-            kind: "wsl",
-            ready: environment.wsl_installed && !environment.wsl_distros.is_empty(),
-        }
-    } else {
-        HostCheck {
-            kind: "shell_tools",
-            ready: environment.bash.is_some() && environment.ssh.is_some(),
-        }
-    };
+    let (environment, snapshot) = state.web.probe_environment().await?;
+    let host = HostCheck::from_probe(&environment, platform::uses_wsl());
     let cli_installed = environment.colab.is_some();
     let helper_available = environment.helper_python.is_some();
     let keyring = if snapshot.accounts_error == Some(ErrorKind::KeyringUnavailable)
@@ -97,21 +153,9 @@ pub(super) async fn get(State(state): State<StateData>) -> Result<Json<Overview>
             hint_key: None,
         }
     };
-    let runtimes = snapshot.runtimes.as_ref();
-    let count = runtimes.map(|view| {
-        view.runtimes
-            .iter()
-            .filter(|runtime| !runtime.managed)
-            .count()
-    });
-    let incomplete =
-        snapshot.runtimes_error.is_some() || runtimes.is_none_or(|view| !view.errors.is_empty());
-    let warning_key = match count {
-        Some(1) => Some(keys::QUIT_UNWATCHED_ONE),
-        Some(count) if count > 1 => Some(keys::QUIT_UNWATCHED_MANY),
-        _ if incomplete => Some(keys::SUMMARY_INCOMPLETE),
-        _ => None,
-    };
+    let can_list =
+        cli_installed && snapshot.accounts.is_some() && snapshot.accounts_error.is_none();
+    let unmanaged_runtimes = UnmanagedRuntimes::summarize(&snapshot, can_list);
     let mut install_methods = vec![if environment.uv.is_some() {
         InstallMethod::Uv
     } else {
@@ -128,12 +172,12 @@ pub(super) async fn get(State(state): State<StateData>) -> Result<Json<Overview>
         keyring,
         accounts: snapshot.accounts.clone(),
         accounts_error: snapshot.accounts_error,
-        usage: snapshot.usage.clone(),
-        unmanaged_runtimes: UnmanagedRuntimes {
-            count,
-            incomplete,
-            warning_key,
+        usage: if can_list {
+            snapshot.usage.clone()
+        } else {
+            Vec::new()
         },
+        unmanaged_runtimes,
         install_methods,
     }))
 }
@@ -225,5 +269,21 @@ pub(super) async fn cancel_install(
             "install_not_running",
             i18n::INSTALL_NOT_RUNNING,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bash_without_ssh_keeps_the_host_ready_and_explains_the_forward_limit() {
+        let report = ProbeReport {
+            bash: Some("/bin/bash".into()),
+            ..ProbeReport::default()
+        };
+        let host = HostCheck::from_probe(&report, false);
+        assert!(host.ready);
+        assert_eq!(host.hint_key, Some(keys::STEP_SHELL_NO_SSH));
     }
 }

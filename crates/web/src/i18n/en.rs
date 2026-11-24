@@ -59,4 +59,8 @@ pub(super) const MESSAGES: colab_playground_shared::i18n::Messages = &[
     ),
     ("web.settings.config_dir", "Server configuration folder"),
     ("web.settings.copy_config_dir", "Copy folder path"),
+    (
+        super::UNMANAGED_UNKNOWN,
+        "Some accounts could not be checked. Any unmanaged runtimes on those accounts keep billing until they are stopped.",
+    ),
 ];

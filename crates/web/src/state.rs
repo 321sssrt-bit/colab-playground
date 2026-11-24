@@ -203,17 +203,18 @@ impl WebState {
         self.backend_job(Slot::Independent, work).await
     }
 
-    pub async fn probe_environment(&self) -> Result<ProbeReport> {
+    pub async fn probe_environment(&self) -> Result<(ProbeReport, Arc<Snapshot>)> {
         let state = self.clone();
         self.backend_job(Slot::Shared, move |backend, cancel| {
             let _poll = state.lock_poll_slot();
             cancel.check()?;
             let report = backend.probe(cancel)?;
             if report.colab.is_some() {
-                // The interpreter's import check does not tell us whether the keyring is unlocked.
-                state.record_accounts(backend.accounts(cancel));
+                state.refresh_overview(backend, cancel);
+            } else {
+                state.clear_overview();
             }
-            Ok(report)
+            Ok((report, state.snapshot()))
         })
         .await
     }

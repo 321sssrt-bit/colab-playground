@@ -59,4 +59,8 @@ pub(super) const MESSAGES: colab_playground_shared::i18n::Messages = &[
     ),
     ("web.settings.config_dir", "サーバーの設定フォルダー"),
     ("web.settings.copy_config_dir", "フォルダーのパスをコピー"),
+    (
+        super::UNMANAGED_UNKNOWN,
+        "一部のアカウントを確認できませんでした。それらのアカウントに管理対象外のランタイムがある場合、停止するまで課金が続きます。",
+    ),
 ];

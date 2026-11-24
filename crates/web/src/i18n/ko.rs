@@ -56,4 +56,8 @@ pub(super) const MESSAGES: colab_playground_shared::i18n::Messages = &[
     ),
     ("web.settings.config_dir", "서버 설정 폴더"),
     ("web.settings.copy_config_dir", "폴더 경로 복사"),
+    (
+        super::UNMANAGED_UNKNOWN,
+        "일부 계정을 확인할 수 없습니다. 해당 계정에 관리되지 않는 런타임이 있으면 중지할 때까지 요금이 계속 부과됩니다.",
+    ),
 ];

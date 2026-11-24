@@ -56,4 +56,8 @@ pub(super) const MESSAGES: colab_playground_shared::i18n::Messages = &[
     ),
     ("web.settings.config_dir", "伺服器設定資料夾"),
     ("web.settings.copy_config_dir", "複製資料夾路徑"),
+    (
+        super::UNMANAGED_UNKNOWN,
+        "部分帳戶無法檢查。這些帳戶若有未受管理的執行階段，會持續計費，直到手動停止。",
+    ),
 ];

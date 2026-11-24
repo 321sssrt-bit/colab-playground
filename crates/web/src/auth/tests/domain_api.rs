@@ -80,10 +80,18 @@ fn json(mut response: Response<Body>, status: StatusCode) -> Value {
 
 async fn exercise(
     dir: &Path,
+    config: MockConfig,
+    run: impl FnOnce(Client, Arc<MockBackend>, SettingsStore) + Send + 'static,
+) {
+    exercise_with_store(dir, SettingsStore::new(Some(dir.to_owned())), config, run).await;
+}
+
+async fn exercise_with_store(
+    dir: &Path,
+    store: SettingsStore,
     mut config: MockConfig,
     run: impl FnOnce(Client, Arc<MockBackend>, SettingsStore) + Send + 'static,
 ) {
-    let store = SettingsStore::new(Some(dir.to_owned()));
     let settings = WebSettings::load(store.clone());
     config.defaults = settings.initial_settings().defaults;
     let backend = Arc::new(MockBackend::new(config));
@@ -344,6 +352,7 @@ async fn keyring_update_and_install_failures_have_localizable_diagnostics() {
         let overview = client.get("/api/overview");
         assert_eq!(overview["keyring"]["status"], "unavailable");
         assert_eq!(overview["accounts_error"], "keyring_unavailable");
+        assert!(overview["unmanaged_runtimes"]["warning_key"].is_null());
         let hint = overview["keyring"]["hint_key"].as_str().unwrap();
         let dictionary = client.get("/api/i18n/en-US");
         assert!(dictionary[hint].as_str().unwrap().contains("keyring"));
@@ -363,7 +372,71 @@ async fn keyring_update_and_install_failures_have_localizable_diagnostics() {
         assert_eq!(failed["error"]["kind"], "install_failed");
         assert_eq!(failed["error"]["args"]["exit_code"], "2");
         backend.set_failures(MockFailures::default());
-        assert_eq!(client.get("/api/overview")["keyring"]["status"], "ready");
+        let recovered = client.get("/api/overview");
+        assert_eq!(recovered["keyring"]["status"], "ready");
+        assert_eq!(recovered["usage"].as_array().unwrap().len(), 2);
+        assert_eq!(recovered["unmanaged_runtimes"]["count"], 1);
+
+        backend.set_failures(MockFailures { cli_missing: true, ..Default::default() });
+        let missing = client.get("/api/overview");
+        assert_eq!(missing["cli_installed"], false);
+        assert!(missing["accounts"].is_null());
+        assert_eq!(missing["usage"], serde_json::json!([]));
+        assert!(missing["unmanaged_runtimes"]["warning_key"].is_null());
         println!("Keyring unavailable, diagnostic {hint}; simulated update -> 502; install stderr -> failed, exit code 2.");
     }).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn overview_reports_which_accounts_could_not_be_checked() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut config, _) = MockConfig::headless(MockScenario::demo());
+    config
+        .failures
+        .unlisted_accounts
+        .push("ada@example.com".into());
+    exercise(dir.path(), config, |client, backend, _| {
+        let overview = client.get("/api/overview");
+        let runtimes = &overview["unmanaged_runtimes"];
+        assert!(runtimes["count"].is_null());
+        assert_eq!(runtimes["incomplete"], true);
+        assert_eq!(runtimes["unverified_accounts"], serde_json::json!([overview["accounts"]["active"]]));
+        assert_eq!(runtimes["warning_key"], "web.runtimes.unmanaged_unknown");
+        backend.set_failures(MockFailures::default());
+        let recovered = client.get("/api/overview");
+        assert_eq!(recovered["unmanaged_runtimes"]["count"], 1);
+        assert_eq!(recovered["unmanaged_runtimes"]["unverified_accounts"], serde_json::json!([]));
+        println!("Partial runtime listing: count null, one unverified account, billing warning; retry after recovery: count 1.");
+    }).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn settings_without_a_config_directory_remain_live_in_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let (config, _) = MockConfig::headless(MockScenario::demo());
+    exercise_with_store(
+        dir.path(),
+        SettingsStore::new(None),
+        config,
+        |client, backend, store| {
+            let settings = json(
+                client.request(
+                    "PATCH",
+                    "/api/settings",
+                    r#"{"appearance":"dark","defaults":{"max_attempts":5}}"#,
+                ),
+                StatusCode::OK,
+            );
+            assert_eq!(settings["load_status"], "no_config_dir");
+            assert!(settings["config_dir"].is_null());
+            assert_eq!(settings["appearance"], "dark");
+            assert_eq!(backend.defaults().max_attempts, 5);
+            assert!(store.file().is_none());
+            assert_eq!(client.get("/api/settings"), settings);
+            println!(
+                "Without a config directory: PATCH 200, appearance dark and attempts 5 in memory."
+            );
+        },
+    )
+    .await;
 }

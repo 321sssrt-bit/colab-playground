@@ -56,4 +56,8 @@ pub(super) const MESSAGES: colab_playground_shared::i18n::Messages = &[
     ),
     ("web.settings.config_dir", "服务器配置目录"),
     ("web.settings.copy_config_dir", "复制目录路径"),
+    (
+        super::UNMANAGED_UNKNOWN,
+        "部分账号无法检查。这些账号上若有未托管的运行时，仍会持续计费，直到手动停止。",
+    ),
 ];

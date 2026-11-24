@@ -117,9 +117,6 @@ pub(super) async fn patch(
                     .map_err(|_| Error::invalid("defaults", "invalid default field"))?;
                 updated.defaults = sanitize(defaults);
             }
-            if settings.store.dir().is_none() {
-                return Err(Error::new(ErrorKind::Io));
-            }
             cancel.commit()?;
             settings
                 .store
@@ -128,7 +125,11 @@ pub(super) async fn patch(
             backend.set_defaults(updated.defaults.clone());
             *loaded = Loaded {
                 settings: updated,
-                outcome: LoadOutcome::Loaded,
+                outcome: if settings.store.dir().is_some() {
+                    LoadOutcome::Loaded
+                } else {
+                    LoadOutcome::NoConfigDir
+                },
                 reset_defaults: Vec::new(),
             };
             Ok(settings.view(&loaded))

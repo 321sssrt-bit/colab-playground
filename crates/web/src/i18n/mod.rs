@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use colab_playground_shared::i18n::{self, CATALOGS};
 
 pub(crate) const HEADLESS_KEYRING: &str = "web.keyring.headless";
+pub(crate) const UNMANAGED_UNKNOWN: &str = "web.runtimes.unmanaged_unknown";
 pub(crate) const INVALID_REQUEST: &str = "web.error.invalid_request";
 pub(crate) const LOCALE_NOT_FOUND: &str = "web.error.locale_not_found";
 pub(crate) const INSTALL_NOT_RUNNING: &str = "web.error.install_not_running";
