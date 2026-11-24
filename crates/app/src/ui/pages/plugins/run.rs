@@ -367,6 +367,7 @@ fn endpoint_card(
         let handle = handle.clone();
         let id = tunnel.map(|t| t.id);
         let spec = TunnelSpec {
+            bind: Default::default(),
             account: outcome.account.clone(),
             session: outcome.session.clone(),
             local_port: endpoint.remote_port,

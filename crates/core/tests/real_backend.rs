@@ -4,10 +4,11 @@
 //! `colab`, the fake CLI interpreter (which runs the real
 //! `account_helper.py` with fake keyring/google-auth modules) and a fake
 //! `ssh`, all given by absolute path; `HOME` and the data directories point
-//! into the temp dir. No real `colab`, keyring or network is ever used.
+//! into the temp dir. Network probes stay on loopback.
 #![cfg(unix)]
 
 use std::collections::BTreeMap;
+use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -20,13 +21,14 @@ use colab_playground_core::backend::{
 };
 use colab_playground_core::cli::Cli;
 use colab_playground_core::guard::GuardPolicy;
+use colab_playground_core::host::ScriptRequest;
 use colab_playground_core::http::NoHttp;
 use colab_playground_core::paths::HostPath;
 use colab_playground_core::plugins::InputValue;
 use colab_playground_core::provision::{ProvisionEvent, ProvisionSpec, WATCHDOG_ATTEMPTS};
 use colab_playground_core::real::{RealBackend, RealConfig};
 use colab_playground_core::sessions::{Accelerator, StopReason, WatchdogInfo};
-use colab_playground_core::tunnel::{TunnelEvent, TunnelSpec, TunnelState};
+use colab_playground_core::tunnel::{ForwardBind, TunnelEvent, TunnelSpec, TunnelState};
 use colab_playground_core::vm::RunState;
 use colab_playground_core::{CancelToken, Defaults, ErrorKind, Host, ManualClock, Toolchain};
 use serde_json::{Value, json};
@@ -908,6 +910,7 @@ fn a_switch_that_cannot_start_leaves_the_tunnels_open() {
     let (tx, rx) = channel();
     f.b.open_tunnel(
         TunnelSpec {
+            bind: Default::default(),
             account: bob.id.clone(),
             session: "tun".into(),
             local_port: free_port(),
@@ -971,6 +974,7 @@ fn tunnel_uses_per_account_proxy_command_and_never_auto_creates() {
     f.provision("tun1", Accelerator::T4);
     let port = free_port();
     let spec = TunnelSpec {
+        bind: Default::default(),
         account: alice.id.clone(),
         session: "tun1".into(),
         local_port: port,
@@ -1041,6 +1045,7 @@ fn tunnel_reports_429_and_port_in_use() {
     f.knob("ssh_busy", json!(true));
     let (tx, rx) = channel();
     let spec = TunnelSpec {
+        bind: Default::default(),
         account: alice.id.clone(),
         session: "busy".into(),
         local_port: free_port(),
@@ -1064,28 +1069,146 @@ fn tunnel_reports_429_and_port_in_use() {
         other => panic!("{other:?}"),
     }
     f.knob("ssh_busy", json!(false));
-    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let (tx, rx) = channel();
-    let spec = TunnelSpec {
-        local_port: taken.local_addr().unwrap().port(),
-        ..spec
-    };
-    f.b.open_tunnel(spec, tx).unwrap();
-    match wait_for(&rx, 30, |e| {
-        matches!(
-            e,
-            TunnelEvent::State {
-                state: TunnelState::Failed { .. },
+    for (bind, addr) in [
+        (ForwardBind::Loopback, "0.0.0.0:0"),
+        (ForwardBind::AllInterfaces, "127.0.0.1:0"),
+    ] {
+        let taken = TcpListener::bind(addr).unwrap();
+        let port = taken.local_addr().unwrap().port();
+        let (tx, rx) = channel();
+        let spec = TunnelSpec {
+            bind,
+            local_port: port,
+            ..spec.clone()
+        };
+        let log = f.state.join("ssh_calls.jsonl");
+        let before = std::fs::metadata(&log).unwrap().len();
+        f.b.open_tunnel(spec, tx).unwrap();
+        match wait_for(&rx, 30, |e| {
+            matches!(
+                e,
+                TunnelEvent::State {
+                    state: TunnelState::Failed { .. },
+                    ..
+                }
+            )
+        }) {
+            Some(TunnelEvent::State {
+                state: TunnelState::Failed { error },
                 ..
+            }) => {
+                assert!(error.is(ErrorKind::PortInUse), "{error}");
+                assert_eq!(error.param("port"), Some(port.to_string().as_str()));
             }
-        )
-    }) {
-        Some(TunnelEvent::State {
-            state: TunnelState::Failed { error },
-            ..
-        }) => assert!(error.is(ErrorKind::PortInUse), "{error}"),
-        other => panic!("{other:?}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(std::fs::metadata(&log).unwrap().len(), before);
     }
+}
+
+#[test]
+fn tunnel_bind_modes_reach_up_and_healthy_on_ipv4_loopback() {
+    let mut f = fixture();
+    f.cfg
+        .base_env
+        .push(("CPG_FAKE_SSH_HEALTH_STATUS".into(), "204 No Content".into()));
+    f.b = RealBackend::new(f.cfg.clone()).unwrap();
+    let alice = f.adopt_alice();
+    f.provision("health", Accelerator::T4);
+
+    for (bind, ip) in [
+        (ForwardBind::Loopback, "127.0.0.1"),
+        (ForwardBind::AllInterfaces, "0.0.0.0"),
+    ] {
+        let port = free_port();
+        let spec = TunnelSpec {
+            account: alice.id.clone(),
+            session: "health".into(),
+            bind,
+            local_port: port,
+            remote_port: 8000,
+            health_path: Some("/health".into()),
+        };
+        assert_eq!(spec.local_url(), format!("http://127.0.0.1:{port}"));
+        let (tx, rx) = channel();
+        let id = f.b.open_tunnel(spec, tx).unwrap();
+        let event = wait_for(&rx, 15, |e| matches!(e, TunnelEvent::Health { .. }));
+        assert_eq!(event, Some(TunnelEvent::Health { id, healthy: true }));
+        let tunnel = &f.b.tunnels()[0];
+        assert_eq!(tunnel.spec.bind, bind);
+        assert_eq!(tunnel.state, TunnelState::Up);
+        assert_eq!(tunnel.healthy, Some(true));
+
+        let calls = std::fs::read_to_string(f.state.join("ssh_calls.jsonl")).unwrap();
+        let argv: Vec<String> = serde_json::from_str(calls.lines().last().unwrap()).unwrap();
+        assert_eq!(&argv[..4], ["-N", "-T", "-F", "/dev/null"]);
+        assert!(
+            argv.windows(2)
+                .any(|args| args == ["-o", "ExitOnForwardFailure=yes"])
+        );
+        let expected = format!("{ip}:{port}:127.0.0.1:8000");
+        assert!(argv.windows(2).any(|args| args == ["-L", &expected]));
+        f.b.close_tunnel(id).unwrap();
+    }
+}
+
+#[test]
+fn tunnel_rejects_all_interfaces_on_wsl_before_starting_ssh() {
+    let f = fixture();
+    let mut cfg = f.cfg.clone();
+    cfg.host = Host::Wsl { distro: None };
+    let wsl = RealBackend::new(cfg).unwrap();
+    let (tx, _rx) = channel();
+    let err = wsl
+        .open_tunnel(
+            TunnelSpec {
+                account: AccountId::new("alice").unwrap(),
+                session: "wsl".into(),
+                bind: ForwardBind::AllInterfaces,
+                local_port: free_port(),
+                remote_port: 8000,
+                health_path: None,
+            },
+            tx,
+        )
+        .unwrap_err();
+    assert_eq!(err.kind, ErrorKind::Unsupported);
+    assert_eq!(err.param("bind"), Some("all_interfaces"));
+    assert!(err.detail.contains("Windows or WSL"));
+    assert!(wsl.tunnels().is_empty());
+    assert!(!f.state.join("ssh_calls.jsonl").exists());
+}
+
+#[test]
+fn fake_ssh_listens_on_a_bracketed_ipv6_address() {
+    let Ok(listener) = TcpListener::bind("[::1]:0") else {
+        return;
+    };
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let f = fixture();
+    let mut req = ScriptRequest::new(r#"exec "$CPG_SSH" "$@""#)
+        .args([
+            "-o",
+            "ProxyCommand=exec cat",
+            "-L",
+            &format!("{address}:[::1]:8000"),
+        ])
+        .stdin_pipe();
+    req.env = f.cfg.base_env.clone();
+    let mut ssh = Host::Local.spawn(req).unwrap();
+    let end = Instant::now() + Duration::from_secs(5);
+    let connected = loop {
+        if TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok() {
+            break true;
+        }
+        if ssh.try_wait().is_some() || Instant::now() >= end {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    ssh.kill();
+    assert!(connected, "fake SSH did not listen on {address}");
 }
 
 #[test]

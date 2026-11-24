@@ -1,8 +1,6 @@
 //! Port forwarding over `colab ssh --proxy-mode`.
 //!
-//! `ssh -N -L 127.0.0.1:<local>:127.0.0.1:<remote>` with the CLI as
-//! `ProxyCommand` (given on the command line; `~/.ssh/config` is neither read
-//! nor edited). A runtime allows a single `colab ssh` connection (HTTP 429),
+//! A runtime allows a single `colab ssh` connection (HTTP 429),
 //! so the tunnel owns it and everything else uses `colab exec`.
 //!
 //! **Cost trap:** `colab ssh --proxy-mode -s NAME` *creates* a runtime when
@@ -11,6 +9,7 @@
 //! with `SessionGone` otherwise, so a reconnect can never allocate a new VM.
 
 use std::collections::BTreeMap;
+use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -25,7 +24,7 @@ use crate::clock::{CancelToken, Clock};
 use crate::error::{Error, ErrorKind, Result};
 use crate::host::{Host, ScriptRequest, shell_quote, tail};
 use crate::hostfs::HostFs;
-use crate::http::{local_http_status, local_port_in_use, local_port_open};
+use crate::http::{forward_port_in_use, local_http_status, local_port_open};
 use crate::paths::HostPath;
 use crate::sessions::validate_session_name;
 
@@ -34,12 +33,39 @@ pub struct TunnelSpec {
     /// Account owning the session (must be active while the tunnel runs).
     pub account: AccountId,
     pub session: String,
-    /// Local port on `127.0.0.1`.
+    #[serde(default)]
+    pub bind: ForwardBind,
     pub local_port: u16,
     /// Port on the VM (never 8080).
     pub remote_port: u16,
     /// Optional HTTP health path probed through the tunnel (e.g. `/health`).
     pub health_path: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForwardBind {
+    #[default]
+    Loopback,
+    AllInterfaces,
+}
+
+impl ForwardBind {
+    fn listen_ip(self) -> Ipv4Addr {
+        match self {
+            Self::Loopback => Ipv4Addr::LOCALHOST,
+            Self::AllInterfaces => Ipv4Addr::UNSPECIFIED,
+        }
+    }
+
+    pub(crate) fn validate_for(self, host: &Host) -> Result<()> {
+        if self == Self::AllInterfaces && !host.supports_all_interfaces_forward() {
+            return Err(Error::new(ErrorKind::Unsupported)
+                .with("bind", "all_interfaces")
+                .detail("All-interface forwarding is unavailable on Windows or WSL"));
+        }
+        Ok(())
+    }
 }
 
 impl TunnelSpec {
@@ -59,8 +85,9 @@ impl TunnelSpec {
         Ok(())
     }
 
+    /// The host-local URL. A remote-facing URL is chosen by the caller based on `bind`.
     pub fn local_url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.local_port)
+        format!("http://{}:{}", Ipv4Addr::LOCALHOST, self.local_port)
     }
 }
 
@@ -153,8 +180,11 @@ pub fn ssh_args(colab: &str, state_file: &HostPath, spec: &TunnelSpec) -> Result
     )));
     args.push("-L".into());
     args.push(format!(
-        "127.0.0.1:{}:127.0.0.1:{}",
-        spec.local_port, spec.remote_port
+        "{}:{}:{}:{}",
+        spec.bind.listen_ip(),
+        spec.local_port,
+        Ipv4Addr::LOCALHOST,
+        spec.remote_port
     ));
     args.push("root@colab-runtime".into());
     Ok(args)
@@ -409,7 +439,11 @@ fn run(ctx: TunnelCtx, spec: TunnelSpec, stop: CancelToken, shared: Arc<Shared>)
                 continue;
             }
         }
-        if local_port_in_use(spec.local_port, Duration::from_millis(300)) {
+        if forward_port_in_use(
+            spec.bind.listen_ip(),
+            spec.local_port,
+            Duration::from_millis(300),
+        ) {
             return fail(
                 &shared,
                 Error::new(ErrorKind::PortInUse).with("port", spec.local_port),
@@ -525,6 +559,7 @@ impl TunnelManager {
         events: Option<Sender<TunnelEvent>>,
     ) -> Result<TunnelId> {
         spec.validate()?;
+        spec.bind.validate_for(&ctx.host)?;
         let mut map = self.tunnels.lock().unwrap_or_else(|e| e.into_inner());
         let clash = map.values().any(|e| {
             let i = e.shared.info.lock().unwrap_or_else(|e| e.into_inner());
@@ -626,6 +661,7 @@ mod tests {
 
     fn spec() -> TunnelSpec {
         TunnelSpec {
+            bind: Default::default(),
             account: AccountId::new("a1").unwrap(),
             session: "llm".into(),
             local_port: 18000,
@@ -661,11 +697,34 @@ mod tests {
     }
 
     #[test]
+    fn forward_bind_defaults_for_old_specs_and_round_trips_explicit_opt_in() {
+        let mut old = serde_json::to_value(spec()).unwrap();
+        old.as_object_mut().unwrap().remove("bind");
+        let mut decoded: TunnelSpec = serde_json::from_value(old).unwrap();
+        assert_eq!(ForwardBind::default(), ForwardBind::Loopback);
+        assert_eq!(decoded.bind, ForwardBind::Loopback);
+
+        decoded.bind = ForwardBind::AllInterfaces;
+        let explicit = serde_json::to_value(&decoded).unwrap();
+        assert_eq!(explicit["bind"], "all_interfaces");
+        assert_eq!(
+            serde_json::from_value::<TunnelSpec>(explicit).unwrap(),
+            decoded
+        );
+    }
+
+    #[test]
     fn port_8080_and_bad_input_are_rejected() {
         let mut s = spec();
         s.remote_port = 8080;
         assert!(s.validate().unwrap_err().is(ErrorKind::PortReserved));
+        s.remote_port = 0;
+        assert!(s.validate().unwrap_err().is(ErrorKind::InvalidInput));
         s.remote_port = 8000;
+        s.local_port = 0;
+        assert!(s.validate().unwrap_err().is(ErrorKind::InvalidInput));
+        s.local_port = u16::MAX;
+        assert!(s.validate().is_ok());
         s.session = "a b".into();
         assert!(s.validate().is_err());
         s.session = "ok".into();

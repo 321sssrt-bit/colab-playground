@@ -642,6 +642,7 @@ impl World {
 pub struct MockBackend {
     cfg: Arc<MockConfig>,
     world: Arc<Mutex<World>>,
+    host: Host,
 }
 
 impl std::fmt::Debug for MockBackend {
@@ -742,6 +743,7 @@ impl MockBackend {
         MockBackend {
             cfg: Arc::new(cfg),
             world: Arc::new(Mutex::new(world)),
+            host: Host::detect(),
         }
     }
 
@@ -1697,6 +1699,7 @@ impl Backend for MockBackend {
 
     fn open_tunnel(&self, spec: TunnelSpec, events: Events<TunnelEvent>) -> Result<TunnelId> {
         spec.validate()?;
+        spec.bind.validate_for(&self.host)?;
         self.require_active(&spec.account)?;
         let mut w = self.w();
         if !w.runtime(&spec.account, &spec.session).is_some() {
@@ -2682,6 +2685,7 @@ mod tests {
         let id = m
             .open_tunnel(
                 TunnelSpec {
+                    bind: Default::default(),
                     account: out.account.clone(),
                     session: out.session.clone(),
                     local_port: ep.remote_port,
@@ -2699,6 +2703,63 @@ mod tests {
             }
         )));
         assert_eq!(m.tunnels()[0].id, id);
+    }
+
+    #[test]
+    fn forward_modes_report_health_conflicts_and_wsl_rejection() {
+        use crate::tunnel::ForwardBind;
+
+        let (mut m, _) = mock(MockScenario::demo());
+        let spec = TunnelSpec {
+            account: m.accounts(&nc()).unwrap().active.unwrap(),
+            session: "a100-7f3a".into(),
+            // MockBackend does not open a socket.
+            local_port: 18_000,
+            remote_port: 8000,
+            health_path: Some("/health".into()),
+            bind: ForwardBind::Loopback,
+        };
+        for bind in [ForwardBind::Loopback, ForwardBind::AllInterfaces] {
+            let spec = TunnelSpec {
+                bind,
+                ..spec.clone()
+            };
+            let (tx, rx) = mpsc::channel();
+            if bind == ForwardBind::AllInterfaces && !m.host.supports_all_interfaces_forward() {
+                assert_eq!(
+                    m.open_tunnel(spec, tx).unwrap_err().kind,
+                    ErrorKind::Unsupported
+                );
+                continue;
+            }
+            let id = m.open_tunnel(spec.clone(), tx.clone()).unwrap();
+            assert!(rx.try_iter().any(|event| matches!(
+                event, TunnelEvent::Health { id: reported, healthy: true } if reported == id
+            )));
+            let tunnel = &m.tunnels()[0];
+            assert_eq!(tunnel.spec.bind, bind);
+            assert_eq!(tunnel.state, TunnelState::Up);
+            assert_eq!(tunnel.healthy, Some(true));
+            let err = m.open_tunnel(spec, tx).unwrap_err();
+            assert_eq!(err.kind, ErrorKind::PortInUse);
+            assert_eq!(err.param("port"), Some("18000"));
+            m.close_tunnel(id).unwrap();
+        }
+
+        m.host = Host::Wsl { distro: None };
+        let (tx, _rx) = mpsc::channel();
+        let err = m
+            .open_tunnel(
+                TunnelSpec {
+                    bind: ForwardBind::AllInterfaces,
+                    ..spec
+                },
+                tx,
+            )
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Unsupported);
+        assert_eq!(err.param("bind"), Some("all_interfaces"));
+        assert!(m.tunnels().is_empty());
     }
 
     #[test]
@@ -2737,6 +2798,7 @@ mod tests {
         let (tx, trx) = mpsc::channel();
         m.open_tunnel(
             TunnelSpec {
+                bind: Default::default(),
                 account: acct,
                 session: "t".into(),
                 local_port: 18001,
@@ -2757,6 +2819,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         m.open_tunnel(
             TunnelSpec {
+                bind: Default::default(),
                 account: accts.accounts[0].id.clone(),
                 session: "a100-7f3a".into(),
                 local_port: 18000,
@@ -2959,6 +3022,7 @@ mod tests {
 
         let acct = m.accounts(&nc()).unwrap().active.unwrap();
         let tspec = |port| TunnelSpec {
+            bind: Default::default(),
             account: acct.clone(),
             session: "t4-x".into(),
             local_port: port,
