@@ -29,7 +29,7 @@ use tokio::{
     task::{JoinHandle, spawn_blocking},
 };
 
-pub use accounts::AccountSwitchPreview;
+pub use accounts::{AccountSwitchApproval, AccountSwitchPreview};
 pub use forwards::ForwardPolicy;
 pub use login::LoginPrompt;
 pub use shutdown::{Billing, ShutdownReport};
@@ -45,11 +45,24 @@ pub struct AccountContext {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Operation {
-    Provision { session: String },
-    PluginRun { plugin: String, session: String },
-    SwitchAccount { to: AccountId },
-    Login,
-    Domain { name: &'static str, key: String },
+    Provision {
+        session: String,
+    },
+    PluginRun {
+        plugin: String,
+        session: String,
+    },
+    SwitchAccount {
+        to: AccountId,
+    },
+    Login {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        login_id: Option<u64>,
+    },
+    Domain {
+        name: &'static str,
+        key: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

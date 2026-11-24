@@ -2,10 +2,32 @@ use colab_playground_core::{accounts::Account, backend::SwitchImpact};
 
 use super::*;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize)]
 pub struct AccountSwitchPreview {
-    pub account_context: AccountContext,
-    pub impact: SwitchImpact,
+    #[serde(flatten)]
+    approval: AccountSwitchApproval,
+    impact: SwitchImpact,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct AccountSwitchApproval {
+    account_context: AccountContext,
+    confirmation: SwitchConfirmation,
+}
+
+impl AccountSwitchApproval {
+    pub fn target(&self) -> &AccountId {
+        &self.confirmation.to
+    }
+}
+
+#[derive(PartialEq, Eq, Serialize, Deserialize)]
+struct SwitchConfirmation {
+    from: Option<AccountId>,
+    to: AccountId,
+    forwards: Vec<TunnelId>,
+    managed: Vec<(String, Option<String>)>,
+    unmanaged: Option<Vec<String>>,
 }
 
 impl WebState {
@@ -85,9 +107,13 @@ impl WebState {
             let accounts = backend.accounts(cancel);
             state.record_accounts(accounts.clone());
             accounts?;
+            let impact = backend.switch_impact(&to)?;
             Ok(AccountSwitchPreview {
-                account_context: state.snapshot().account.clone(),
-                impact: backend.switch_impact(&to)?,
+                approval: AccountSwitchApproval {
+                    account_context: state.snapshot().account.clone(),
+                    confirmation: SwitchConfirmation::from(&impact),
+                },
+                impact,
             })
         })
         .await
@@ -95,12 +121,12 @@ impl WebState {
 
     pub fn confirm_switch(
         &self,
-        preview: AccountSwitchPreview,
+        approval: AccountSwitchApproval,
     ) -> Result<Submission<AccountsView>> {
         self.start_switch(
-            preview.account_context,
-            preview.impact.to.clone(),
-            Some(preview.impact),
+            approval.account_context,
+            approval.confirmation.to.clone(),
+            Some(approval.confirmation),
         )
     }
 
@@ -116,7 +142,7 @@ impl WebState {
         &self,
         account: AccountContext,
         to: AccountId,
-        confirmed: Option<SwitchImpact>,
+        confirmed: Option<SwitchConfirmation>,
     ) -> Result<Submission<AccountsView>> {
         let state = self.clone();
         self.start_job(
@@ -126,7 +152,7 @@ impl WebState {
             move |_, backend, cancel| {
                 if let Some(confirmed) = confirmed {
                     let current = backend.switch_impact(&to)?;
-                    if !same_impact(&confirmed, &current) {
+                    if confirmed != SwitchConfirmation::from(&current) {
                         return Err(
                             Error::new(ErrorKind::Busy).with("switch_impact_changed", "true")
                         );
@@ -135,42 +161,53 @@ impl WebState {
                 }
                 let result = backend.switch_account(&to, cancel);
                 state.sync_forwards();
-                state.record_accounts(result.clone());
-                result
+                let view = match result {
+                    Ok(view) => view,
+                    Err(error) => {
+                        state.record_accounts(backend.accounts(&CancelToken::new()));
+                        return Err(error);
+                    }
+                };
+                state.record_accounts(Ok(view));
+                Ok(state
+                    .snapshot()
+                    .accounts
+                    .clone()
+                    .expect("account switch recorded"))
             },
         )
     }
 }
 
-fn same_impact(reviewed: &SwitchImpact, current: &SwitchImpact) -> bool {
-    fn same_items<T, K: Ord>(reviewed: &[T], current: &[T], key: impl Fn(&T) -> K) -> bool {
-        let mut reviewed: Vec<_> = reviewed.iter().map(&key).collect();
-        let mut current: Vec<_> = current.iter().map(key).collect();
-        reviewed.sort_unstable();
-        current.sort_unstable();
-        reviewed == current
-    }
-
-    // Health and measured spend can change while the user reads the preview.
-    reviewed.from == current.from
-        && same_items(
-            &reviewed.tunnels_closing,
-            &current.tunnels_closing,
-            |tunnel| tunnel.id,
-        )
-        && same_items(
-            &reviewed.sessions_left_running,
-            &current.sessions_left_running,
-            |session| (session.name.clone(), session.endpoint.clone()),
-        )
-        && match (
-            &reviewed.unmanaged_left_running,
-            &current.unmanaged_left_running,
-        ) {
-            (Some(reviewed), Some(current)) => {
-                same_items(reviewed, current, |runtime| runtime.endpoint.clone())
-            }
-            (None, None) => true,
-            _ => false,
+impl From<&SwitchImpact> for SwitchConfirmation {
+    fn from(impact: &SwitchImpact) -> Self {
+        // Health and measured spend can change while the user reads the preview.
+        let mut forwards: Vec<_> = impact
+            .tunnels_closing
+            .iter()
+            .map(|tunnel| tunnel.id)
+            .collect();
+        forwards.sort_unstable();
+        let mut managed: Vec<_> = impact
+            .sessions_left_running
+            .iter()
+            .map(|session| (session.name.clone(), session.endpoint.clone()))
+            .collect();
+        managed.sort_unstable();
+        let unmanaged = impact.unmanaged_left_running.as_ref().map(|runtimes| {
+            let mut endpoints: Vec<_> = runtimes
+                .iter()
+                .map(|runtime| runtime.endpoint.clone())
+                .collect();
+            endpoints.sort_unstable();
+            endpoints
+        });
+        Self {
+            from: impact.from.clone(),
+            to: impact.to.clone(),
+            forwards,
+            managed,
+            unmanaged,
         }
+    }
 }

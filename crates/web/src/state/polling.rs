@@ -71,20 +71,28 @@ impl WebState {
         self.record_usage(usage);
     }
 
-    pub(super) fn record_usage(&self, usage: Vec<AccountUsageView>) {
+    pub(super) fn record_usage(&self, mut usage: Vec<AccountUsageView>) {
         let now = self.0.backend.now();
         self.update(|snapshot| {
-            let mut usage = usage;
             let _ = expire_usage(&mut usage, now);
-            let mut changed = snapshot.usage != usage;
+            let mut changed = false;
             if let Some(accounts) = &mut snapshot.accounts {
                 for account in &mut accounts.accounts {
-                    if let Some(view) = usage.iter().find(|view| view.account == account.id) {
+                    if let Some(view) = usage.iter_mut().find(|view| view.account == account.id) {
+                        // After a restart, the account store can hold the only known sample.
+                        if view.snapshot.is_none()
+                            && let Some(mut sample) = account.usage
+                        {
+                            sample.stale = true;
+                            view.eta = sample.eta();
+                            view.snapshot = Some(sample);
+                        }
                         changed |= account.usage != view.snapshot;
                         account.usage = view.snapshot;
                     }
                 }
             }
+            changed |= snapshot.usage != usage;
             snapshot.usage = usage;
             changed
         });

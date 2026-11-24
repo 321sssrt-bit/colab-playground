@@ -11,7 +11,9 @@ use colab_playground_core::{
     accounts::{Account, AccountId, AccountsView},
     backend::AccountUsageView,
 };
-use colab_playground_web::state::{AccountContext, AccountSwitchPreview, LoginPrompt, Snapshot};
+use colab_playground_web::state::{
+    AccountContext, AccountSwitchApproval, AccountSwitchPreview, LoginPrompt, Snapshot,
+};
 use serde::{Deserialize, Serialize};
 
 use super::{ApiError, finish};
@@ -121,8 +123,11 @@ async fn cancel_login(
     payload: Result<Json<Empty>, JsonRejection>,
 ) -> Result<StatusCode, ApiError> {
     let Json(_) = payload?;
-    finish(state.web.cancel_login(id)?).await?;
-    Ok(StatusCode::NO_CONTENT)
+    if let Some(rollback) = state.web.cancel_login(id)? {
+        finish(rollback).await?;
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    Ok(StatusCode::ACCEPTED)
 }
 
 async fn preview_switch(
@@ -135,13 +140,13 @@ async fn preview_switch(
 async fn confirm_switch(
     State(state): State<StateData>,
     Path(id): Path<String>,
-    payload: Result<Json<AccountSwitchPreview>, JsonRejection>,
+    payload: Result<Json<AccountSwitchApproval>, JsonRejection>,
 ) -> Result<Json<AccountsView>, ApiError> {
-    let Json(preview) = payload?;
-    if preview.impact.to != AccountId::new(id)? {
+    let Json(approval) = payload?;
+    if approval.target() != &AccountId::new(id)? {
         return Err(ApiError::invalid_request());
     }
-    Ok(Json(finish(state.web.confirm_switch(preview)?).await?))
+    Ok(Json(finish(state.web.confirm_switch(approval)?).await?))
 }
 
 async fn remove(

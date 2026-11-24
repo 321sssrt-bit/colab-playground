@@ -101,6 +101,13 @@ async fn account_metadata_cannot_replace_a_stale_usage_sample_with_a_fresh_copy(
         snapshot.accounts.as_ref().unwrap().accounts[0].usage,
         snapshot.usage[0].snapshot
     );
+    let mut missing = snapshot.usage.clone();
+    missing[0].snapshot = None;
+    state.record_usage(missing);
+    assert_eq!(
+        state.snapshot().usage[0].snapshot,
+        snapshot.usage[0].snapshot
+    );
     assert!(state.shutdown(TEST_TIMEOUT).await.completed);
 }
 
@@ -390,7 +397,7 @@ impl colab_playground_core::clock::Clock for HoldStep {
                 .recv_timeout(TEST_TIMEOUT)
                 .unwrap();
         }
-        Ok(())
+        cancel.check()
     }
 }
 
@@ -441,6 +448,29 @@ async fn an_account_write_is_accepted_while_a_background_poll_finishes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_switch_rechecks_accounts_without_marking_the_list_failed() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let (state, _, step, at_step, resume) = demo_with_held_step().await;
+    let initial = state.snapshot();
+    let to = initial.accounts.as_ref().unwrap().accounts[1].id.clone();
+    step.steps.store(2, SeqCst);
+    let (id, switch) = started(state.switch_account(initial.account.clone(), to).unwrap());
+    at_step.recv_timeout(TEST_TIMEOUT).unwrap();
+    assert!(state.cancel(id));
+
+    step.steps.store(1, SeqCst);
+    resume.send(()).unwrap();
+    at_step.recv_timeout(TEST_TIMEOUT).unwrap();
+    let after = state.snapshot();
+    assert!(after.accounts_error.is_none());
+    assert_eq!(after.account, initial.account);
+    resume.send(()).unwrap();
+    assert!(switch.await.unwrap().unwrap_err().is(ErrorKind::Cancelled));
+    assert!(state.shutdown(TEST_TIMEOUT).await.completed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn login_keeps_its_job_id_and_rolls_back_if_cancelled_while_opening() {
     use std::sync::atomic::Ordering::SeqCst;
 
@@ -461,7 +491,7 @@ async fn login_keeps_its_job_id_and_rolls_back_if_cancelled_while_opening() {
     let prompt = login.await.unwrap().unwrap();
     assert_eq!(prompt.id, id);
     assert_eq!(state.snapshot().login_id, Some(id));
-    let (_, rollback) = started(state.cancel_login(prompt.id).unwrap());
+    let (_, rollback) = started(state.cancel_login(prompt.id).unwrap().unwrap());
     rollback.await.unwrap().unwrap();
     ready(&state).await;
 

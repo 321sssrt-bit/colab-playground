@@ -308,6 +308,77 @@ async fn login_failure_cancel_and_success_publish_state_and_release_the_slot() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn cancellation_reaches_login_while_opening_and_while_submitting() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = MockConfig::interactive(Duration::from_millis(400));
+    config.scenario = MockScenario::single();
+    exercise(dir.path(), config, |client, backend, _| {
+        let original = client.get(ACCOUNTS)["accounts"]["active"].clone();
+        let mut stream = events(&client);
+        std::thread::scope(|scope| {
+            let opening = scope.spawn(|| {
+                mutate(
+                    &client,
+                    LOGIN,
+                    &account_action(&client),
+                    StatusCode::CONFLICT,
+                )
+            });
+            let opening_id = snapshot_when(&mut stream, |snapshot| {
+                snapshot["operations"][0]["operation"]["kind"] == "login"
+            })["operations"][0]["id"]
+                .clone();
+            let route = format!("{LOGIN}/{opening_id}");
+            assert_eq!(
+                client.request("DELETE", &route, "{}").status(),
+                StatusCode::ACCEPTED
+            );
+            assert_eq!(opening.join().unwrap()["error"]["kind"], "cancelled");
+        });
+        let opened = begin_login(&client);
+        let route = format!("{LOGIN}/{opened}");
+        std::thread::scope(|scope| {
+            let submitting = scope.spawn(|| {
+                mutate(
+                    &client,
+                    &route,
+                    &json!({"code":"demo-code"}),
+                    StatusCode::CONFLICT,
+                )
+            });
+            snapshot_when(&mut stream, |snapshot| {
+                snapshot["operations"][0]["operation"]["login_id"] == opened
+            });
+            assert_eq!(
+                client.request("DELETE", &route, "{}").status(),
+                StatusCode::ACCEPTED
+            );
+            assert_eq!(submitting.join().unwrap()["error"]["kind"], "cancelled");
+        });
+        let finished = snapshot_when(&mut stream, |snapshot| {
+            snapshot["login_id"].is_null()
+                && snapshot["operations"] == json!([])
+                && snapshot["account"]["active"] == original
+        });
+        assert_eq!(
+            finished["accounts"]["accounts"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            backend
+                .accounts(&CancelToken::new())
+                .unwrap()
+                .active
+                .unwrap()
+                .as_str(),
+            original
+        );
+        assert_eq!(client.get(ACCOUNTS)["accounts"]["active"], original);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn oauth_inactivity_rolls_back_after_a_browser_disconnect() {
     let dir = tempfile::tempdir().unwrap();
     let (config, _) = MockConfig::headless(MockScenario::single());
@@ -369,6 +440,12 @@ async fn switch_requires_current_impact_and_closes_forwards_without_stopping_run
         let target = &accounts["accounts"]["accounts"][1]["id"];
         let route = format!("{ACCOUNTS}/{}/switch", target.as_str().unwrap());
         let before = client.get(&route);
+        assert_eq!(
+            client
+                .request("POST", &route, &account_action(&client).to_string())
+                .status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
         let impact = &before["impact"];
         assert_eq!(impact["from"], *active);
         assert_eq!(impact["to"], *target);
