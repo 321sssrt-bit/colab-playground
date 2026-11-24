@@ -92,7 +92,19 @@ async fn usage_preserves_the_cli_slot_and_distinguishes_unknown_stale_and_fresh(
         }
         let updated = snapshot_when(&mut stream, |snapshot| snapshot["usage"] == stale["usage"]);
         assert_eq!(updated["account"], active);
-        assert_eq!(client.get(ACCOUNTS), stale);
+        let other = before["accounts"]["accounts"][1]["id"].as_str().unwrap();
+        client.get(&format!("{ACCOUNTS}/{other}/switch"));
+        let listed = client.get(ACCOUNTS);
+        for (index, usage) in stale["usage"].as_array().unwrap().iter().enumerate() {
+            assert_eq!(
+                updated["accounts"]["accounts"][index]["usage"],
+                usage["snapshot"]
+            );
+            assert_eq!(
+                listed["accounts"]["accounts"][index]["usage"],
+                usage["snapshot"]
+            );
+        }
         assert_eq!(
             backend
                 .accounts(&CancelToken::new())

@@ -2,7 +2,7 @@ use std::sync::mpsc;
 
 use colab_playground_core::{
     backend::{Backend, RunTarget},
-    mock::{MockBackend, MockConfig, MockScenario},
+    mock::{MockBackend, MockConfig, MockFailures, MockScenario},
     plugins::InputValue,
     provision::ProvisionEvent,
     sessions::Accelerator,
@@ -72,6 +72,36 @@ async fn wait_event<T: Send + 'static>(
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn account_metadata_cannot_replace_a_stale_usage_sample_with_a_fresh_copy() {
+    let (config, _) = MockConfig::headless(MockScenario::single());
+    let backend = Arc::new(MockBackend::new(config));
+    let state = WebState::start(backend.clone()).await.unwrap();
+    ready(&state).await;
+    let cached = backend.accounts(&CancelToken::new()).unwrap();
+    assert!(!cached.accounts[0].usage.unwrap().stale);
+
+    backend.set_failures(MockFailures {
+        usage_fetch_fails: true,
+        ..Default::default()
+    });
+    assert!(
+        state.refresh_accounts().await.unwrap().usage[0]
+            .snapshot
+            .unwrap()
+            .stale
+    );
+
+    // The real account store keeps the last successful sample when a refresh fails.
+    state.record_accounts(Ok(cached));
+    let snapshot = state.snapshot();
+    assert_eq!(
+        snapshot.accounts.as_ref().unwrap().accounts[0].usage,
+        snapshot.usage[0].snapshot
+    );
+    assert!(state.shutdown(TEST_TIMEOUT).await.completed);
 }
 
 #[tokio::test]

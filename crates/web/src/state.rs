@@ -467,6 +467,13 @@ impl WebState {
         self.update(|snapshot| match result {
             Ok(mut view) => {
                 for account in &mut view.accounts {
+                    if let Some(usage) = snapshot
+                        .usage
+                        .iter()
+                        .find(|usage| usage.account == account.id)
+                    {
+                        account.usage = usage.snapshot;
+                    }
                     if let Some(sample) = &mut account.usage {
                         polling::expire_sample(sample, now);
                     }
