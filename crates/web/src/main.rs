@@ -1,6 +1,8 @@
+mod api;
 mod auth;
 mod cli;
 mod http;
+mod i18n;
 mod platform;
 
 use std::{
@@ -18,12 +20,13 @@ use colab_playground_shared::{
     backend::{BACKEND_ENV, BackendSelection},
     errors,
     i18n::{Language, fill_lenient, template},
-    settings::{CONFIG_DIR_ENV, SettingsStore, config_dir},
+    settings::{CONFIG_DIR_ENV, Settings, SettingsStore, config_dir},
 };
 
 use colab_playground_web::state::WebState;
 
 use crate::{
+    api::WebSettings,
     auth::{Auth, KeyStore},
     cli::{Command, Serve},
     http::Origins,
@@ -41,10 +44,10 @@ const MOCK_STEP_DELAY: Duration = Duration::from_millis(600);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(120);
 const INTERRUPTED: u8 = 130;
 
-fn build_backend(selection: BackendSelection) -> colab_playground_core::Result<Arc<dyn Backend>> {
-    let settings = SettingsStore::new(config_dir(env::var_os(CONFIG_DIR_ENV)))
-        .load()
-        .settings;
+fn build_backend(
+    selection: BackendSelection,
+    settings: Settings,
+) -> colab_playground_core::Result<Arc<dyn Backend>> {
     match selection {
         BackendSelection::Mock(flags) => {
             let mut config = MockConfig::interactive(MOCK_STEP_DELAY);
@@ -87,7 +90,13 @@ async fn serve(options: Serve) -> Result<(), Box<dyn std::error::Error>> {
         BackendSelection::Mock(_) => "Demo data",
         BackendSelection::Real => "Real",
     };
-    let backend = tokio::task::spawn_blocking(move || build_backend(options.backend)).await??;
+    let (backend, settings) = tokio::task::spawn_blocking(move || {
+        let settings =
+            WebSettings::load(SettingsStore::new(config_dir(env::var_os(CONFIG_DIR_ENV))));
+        let backend = build_backend(options.backend, settings.initial_settings())?;
+        Ok::<_, Error>((backend, settings))
+    })
+    .await??;
     let state = WebState::start(backend).await?;
     eprintln!("Web Server listening on {addr} ({mode})");
     if !options.no_open
@@ -99,7 +108,13 @@ async fn serve(options: Serve) -> Result<(), Box<dyn std::error::Error>> {
     let mut snapshots = state.subscribe();
     let server = axum::serve(
         listener,
-        http::router(Auth::new(keys), key_changes, origins, state.clone()),
+        http::router(
+            Auth::new(keys),
+            key_changes,
+            origins,
+            state.clone(),
+            settings,
+        ),
     )
     .with_graceful_shutdown(async move {
         let _ = snapshots.wait_for(|snapshot| snapshot.shutting_down).await;

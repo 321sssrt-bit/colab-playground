@@ -15,6 +15,7 @@ use colab_playground_core::{
         AccountUsageView, Backend, BackendKind, Events, GuardReport, PluginRunEvent,
         PluginRunOutcome, PluginRunSpec, RunTarget, RuntimeRef, RuntimesView,
     },
+    host::ProbeReport,
     provision::{ProvisionEvent, ProvisionOutcome, ProvisionSpec},
     tunnel::TunnelInfo,
 };
@@ -73,6 +74,7 @@ pub struct Snapshot {
 #[derive(Debug, Clone)]
 pub enum Access {
     Independent,
+    HostWrite,
     Account(AccountContext),
     AccountWrite(AccountContext),
 }
@@ -192,6 +194,52 @@ impl WebState {
 
     pub fn subscribe(&self) -> watch::Receiver<Arc<Snapshot>> {
         self.0.snapshots.subscribe()
+    }
+
+    pub async fn run_backend<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&dyn Backend, &CancelToken) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        self.backend_job(Slot::Independent, work).await
+    }
+
+    pub async fn probe_environment(&self) -> Result<(ProbeReport, Arc<Snapshot>)> {
+        let state = self.clone();
+        self.backend_job(Slot::Shared, move |backend, cancel| {
+            let _poll = state.lock_poll_slot();
+            cancel.check()?;
+            let report = backend.probe(cancel)?;
+            if report.colab.is_some() {
+                state.refresh_overview(backend, cancel);
+            } else {
+                state.clear_overview();
+            }
+            Ok((report, state.snapshot()))
+        })
+        .await
+    }
+
+    async fn backend_job<T: Send + 'static>(
+        &self,
+        slot: Slot,
+        work: impl FnOnce(&dyn Backend, &CancelToken) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let job = {
+            let mut control = self.lock();
+            if control.shutting_down {
+                return Err(Error::cancelled());
+            }
+            if !control.available(slot) {
+                return Err(Error::new(ErrorKind::Busy));
+            }
+            self.reserve(&mut control, None, slot, false)
+        };
+        spawn_blocking(move || {
+            job.cancel.check()?;
+            work(&*job.state.0.backend, &job.cancel)
+        })
+        .await
+        .map_err(|_| Error::new(ErrorKind::Other))?
     }
 
     /// Domain adapters supply a stable, non-secret key. Dropping the handle leaves the job running.
@@ -365,7 +413,7 @@ impl WebState {
             return Err(Error::cancelled());
         }
         let expected = match &access {
-            Access::Independent => None,
+            Access::Independent | Access::HostWrite => None,
             Access::Account(account) | Access::AccountWrite(account) => Some(account),
         };
         if let Some(expected) = expected {
@@ -381,7 +429,7 @@ impl WebState {
         let slot = match access {
             Access::Independent => Slot::Independent,
             Access::Account(_) => Slot::Shared,
-            Access::AccountWrite(_) => Slot::Exclusive,
+            Access::AccountWrite(_) | Access::HostWrite => Slot::Exclusive,
         };
         // Core's failed-allocation cleanup can reap any newly seen unnamed VM.
         if !control.available(slot)
