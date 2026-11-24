@@ -433,6 +433,14 @@ impl RateAttribution {
                 }
             }
         }
+        // A session still without an estimate after the rate moved or a
+        // runtime went may have shown in that reading, so a later rise is
+        // not all of what the sessions without an estimate burn.
+        if (fall.abs() > NO_RATE || went)
+            && self.rates.values().any(|r| r.is_none_or(|r| r <= NO_RATE))
+        {
+            self.mixed = true;
+        }
         self.splits.retain(|split| split.sessions.len() > 1);
         // An empty account that still burns has a fall yet to show.
         self.steady = still || (assignments == 0 && rate <= NO_RATE);
@@ -818,6 +826,30 @@ mod tests {
         a.observe(36.60, 2, &set(&["h1", "h2"]));
         a.observe(18.30, 1, &set(&["h2"]));
         assert_eq!(a.rate_of("h2"), share);
+    }
+
+    #[test]
+    fn a_rise_is_not_shared_as_a_split_with_a_session_whose_rate_had_shown() {
+        // The app starts while a CPU (0.08) and two H100s (18.3 each) run:
+        // 12.23 each, so the CPU's estimate is more than it burns.
+        let mut a = RateAttribution::default();
+        a.observe(36.68, 3, &set(&["cpu", "h1", "h2"]));
+        a.observe(36.68, 3, &set(&["cpu", "h1", "h2"]));
+        a.observe(18.38, 2, &set(&["cpu", "h1"]));
+        a.observe(0.08, 1, &set(&["cpu"]));
+        // An A100 (11.77) starts and shows a reading late. The CPU's estimate
+        // leaves nothing of the rate, so the A100 stays without one.
+        a.observe(0.08, 2, &set(&["a100", "cpu"]));
+        a.observe(11.85, 2, &set(&["a100", "cpu"]));
+        assert_eq!(a.rate_of("a100"), None);
+        // An H100 starts and shows a reading late too. The rise is its rate
+        // alone, and both sessions take a share of what the CPU leaves.
+        a.observe(11.85, 3, &set(&["a100", "cpu", "h"]));
+        a.observe(30.15, 3, &set(&["a100", "cpu", "h"]));
+        let share = a.rate_of("h");
+        a.observe(30.15, 3, &set(&["a100", "cpu", "h"]));
+        a.observe(18.38, 2, &set(&["cpu", "h"]));
+        assert_eq!(a.rate_of("h"), share);
     }
 
     #[test]
