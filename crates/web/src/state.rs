@@ -1,3 +1,4 @@
+mod forwards;
 mod login;
 mod polling;
 mod shutdown;
@@ -25,6 +26,7 @@ use tokio::{
     task::{JoinHandle, spawn_blocking},
 };
 
+pub use forwards::ForwardPolicy;
 pub use login::LoginPrompt;
 pub use shutdown::{Billing, ShutdownReport};
 
@@ -90,6 +92,8 @@ struct Inner {
     refresh: Notify,
     drained: Notify,
     login_inactivity: Duration,
+    forward_policy: ForwardPolicy,
+    forwards: Mutex<forwards::ForwardUpdates>,
 }
 
 #[derive(Default)]
@@ -143,12 +147,20 @@ impl Drop for Job {
 
 impl WebState {
     pub async fn start(backend: Arc<dyn Backend>) -> Result<Self> {
-        Self::start_with_timeout(backend, LOGIN_INACTIVITY).await
+        Self::start_with_forward_policy(backend, ForwardPolicy::default()).await
+    }
+
+    pub async fn start_with_forward_policy(
+        backend: Arc<dyn Backend>,
+        forward_policy: ForwardPolicy,
+    ) -> Result<Self> {
+        Self::start_with_timeout(backend, LOGIN_INACTIVITY, forward_policy).await
     }
 
     async fn start_with_timeout(
         backend: Arc<dyn Backend>,
         login_inactivity: Duration,
+        forward_policy: ForwardPolicy,
     ) -> Result<Self> {
         let (backend, kind) = spawn_blocking(move || {
             let kind = backend.kind();
@@ -183,8 +195,11 @@ impl WebState {
             refresh: Notify::new(),
             drained: Notify::new(),
             login_inactivity,
+            forward_policy,
+            forwards: Mutex::default(),
         }));
         tokio::spawn(state.clone().poll());
+        tokio::spawn(state.clone().poll_forwards());
         Ok(state)
     }
 

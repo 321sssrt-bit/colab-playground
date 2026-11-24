@@ -151,7 +151,7 @@ async fn login_timeout_rolls_back_and_releases_the_slot() {
     let (config, _) = MockConfig::headless(MockScenario::demo());
     let backend = Arc::new(MockBackend::new(config));
     let inactivity = Duration::from_millis(250);
-    let state = WebState::start_with_timeout(backend.clone(), inactivity)
+    let state = WebState::start_with_timeout(backend.clone(), inactivity, ForwardPolicy::default())
         .await
         .unwrap();
     let initial = ready(&state).await;

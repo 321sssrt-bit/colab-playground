@@ -60,4 +60,17 @@ pub(super) const MESSAGES: colab_playground_shared::i18n::Messages = &[
         super::UNMANAGED_UNKNOWN,
         "部分帳戶無法檢查。這些帳戶若有未受管理的執行階段，會持續計費，直到手動停止。",
     ),
+    (
+        super::FORWARD_BIND_WINDOWS,
+        "Windows 或 WSL 不支援所有網路介面的轉送。",
+    ),
+    (
+        super::FORWARD_BIND_LOOPBACK,
+        "所有網路介面的轉送需要 Web 伺服器監聽非迴路位址。",
+    ),
+    (super::FORWARD_SERVER_LOCAL, "僅能從伺服器本機存取。"),
+    (
+        super::FORWARD_DOWNSTREAM_AUTH,
+        "轉送連接埠僅由目標服務本身的身分驗證保護。",
+    ),
 ];

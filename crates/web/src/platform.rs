@@ -1,10 +1,16 @@
 use std::{
     fs::File,
     io::{self, IsTerminal, Write},
+    net::SocketAddr,
     path::Path,
 };
 
 use colab_playground_core::Host;
+use colab_playground_web::state::ForwardPolicy;
+
+pub fn forward_policy(listener: SocketAddr) -> ForwardPolicy {
+    ForwardPolicy::new(listener.ip(), &Host::detect())
+}
 
 pub fn key_terminal() -> io::Result<io::StderrLock<'static>> {
     let terminal = io::stderr().lock();

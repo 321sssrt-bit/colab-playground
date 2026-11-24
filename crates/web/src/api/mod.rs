@@ -1,3 +1,4 @@
+mod forwards;
 mod overview;
 mod settings;
 mod updates;
@@ -9,7 +10,7 @@ use axum::{
     extract::{Path, rejection::JsonRejection},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use colab_playground_core::{Error, ErrorKind};
 use colab_playground_shared::errors;
@@ -22,6 +23,8 @@ pub(crate) use settings::WebSettings;
 
 pub(crate) fn routes() -> Router<StateData> {
     Router::new()
+        .route("/api/forwards", get(forwards::list).post(forwards::open))
+        .route("/api/forwards/{id}", delete(forwards::close))
         .route("/api/overview", get(overview::get))
         .route("/api/overview/cli/install", post(overview::install))
         .route(
@@ -118,8 +121,16 @@ impl From<Error> for ApiError {
         use ErrorKind as K;
 
         let status = match error.kind {
-            K::InvalidInput => StatusCode::UNPROCESSABLE_ENTITY,
-            K::Busy
+            K::InvalidInput | K::PortReserved => StatusCode::UNPROCESSABLE_ENTITY,
+            K::Unsupported if error.param("forward_bind_restriction").is_some() => {
+                let key = match error.param("forward_bind_restriction") {
+                    Some("windows_or_wsl") => i18n::FORWARD_BIND_WINDOWS,
+                    _ => i18n::FORWARD_BIND_LOOPBACK,
+                };
+                return Self::new(StatusCode::CONFLICT, "unsupported", key);
+            }
+            K::PortInUse
+            | K::Busy
             | K::Cancelled
             | K::AccountNotActive
             | K::NoActiveAccount

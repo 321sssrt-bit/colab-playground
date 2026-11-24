@@ -60,4 +60,20 @@ pub(super) const MESSAGES: colab_playground_shared::i18n::Messages = &[
         super::UNMANAGED_UNKNOWN,
         "일부 계정을 확인할 수 없습니다. 해당 계정에 관리되지 않는 런타임이 있으면 중지할 때까지 요금이 계속 부과됩니다.",
     ),
+    (
+        super::FORWARD_BIND_WINDOWS,
+        "Windows 또는 WSL에서는 모든 인터페이스로 포워딩할 수 없습니다.",
+    ),
+    (
+        super::FORWARD_BIND_LOOPBACK,
+        "모든 인터페이스로 포워딩하려면 웹 서버가 루프백 이외의 주소에서 수신해야 합니다.",
+    ),
+    (
+        super::FORWARD_SERVER_LOCAL,
+        "서버 자체에서만 접속할 수 있습니다.",
+    ),
+    (
+        super::FORWARD_DOWNSTREAM_AUTH,
+        "포워딩된 포트는 대상 서비스 자체의 인증으로만 보호됩니다.",
+    ),
 ];

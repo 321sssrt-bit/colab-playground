@@ -63,4 +63,20 @@ pub(super) const MESSAGES: colab_playground_shared::i18n::Messages = &[
         super::UNMANAGED_UNKNOWN,
         "Some accounts could not be checked. Any unmanaged runtimes on those accounts keep billing until they are stopped.",
     ),
+    (
+        super::FORWARD_BIND_WINDOWS,
+        "All-interface forwarding is unavailable on Windows or WSL.",
+    ),
+    (
+        super::FORWARD_BIND_LOOPBACK,
+        "All-interface forwarding requires the Web Server to listen on a non-loopback address.",
+    ),
+    (
+        super::FORWARD_SERVER_LOCAL,
+        "Only reachable from the server itself.",
+    ),
+    (
+        super::FORWARD_DOWNSTREAM_AUTH,
+        "The forwarded port relies on the service’s own authentication.",
+    ),
 ];
