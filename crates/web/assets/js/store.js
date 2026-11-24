@@ -56,10 +56,6 @@ function emit(reason) {
   }
 }
 
-export function notifyState(reason) {
-  emit(reason);
-}
-
 function stopSse() {
   sseGeneration += 1;
   if (reconnectTimer !== null) {

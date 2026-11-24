@@ -67,12 +67,7 @@ export function createOverviewPage({ navigate }) {
       runtimesNote =
         emails.length <= 2
           ? t("app.b10.summary_not_counted", { emails: emails.join(t("app.fmt.list_separator")) })
-          : t(
-              emails.length === 1
-                ? "app.accounts.total.missing_one"
-                : "app.accounts.total.missing_many",
-              { count: emails.length }
-            );
+          : t("app.accounts.total.missing_many", { count: emails.length });
     }
 
     const activeEmail = formatEmail(getActiveEmail());

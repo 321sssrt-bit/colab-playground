@@ -94,10 +94,6 @@ export function getLanguagePreference() {
   return preference;
 }
 
-export function getLocale() {
-  return currentLocale;
-}
-
 export function languageNameKey(locale) {
   return LANGUAGE_NAME_KEYS[locale] || LANGUAGE_NAME_KEYS["en-US"];
 }
