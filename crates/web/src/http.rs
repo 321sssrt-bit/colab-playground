@@ -19,6 +19,8 @@ use tokio::sync::watch;
 
 use crate::auth::{Auth, SESSION_LIFETIME, Session};
 
+const HTTP_PORT: u16 = 80;
+const HTTPS_PORT: u16 = 443;
 const EVENTS: &str = "/api/events";
 const KEY_BODY_LIMIT: usize = 4096;
 const WATCH_FALLBACK: Duration = Duration::from_secs(1);
@@ -33,15 +35,19 @@ pub struct TrustedHost {
 impl TrustedHost {
     pub fn parse(input: &str) -> Result<Self, &'static str> {
         const INVALID: &str = "--trusted-host needs [http[s]://]HOST[:PORT].";
-        let (https, authority) = match input.split_once("://") {
-            Some(("https", authority)) => (true, authority),
-            Some(("http", authority)) => (false, authority),
-            None => (false, input),
+        let (https, default_port, authority) = match input.split_once("://") {
+            Some(("https", authority)) => (true, Some(HTTPS_PORT), authority),
+            Some(("http", authority)) => (false, Some(HTTP_PORT), authority),
+            None => (false, None, input),
             Some(_) => return Err(INVALID),
         };
         let (host, port) = parse_authority(authority).ok_or(INVALID)?;
         let host = url::Host::parse(&host).map_err(|_| INVALID)?.to_string();
-        Ok(Self { https, host, port })
+        Ok(Self {
+            https,
+            host,
+            port: port.or(default_port),
+        })
     }
 }
 
@@ -72,7 +78,11 @@ struct AllowedOrigin {
 
 impl AllowedOrigin {
     fn new(host: String, https: bool, port: u16) -> Self {
-        let (scheme, default_port) = if https { ("https", 443) } else { ("http", 80) };
+        let (scheme, default_port) = if https {
+            ("https", HTTPS_PORT)
+        } else {
+            ("http", HTTP_PORT)
+        };
         let origin = if port == default_port {
             format!("{scheme}://{host}")
         } else {
@@ -104,7 +114,7 @@ impl Origins {
             origins.push(AllowedOrigin::new(host_literal(addr.ip()), false, port));
         }
         origins.extend(trusted.into_iter().map(|entry| {
-            let port = entry.port.unwrap_or(if entry.https { 443 } else { port });
+            let port = entry.port.unwrap_or(port);
             AllowedOrigin::new(entry.host, entry.https, port)
         }));
         Self(origins)

@@ -33,6 +33,7 @@ pub fn usage() -> String {
          \x20      colab-playground-web rotate-token [--mock | --real]\n\
          Listen address defaults to 127.0.0.1:{PORT}.\n\
          A bare --trusted-host uses HTTP and the listen port unless a port is given.\n\
+         An explicit scheme uses its standard port unless a port is given.\n\
          For a TLS proxy, pass --trusted-host https://HOST[:PORT] and preserve Host.\n\
          First launch and rotate-token require an interactive terminal."
     )

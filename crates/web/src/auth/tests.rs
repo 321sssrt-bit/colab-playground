@@ -42,6 +42,7 @@ async fn http_checks_origins_and_revokes_open_streams_on_rotation() {
             addr,
             vec![
                 TrustedHost::parse("https://console.example").unwrap(),
+                TrustedHost::parse("http://plain.example").unwrap(),
                 TrustedHost::parse("https://proxy.example:8443").unwrap(),
             ],
         ),
@@ -144,6 +145,7 @@ async fn http_checks_origins_and_revokes_open_streams_on_rotation() {
         for (host, origin) in [
             (authority.as_str(), origin.as_str()),
             ("console.example", "https://console.example"),
+            ("plain.example", "http://plain.example"),
             ("proxy.example:8443", "https://proxy.example:8443"),
         ] {
             let mut response = login(&[("Host", host), ("Origin", origin), json], &key);

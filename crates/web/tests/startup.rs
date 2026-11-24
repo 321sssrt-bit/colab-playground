@@ -65,7 +65,7 @@ fn only_one_server_can_use_a_demo_data_directory() {
 
     let duplicate = command.output().unwrap();
     assert_eq!(duplicate.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("data_dir_in_use"));
+    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("Close it and try again."));
 
     let rotation = web(dir.path())
         .args(["rotate-token", "--mock"])

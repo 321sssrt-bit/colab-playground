@@ -5,9 +5,11 @@ mod platform;
 
 use std::{env, io, path::PathBuf, process::ExitCode};
 
-use colab_playground_core::{InstanceLock, paths::default_local_data_dir};
+use colab_playground_core::{Error, ErrorKind, InstanceLock, paths::default_local_data_dir};
 use colab_playground_shared::{
     backend::{BACKEND_ENV, BackendSelection},
+    errors,
+    i18n::{Language, fill_lenient, template},
     settings::{CONFIG_DIR_ENV, config_dir},
 };
 
@@ -93,7 +95,17 @@ async fn main() -> ExitCode {
         }
     };
     if let Err(error) = result {
-        eprintln!("Web Server: {error}");
+        if let Some(error) = error.downcast_ref::<Error>()
+            && error.kind == ErrorKind::DataDirInUse
+        {
+            let message = errors::message(error, false);
+            eprintln!(
+                "{}",
+                fill_lenient(template(Language::EnUs, message.key), &message.args)
+            );
+        } else {
+            eprintln!("Web Server: {error}");
+        }
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
