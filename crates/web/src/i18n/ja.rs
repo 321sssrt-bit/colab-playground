@@ -63,4 +63,24 @@ pub(super) const MESSAGES: colab_playground_shared::i18n::Messages = &[
         super::UNMANAGED_UNKNOWN,
         "一部のアカウントを確認できませんでした。それらのアカウントに管理対象外のランタイムがある場合、停止するまで課金が続きます。",
     ),
+    (
+        super::FORWARD_BIND_WINDOWS,
+        "Windows または WSL では、すべてのインターフェースへの転送は利用できません。",
+    ),
+    (
+        super::FORWARD_BIND_LOOPBACK,
+        "すべてのインターフェースへの転送には、Web サーバーがループバック以外のアドレスで待ち受ける必要があります。",
+    ),
+    (
+        super::FORWARD_SERVER_LOCAL,
+        "サーバー本体からのみアクセスできます。",
+    ),
+    (
+        super::FORWARD_DOWNSTREAM_AUTH,
+        "転送されたポートは、接続先サービス自身の認証でのみ保護されます。",
+    ),
+    (
+        super::FORWARD_EXTERNAL_HOST,
+        "転送リンクを取得するには、到達可能な IPv4 アドレスか、そのアドレスに解決されるホスト名で Web サーバーにアクセスしてください。",
+    ),
 ];

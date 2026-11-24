@@ -6,7 +6,7 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Extension, Request, State, rejection::JsonRejection},
+    extract::{ConnectInfo, DefaultBodyLimit, Extension, Request, State, rejection::JsonRejection},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header, uri::Authority},
     middleware::{self, Next},
     response::{
@@ -109,6 +109,11 @@ impl AllowedOrigin {
 
 pub struct Origins(Vec<AllowedOrigin>);
 
+pub(crate) struct RequestHost {
+    pub(crate) name: String,
+    pub(crate) direct_loopback: bool,
+}
+
 impl Origins {
     pub fn new(addr: SocketAddr, trusted: Vec<TrustedHost>) -> Self {
         let port = addr.port();
@@ -142,7 +147,7 @@ impl Origins {
             .map(|entry| entry.origin.as_str())
     }
 
-    fn check(&self, request: &Request) -> Result<(), StatusCode> {
+    fn check(&self, request: &Request) -> Result<RequestHost, StatusCode> {
         let headers = request.headers();
         let (host, port) = unique_header(headers, header::HOST)
             .and_then(parse_authority)
@@ -171,7 +176,24 @@ impl Origins {
         {
             return Err(StatusCode::UNSUPPORTED_MEDIA_TYPE);
         }
-        Ok(())
+        let direct_loopback = request
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .is_some_and(|ConnectInfo(peer)| peer.ip().to_canonical().is_loopback())
+            && is_loopback_host(&host);
+        Ok(RequestHost {
+            name: host,
+            direct_loopback,
+        })
+    }
+}
+
+pub(crate) fn is_loopback_host(host: &str) -> bool {
+    match url::Host::parse(host) {
+        Ok(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Ok(url::Host::Ipv6(ip)) => IpAddr::V6(ip).to_canonical().is_loopback(),
+        Ok(url::Host::Domain(name)) => name.trim_end_matches('.') == "localhost",
+        Err(_) => false,
     }
 }
 
@@ -238,11 +260,14 @@ pub fn router(
 
 async fn check_origin(
     State(origins): State<Arc<Origins>>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     let mut response = match origins.check(&request) {
-        Ok(()) => next.run(request).await,
+        Ok(host) => {
+            request.extensions_mut().insert(Arc::new(host));
+            next.run(request).await
+        }
         Err(status) => status.into_response(),
     };
     let headers = response.headers_mut();
@@ -339,7 +364,18 @@ async fn events(
             Some((event, (snapshots, false)))
         },
     );
-    authenticated_events(state, session, snapshots)
+    let forwards = stream::unfold(state.web.subscribe_forwards(), |mut forwards| async {
+        loop {
+            match forwards.recv().await {
+                Ok(event) => {
+                    return Some((Event::default().event("forward").json_data(event), forwards));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    });
+    authenticated_events(state, session, stream::select(snapshots, forwards))
 }
 
 pub(crate) fn authenticated_events(

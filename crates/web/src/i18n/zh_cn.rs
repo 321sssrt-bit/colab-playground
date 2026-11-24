@@ -60,4 +60,21 @@ pub(super) const MESSAGES: colab_playground_shared::i18n::Messages = &[
         super::UNMANAGED_UNKNOWN,
         "部分账号无法检查。这些账号上若有未托管的运行时，仍会持续计费，直到手动停止。",
     ),
+    (
+        super::FORWARD_BIND_WINDOWS,
+        "Windows 或 WSL 不支持全网卡转发。",
+    ),
+    (
+        super::FORWARD_BIND_LOOPBACK,
+        "全网卡转发要求 Web 服务器监听非回环地址。",
+    ),
+    (super::FORWARD_SERVER_LOCAL, "仅服务器本机可达。"),
+    (
+        super::FORWARD_DOWNSTREAM_AUTH,
+        "转发端口仅由目标服务自身的身份验证保护。",
+    ),
+    (
+        super::FORWARD_EXTERNAL_HOST,
+        "请用可达的 IPv4 地址或解析到该地址的主机名访问 Web 服务器，以获取转发链接。",
+    ),
 ];

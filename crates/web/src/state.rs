@@ -1,3 +1,4 @@
+mod forwards;
 mod login;
 mod polling;
 mod shutdown;
@@ -16,8 +17,9 @@ use colab_playground_core::{
         PluginRunOutcome, PluginRunSpec, RunTarget, RuntimeRef, RuntimesView,
     },
     host::ProbeReport,
+    plugins::ResolvedEndpoint,
     provision::{ProvisionEvent, ProvisionOutcome, ProvisionSpec},
-    tunnel::TunnelInfo,
+    tunnel::{TunnelId, TunnelInfo},
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -25,6 +27,7 @@ use tokio::{
     task::{JoinHandle, spawn_blocking},
 };
 
+pub use forwards::ForwardPolicy;
 pub use login::LoginPrompt;
 pub use shutdown::{Billing, ShutdownReport};
 
@@ -63,6 +66,8 @@ pub struct Snapshot {
     pub runtimes: Option<RuntimesView>,
     pub runtimes_error: Option<ErrorKind>,
     pub tunnels: Vec<TunnelInfo>,
+    #[serde(skip)]
+    forward_endpoints: BTreeMap<TunnelId, ResolvedEndpoint>,
     pub usage: Vec<AccountUsageView>,
     pub guard: Option<GuardReport>,
     pub guard_error: Option<ErrorKind>,
@@ -90,6 +95,8 @@ struct Inner {
     refresh: Notify,
     drained: Notify,
     login_inactivity: Duration,
+    forward_policy: ForwardPolicy,
+    forwards: Mutex<forwards::ForwardUpdates>,
 }
 
 #[derive(Default)]
@@ -143,12 +150,20 @@ impl Drop for Job {
 
 impl WebState {
     pub async fn start(backend: Arc<dyn Backend>) -> Result<Self> {
-        Self::start_with_timeout(backend, LOGIN_INACTIVITY).await
+        Self::start_with_forward_policy(backend, ForwardPolicy::default()).await
+    }
+
+    pub async fn start_with_forward_policy(
+        backend: Arc<dyn Backend>,
+        forward_policy: ForwardPolicy,
+    ) -> Result<Self> {
+        Self::start_with_timeout(backend, LOGIN_INACTIVITY, forward_policy).await
     }
 
     async fn start_with_timeout(
         backend: Arc<dyn Backend>,
         login_inactivity: Duration,
+        forward_policy: ForwardPolicy,
     ) -> Result<Self> {
         let (backend, kind) = spawn_blocking(move || {
             let kind = backend.kind();
@@ -168,6 +183,7 @@ impl WebState {
             runtimes: None,
             runtimes_error: None,
             tunnels: Vec::new(),
+            forward_endpoints: BTreeMap::new(),
             usage: Vec::new(),
             guard: None,
             guard_error: None,
@@ -183,8 +199,11 @@ impl WebState {
             refresh: Notify::new(),
             drained: Notify::new(),
             login_inactivity,
+            forward_policy,
+            forwards: Mutex::default(),
         }));
         tokio::spawn(state.clone().poll());
+        tokio::spawn(state.clone().poll_forwards());
         Ok(state)
     }
 

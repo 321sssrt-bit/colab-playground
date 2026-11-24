@@ -1,3 +1,5 @@
+mod forwards;
+
 use std::{
     fs,
     io::{BufRead, BufReader, Read},
@@ -12,7 +14,7 @@ use colab_playground_core::{
     sessions::Accelerator,
 };
 use colab_playground_shared::settings::SettingsStore;
-use colab_playground_web::state::{Submission, WebState};
+use colab_playground_web::state::{ForwardPolicy, Submission, WebState};
 use serde_json::Value;
 use ureq::{
     Agent, Body,
@@ -22,7 +24,7 @@ use ureq::{
 use super::{Auth, KeyStore};
 use crate::{
     api::WebSettings,
-    http::{Origins, router},
+    http::{Origins, TrustedHost, router},
 };
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -91,13 +93,29 @@ async fn exercise(
 async fn exercise_with_store(
     dir: &Path,
     store: SettingsStore,
+    config: MockConfig,
+    run: impl FnOnce(Client, Arc<MockBackend>, SettingsStore) + Send + 'static,
+) {
+    exercise_with_policy(dir, store, config, None, vec![], run).await;
+}
+
+async fn exercise_with_policy(
+    dir: &Path,
+    store: SettingsStore,
     mut config: MockConfig,
+    policy: Option<ForwardPolicy>,
+    trusted: Vec<TrustedHost>,
     run: impl FnOnce(Client, Arc<MockBackend>, SettingsStore) + Send + 'static,
 ) {
     let settings = WebSettings::load(store.clone());
     config.defaults = settings.initial_settings().defaults;
     let backend = Arc::new(MockBackend::new(config));
-    let web = WebState::start(backend.clone()).await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let policy = policy.unwrap_or_else(|| crate::platform::forward_policy(addr));
+    let web = WebState::start_with_forward_policy(backend.clone(), policy)
+        .await
+        .unwrap();
     tokio::time::timeout(
         TIMEOUT,
         web.subscribe().wait_for(|snapshot| {
@@ -108,8 +126,6 @@ async fn exercise_with_store(
     .await
     .unwrap()
     .unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
     let keys = KeyStore::new(dir);
     let _lock = colab_playground_core::InstanceLock::acquire(keys.dir()).unwrap();
     let key = keys.replace().unwrap();
@@ -117,11 +133,18 @@ async fn exercise_with_store(
     let app = router(
         Auth::new(keys),
         changes,
-        Origins::new(addr, vec![]),
+        Origins::new(addr, trusted),
         web.clone(),
         settings,
     );
-    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap()
+    });
 
     let client_web = web.clone();
     let result = tokio::task::spawn_blocking(move || {

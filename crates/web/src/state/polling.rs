@@ -152,10 +152,5 @@ fn poll_backend(job: &Job, refresh: bool) {
     if refresh || due || snapshot.runtimes.is_none() {
         state.record_runtimes(backend.runtimes(cancel));
     }
-    let tunnels = backend.tunnels();
-    state.update(|snapshot| {
-        let changed = snapshot.tunnels != tunnels;
-        snapshot.tunnels = tunnels;
-        changed
-    });
+    state.sync_forwards();
 }

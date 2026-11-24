@@ -97,7 +97,8 @@ async fn serve(options: Serve) -> Result<(), Box<dyn std::error::Error>> {
         Ok::<_, Error>((backend, settings))
     })
     .await??;
-    let state = WebState::start(backend).await?;
+    let state =
+        WebState::start_with_forward_policy(backend, platform::forward_policy(addr)).await?;
     eprintln!("Web Server listening on {addr} ({mode})");
     if !options.no_open
         && let Some(url) = origins.browser_url(addr)
@@ -114,7 +115,8 @@ async fn serve(options: Serve) -> Result<(), Box<dyn std::error::Error>> {
             origins,
             state.clone(),
             settings,
-        ),
+        )
+        .into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .with_graceful_shutdown(async move {
         let _ = snapshots.wait_for(|snapshot| snapshot.shutting_down).await;
