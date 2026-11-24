@@ -229,8 +229,6 @@ async fn overview_updates_and_all_dictionaries() {
         }
         let bad_locale = json(client.request("GET", "/api/i18n/fr-FR", ""), StatusCode::NOT_FOUND);
         assert_eq!(bad_locale["error"]["kind"], "locale_not_found");
-        println!("Overview: CLI {}, 2 saved accounts, 1 unmanaged runtime. Update: {update}. 5 dictionaries with {} keys.",
-            overview["environment"]["colab_version"], english.unwrap().len());
     }).await;
 }
 
@@ -271,7 +269,6 @@ async fn settings_recover_per_field_and_keep_desktop_metadata() {
         assert_eq!(invalid["error"]["kind"], "invalid_input");
         assert_eq!(store.load().settings, saved);
         assert_eq!(client.get("/api/settings"), updated);
-        println!("Settings: invalid language -> system, invalid max_attempts recovered, retry delay 45s preserved. PATCH -> ja-JP, idle timeout 1s; invalid PATCH -> 422.");
     }).await;
 }
 
@@ -299,7 +296,6 @@ async fn corrupt_settings_survive_and_failed_writes_do_not_change_defaults() {
         assert_eq!(saved["load_status"], "loaded");
         assert_eq!(saved["appearance"], "light");
         assert_eq!(fs::read_to_string(backup).unwrap(), "{ invalid");
-        println!("Corrupt settings backed up byte-for-byte; a failed save returned 500 and left the previous settings live.");
     }).await;
 }
 
@@ -338,7 +334,6 @@ async fn cli_install_streams_deduplicates_cancels_and_can_be_retried() {
         }
         assert_eq!(event(&mut reader, "finished")["status"], "succeeded");
         assert_eq!(client.get("/api/overview")["cli_installed"], true);
-        println!("CLI install: stdout before completion, concurrent install 409 with same id, cancel 202 -> cancelled, retry streamed 5 lines -> succeeded.");
     }).await;
 }
 
@@ -387,7 +382,6 @@ async fn keyring_update_and_install_failures_have_localizable_diagnostics() {
         assert!(missing["accounts"].is_null());
         assert_eq!(missing["usage"], serde_json::json!([]));
         assert!(missing["unmanaged_runtimes"]["warning_key"].is_null());
-        println!("Keyring unavailable, diagnostic {hint}; simulated update -> 502; install stderr -> failed, exit code 2.");
     }).await;
 }
 
@@ -410,7 +404,6 @@ async fn overview_reports_which_accounts_could_not_be_checked() {
         let recovered = client.get("/api/overview");
         assert_eq!(recovered["unmanaged_runtimes"]["count"], 1);
         assert_eq!(recovered["unmanaged_runtimes"]["unverified_accounts"], serde_json::json!([]));
-        println!("Partial runtime listing: count null, one unverified account, billing warning; retry after recovery: count 1.");
     }).await;
 }
 
@@ -437,9 +430,6 @@ async fn settings_without_a_config_directory_remain_live_in_memory() {
             assert_eq!(backend.defaults().max_attempts, 5);
             assert!(store.file().is_none());
             assert_eq!(client.get("/api/settings"), settings);
-            println!(
-                "Without a config directory: PATCH 200, appearance dark and attempts 5 in memory."
-            );
         },
     )
     .await;
@@ -460,7 +450,6 @@ async fn overview_retries_failed_usage_within_the_poll_cooldown() {
         assert!(recovered["usage"][0]["last_error"].is_null());
         assert_eq!(recovered["usage"][0]["snapshot"]["stale"], false);
         assert!(recovered["usage"][0]["snapshot"]["balance_cu"].is_number());
-        println!("Usage recovery during cooldown: overview shows a fresh non-null balance and no usage error.");
     }).await;
 }
 
@@ -488,7 +477,6 @@ async fn overview_refreshes_usage_and_runtime_counts_after_login() {
             .find(|view| view["account"] == account.id.as_str()).unwrap();
         assert_eq!(usage["snapshot"]["assignments"], 1);
         assert_eq!(overview["unmanaged_runtimes"]["count"], 2);
-        println!("Mock login: overview is busy during login, then shows the new account with 1 assignment and 2 unmanaged runtimes across accounts.");
     }).await;
 }
 
@@ -518,6 +506,5 @@ async fn overview_refreshes_even_after_background_poll_recovers_accounts() {
         assert_eq!(recovered["keyring"]["status"], "ready");
         assert_eq!(recovered["usage"][0]["snapshot"]["assignments"], 4);
         assert_eq!(recovered["unmanaged_runtimes"]["count"], 2);
-        println!("Background account recovery left runtime data cached; overview immediately showed 4 active-account assignments and 2 unmanaged runtimes.");
     }).await;
 }
