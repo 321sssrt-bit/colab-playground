@@ -20,6 +20,7 @@ pub(crate) const FORWARD_BIND_WINDOWS: &str = "web.forward.bind_windows_or_wsl";
 pub(crate) const FORWARD_BIND_LOOPBACK: &str = "web.forward.bind_loopback_listener";
 pub(crate) const FORWARD_SERVER_LOCAL: &str = "web.forward.server_local";
 pub(crate) const FORWARD_DOWNSTREAM_AUTH: &str = "web.forward.downstream_auth";
+pub(crate) const FORWARD_EXTERNAL_HOST: &str = "web.forward.external_host";
 
 const WEB_CATALOGS: [(&str, i18n::Messages); 5] = [
     ("en-US", en::MESSAGES),

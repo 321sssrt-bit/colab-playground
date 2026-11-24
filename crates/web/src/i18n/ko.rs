@@ -76,4 +76,8 @@ pub(super) const MESSAGES: colab_playground_shared::i18n::Messages = &[
         super::FORWARD_DOWNSTREAM_AUTH,
         "포워딩된 포트는 대상 서비스 자체의 인증으로만 보호됩니다.",
     ),
+    (
+        super::FORWARD_EXTERNAL_HOST,
+        "포워딩 링크를 받으려면 접근할 수 있는 IPv4 주소나 해당 주소로 확인되는 호스트 이름으로 웹 서버에 접속하세요.",
+    ),
 ];

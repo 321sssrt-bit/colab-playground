@@ -79,4 +79,8 @@ pub(super) const MESSAGES: colab_playground_shared::i18n::Messages = &[
         super::FORWARD_DOWNSTREAM_AUTH,
         "The forwarded port relies on the service’s own authentication.",
     ),
+    (
+        super::FORWARD_EXTERNAL_HOST,
+        "Reach the Web Server through an IPv4 address or a hostname that resolves to a reachable IPv4 address to get Forward links.",
+    ),
 ];

@@ -1,6 +1,12 @@
 use std::net::{Ipv4Addr, TcpListener};
 
-use colab_playground_core::{Host, backend::RunTarget, plugins::InputValue, tunnel::ForwardBind};
+use colab_playground_core::{
+    Host,
+    backend::{PluginRunOutcome, RunTarget},
+    plugins::InputValue,
+    tunnel::ForwardBind,
+};
+use colab_playground_web::state::AccountContext;
 use serde_json::json;
 
 use super::*;
@@ -39,12 +45,18 @@ fn open(client: &Client, form: &Value, expected: StatusCode) -> Value {
 
 fn from_host(client: &Client, host: &str) -> Value {
     let port = client.origin.rsplit_once(':').unwrap().1;
+    let (authority, origin) = if host == FIRST_HOST {
+        (host.to_owned(), format!("https://{host}"))
+    } else {
+        (format!("{host}:{port}"), format!("http://{host}:{port}"))
+    };
     let response = client
         .agent
         .run(
             Request::builder()
                 .uri(format!("{}{FORWARDS}", client.origin))
-                .header("host", format!("{host}:{port}"))
+                .header("host", authority)
+                .header("origin", origin)
                 .header("authorization", format!("Bearer {}", client.token))
                 .body("")
                 .unwrap(),
@@ -64,9 +76,14 @@ async fn exercise_forwards(
         SettingsStore::new(Some(dir.path().into())),
         config,
         policy,
-        [FIRST_HOST, SECOND_HOST, "[2001:db8::1]", "0.0.0.0"]
-            .map(|name| TrustedHost::parse(name).unwrap())
-            .into(),
+        [
+            "https://first.example.test",
+            SECOND_HOST,
+            "[2001:db8::1]",
+            "0.0.0.0",
+        ]
+        .map(|name| TrustedHost::parse(name).unwrap())
+        .into(),
         |client, backend, _| run(client, backend),
     )
     .await;
@@ -185,12 +202,12 @@ async fn all_interface_forward_uses_each_validated_host_and_warns_about_auth() {
         return;
     }
     let policy = ForwardPolicy::new(Ipv4Addr::UNSPECIFIED.into(), &Host::Local);
-    exercise_forwards(Some(policy), |client, _| {
+    exercise_forwards(Some(policy), |client, backend| {
         let mut request = form(&client);
         request["bind"] = json!("all_interfaces");
         let created = open(&client, &request, StatusCode::CREATED);
         assert_eq!(created["spec"]["bind"], "all_interfaces");
-        for host in [FIRST_HOST, SECOND_HOST, "[2001:db8::1]"] {
+        for host in [FIRST_HOST, SECOND_HOST] {
             let base = format!("http://{host}:{}", request["local_port"]);
             assert_eq!(
                 from_host(&client, host)[0]["addresses"],
@@ -203,7 +220,43 @@ async fn all_interface_forward_uses_each_validated_host_and_warns_about_auth() {
                 })
             );
         }
-        assert!(from_host(&client, "0.0.0.0")[0]["addresses"]["open_url"].is_null());
+        for host in ["0.0.0.0", "[2001:db8::1]"] {
+            let addresses = &from_host(&client, host)[0]["addresses"];
+            assert!(addresses["open_url"].is_null());
+            assert_eq!(addresses["notice_key"], "web.forward.external_host");
+        }
+        let (account, outcome) = ready_plugin(&client, &backend);
+        let endpoint = &outcome.endpoints[0];
+        let Submission::Started { job, .. } = client
+            .web
+            .open_plugin_forward(
+                account,
+                &outcome,
+                endpoint,
+                Some(ForwardBind::AllInterfaces),
+            )
+            .unwrap()
+        else {
+            panic!("expected forward job");
+        };
+        let id = json!(
+            tokio::runtime::Handle::current()
+                .block_on(job)
+                .unwrap()
+                .unwrap()
+                .id
+        );
+        let listed = from_host(&client, SECOND_HOST);
+        let plugin = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|view| view["id"] == id)
+            .unwrap();
+        let base = format!("http://{SECOND_HOST}:{}", endpoint.remote_port);
+        assert_eq!(plugin["addresses"]["open_url"], base);
+        assert_eq!(plugin["addresses"]["copy_url"], format!("{base}/v1"));
+        assert_eq!(plugin["addresses"]["openai_base_url"], format!("{base}/v1"));
     })
     .await;
 }
@@ -221,36 +274,8 @@ async fn wsl_rejects_explicit_wide_bind_and_plugin_forward_defaults_to_loopback(
             "web.forward.bind_windows_or_wsl"
         );
 
-        let snapshot = client.web.snapshot();
-        let target = snapshot
-            .runtimes
-            .as_ref()
-            .unwrap()
-            .runtimes
-            .iter()
-            .find(|runtime| runtime.id.name.as_deref() == Some(NAMED_SESSION))
-            .unwrap()
-            .id
-            .clone();
-        let account = snapshot.account.clone();
-        let mut run = backend.plugin_run_template("llama-cpp").unwrap();
-        run.inputs.insert(
-            "repo".into(),
-            InputValue::Text("unsloth/Qwen3-0.6B-GGUF".into()),
-        );
-        run.target = RunTarget::Existing {
-            name: NAMED_SESSION.into(),
-        };
-        let (events, _) = std::sync::mpsc::channel();
-        let Submission::Started { job, .. } = client
-            .web
-            .run_plugin(account.clone(), run, Some(target), events)
-            .unwrap()
-        else {
-            panic!("expected plugin job");
-        };
+        let (account, outcome) = ready_plugin(&client, &backend);
         let tokio = tokio::runtime::Handle::current();
-        let outcome = tokio.block_on(job).unwrap().unwrap();
         let endpoint = &outcome.endpoints[0];
         let error = client
             .web
@@ -288,6 +313,92 @@ async fn wsl_rejects_explicit_wide_bind_and_plugin_forward_defaults_to_loopback(
             listed["addresses"]["notice_key"],
             "web.forward.server_local"
         );
+    })
+    .await;
+}
+
+fn ready_plugin(client: &Client, backend: &MockBackend) -> (AccountContext, PluginRunOutcome) {
+    let snapshot = client.web.snapshot();
+    let target = snapshot
+        .runtimes
+        .as_ref()
+        .unwrap()
+        .runtimes
+        .iter()
+        .find(|runtime| runtime.id.name.as_deref() == Some(NAMED_SESSION))
+        .unwrap()
+        .id
+        .clone();
+    let account = snapshot.account.clone();
+    let mut run = backend.plugin_run_template("llama-cpp").unwrap();
+    run.inputs.insert(
+        "repo".into(),
+        InputValue::Text("unsloth/Qwen3-0.6B-GGUF".into()),
+    );
+    run.target = RunTarget::Existing {
+        name: NAMED_SESSION.into(),
+    };
+    let (events, _) = std::sync::mpsc::channel();
+    let Submission::Started { job, .. } = client
+        .web
+        .run_plugin(account.clone(), run, Some(target), events)
+        .unwrap()
+    else {
+        panic!("expected plugin job");
+    };
+    (
+        account,
+        tokio::runtime::Handle::current()
+            .block_on(job)
+            .unwrap()
+            .unwrap(),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn immediate_ssh_failure_is_reported_and_discarded() {
+    exercise_forwards(None, |client, backend| {
+        backend.set_failures(MockFailures {
+            ssh_busy_attempts: 1,
+            ..Default::default()
+        });
+        let request = form(&client);
+        let failed = open(&client, &request, StatusCode::CONFLICT);
+        assert_eq!(failed["error"]["kind"], "ssh_busy");
+        assert_eq!(client.get(FORWARDS), json!([]));
+        assert!(backend.tunnels().is_empty());
+        assert_eq!(
+            open(&client, &request, StatusCode::CREATED)["state"]["state"],
+            "up"
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn login_closes_forwards_while_guard_polling_is_paused() {
+    exercise_forwards(None, |client, _| {
+        let mut stream = live_events(&client);
+        let created = open(&client, &form(&client), StatusCode::CREATED);
+        let id = &created["id"];
+        assert_eq!(next_forward(&mut stream, id)["state"]["state"], "starting");
+        assert_eq!(next_forward(&mut stream, id)["state"]["state"], "up");
+        assert_eq!(next_forward(&mut stream, id)["event"], "health");
+
+        let Submission::Started { job, .. } = client
+            .web
+            .begin_login(client.web.snapshot().account.clone())
+            .unwrap()
+        else {
+            panic!("expected a login job");
+        };
+        let prompt = tokio::runtime::Handle::current()
+            .block_on(job)
+            .unwrap()
+            .unwrap();
+        assert_eq!(next_forward(&mut stream, id)["state"]["state"], "stopped");
+        assert_eq!(client.get("/api/snapshot")["login_id"], prompt.id);
+        assert_eq!(client.get(FORWARDS), json!([]));
     })
     .await;
 }

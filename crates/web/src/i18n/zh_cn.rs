@@ -73,4 +73,8 @@ pub(super) const MESSAGES: colab_playground_shared::i18n::Messages = &[
         super::FORWARD_DOWNSTREAM_AUTH,
         "转发端口仅由目标服务自身的身份验证保护。",
     ),
+    (
+        super::FORWARD_EXTERNAL_HOST,
+        "请用可达的 IPv4 地址或解析到该地址的主机名访问 Web 服务器，以获取转发链接。",
+    ),
 ];

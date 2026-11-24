@@ -42,37 +42,52 @@ impl ForwardAddresses {
         spec: &TunnelSpec,
         endpoint: Option<&ResolvedEndpoint>,
     ) -> Self {
-        let all_interfaces = spec.bind == ForwardBind::AllInterfaces;
-        let base = if !all_interfaces {
-            host.direct_loopback.then(|| spec.local_url())
-        } else if !host.direct_loopback && is_loopback_host(&host.name)
+        let (base, notice_key) = if host.direct_loopback {
+            (Some(spec.local_url()), None)
+        } else if spec.bind == ForwardBind::Loopback {
+            (None, Some(i18n::FORWARD_SERVER_LOCAL))
+        } else if is_loopback_host(&host.name)
             || host
                 .name
                 .trim_matches(['[', ']'])
                 .parse::<IpAddr>()
-                .is_ok_and(|ip| ip.is_unspecified())
+                .is_ok_and(|ip| {
+                    let ip = ip.to_canonical();
+                    ip.is_ipv6() || ip.is_unspecified()
+                })
         {
-            None
+            (None, Some(i18n::FORWARD_EXTERNAL_HOST))
         } else {
-            Some(format!("http://{}:{}", host.name, spec.local_port))
+            // The direct Forward bypasses the Web Server's TLS-terminating proxy.
+            (
+                Some(format!("http://{}:{}", host.name, spec.local_port)),
+                None,
+            )
         };
 
-        let open_url = base.as_ref().map(|base| match endpoint {
-            Some(endpoint) => format!("{base}{}", endpoint.path),
-            None => base.clone(),
-        });
-        let openai_base_url = base.and_then(|base| match endpoint {
-            Some(endpoint) if endpoint.kind == "openai" => Some(format!("{base}{}", endpoint.path)),
-            Some(_) => None,
-            None => Some(format!("{base}/v1")),
-        });
+        let (open_url, copy_url, openai_base_url) = match (base, endpoint) {
+            (None, _) => (None, None, None),
+            (Some(base), Some(endpoint)) => {
+                let url = format!("{base}{}", endpoint.path.trim_end_matches('/'));
+                if endpoint.kind == "openai" {
+                    (Some(base), Some(url.clone()), Some(url))
+                } else {
+                    (Some(url.clone()), Some(url), None)
+                }
+            }
+            (Some(base), None) => (
+                Some(base.clone()),
+                Some(base.clone()),
+                Some(format!("{base}/v1")),
+            ),
+        };
         Self {
-            copy_url: open_url.clone(),
+            copy_url,
             open_url,
             openai_base_url,
-            notice_key: (!all_interfaces && !host.direct_loopback)
-                .then_some(i18n::FORWARD_SERVER_LOCAL),
-            warning_key: all_interfaces.then_some(i18n::FORWARD_DOWNSTREAM_AUTH),
+            notice_key,
+            warning_key: (spec.bind == ForwardBind::AllInterfaces)
+                .then_some(i18n::FORWARD_DOWNSTREAM_AUTH),
         }
     }
 }
@@ -85,9 +100,9 @@ pub(super) struct ForwardView {
 }
 
 impl ForwardView {
-    fn new(info: TunnelInfo, host: &RequestHost) -> Self {
+    fn new(info: TunnelInfo, host: &RequestHost, endpoint: Option<&ResolvedEndpoint>) -> Self {
         Self {
-            addresses: ForwardAddresses::for_request(host, &info.spec, None),
+            addresses: ForwardAddresses::for_request(host, &info.spec, endpoint),
             info,
         }
     }
@@ -97,14 +112,16 @@ pub(super) async fn list(
     State(state): State<StateData>,
     Extension(host): Extension<Arc<RequestHost>>,
 ) -> Json<Vec<ForwardView>> {
+    let snapshot = state.web.snapshot();
     Json(
-        state
-            .web
-            .snapshot()
+        snapshot
             .tunnels
             .iter()
             .cloned()
-            .map(|info| ForwardView::new(info, &host))
+            .map(|info| {
+                let endpoint = snapshot.forward_endpoint(info.id);
+                ForwardView::new(info, &host, endpoint)
+            })
             .collect(),
     )
 }
@@ -120,7 +137,7 @@ pub(super) async fn open(
         .open_forward(payload.account_context, payload.spec)?;
     Ok((
         StatusCode::CREATED,
-        Json(ForwardView::new(finish(job).await?, &host)),
+        Json(ForwardView::new(finish(job).await?, &host, None)),
     ))
 }
 
@@ -169,7 +186,7 @@ mod tests {
         let endpoint = ResolvedEndpoint {
             id: "api".into(),
             remote_port: spec.remote_port,
-            path: "/custom/v1".into(),
+            path: "/custom/v1/".into(),
             health: spec.health_path.clone(),
             kind: "openai".into(),
             label: LocalizedText(Default::default()),
@@ -180,8 +197,21 @@ mod tests {
         };
         let addresses = ForwardAddresses::for_request(&host, &spec, Some(&endpoint));
         let expected = Some("http://plugin.example.test:18000/custom/v1");
-        assert_eq!(addresses.open_url.as_deref(), expected);
+        assert_eq!(
+            addresses.open_url.as_deref(),
+            Some("http://plugin.example.test:18000")
+        );
         assert_eq!(addresses.copy_url.as_deref(), expected);
         assert_eq!(addresses.openai_base_url.as_deref(), expected);
+
+        let local = RequestHost {
+            name: "[::1]".into(),
+            direct_loopback: true,
+        };
+        let addresses = ForwardAddresses::for_request(&local, &spec, None);
+        assert_eq!(
+            addresses.open_url.as_deref(),
+            Some("http://127.0.0.1:18000")
+        );
     }
 }

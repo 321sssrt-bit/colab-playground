@@ -79,4 +79,8 @@ pub(super) const MESSAGES: colab_playground_shared::i18n::Messages = &[
         super::FORWARD_DOWNSTREAM_AUTH,
         "転送されたポートは、接続先サービス自身の認証でのみ保護されます。",
     ),
+    (
+        super::FORWARD_EXTERNAL_HOST,
+        "転送リンクを取得するには、到達可能な IPv4 アドレスか、そのアドレスに解決されるホスト名で Web サーバーにアクセスしてください。",
+    ),
 ];

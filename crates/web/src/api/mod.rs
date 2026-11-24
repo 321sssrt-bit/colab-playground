@@ -130,6 +130,7 @@ impl From<Error> for ApiError {
                 return Self::new(StatusCode::CONFLICT, "unsupported", key);
             }
             K::PortInUse
+            | K::SshBusy
             | K::Busy
             | K::Cancelled
             | K::AccountNotActive

@@ -25,7 +25,7 @@ impl Default for ForwardPolicy {
     fn default() -> Self {
         Self {
             loopback: true,
-            supported_host: true,
+            supported_host: Host::detect().supports_all_interfaces_forward(),
         }
     }
 }
@@ -33,7 +33,7 @@ impl Default for ForwardPolicy {
 impl ForwardPolicy {
     pub fn new(listener: IpAddr, host: &Host) -> Self {
         Self {
-            loopback: listener.is_loopback(),
+            loopback: listener.to_canonical().is_loopback(),
             supported_host: host.supports_all_interfaces_forward(),
         }
     }
@@ -67,6 +67,12 @@ impl Default for ForwardUpdates {
     }
 }
 
+impl Snapshot {
+    pub fn forward_endpoint(&self, id: TunnelId) -> Option<&ResolvedEndpoint> {
+        self.forward_endpoints.get(&id)
+    }
+}
+
 impl WebState {
     /// Subscribe to transitions that can occur between two versioned snapshots.
     pub fn subscribe_forwards(&self) -> broadcast::Receiver<TunnelEvent> {
@@ -77,6 +83,15 @@ impl WebState {
         &self,
         account: AccountContext,
         spec: TunnelSpec,
+    ) -> Result<Submission<TunnelInfo>> {
+        self.open_forward_with_endpoint(account, spec, None)
+    }
+
+    fn open_forward_with_endpoint(
+        &self,
+        account: AccountContext,
+        spec: TunnelSpec,
+        endpoint: Option<ResolvedEndpoint>,
     ) -> Result<Submission<TunnelInfo>> {
         self.0.forward_policy.check(spec.bind)?;
         spec.validate()?;
@@ -97,22 +112,23 @@ impl WebState {
                     let _ = backend.close_tunnel(id);
                     return Err(Error::cancelled());
                 }
-                let mut updates = state.forward_updates();
-                updates.receivers.insert(id, received);
-                state.sync_forward_updates(
-                    &mut updates,
-                    Some(TunnelEvent::State {
-                        id,
-                        state: TunnelState::Starting,
-                    }),
-                );
-                state
-                    .snapshot()
+                let snapshot = {
+                    let mut updates = state.forward_updates();
+                    updates.receivers.insert(id, received);
+                    state.sync_forward_updates(&mut updates, Some((id, endpoint)));
+                    state.snapshot()
+                };
+                let info = snapshot
                     .tunnels
                     .iter()
                     .find(|tunnel| tunnel.id == id)
-                    .cloned()
-                    .ok_or_else(|| Error::new(ErrorKind::SessionGone))
+                    .ok_or_else(|| Error::new(ErrorKind::SessionGone))?;
+                if let TunnelState::Failed { error } = &info.state {
+                    backend.close_tunnel(id)?;
+                    state.sync_forwards();
+                    return Err(error.clone());
+                }
+                Ok(info.clone())
             },
         )
     }
@@ -125,7 +141,7 @@ impl WebState {
         endpoint: &ResolvedEndpoint,
         bind: Option<ForwardBind>,
     ) -> Result<Submission<TunnelInfo>> {
-        self.open_forward(
+        self.open_forward_with_endpoint(
             account,
             TunnelSpec {
                 account: outcome.account.clone(),
@@ -135,6 +151,7 @@ impl WebState {
                 remote_port: endpoint.remote_port,
                 health_path: endpoint.health.clone(),
             },
+            Some(endpoint.clone()),
         )
     }
 
@@ -162,7 +179,7 @@ impl WebState {
                 _ = shutdown.wait_for(|snapshot| snapshot.shutting_down) => return,
                 _ = timer.tick() => {}
             }
-            if !self.forward_updates().receivers.is_empty() {
+            if !self.snapshot().tunnels.is_empty() {
                 let state = self.clone();
                 let _ = spawn_blocking(move || state.sync_forwards()).await;
             }
@@ -180,8 +197,18 @@ impl WebState {
         self.sync_forward_updates(&mut self.forward_updates(), None);
     }
 
-    fn sync_forward_updates(&self, updates: &mut ForwardUpdates, first: Option<TunnelEvent>) {
-        let mut events: Vec<_> = first.into_iter().collect();
+    fn sync_forward_updates(
+        &self,
+        updates: &mut ForwardUpdates,
+        opened: Option<(TunnelId, Option<ResolvedEndpoint>)>,
+    ) {
+        let mut events = Vec::new();
+        if let Some((id, _)) = &opened {
+            events.push(TunnelEvent::State {
+                id: *id,
+                state: TunnelState::Starting,
+            });
+        }
         updates.receivers.retain(|_, received| {
             loop {
                 match received.try_recv() {
@@ -213,6 +240,12 @@ impl WebState {
             .receivers
             .retain(|id, _| tunnels.iter().any(|tunnel| tunnel.id == *id));
         self.update(|snapshot| {
+            if let Some((id, Some(endpoint))) = opened {
+                snapshot.forward_endpoints.insert(id, endpoint);
+            }
+            snapshot
+                .forward_endpoints
+                .retain(|id, _| tunnels.iter().any(|tunnel| tunnel.id == *id));
             for removed in snapshot
                 .tunnels
                 .iter()

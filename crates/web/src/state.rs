@@ -17,8 +17,9 @@ use colab_playground_core::{
         PluginRunOutcome, PluginRunSpec, RunTarget, RuntimeRef, RuntimesView,
     },
     host::ProbeReport,
+    plugins::ResolvedEndpoint,
     provision::{ProvisionEvent, ProvisionOutcome, ProvisionSpec},
-    tunnel::TunnelInfo,
+    tunnel::{TunnelId, TunnelInfo},
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -65,6 +66,8 @@ pub struct Snapshot {
     pub runtimes: Option<RuntimesView>,
     pub runtimes_error: Option<ErrorKind>,
     pub tunnels: Vec<TunnelInfo>,
+    #[serde(skip)]
+    forward_endpoints: BTreeMap<TunnelId, ResolvedEndpoint>,
     pub usage: Vec<AccountUsageView>,
     pub guard: Option<GuardReport>,
     pub guard_error: Option<ErrorKind>,
@@ -180,6 +183,7 @@ impl WebState {
             runtimes: None,
             runtimes_error: None,
             tunnels: Vec::new(),
+            forward_endpoints: BTreeMap::new(),
             usage: Vec::new(),
             guard: None,
             guard_error: None,
