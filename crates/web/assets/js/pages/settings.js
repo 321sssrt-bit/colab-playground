@@ -46,6 +46,7 @@ export function createSettingsPage() {
   let draft = null;
   let dirty = false;
   let editVersion = 0;
+  let mountGeneration = 0;
   let saving = false;
   let saveError = null;
   let saveStatus = null;
@@ -528,12 +529,14 @@ export function createSettingsPage() {
           saving = true;
           saveError = null;
           saveStatus = null;
+          const submittedMount = mountGeneration;
           const submittedVersion = editVersion;
           const payload = cloneDefaults(draft);
           updateDefaultsFooter();
           try {
             const updated = await patchSettings({ defaults: payload });
-            // Keep newer user edits made while the save request was in flight.
+            // Ignore responses from a prior page mount or superseded by newer user edits.
+            if (mountGeneration !== submittedMount) return;
             if (editVersion === submittedVersion) {
               draft = cloneDefaults(updated.defaults);
               dirty = false;
@@ -542,13 +545,15 @@ export function createSettingsPage() {
               renderDefaultsSection();
             }
           } catch (err) {
-            if (err && err.status === 401) return;
+            if (mountGeneration !== submittedMount || (err && err.status === 401)) return;
             const formatted = formatApiError(err?.payload);
             saveError = formatted.message || t("app.toast.save_failed.title");
             announce(saveError, "assertive");
           } finally {
-            saving = false;
-            updateDefaultsFooter();
+            if (mountGeneration === submittedMount) {
+              saving = false;
+              updateDefaultsFooter();
+            }
           }
         },
       },
@@ -747,7 +752,9 @@ export function createSettingsPage() {
 
   return {
     mount(container) {
+      mountGeneration += 1;
       root = container;
+      saving = false;
       clear(root);
       headerEl = el("header", { className: "page-header" });
       noticesEl = el("div", { className: "section-stack" });
@@ -801,6 +808,7 @@ export function createSettingsPage() {
       }
     },
     unmount() {
+      mountGeneration += 1;
       root = null;
       headerEl = null;
       noticesEl = null;
@@ -809,7 +817,7 @@ export function createSettingsPage() {
       aboutEl = null;
       draft = null;
       dirty = false;
-      editVersion = 0;
+      saving = false;
       saveError = null;
       saveStatus = null;
       copiedFeedback = false;

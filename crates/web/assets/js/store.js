@@ -9,6 +9,7 @@ const listeners = new Set();
 let sseController = null;
 let reconnectTimer = null;
 let sseGeneration = 0;
+let authGeneration = 0;
 let pendingLoginLanguage = null;
 let pendingLoginAppearance = null;
 
@@ -72,6 +73,7 @@ function stopSse() {
 }
 
 export function handleSessionLost({ expired = true } = {}) {
+  authGeneration += 1;
   stopSse();
   clearToken();
   state.authenticated = false;
@@ -102,6 +104,7 @@ setUnauthorizedHandler(() => {
 });
 
 export async function enterAuthenticatedSession() {
+  authGeneration += 1;
   state.authenticated = true;
   state.sessionExpired = false;
   state.connection = "connecting";
@@ -119,8 +122,10 @@ export async function enterAuthenticatedSession() {
 }
 
 export async function fetchInitialSnapshot() {
+  const gen = authGeneration;
   try {
     const snap = await apiRequest("/api/snapshot");
+    if (gen !== authGeneration || !state.authenticated) return;
     applySnapshot(snap);
   } catch {
     // 401 is handled globally; transient failure recovers via SSE loop.
@@ -187,6 +192,9 @@ async function startSseLoop() {
           return;
         }
       }
+      if (generation !== sseGeneration || !state.authenticated) {
+        return;
+      }
     }
 
     needsRecoverySnapshot = true;
@@ -205,6 +213,7 @@ async function startSseLoop() {
 
 export async function loadOverview({ silent = false } = {}) {
   if (!state.authenticated) return;
+  const gen = authGeneration;
   if (!silent) {
     state.overviewLoading = true;
     state.overviewError = null;
@@ -212,21 +221,26 @@ export async function loadOverview({ silent = false } = {}) {
   }
   try {
     const data = await apiRequest("/api/overview");
+    if (gen !== authGeneration || !state.authenticated) return;
     state.overview = data;
     state.overviewError = null;
   } catch (err) {
-    if (err && err.status === 401) return;
+    if (gen !== authGeneration || (err && err.status === 401)) return;
     state.overviewError = err?.payload || { error: {} };
   } finally {
-    state.overviewLoading = false;
-    emit("overview");
+    if (gen === authGeneration) {
+      state.overviewLoading = false;
+      emit("overview");
+    }
   }
 }
 
 export async function loadPlugins() {
   if (!state.authenticated) return;
+  const gen = authGeneration;
   try {
     const list = await apiRequest("/api/plugins");
+    if (gen !== authGeneration || !state.authenticated) return;
     if (Array.isArray(list)) {
       state.plugins = list;
       emit("plugins");
@@ -238,10 +252,12 @@ export async function loadPlugins() {
 
 export async function loadSettings({ applyPrefs = false } = {}) {
   if (!state.authenticated) return null;
+  const gen = authGeneration;
   state.settingsLoading = true;
   emit("settings");
   try {
     let data = await apiRequest("/api/settings");
+    if (gen !== authGeneration || !state.authenticated) return null;
     if (applyPrefs && data) {
       const loginLang = pendingLoginLanguage;
       const loginAppearance = pendingLoginAppearance;
@@ -257,8 +273,11 @@ export async function loadSettings({ applyPrefs = false } = {}) {
       }
       if (Object.keys(patch).length > 0) {
         try {
-          data = await apiRequest("/api/settings", { method: "PATCH", body: patch });
+          const patched = await apiRequest("/api/settings", { method: "PATCH", body: patch });
+          if (gen !== authGeneration || !state.authenticated) return null;
+          data = patched;
         } catch {
+          if (gen !== authGeneration || !state.authenticated) return null;
           data = { ...data, ...patch };
         }
       }
@@ -276,31 +295,41 @@ export async function loadSettings({ applyPrefs = false } = {}) {
   } catch {
     return null;
   } finally {
-    state.settingsLoading = false;
-    emit("settings");
+    if (gen === authGeneration) {
+      state.settingsLoading = false;
+      emit("settings");
+    }
   }
 }
 
 export async function patchSettings(patch) {
+  const gen = authGeneration;
   const data = await apiRequest("/api/settings", { method: "PATCH", body: patch });
-  state.settings = data;
-  emit("settings");
+  if (gen === authGeneration && state.authenticated) {
+    state.settings = data;
+    emit("settings");
+  }
   return data;
 }
 
 export async function loadUpdates() {
   if (!state.authenticated) return;
+  const gen = authGeneration;
   state.updatesLoading = true;
   state.updatesError = null;
   emit("updates");
   try {
-    state.updates = await apiRequest("/api/updates");
+    const data = await apiRequest("/api/updates");
+    if (gen !== authGeneration || !state.authenticated) return;
+    state.updates = data;
   } catch (err) {
-    if (err && err.status === 401) return;
+    if (gen !== authGeneration || (err && err.status === 401)) return;
     state.updatesError = err?.payload || { error: {} };
   } finally {
-    state.updatesLoading = false;
-    emit("updates");
+    if (gen === authGeneration) {
+      state.updatesLoading = false;
+      emit("updates");
+    }
   }
 }
 
