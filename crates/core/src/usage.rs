@@ -854,6 +854,29 @@ mod tests {
     }
 
     #[test]
+    fn a_rate_may_have_shown_while_a_runtime_went_and_the_rate_held() {
+        // The app starts while a CPU and two H100s run beside an unmanaged
+        // A100 (11.77): 12.11 each, more than the account burns once the
+        // H100s have stopped.
+        let mut a = RateAttribution::default();
+        a.observe(48.45, 4, &set(&["cpu", "h1", "h2"]));
+        a.observe(48.45, 4, &set(&["cpu", "h1", "h2"]));
+        a.observe(30.15, 3, &set(&["cpu", "h1"]));
+        a.observe(11.85, 2, &set(&["cpu"]));
+        // An A100 starts, and its rate shows as the unmanaged one goes.
+        a.observe(11.85, 3, &set(&["a100", "cpu"]));
+        a.observe(11.85, 2, &set(&["a100", "cpu"]));
+        assert_eq!(a.rate_of("a100"), None);
+        // The rise a reading after an H100 starts is its rate alone.
+        a.observe(11.85, 3, &set(&["a100", "cpu", "h"]));
+        a.observe(30.15, 3, &set(&["a100", "cpu", "h"]));
+        let share = a.rate_of("h");
+        a.observe(30.15, 3, &set(&["a100", "cpu", "h"]));
+        a.observe(18.38, 2, &set(&["cpu", "h"]));
+        assert_eq!(a.rate_of("h"), share);
+    }
+
+    #[test]
     fn an_empty_account_has_nothing_yet_to_show() {
         let mut a = RateAttribution::default();
         a.observe(0.0, 0, &set(&[]));
