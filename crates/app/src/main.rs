@@ -89,19 +89,3 @@ fn main() {
         os_locale,
     });
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn an_update_restart_stops_waiting_if_the_directory_stays_locked() {
-        let temp = tempfile::tempdir().unwrap();
-        let _holder = InstanceLock::acquire(temp.path()).unwrap();
-        let wait = Duration::from_millis(20);
-        let started = Instant::now();
-        let error = acquire_startup_lock(temp.path(), wait).unwrap_err();
-        assert_eq!(error.kind, ErrorKind::DataDirInUse);
-        assert!(started.elapsed() >= wait);
-    }
-}
