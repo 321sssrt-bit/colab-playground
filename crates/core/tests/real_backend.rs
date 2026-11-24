@@ -1083,7 +1083,12 @@ fn tunnel_reports_429_and_port_in_use() {
         };
         let log = f.state.join("ssh_calls.jsonl");
         let before = std::fs::metadata(&log).unwrap().len();
-        f.b.open_tunnel(spec, tx).unwrap();
+        let result = f.b.open_tunnel(spec, tx);
+        if bind == ForwardBind::AllInterfaces && !f.cfg.host.supports_all_interfaces_forward() {
+            assert_eq!(result.unwrap_err().kind, ErrorKind::Unsupported);
+            continue;
+        }
+        result.unwrap();
         match wait_for(&rx, 30, |e| {
             matches!(
                 e,
@@ -1131,7 +1136,12 @@ fn tunnel_bind_modes_reach_up_and_healthy_on_ipv4_loopback() {
         };
         assert_eq!(spec.local_url(), format!("http://127.0.0.1:{port}"));
         let (tx, rx) = channel();
-        let id = f.b.open_tunnel(spec, tx).unwrap();
+        let result = f.b.open_tunnel(spec, tx);
+        if bind == ForwardBind::AllInterfaces && !f.cfg.host.supports_all_interfaces_forward() {
+            assert_eq!(result.unwrap_err().kind, ErrorKind::Unsupported);
+            continue;
+        }
+        let id = result.unwrap();
         let event = wait_for(&rx, 15, |e| matches!(e, TunnelEvent::Health { .. }));
         assert_eq!(event, Some(TunnelEvent::Health { id, healthy: true }));
         let tunnel = &f.b.tunnels()[0];
