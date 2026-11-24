@@ -238,6 +238,10 @@ pub struct RateAttribution {
     /// holds what that runtime burned.
     #[serde(default)]
     lagging: bool,
+    /// An unmanaged runtime came and the account rate has yet to rise for
+    /// it, so the next change of the rate holds what that runtime burns too.
+    #[serde(default)]
+    unshown: bool,
 }
 
 impl RateAttribution {
@@ -314,10 +318,11 @@ impl RateAttribution {
             && unmanaged_steady
             && all_known
             && !self.lagging
+            && !self.unshown
             && fall > NO_RATE
         {
             self.settle(broken, owed + freed - fall);
-        } else if delta_share.is_some() && unmanaged_steady {
+        } else if delta_share.is_some() && unmanaged_steady && !self.unshown {
             // A start beside a stop in a split is measured against that
             // split's guess of what stopped, so it is only as good as the guess.
             self.regroup(started.iter().chain(&broken).cloned().collect(), owed);
@@ -333,6 +338,13 @@ impl RateAttribution {
             self.lagging = false;
         } else if went && !came && all_known {
             self.lagging = true;
+        }
+        let rose = fall < -NO_RATE;
+        if self.unmanaged.is_some_and(|before| unmanaged > before) {
+            // A rise as another one comes may be the earlier one's alone.
+            self.unshown |= !rose;
+        } else if rose || unmanaged == 0 {
+            self.unshown = false;
         }
         for name in started {
             self.rates.insert(name, delta_share);
@@ -737,6 +749,63 @@ mod tests {
         a.observe(11.40, 2, &set(&["l4a", "l4b"]));
         // The fall as an L4 stops holds what the T4 burned as well.
         a.observe(4.82, 1, &set(&["l4a"]));
+        assert_eq!(a.rate_of("l4a"), share);
+    }
+
+    #[test]
+    fn a_fall_short_by_an_unmanaged_runtime_yet_to_show_does_not_measure_a_split() {
+        let mut a = RateAttribution::default();
+        a.observe(0.0, 0, &set(&[]));
+        // An A100 (11.8) and an L4 (4.82) start together.
+        a.observe(16.62, 2, &set(&["a100", "l4"]));
+        let share = a.rate_of("l4");
+        // An unmanaged L4 starts; the account rate lags behind it.
+        a.observe(16.62, 3, &set(&["a100", "l4"]));
+        // The A100 stops as the unmanaged L4's rate shows: the fall is 6.98.
+        a.observe(9.64, 2, &set(&["l4"]));
+        assert_eq!(a.rate_of("l4"), share);
+    }
+
+    #[test]
+    fn a_stop_in_a_split_is_measured_once_an_unmanaged_runtime_has_shown() {
+        let mut a = RateAttribution::default();
+        a.observe(0.0, 0, &set(&[]));
+        a.observe(16.62, 2, &set(&["a100", "l4"]));
+        // An unmanaged L4 starts; the account rate lags behind it, then shows it.
+        a.observe(16.62, 3, &set(&["a100", "l4"]));
+        a.observe(21.44, 3, &set(&["a100", "l4"]));
+        a.observe(9.64, 2, &set(&["l4"]));
+        assert!((a.rate_of("l4").unwrap() - 4.82).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_rise_as_another_unmanaged_runtime_starts_leaves_that_one_yet_to_show() {
+        // The app starts while two T4s (1.76 each) run.
+        let mut a = RateAttribution::default();
+        a.observe(3.52, 2, &set(&["t4a", "t4b"]));
+        let share = a.rate_of("t4b");
+        // An unmanaged H100 (18.3) starts; the account rate lags behind it.
+        a.observe(3.52, 3, &set(&["t4a", "t4b"]));
+        // Its rate shows as an unmanaged CPU (0.08) starts, which lags too.
+        a.observe(21.82, 4, &set(&["t4a", "t4b"]));
+        // A T4 stops as the CPU's rate shows: the fall is 1.68.
+        a.observe(20.14, 3, &set(&["t4b"]));
+        assert_eq!(a.rate_of("t4b"), share);
+    }
+
+    #[test]
+    fn starts_measured_as_an_unmanaged_runtime_shows_are_not_a_split() {
+        // An unmanaged CPU (0.08) runs; an unmanaged T4 (1.76) starts and the
+        // account rate lags behind it.
+        let mut a = RateAttribution::default();
+        a.observe(0.08, 1, &set(&[]));
+        a.observe(0.08, 2, &set(&[]));
+        // Two L4s (4.82 each) start as the T4's rate shows: 5.70 each.
+        a.observe(11.48, 4, &set(&["l4a", "l4b"]));
+        let share = a.rate_of("l4a");
+        // The rise held the T4, so the fall as an L4 stops does not tell
+        // what the other burns.
+        a.observe(6.66, 3, &set(&["l4a"]));
         assert_eq!(a.rate_of("l4a"), share);
     }
 
