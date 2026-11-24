@@ -1,5 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::{
+    path::Path,
+    thread,
+    time::{Duration, Instant},
+};
+
 use colab_playground::{
     app,
     backend::{BACKEND_ENV, BackendSource, source_from_args, usage},
@@ -7,12 +13,33 @@ use colab_playground::{
     settings::{CONFIG_DIR_ENV, SettingsStore, config_dir},
     state::StateOptions,
 };
-use colab_playground_core::{Error, ErrorKind, InstanceLock, paths::default_local_data_dir};
+use colab_playground_core::{
+    Error, ErrorKind, InstanceLock, paths::default_local_data_dir, updater::RESTART_ENV,
+};
 use colab_playground_shared::{
     errors,
     i18n::{fill_lenient, resolve, template},
     settings::LanguagePref,
 };
+
+const RESTART_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
+const RESTART_LOCK_RETRY: Duration = Duration::from_millis(100);
+
+fn acquire_startup_lock(dir: &Path, wait: Duration) -> colab_playground_core::Result<InstanceLock> {
+    let deadline = Instant::now() + wait;
+    loop {
+        let lock = InstanceLock::acquire(dir);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero()
+            || !lock
+                .as_ref()
+                .is_err_and(|error| error.is(ErrorKind::DataDirInUse))
+        {
+            return lock;
+        }
+        thread::sleep(remaining.min(RESTART_LOCK_RETRY));
+    }
+}
 
 fn main() {
     env_logger::Builder::from_env(
@@ -31,12 +58,19 @@ fn main() {
     };
     let store = SettingsStore::new(config_dir(std::env::var_os(CONFIG_DIR_ENV)));
     let os_locale = platform::os_locale();
+    // The updater starts its replacement before the old process quits.
+    let lock_wait = if std::env::var(RESTART_ENV).is_ok_and(|value| value == "1") {
+        RESTART_LOCK_TIMEOUT
+    } else {
+        Duration::ZERO
+    };
+    let acquire = |dir: &Path| acquire_startup_lock(dir, lock_wait);
     let lock = match &source {
         BackendSource::Real => default_local_data_dir()
             .ok_or_else(|| Error::new(ErrorKind::Io).detail("no data directory"))
-            .and_then(|dir| InstanceLock::acquire(&dir))
+            .and_then(|dir| acquire(&dir))
             .map(Some),
-        BackendSource::Mock(_) => store.dir().map(InstanceLock::acquire).transpose(),
+        BackendSource::Mock(_) => store.dir().map(acquire).transpose(),
     };
     let _instance_lock = match lock {
         Ok(lock) => lock,
@@ -54,4 +88,20 @@ fn main() {
         store,
         os_locale,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_update_restart_stops_waiting_if_the_directory_stays_locked() {
+        let temp = tempfile::tempdir().unwrap();
+        let _holder = InstanceLock::acquire(temp.path()).unwrap();
+        let wait = Duration::from_millis(20);
+        let started = Instant::now();
+        let error = acquire_startup_lock(temp.path(), wait).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::DataDirInUse);
+        assert!(started.elapsed() >= wait);
+    }
 }

@@ -508,13 +508,19 @@ impl Host {
     /// Starts `program` on the local machine and leaves it running on its own: nothing is
     /// piped, nothing waits for it and nothing kills it, so it outlives this process. Only
     /// valid for [`Host::Local`]; used to start the app again after an update.
-    pub fn launch_detached(&self, program: &std::path::Path, args: &[String]) -> Result<()> {
+    pub fn launch_detached(
+        &self,
+        program: &std::path::Path,
+        args: &[String],
+        env: &[(&str, &str)],
+    ) -> Result<()> {
         if *self != Host::Local {
             return Err(Error::new(ErrorKind::Unsupported)
                 .detail("launch_detached runs on the local machine only"));
         }
         let mut cmd = Command::new(program);
         cmd.args(args)
+            .envs(env.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());

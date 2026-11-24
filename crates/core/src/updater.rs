@@ -26,6 +26,9 @@ use crate::host::{Host, tail};
 use crate::http::HttpClient;
 use crate::update::{Release, Version};
 
+/// Passed to the replacement process so it can wait for its predecessor to exit.
+pub const RESTART_ENV: &str = "COLAB_PLAYGROUND_UPDATE_RESTART";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case")]
 pub enum UpdateProgress {
@@ -271,7 +274,12 @@ impl Update<'_> {
             // Through Launch Services, as a new instance: `open` would otherwise bring the
             // running (old) one to the front.
             Install::Bundle { app } => {
-                let mut args = vec!["-n".to_owned(), app.display().to_string()];
+                let mut args = vec![
+                    "-n".to_owned(),
+                    "--env".to_owned(),
+                    format!("{RESTART_ENV}=1"),
+                    app.display().to_string(),
+                ];
                 if !self.args.is_empty() {
                     args.push("--args".to_owned());
                     args.extend(self.args.iter().cloned());
@@ -486,7 +494,14 @@ mod tests {
                     assert_eq!(relaunch.program, Path::new("/usr/bin/open"));
                     assert_eq!(
                         relaunch.args,
-                        ["-n", &app.display().to_string(), "--args", "--real"]
+                        [
+                            "-n",
+                            "--env",
+                            &format!("{RESTART_ENV}=1"),
+                            &app.display().to_string(),
+                            "--args",
+                            "--real",
+                        ]
                     );
                 }
             }

@@ -143,7 +143,6 @@ impl ErrorKind {
             | K::ConnectionLost
             | K::ExecTimeout
             | K::Busy
-            | K::DataDirInUse
             | K::Timeout
             | K::RateLimited => NextStep::RetryLater,
             K::SshBusy => NextStep::CloseOtherConnection,
@@ -163,9 +162,11 @@ impl ErrorKind {
             }
             // For the update kinds another attempt would fetch the same files; the app offers
             // what is left itself.
-            K::PluginExists | K::Cancelled | K::UpdateUnverified | K::UpdateUnavailable => {
-                NextStep::None
-            }
+            K::PluginExists
+            | K::Cancelled
+            | K::UpdateUnverified
+            | K::UpdateUnavailable
+            | K::DataDirInUse => NextStep::None,
             K::Unsupported | K::CommandTooLong | K::Parse | K::Io | K::Other => {
                 NextStep::ReportProblem
             }
