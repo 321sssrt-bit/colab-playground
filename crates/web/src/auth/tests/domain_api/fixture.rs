@@ -13,11 +13,14 @@ use colab_playground_core::{
     tunnel::{TunnelEvent, TunnelId, TunnelInfo, TunnelSpec},
 };
 
-use super::{MockBackend, Path, json};
+use serde_json::json;
+
+use super::{MockBackend, Path};
 
 pub(super) struct Fixtures {
     pub mock: MockBackend,
     pub checkout: PathBuf,
+    pub stop_failure: Option<&'static str>,
 }
 
 macro_rules! delegate {
@@ -49,7 +52,6 @@ impl Backend for Fixtures {
         fn runtimes(cancel: &CancelToken) -> Result<RuntimesView>;
         fn new_session_name(prefix: Option<&str>) -> String;
         fn provision(spec: ProvisionSpec, events: Events<ProvisionEvent>, cancel: &CancelToken) -> Result<ProvisionOutcome>;
-        fn stop_session(target: &RuntimeRef, options: StopOptions, cancel: &CancelToken) -> Result<()>;
         fn extend_session(target: &RuntimeRef, by: std::time::Duration, cancel: &CancelToken) -> Result<Extension>;
         fn set_auto_stop(target: &RuntimeRef, runtime: std::time::Duration, cancel: &CancelToken) -> Result<WatchdogInfo>;
         fn cancel_auto_stop(target: &RuntimeRef, cancel: &CancelToken) -> Result<()>;
@@ -69,6 +71,23 @@ impl Backend for Fixtures {
         fn delete_secret(name: &str, cancel: &CancelToken) -> Result<()>;
         fn hf_search(query: &str, limit: u32, cancel: &CancelToken) -> Result<Vec<HfModel>>;
         fn hf_files(repo: &str, cancel: &CancelToken) -> Result<GgufListing>;
+    }
+
+    fn stop_session(
+        &self,
+        target: &RuntimeRef,
+        options: StopOptions,
+        cancel: &CancelToken,
+    ) -> Result<()> {
+        if self
+            .stop_failure
+            .is_some_and(|name| target.name.as_deref() == Some(name))
+        {
+            return Err(colab_playground_core::Error::new(
+                colab_playground_core::ErrorKind::Http,
+            ));
+        }
+        self.mock.stop_session(target, options, cancel)
     }
 
     fn inspect_plugin_git(&self, url: &str, cancel: &CancelToken) -> Result<PluginPreview> {

@@ -1,4 +1,8 @@
 pub(super) const MESSAGES: colab_playground_shared::i18n::Messages = &[
+    (
+        super::PROVISION_NOT_FOUND,
+        "This session creation is no longer in progress or available to view.",
+    ),
     ("confirm.hold", "Press again to confirm"),
     ("confirm.twice", "Click again to confirm"),
     ("copy.button", "Copy"),

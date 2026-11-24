@@ -3,6 +3,7 @@ mod forwards;
 mod login;
 pub mod plugins;
 mod polling;
+pub mod sessions;
 mod shutdown;
 
 use std::{
@@ -95,6 +96,7 @@ pub struct Snapshot {
 #[derive(Debug, Clone)]
 pub enum Access {
     Independent,
+    Runtime,
     HostWrite,
     Account(AccountContext),
     AccountWrite(AccountContext),
@@ -114,6 +116,7 @@ struct Inner {
     forward_policy: ForwardPolicy,
     forwards: Mutex<forwards::ForwardUpdates>,
     plugins: plugins::Plugins,
+    provisions: sessions::Provisions,
 }
 
 #[derive(Default)]
@@ -159,9 +162,7 @@ impl Drop for Job {
         if running.operation.is_some() {
             self.state.0.refresh.notify_one();
         }
-        if control.running.is_empty() {
-            self.state.0.drained.notify_one();
-        }
+        self.state.0.drained.notify_waiters();
     }
 }
 
@@ -220,6 +221,7 @@ impl WebState {
             forward_policy,
             forwards: Mutex::default(),
             plugins: plugins::Plugins::default(),
+            provisions: Mutex::default(),
         }));
         tokio::spawn(state.clone().poll());
         tokio::spawn(state.clone().poll_forwards());
@@ -402,7 +404,7 @@ impl WebState {
             return Err(Error::cancelled());
         }
         let expected = match &access {
-            Access::Independent | Access::HostWrite => None,
+            Access::Independent | Access::HostWrite | Access::Runtime => None,
             Access::Account(account) | Access::AccountWrite(account) => Some(account),
         };
         if let Some(expected) = expected {
@@ -417,7 +419,7 @@ impl WebState {
         }
         let slot = match access {
             Access::Independent => Slot::Independent,
-            Access::Account(_) => Slot::Shared,
+            Access::Account(_) | Access::Runtime => Slot::Shared,
             Access::AccountWrite(_) | Access::HostWrite => Slot::Exclusive,
         };
         // Core's failed-allocation cleanup can reap any newly seen unnamed VM.

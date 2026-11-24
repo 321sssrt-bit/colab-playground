@@ -1,5 +1,3 @@
-mod fixture;
-
 use colab_playground_core::{
     CancelToken,
     backend::RunTarget,
@@ -7,7 +5,7 @@ use colab_playground_core::{
 };
 use serde_json::json;
 
-use self::fixture::Fixtures;
+use super::fixture::Fixtures;
 use super::*;
 
 const PLUGINS: &str = "/api/plugins";
@@ -370,6 +368,7 @@ async fn git_fixture_runs_on_existing_session_with_redacted_replay_and_loopback_
     let backend = Arc::new(Fixtures {
         mock: MockBackend::new(config),
         checkout: checkout.path().into(),
+        stop_failure: None,
     });
     let store = SettingsStore::new(Some(data.path().into()));
     let settings = WebSettings::load(store.clone());

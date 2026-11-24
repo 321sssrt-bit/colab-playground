@@ -1,4 +1,8 @@
 pub(super) const MESSAGES: colab_playground_shared::i18n::Messages = &[
+    (
+        super::PROVISION_NOT_FOUND,
+        "세션 생성이 끝났거나 기록을 찾을 수 없습니다.",
+    ),
     ("confirm.hold", "확인하려면 한 번 더 누르십시오"),
     ("confirm.twice", "확인하려면 한 번 더 클릭하십시오"),
     ("copy.button", "복사"),

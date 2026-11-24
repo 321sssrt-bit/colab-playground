@@ -1,6 +1,8 @@
 mod accounts;
+mod fixture;
 mod forwards;
 mod plugins;
+mod sessions;
 
 use std::{
     fs,

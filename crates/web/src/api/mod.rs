@@ -2,6 +2,7 @@ mod accounts;
 mod forwards;
 mod overview;
 mod plugins;
+mod sessions;
 mod settings;
 mod updates;
 
@@ -39,6 +40,7 @@ pub(crate) fn routes() -> Router<StateData> {
         .route("/api/i18n/{locale}", get(dictionary))
         .merge(accounts::routes())
         .merge(plugins::routes())
+        .merge(sessions::routes())
 }
 
 async fn dictionary(Path(locale): Path<String>) -> Result<Json<i18n::Messages>, ApiError> {

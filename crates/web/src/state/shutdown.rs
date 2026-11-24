@@ -27,6 +27,7 @@ impl WebState {
             running.cancel.cancel();
         }
         self.publish_operations(&control);
+        self.0.drained.notify_waiters();
     }
 
     pub async fn shutdown(&self, grace: Duration) -> ShutdownReport {
@@ -34,8 +35,12 @@ impl WebState {
         let deadline = Instant::now() + grace;
         let drain_deadline = deadline - FORWARD_CLEANUP_RESERVE.min(grace / 4);
         let drained = timeout_at(drain_deadline, async {
-            while !self.lock().running.is_empty() {
-                self.0.drained.notified().await;
+            loop {
+                let changed = self.0.drained.notified();
+                if self.lock().running.is_empty() {
+                    break;
+                }
+                changed.await;
             }
         })
         .await
