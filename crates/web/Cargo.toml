@@ -1,0 +1,33 @@
+[package]
+name = "colab-playground-web"
+description.workspace = true
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+base64 = "0.22"
+colab-playground-core = { path = "../core" }
+colab-playground-shared = { path = "../shared" }
+futures-util = { version = "0.3", default-features = false }
+getrandom = "0.4"
+mime = "0.3"
+notify = "8"
+serde = { version = "1", features = ["derive"] }
+sha2 = { version = "0.11", default-features = false }
+subtle = "2"
+tempfile = "3"
+tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "sync", "time"] }
+url = "2"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+serde_json = "1"
+ureq = { version = "3", default-features = false }
