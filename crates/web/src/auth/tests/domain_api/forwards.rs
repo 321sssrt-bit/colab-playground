@@ -1,4 +1,4 @@
-use std::net::{Ipv4Addr, TcpListener};
+use std::net::Ipv4Addr;
 
 use colab_playground_core::{
     Host,
@@ -15,14 +15,6 @@ const FORWARDS: &str = "/api/forwards";
 const FIRST_HOST: &str = "first.example.test";
 const SECOND_HOST: &str = "second.example.test";
 const NAMED_SESSION: &str = "a100-7f3a";
-
-fn free_port() -> u16 {
-    TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 fn form(client: &Client) -> Value {
     let account_context = client.get("/api/snapshot")["account"].clone();
@@ -96,26 +88,6 @@ fn live_events(client: &Client) -> BufReader<impl Read + use<>> {
     let mut reader = BufReader::new(response.into_body().into_reader());
     assert_eq!(next_event(&mut reader).0, "snapshot");
     reader
-}
-
-fn next_event(reader: &mut impl BufRead) -> (String, Value) {
-    let mut name = String::new();
-    let mut data = None;
-    loop {
-        let mut line = String::new();
-        assert_ne!(reader.read_line(&mut line).unwrap(), 0, "SSE ended");
-        if let Some(value) = line.trim_end().strip_prefix("event: ") {
-            name = value.into();
-        }
-        if let Some(value) = line.trim_end().strip_prefix("data: ") {
-            data = Some(serde_json::from_str(value).unwrap());
-        }
-        if line.trim_end().is_empty()
-            && let Some(value) = data.take()
-        {
-            return (name, value);
-        }
-    }
 }
 
 fn next_forward(reader: &mut impl BufRead, id: &Value) -> Value {

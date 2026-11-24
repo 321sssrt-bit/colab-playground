@@ -50,6 +50,7 @@ pub(super) const MESSAGES: colab_playground_shared::i18n::Messages = &[
         "请检查请求字段，并发送有效的 JSON 请求。",
     ),
     (super::LOCALE_NOT_FOUND, "请选择五种受支持的语言之一。"),
+    (super::PLUGIN_RUN_NOT_FOUND, "此插件运行记录已不可用。"),
     (
         super::INSTALL_NOT_RUNNING,
         "Colab CLI 安装已结束或尚未启动。",

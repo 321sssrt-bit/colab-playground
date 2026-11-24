@@ -10,10 +10,10 @@ use colab_playground_core::{
     tunnel::{ForwardBind, TunnelId, TunnelInfo, TunnelSpec},
 };
 use colab_playground_shared::i18n::keys;
-use colab_playground_web::state::{AccountContext, Submission};
+use colab_playground_web::state::AccountContext;
 use serde::{Deserialize, Serialize, de::IgnoredAny};
 
-use super::ApiError;
+use super::{ApiError, finish};
 use crate::{
     http::{RequestHost, StateData, is_loopback_host},
     i18n,
@@ -100,7 +100,11 @@ pub(super) struct ForwardView {
 }
 
 impl ForwardView {
-    fn new(info: TunnelInfo, host: &RequestHost, endpoint: Option<&ResolvedEndpoint>) -> Self {
+    pub(super) fn new(
+        info: TunnelInfo,
+        host: &RequestHost,
+        endpoint: Option<&ResolvedEndpoint>,
+    ) -> Self {
         Self {
             addresses: ForwardAddresses::for_request(host, &info.spec, endpoint),
             info,
@@ -158,13 +162,6 @@ pub(super) async fn close(
         billing_continues: true,
         notice_key: keys::FORWARD_CLOSED_BILLING,
     }))
-}
-
-async fn finish<T>(submission: Submission<T>) -> Result<T, ApiError> {
-    match submission {
-        Submission::Started { job, .. } => Ok(job.await??),
-        Submission::AlreadyRunning { id } => Err(ApiError::busy(id)),
-    }
 }
 
 #[cfg(test)]

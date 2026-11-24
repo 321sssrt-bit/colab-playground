@@ -1,7 +1,7 @@
 use std::sync::mpsc;
 
 use colab_playground_core::{
-    backend::Backend,
+    backend::{Backend, RunTarget},
     mock::{MockBackend, MockConfig, MockScenario},
     plugins::InputValue,
     provision::ProvisionEvent,

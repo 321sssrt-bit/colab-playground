@@ -104,33 +104,41 @@ impl WebState {
             "open_forward",
             key,
             Access::Account(account),
-            move |backend, cancel| {
-                cancel.check()?;
-                let (events, received) = channel();
-                let id = backend.open_tunnel(spec, events)?;
-                if cancel.is_cancelled() {
-                    let _ = backend.close_tunnel(id);
-                    return Err(Error::cancelled());
-                }
-                let snapshot = {
-                    let mut updates = state.forward_updates();
-                    updates.receivers.insert(id, received);
-                    state.sync_forward_updates(&mut updates, Some((id, endpoint)));
-                    state.snapshot()
-                };
-                let info = snapshot
-                    .tunnels
-                    .iter()
-                    .find(|tunnel| tunnel.id == id)
-                    .ok_or_else(|| Error::new(ErrorKind::SessionGone))?;
-                if let TunnelState::Failed { error } = &info.state {
-                    backend.close_tunnel(id)?;
-                    state.sync_forwards();
-                    return Err(error.clone());
-                }
-                Ok(info.clone())
-            },
+            move |backend, cancel| state.open_tunnel(spec, endpoint, backend, cancel),
         )
+    }
+
+    pub(super) fn open_tunnel(
+        &self,
+        spec: TunnelSpec,
+        endpoint: Option<ResolvedEndpoint>,
+        backend: &dyn Backend,
+        cancel: &CancelToken,
+    ) -> Result<TunnelInfo> {
+        cancel.check()?;
+        let (events, received) = channel();
+        let id = backend.open_tunnel(spec, events)?;
+        if cancel.is_cancelled() {
+            let _ = backend.close_tunnel(id);
+            return Err(Error::cancelled());
+        }
+        let snapshot = {
+            let mut updates = self.forward_updates();
+            updates.receivers.insert(id, received);
+            self.sync_forward_updates(&mut updates, Some((id, endpoint)));
+            self.snapshot()
+        };
+        let info = snapshot
+            .tunnels
+            .iter()
+            .find(|tunnel| tunnel.id == id)
+            .ok_or_else(|| Error::new(ErrorKind::SessionGone))?;
+        if let TunnelState::Failed { error } = &info.state {
+            backend.close_tunnel(id)?;
+            self.sync_forwards();
+            return Err(error.clone());
+        }
+        Ok(info.clone())
     }
 
     /// Call after a successful Plugin run, with the account context used to start it.
@@ -143,14 +151,7 @@ impl WebState {
     ) -> Result<Submission<TunnelInfo>> {
         self.open_forward_with_endpoint(
             account,
-            TunnelSpec {
-                account: outcome.account.clone(),
-                session: outcome.session.clone(),
-                bind: bind.unwrap_or_default(),
-                local_port: endpoint.remote_port,
-                remote_port: endpoint.remote_port,
-                health_path: endpoint.health.clone(),
-            },
+            plugin_tunnel_spec(outcome, endpoint, bind.unwrap_or_default()),
             Some(endpoint.clone()),
         )
     }
@@ -263,6 +264,21 @@ impl WebState {
         for event in events {
             let _ = updates.events.send(event);
         }
+    }
+}
+
+pub(super) fn plugin_tunnel_spec(
+    outcome: &PluginRunOutcome,
+    endpoint: &ResolvedEndpoint,
+    bind: ForwardBind,
+) -> TunnelSpec {
+    TunnelSpec {
+        account: outcome.account.clone(),
+        session: outcome.session.clone(),
+        bind,
+        local_port: endpoint.remote_port,
+        remote_port: endpoint.remote_port,
+        health_path: endpoint.health.clone(),
     }
 }
 

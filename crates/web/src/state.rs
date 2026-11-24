@@ -1,5 +1,6 @@
 mod forwards;
 mod login;
+pub mod plugins;
 mod polling;
 mod shutdown;
 
@@ -14,7 +15,7 @@ use colab_playground_core::{
     accounts::{AccountId, AccountsView},
     backend::{
         AccountUsageView, Backend, BackendKind, Events, GuardReport, PluginRunEvent,
-        PluginRunOutcome, PluginRunSpec, RunTarget, RuntimeRef, RuntimesView,
+        PluginRunOutcome, PluginRunSpec, RuntimeRef, RuntimesView,
     },
     host::ProbeReport,
     plugins::ResolvedEndpoint,
@@ -97,6 +98,7 @@ struct Inner {
     login_inactivity: Duration,
     forward_policy: ForwardPolicy,
     forwards: Mutex<forwards::ForwardUpdates>,
+    plugins: plugins::Plugins,
 }
 
 #[derive(Default)]
@@ -201,6 +203,7 @@ impl WebState {
             login_inactivity,
             forward_policy,
             forwards: Mutex::default(),
+            plugins: plugins::Plugins::default(),
         }));
         tokio::spawn(state.clone().poll());
         tokio::spawn(state.clone().poll_forwards());
@@ -293,7 +296,7 @@ impl WebState {
             Access::Account(account),
             true,
             move |_, backend, cancel| {
-                run_allocation(backend, cancel, &active, &session, || {
+                run_allocation(backend, cancel, &active, &session, false, || {
                     backend.provision(spec, events, cancel)
                 })
             },
@@ -307,43 +310,12 @@ impl WebState {
         existing: Option<RuntimeRef>,
         events: Events<PluginRunEvent>,
     ) -> Result<Submission<PluginRunOutcome>> {
-        let active = required_account(&account)?;
-        let (session, allocating) = match (&spec.target, &existing) {
-            (RunTarget::Existing { name }, Some(target))
-                if target.account == active && target.name.as_ref() == Some(name) =>
-            {
-                (name.clone(), false)
-            }
-            (RunTarget::Provision(provision), None) => {
-                provision.validate()?;
-                (provision.name.clone(), true)
-            }
-            _ => {
-                return Err(Error::invalid(
-                    "target",
-                    "runtime precondition does not match",
-                ));
-            }
-        };
-        self.start_job(
-            Operation::PluginRun {
-                plugin: spec.plugin.clone(),
-                session: session.clone(),
-            },
-            Access::Account(account),
-            allocating,
-            move |_, backend, cancel| {
-                let run = || backend.run_plugin(spec, events, cancel);
-                if let Some(target) = existing {
-                    let view = list_account(backend, cancel, &target.account)?;
-                    if !view.runtimes.iter().any(|runtime| runtime.id == target) {
-                        return Err(Error::new(ErrorKind::SessionGone));
-                    }
-                    run()
-                } else {
-                    run_allocation(backend, cancel, &active, &session, run)
-                }
-            },
+        self.start_plugin_job(
+            account,
+            spec,
+            existing,
+            move |backend, spec, cancel| backend.run_plugin(spec, events, cancel),
+            |_, _, outcome| Ok(outcome),
         )
     }
 
@@ -619,6 +591,7 @@ fn run_allocation<T>(
     cancel: &CancelToken,
     account: &AccountId,
     session: &str,
+    stop_on_failure: bool,
     work: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
     let find = |token| -> Result<Option<RuntimeRef>> {
@@ -638,7 +611,7 @@ fn run_allocation<T>(
     // A cancel can win after core returns success, and plugin cleanup may fail to stop its VM.
     let needs_cleanup = match &result {
         Ok(_) => cancel.commit().is_err(),
-        Err(error) => cancel.is_cancelled() || error.is(ErrorKind::Cancelled),
+        Err(error) => stop_on_failure || cancel.is_cancelled() || error.is(ErrorKind::Cancelled),
     };
     if needs_cleanup {
         let token = CancelToken::new();

@@ -44,6 +44,7 @@ impl WebState {
         let state = self.clone();
         let pending = self.lock().login.take();
         let cleanup = spawn_blocking(move || {
+            state.discard_plugin_previews();
             let backend = &*state.0.backend;
             let mut closed = 0;
             let mut failed = false;

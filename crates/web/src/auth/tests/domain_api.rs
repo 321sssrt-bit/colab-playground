@@ -1,4 +1,5 @@
 mod forwards;
+mod plugins;
 
 use std::{
     fs,
@@ -110,6 +111,18 @@ async fn exercise_with_policy(
     let settings = WebSettings::load(store.clone());
     config.defaults = settings.initial_settings().defaults;
     let backend = Arc::new(MockBackend::new(config));
+    exercise_backend(dir, store, settings, backend, policy, trusted, run).await;
+}
+
+async fn exercise_backend<B: Backend + 'static>(
+    dir: &Path,
+    store: SettingsStore,
+    settings: WebSettings,
+    backend: Arc<B>,
+    policy: Option<ForwardPolicy>,
+    trusted: Vec<TrustedHost>,
+    run: impl FnOnce(Client, Arc<B>, SettingsStore) + Send + 'static,
+) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let policy = policy.unwrap_or_else(|| crate::platform::forward_policy(addr));
@@ -185,6 +198,34 @@ async fn exercise_with_policy(
     server.abort();
     web.shutdown(TIMEOUT).await;
     result.unwrap();
+}
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+fn next_event(reader: &mut impl BufRead) -> (String, Value) {
+    let mut name = String::new();
+    let mut data = None;
+    loop {
+        let mut line = String::new();
+        assert_ne!(reader.read_line(&mut line).unwrap(), 0, "SSE ended");
+        if let Some(value) = line.trim_end().strip_prefix("event: ") {
+            name = value.into();
+        }
+        if let Some(value) = line.trim_end().strip_prefix("data: ") {
+            data = Some(serde_json::from_str(value).unwrap());
+        }
+        if line.trim_end().is_empty()
+            && let Some(value) = data.take()
+        {
+            return (name, value);
+        }
+    }
 }
 
 fn event(reader: &mut impl BufRead, expected: &str) -> Value {
