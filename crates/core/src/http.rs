@@ -1,7 +1,7 @@
 //! HTTP access, behind a trait so tests and the mock never touch the network.
 
 use std::io::{Read, Write};
-use std::net::{Ipv6Addr, SocketAddr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -151,7 +151,7 @@ pub fn local_http_status(port: u16, path: &str, timeout: Duration) -> Result<u16
             "health path must start with '/' and contain no spaces",
         ));
     }
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let mut stream = TcpStream::connect_timeout(&addr, timeout)?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
@@ -172,7 +172,7 @@ pub fn local_http_status(port: u16, path: &str, timeout: Duration) -> Result<u16
 }
 
 pub fn local_port_open(port: u16, timeout: Duration) -> bool {
-    TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], port)), timeout).is_ok()
+    TcpStream::connect_timeout(&SocketAddr::from((Ipv4Addr::LOCALHOST, port)), timeout).is_ok()
 }
 
 fn addr_bound(addr: SocketAddr) -> bool {
@@ -188,16 +188,19 @@ fn addr_bound(addr: SocketAddr) -> bool {
     }
 }
 
-/// A forward is opened as `http://localhost:<port>`, and `localhost` can resolve to `[::1]`,
-/// where another program may be listening while `127.0.0.1:<port>` is still free to bind.
-/// A bind also finds a socket that is bound but not accepting. On Windows it does not collide
-/// with a listener on the wildcard address, so the connects stay.
+/// Checks whether a loopback forward's port is available to local clients.
+pub fn local_port_in_use(port: u16, timeout: Duration) -> bool {
+    forward_port_in_use(Ipv4Addr::LOCALHOST, port, timeout)
+}
+
+/// Preserve the IPv6 loopback conflict check for desktop clients using `localhost`.
+/// Bind probes find sockets that aren't accepting and check the full IPv4 listen scope.
 ///
 /// The connects come first. A bind test opens a listening socket, and a child process that
 /// another thread starts at that moment holds a copy of it until its `exec`: a connect made
 /// after the bind test would reach that copy and report a free port as taken.
-pub fn local_port_in_use(port: u16, timeout: Duration) -> bool {
-    let v4 = SocketAddr::from(([127, 0, 0, 1], port));
+pub(crate) fn forward_port_in_use(listen_ip: Ipv4Addr, port: u16, timeout: Duration) -> bool {
+    let v4 = SocketAddr::from((listen_ip, port));
     let v6 = SocketAddr::from((Ipv6Addr::LOCALHOST, port));
     local_port_open(port, timeout)
         || TcpStream::connect_timeout(&v6, timeout.min(Duration::from_millis(150))).is_ok()
@@ -289,5 +292,17 @@ mod tests {
             assert!(local_port_in_use(v6_port, Duration::from_millis(200)));
             drop(v6);
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn wildcard_preflight_checks_addresses_outside_the_probe_address() {
+        let Ok(listener) = TcpListener::bind("127.0.0.2:0") else {
+            return;
+        };
+        let port = listener.local_addr().unwrap().port();
+        let timeout = Duration::from_millis(200);
+        assert!(!local_port_in_use(port, timeout));
+        assert!(forward_port_in_use(Ipv4Addr::UNSPECIFIED, port, timeout));
     }
 }

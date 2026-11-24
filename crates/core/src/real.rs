@@ -1816,6 +1816,7 @@ impl Backend for RealBackend {
     }
 
     fn open_tunnel(&self, spec: TunnelSpec, events: Events<TunnelEvent>) -> Result<TunnelId> {
+        spec.bind.validate_for(&self.inner.cfg.host)?;
         let cancel = CancelToken::new();
         let (_g, cli, state) = self.inner.cli_for(&spec.account, &cancel)?;
         let ctx = TunnelCtx {

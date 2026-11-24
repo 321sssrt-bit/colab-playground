@@ -510,6 +510,7 @@ impl AppState {
                 run.status = Some(outcome.status.clone());
                 for endpoint in &outcome.endpoints {
                     forwards.push(TunnelSpec {
+                        bind: Default::default(),
                         account: outcome.account.clone(),
                         session: outcome.session.clone(),
                         local_port: endpoint.remote_port,

@@ -40,6 +40,7 @@ pub struct ForwardForm {
 impl ForwardForm {
     pub fn spec(&self, health: Option<String>) -> TunnelSpec {
         TunnelSpec {
+            bind: Default::default(),
             account: self.target.account.clone(),
             session: self.session.clone(),
             local_port: self.local,

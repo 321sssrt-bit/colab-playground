@@ -359,6 +359,7 @@ pub trait Backend: Send + Sync {
 
     // ---- tunnels
     /// Opens a port forward (the session's account must be active).
+    /// All-interface binding is available only on hosts that can listen directly on their LAN.
     fn open_tunnel(&self, spec: TunnelSpec, events: Events<TunnelEvent>) -> Result<TunnelId>;
     /// Closes a tunnel (billing continues).
     fn close_tunnel(&self, id: TunnelId) -> Result<()>;

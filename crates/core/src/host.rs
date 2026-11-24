@@ -365,6 +365,21 @@ impl Host {
         }
     }
 
+    /// Whether a Forward can opt in to all-interface binding on this host.
+    pub fn supports_all_interfaces_forward(&self) -> bool {
+        if cfg!(windows) || matches!(self, Self::Wsl { .. }) {
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        // A Linux binary can run directly inside WSL without using the Windows launcher.
+        if std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .is_ok_and(|release| release.to_ascii_lowercase().contains("microsoft"))
+        {
+            return false;
+        }
+        true
+    }
+
     /// Computes how a script would be launched, without spawning anything.
     ///
     /// `job` runs the script in its own process group (always used by
