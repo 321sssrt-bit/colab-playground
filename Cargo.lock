@@ -1092,7 +1092,7 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "colab-playground-core",
- "dirs 6.0.0",
+ "colab-playground-shared",
  "ely-gpui-component",
  "env_logger",
  "futures",
@@ -1100,7 +1100,6 @@ dependencies = [
  "gpui-pre-platform",
  "log",
  "proc-macro2",
- "serde",
  "serde_json",
  "syn 2.0.119",
  "sys-locale",
@@ -1125,6 +1124,18 @@ dependencies = [
  "thiserror 2.0.21",
  "toml 1.2.1+spec-1.1.0",
  "ureq",
+]
+
+[[package]]
+name = "colab-playground-shared"
+version = "0.4.0"
+dependencies = [
+ "colab-playground-core",
+ "dirs 6.0.0",
+ "log",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
