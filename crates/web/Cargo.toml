@@ -22,7 +22,7 @@ serde = { version = "1", features = ["derive"] }
 sha2 = { version = "0.11", default-features = false }
 subtle = "2"
 tempfile = "3"
-tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 url = "2"
 
 [lints]
