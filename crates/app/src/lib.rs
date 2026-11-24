@@ -17,7 +17,7 @@
 //! does not stop a blocking call), and streamed events arrive through
 //! `run_backend_streaming`. Errors are words only in [`errors`], which maps core's typed errors
 //! and next steps to catalog messages and buttons. Every user-visible string is a key in
-//! [`i18n::keys`] with a message in all three catalogs; colours, radii and sizes come from
+//! [`i18n::keys`] with a message in all five catalogs; colours, radii and sizes come from
 //! `cx.theme()` (sizes it has no token for, from [`ui::metrics`]); platform-specific code lives
 //! only in [`platform`]. Tests drive the real views headlessly through `tests/ui/support`,
 //! always over a headless `MockBackend`.

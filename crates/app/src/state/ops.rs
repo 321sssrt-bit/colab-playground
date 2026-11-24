@@ -124,13 +124,7 @@ impl Op {
     }
 }
 
-/// A stable key for `value`, for the keyed [`Op`] variants.
-pub fn key_of(value: &impl std::hash::Hash) -> u64 {
-    use std::hash::Hasher;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    value.hash(&mut hasher);
-    hasher.finish()
-}
+pub use colab_playground_shared::ops::key_of;
 
 #[derive(Default)]
 pub(crate) struct Ops {
