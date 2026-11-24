@@ -119,11 +119,9 @@ async fn create(
 ) -> Result<(StatusCode, Json<Accepted>), ApiError> {
     let Json(Create {
         account_context,
-        spec,
+        mut spec,
     }) = payload?;
-    if spec.high_mem && !spec.accelerator.supports_high_mem() {
-        return Err(Error::invalid("high_mem", "accelerator has a fixed memory shape").into());
-    }
+    spec.high_mem &= spec.accelerator.supports_high_mem();
     for duration in [spec.guard.max_runtime, spec.guard.idle_timeout]
         .into_iter()
         .flatten()

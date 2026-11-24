@@ -71,6 +71,9 @@ impl WebState {
         let state = self.clone();
         self.backend_job(Slot::Shared, move |backend, cancel| {
             let _poll = state.lock_poll_slot();
+            let accounts = backend.accounts(cancel);
+            state.record_accounts(accounts.clone());
+            accounts?;
             let view = backend.runtimes(cancel);
             state.record_runtimes(view.clone());
             view?;
@@ -207,7 +210,11 @@ impl WebState {
             let runtime = list_account(backend, cancel, &target.account)?
                 .runtimes
                 .into_iter()
-                .find(|runtime| runtime.id == target)
+                .find(|runtime| {
+                    runtime.id.account == target.account
+                        && runtime.id.endpoint == target.endpoint
+                        && (!target.endpoint.is_empty() || runtime.id.name == target.name)
+                })
                 .ok_or_else(|| Error::new(ErrorKind::SessionGone))?;
             let result = work(backend, cancel, runtime);
             state.record_runtimes(backend.runtimes(cancel));

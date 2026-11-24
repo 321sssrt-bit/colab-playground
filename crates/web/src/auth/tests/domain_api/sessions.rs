@@ -76,6 +76,31 @@ fn wait_for_allocation(reader: &mut impl BufRead) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn sessions_refresh_the_account_context_after_keyring_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut config, _) = MockConfig::headless(MockScenario::single());
+    config.failures.keyring_unavailable = true;
+    exercise(dir.path(), config, |client, backend, _| {
+        let error = json(client.request("GET", SESSIONS, ""), StatusCode::CONFLICT);
+        assert_eq!(error["error"]["kind"], "keyring_unavailable");
+        backend.set_failures(MockFailures::default());
+
+        let listed = client.get(SESSIONS);
+        assert_eq!(listed["account_context"]["active"], "mock1");
+        assert!(listed["account_context"]["revision"].as_u64().unwrap() > 0);
+        assert_eq!(client.get("/api/snapshot")["accounts_error"], Value::Null);
+
+        let spec = client.get("/api/sessions/template");
+        let body = json!({"account_context": listed["account_context"], "spec": spec});
+        assert_eq!(
+            finished(&mut updates(&client, submit(&client, &body))).1["phase"],
+            "ready"
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn provisions_with_vram_retry_one_time_guard_and_account_quota() {
     let dir = tempfile::tempdir().unwrap();
     let (mut config, _) = MockConfig::headless(MockScenario::single());
@@ -124,6 +149,19 @@ async fn provisions_with_vram_retry_one_time_guard_and_account_quota() {
         assert_eq!(result["phase"], "failed");
         assert_eq!(result["error"]["kind"], "session_limit_reached");
         assert_eq!(client.get(SESSIONS)["runtimes"].as_array().unwrap().len(), 2);
+
+        let mut stale_target = runtime["id"].clone();
+        stale_target["name"] = Value::Null;
+        assert_eq!(post(&client, STOP, json!({"confirmed": true, "target": stale_target})).status(), StatusCode::NO_CONTENT);
+        let updated = json(client.request("PATCH", "/api/settings", r#"{"defaults":{"high_mem":true}}"#), StatusCode::OK);
+        assert_eq!(updated["defaults"]["high_mem"], true);
+        let mut fixed_shape = create_body(&client, "fixed-memory");
+        assert_eq!(fixed_shape["spec"]["high_mem"], true);
+        fixed_shape["spec"]["accelerator"] = json!("L4");
+        assert_eq!(finished(&mut updates(&client, submit(&client, &fixed_shape))).1["phase"], "ready");
+        let listing = client.get(SESSIONS);
+        let l4 = listing["runtimes"].as_array().unwrap().iter().find(|r| r["id"]["name"] == "fixed-memory").unwrap();
+        assert_eq!(l4["high_mem"], false);
     }).await;
 }
 
@@ -340,6 +378,22 @@ async fn stop_all_reports_remaining_runtime_and_unverifiable_account() {
         (None, None),
         vec![],
         |client, backend, _| {
+            let listed = client.get(SESSIONS);
+            let target = listed["runtimes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["id"]["name"] == "t4-91c2")
+                .unwrap();
+            let error = json(
+                post(
+                    &client,
+                    STOP,
+                    json!({"target": target["id"], "confirmed": true}),
+                ),
+                StatusCode::BAD_GATEWAY,
+            );
+            assert_eq!(error["error"]["kind"], "http");
             let report = json(
                 post(&client, STOP_ALL, json!({"confirmed": true})),
                 StatusCode::OK,
