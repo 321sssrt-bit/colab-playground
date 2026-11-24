@@ -54,6 +54,10 @@ pub(super) const MESSAGES: colab_playground_shared::i18n::Messages = &[
         "対応する 5 言語のいずれかを選択してください。",
     ),
     (
+        super::PLUGIN_RUN_NOT_FOUND,
+        "このプラグインの実行記録は利用できません。",
+    ),
+    (
         super::INSTALL_NOT_RUNNING,
         "Colab CLI のインストールは終了したか、まだ開始されていません。",
     ),

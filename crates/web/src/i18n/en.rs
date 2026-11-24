@@ -54,6 +54,10 @@ pub(super) const MESSAGES: colab_playground_shared::i18n::Messages = &[
         "Choose one of the five supported languages.",
     ),
     (
+        super::PLUGIN_RUN_NOT_FOUND,
+        "This plugin run is no longer available.",
+    ),
+    (
         super::INSTALL_NOT_RUNNING,
         "The Colab CLI install has already finished or was never started.",
     ),

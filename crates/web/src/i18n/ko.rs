@@ -51,6 +51,10 @@ pub(super) const MESSAGES: colab_playground_shared::i18n::Messages = &[
         "지원되는 5개 언어 중 하나를 선택하세요.",
     ),
     (
+        super::PLUGIN_RUN_NOT_FOUND,
+        "이 플러그인 실행 기록을 더 이상 사용할 수 없습니다.",
+    ),
+    (
         super::INSTALL_NOT_RUNNING,
         "Colab CLI 설치가 끝났거나 아직 시작되지 않았습니다.",
     ),

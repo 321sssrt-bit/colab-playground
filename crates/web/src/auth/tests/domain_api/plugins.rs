@@ -85,20 +85,21 @@ fn existing(client: &Client) -> Value {
     runtime["id"].clone()
 }
 
+fn submit(client: &Client, spec: Value, target: Option<Value>) -> Response<Body> {
+    client.request(
+        "POST",
+        RUNS,
+        &json!({
+            "account_context": client.get("/api/snapshot")["account"],
+            "spec": spec,
+            "existing": target,
+        })
+        .to_string(),
+    )
+}
+
 fn start(client: &Client, spec: Value, target: Option<Value>) -> u64 {
-    json(
-        client.request(
-            "POST",
-            RUNS,
-            &json!({
-                "account_context": client.get("/api/snapshot")["account"],
-                "spec": spec,
-                "existing": target,
-            })
-            .to_string(),
-        ),
-        StatusCode::ACCEPTED,
-    )["id"]
+    json(submit(client, spec, target), StatusCode::ACCEPTED)["id"]
         .as_u64()
         .unwrap()
 }
@@ -294,7 +295,7 @@ async fn hf_token_is_presence_only_and_gguf_fit_matches_core() {
         );
         assert_eq!(auto["listing"], json!(listing));
         let expected = fit_auto(&listing, &fit).unwrap();
-        assert_eq!(auto["fit"], json!(expected));
+        assert_eq!(auto["fits"][0]["fit"], json!(expected));
         let fixed = json(
             client.request(
                 "POST",
@@ -304,7 +305,7 @@ async fn hf_token_is_presence_only_and_gguf_fit_matches_core() {
             StatusCode::OK,
         );
         assert_eq!(
-            fixed["fit"],
+            fixed["fits"][0]["fit"],
             json!(fit_fixed(&listing, "Q4_K_M", &fit).unwrap())
         );
         let no_fit = json(
@@ -320,9 +321,41 @@ async fn hf_token_is_presence_only_and_gguf_fit_matches_core() {
             ),
             StatusCode::OK,
         );
-        assert_eq!(no_fit["fit"], Value::Null);
+        assert_eq!(no_fit["fits"][0]["fit"], Value::Null);
         assert_eq!(no_fit["listing"], json!(listing));
-        assert_eq!(no_fit["fit_error"]["kind"], "invalid_input");
+        assert_eq!(no_fit["fits"][0]["fit_error"]["kind"], "invalid_input");
+        let a100 = json(
+            client.request(
+                "POST",
+                GGUF,
+                &json!({"repo":REPO, "accelerator":"A100"}).to_string(),
+            ),
+            StatusCode::OK,
+        );
+        let fits = a100["fits"].as_array().unwrap();
+        assert_eq!(fits.len(), 2);
+        for (item, vram_mib) in fits.iter().zip([40_960, 81_920]) {
+            assert_eq!(item["vram_mib"], vram_mib);
+            let desktop = fit_auto(
+                &listing,
+                &FitInput {
+                    vram_mib,
+                    ctx: 0,
+                    ..fit.clone()
+                },
+            )
+            .unwrap();
+            assert_eq!(item["fit"], json!(desktop));
+        }
+        let cpu = json(
+            client.request(
+                "POST",
+                GGUF,
+                &json!({"repo":REPO, "accelerator":"NONE"}).to_string(),
+            ),
+            StatusCode::OK,
+        );
+        assert_eq!(cpu["fits"], json!([]));
     })
     .await;
 }
@@ -333,7 +366,7 @@ async fn git_fixture_runs_on_existing_session_with_redacted_replay_and_loopback_
     let checkout = tempfile::tempdir().unwrap();
     let port = free_port();
     write_plugin(checkout.path(), LOCAL_ID, port, "worker.py");
-    let config = MockConfig::interactive(Duration::from_millis(150));
+    let config = MockConfig::interactive(Duration::from_millis(250));
     let backend = Arc::new(Fixtures {
         mock: MockBackend::new(config),
         checkout: checkout.path().into(),
@@ -369,6 +402,22 @@ async fn git_fixture_runs_on_existing_session_with_redacted_replay_and_loopback_
             let running = event(&mut stream, "status");
             assert_eq!(running["stage"], "download");
             assert!(running["progress"].as_f64().unwrap() < 1.0);
+            assert_eq!(
+                client
+                    .request("PATCH", "/api/plugins/llama-cpp", r#"{"enabled":false}"#)
+                    .status(),
+                StatusCode::NO_CONTENT
+            );
+            assert_eq!(
+                client
+                    .request(
+                        "PATCH",
+                        &format!("{PLUGINS}/{LOCAL_ID}"),
+                        r#"{"enabled":false}"#
+                    )
+                    .status(),
+                StatusCode::CONFLICT
+            );
 
             let mut global = BufReader::new(
                 client
@@ -413,9 +462,98 @@ async fn git_fixture_runs_on_existing_session_with_redacted_replay_and_loopback_
                 finished["endpoints"][0]["forward"]["addresses"]["openai_base_url"],
                 format!("http://127.0.0.1:{port}/v1")
             );
-            assert_eq!(client.get(RUNS)[0], json!({"id":id, "finished":true}));
+            let run = &client.get(RUNS)[0];
+            assert_eq!(run["id"], id);
+            assert_eq!(run["finished"], true);
+            assert_eq!(run["plugin"], LOCAL_ID);
+            assert_eq!(run["session"], NAMED_SESSION);
+            assert_eq!(run["provisions"], false);
         },
     )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mock_run_validates_before_launch_and_opens_a_ready_endpoint() {
+    let data = tempfile::tempdir().unwrap();
+    let (config, _) = MockConfig::headless(MockScenario::demo());
+    exercise(data.path(), config, |client, backend, _| {
+        let route = "/api/plugins/llama-cpp";
+        let target = existing(&client);
+        let mut spec = client.get(&format!("{route}/template"));
+        spec["target"] = json!({"kind":"existing", "name":target["name"]});
+        let mut unknown = spec.clone();
+        unknown["plugin"] = "unknown-plugin".into();
+        assert_eq!(
+            submit(&client, unknown, Some(target.clone())).status(),
+            StatusCode::NOT_FOUND
+        );
+        spec["inputs"]["repo"] = "".into();
+        assert_eq!(
+            submit(&client, spec.clone(), Some(target.clone())).status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        spec["inputs"]["repo"] = REPO.into();
+        spec["inputs"]["port"] = 8080.into();
+        let reserved = json(
+            submit(&client, spec.clone(), Some(target.clone())),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        );
+        assert_eq!(reserved["error"]["kind"], "port_reserved");
+        assert_eq!(reserved["error"]["args"]["port"], "8080");
+
+        let port = free_port();
+        spec["inputs"]["port"] = port.into();
+        assert_eq!(
+            client
+                .request("PATCH", route, r#"{"enabled":false}"#)
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            submit(&client, spec.clone(), Some(target.clone())).status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(client.get(RUNS), json!([]));
+        assert_eq!(
+            client
+                .request("PATCH", route, r#"{"enabled":true}"#)
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+
+        let id = start(&client, spec.clone(), Some(target.clone()));
+        let mut stream = run_events(&client, id, false);
+        let status = until(&mut stream, "status");
+        assert_eq!(status["state"], "running");
+        assert!(status["progress"].as_f64().unwrap() < 1.0);
+        assert!(
+            until(&mut stream, "log")["lines"][0]
+                .as_str()
+                .unwrap()
+                .starts_with("[mock]")
+        );
+        let ready = until(&mut stream, "finished");
+        assert_eq!(ready["phase"], "ready");
+        assert_eq!(ready["run"]["account"], target["account"]);
+        assert_eq!(ready["outcome"]["status"]["progress"], 1.0);
+        assert_eq!(ready["endpoints"][0]["forward"]["spec"]["bind"], "loopback");
+        assert_eq!(
+            ready["endpoints"][0]["forward"]["addresses"]["openai_base_url"],
+            format!("http://127.0.0.1:{port}/v1")
+        );
+        assert_eq!(backend.tunnels().len(), 1);
+
+        let id = start(&client, spec, Some(target));
+        let collision = until(&mut run_events(&client, id, false), "finished");
+        assert_eq!(collision["phase"], "ready");
+        assert_eq!(collision["endpoints"][0]["forward"], Value::Null);
+        assert_eq!(collision["endpoints"][0]["error"]["kind"], "port_in_use");
+        assert_eq!(
+            collision["endpoints"][0]["error"]["args"]["port"],
+            port.to_string()
+        );
+    })
     .await;
 }
 
@@ -452,7 +590,10 @@ async fn provisioned_run_emits_progress_and_cancel_stops_its_session() {
                 .status(),
             StatusCode::ACCEPTED
         );
-        assert_eq!(until(&mut stream, "finished")["phase"], "cancelled");
+        let finished = until(&mut stream, "finished");
+        assert_eq!(finished["phase"], "cancelled");
+        assert_eq!(finished["run"]["session"], target.name);
+        assert_eq!(finished["run"]["provisions"], true);
         assert!(
             backend
                 .runtimes(&CancelToken::new())
