@@ -1,5 +1,6 @@
 mod forwards;
 mod overview;
+mod plugins;
 mod settings;
 mod updates;
 
@@ -14,6 +15,7 @@ use axum::{
 };
 use colab_playground_core::{Error, ErrorKind};
 use colab_playground_shared::errors;
+use colab_playground_web::state::Submission;
 use serde::Serialize;
 use tokio::task::JoinError;
 
@@ -34,6 +36,7 @@ pub(crate) fn routes() -> Router<StateData> {
         .route("/api/settings", get(settings::get).patch(settings::patch))
         .route("/api/updates", get(updates::get))
         .route("/api/i18n/{locale}", get(dictionary))
+        .merge(plugins::routes())
 }
 
 async fn dictionary(Path(locale): Path<String>) -> Result<Json<i18n::Messages>, ApiError> {
@@ -121,7 +124,9 @@ impl From<Error> for ApiError {
         use ErrorKind as K;
 
         let status = match error.kind {
-            K::InvalidInput | K::PortReserved => StatusCode::UNPROCESSABLE_ENTITY,
+            K::InvalidInput | K::ManifestInvalid | K::PortReserved => {
+                StatusCode::UNPROCESSABLE_ENTITY
+            }
             K::Unsupported if error.param("forward_bind_restriction").is_some() => {
                 let key = match error.param("forward_bind_restriction") {
                     Some("windows_or_wsl") => i18n::FORWARD_BIND_WINDOWS,
@@ -129,7 +134,8 @@ impl From<Error> for ApiError {
                 };
                 return Self::new(StatusCode::CONFLICT, "unsupported", key);
             }
-            K::PortInUse
+            K::PluginExists
+            | K::PortInUse
             | K::SshBusy
             | K::Busy
             | K::Cancelled
@@ -140,7 +146,7 @@ impl From<Error> for ApiError {
             | K::AddInProgress => StatusCode::CONFLICT,
             K::AccountNotFound | K::SessionGone | K::PluginNotFound => StatusCode::NOT_FOUND,
             K::RateLimited | K::HttpUnavailable => StatusCode::SERVICE_UNAVAILABLE,
-            K::Http => StatusCode::BAD_GATEWAY,
+            K::Http | K::GitFailed => StatusCode::BAD_GATEWAY,
             K::Timeout => StatusCode::GATEWAY_TIMEOUT,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -163,5 +169,12 @@ impl From<JsonRejection> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         *self.0
+    }
+}
+
+async fn finish<T>(submission: Submission<T>) -> Result<T, ApiError> {
+    match submission {
+        Submission::Started { job, .. } => Ok(job.await??),
+        Submission::AlreadyRunning { id } => Err(ApiError::busy(id)),
     }
 }
