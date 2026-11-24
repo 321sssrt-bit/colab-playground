@@ -9,9 +9,10 @@ use std::{
 use colab_playground_core::{
     backend::Backend,
     mock::{MockBackend, MockConfig, MockFailures, MockScenario},
+    sessions::Accelerator,
 };
 use colab_playground_shared::settings::SettingsStore;
-use colab_playground_web::state::WebState;
+use colab_playground_web::state::{Submission, WebState};
 use serde_json::Value;
 use ureq::{
     Agent, Body,
@@ -31,6 +32,7 @@ struct Client {
     agent: Agent,
     origin: String,
     token: String,
+    web: WebState,
 }
 
 impl Client {
@@ -121,6 +123,7 @@ async fn exercise_with_store(
     );
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
+    let client_web = web.clone();
     let result = tokio::task::spawn_blocking(move || {
         let agent: Agent = Agent::config_builder()
             .proxy(None)
@@ -149,6 +152,7 @@ async fn exercise_with_store(
                 agent,
                 origin,
                 token: credentials["token"].as_str().unwrap().to_owned(),
+                web: client_web,
             },
             backend,
             store,
@@ -439,4 +443,81 @@ async fn settings_without_a_config_directory_remain_live_in_memory() {
         },
     )
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn overview_retries_failed_usage_within_the_poll_cooldown() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut config, _) = MockConfig::headless(MockScenario::demo());
+    config.failures.usage_fetch_fails = true;
+    exercise(dir.path(), config, |client, backend, _| {
+        let failed = client.get("/api/overview");
+        assert!(failed["usage"][0]["last_error"].is_object());
+        backend.set_failures(MockFailures::default());
+        assert!(!backend.usage_poll_due());
+
+        let recovered = client.get("/api/overview");
+        assert!(recovered["usage"][0]["last_error"].is_null());
+        assert_eq!(recovered["usage"][0]["snapshot"]["stale"], false);
+        assert!(recovered["usage"][0]["snapshot"]["balance_cu"].is_number());
+        println!("Usage recovery during cooldown: overview shows a fresh non-null balance and no usage error.");
+    }).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn overview_refreshes_usage_and_runtime_counts_after_login() {
+    let dir = tempfile::tempdir().unwrap();
+    let (config, _) = MockConfig::headless(MockScenario::demo());
+    exercise(dir.path(), config, |client, backend, _| {
+        let runtime = tokio::runtime::Handle::current();
+        let account = client.web.snapshot().account.clone();
+        let Submission::Started { job, .. } = client.web.begin_login(account).unwrap() else {
+            panic!("expected login to start");
+        };
+        let prompt = runtime.block_on(job).unwrap().unwrap();
+        assert_eq!(client.request("GET", "/api/overview", "").status(), StatusCode::CONFLICT);
+        let Submission::Started { job, .. } = client.web.submit_login(prompt.id, "demo-code".into()).unwrap() else {
+            panic!("expected login to complete");
+        };
+        let account = runtime.block_on(job).unwrap().unwrap().unwrap();
+        backend.add_unmanaged_runtime(&account.id, Accelerator::None);
+
+        let overview = client.get("/api/overview");
+        assert_eq!(overview["accounts"]["active"], account.id.as_str());
+        let usage = overview["usage"].as_array().unwrap().iter()
+            .find(|view| view["account"] == account.id.as_str()).unwrap();
+        assert_eq!(usage["snapshot"]["assignments"], 1);
+        assert_eq!(overview["unmanaged_runtimes"]["count"], 2);
+        println!("Mock login: overview is busy during login, then shows the new account with 1 assignment and 2 unmanaged runtimes across accounts.");
+    }).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn overview_refreshes_even_after_background_poll_recovers_accounts() {
+    let dir = tempfile::tempdir().unwrap();
+    let (config, _) = MockConfig::headless(MockScenario::demo());
+    exercise(dir.path(), config, |client, backend, _| {
+        let overview = client.get("/api/overview");
+        assert_eq!(overview["unmanaged_runtimes"]["count"], 1);
+        let active = client.web.snapshot().account.active.clone().unwrap();
+        let listed = backend.runtime_listings();
+        backend.set_failures(MockFailures { keyring_unavailable: true, ..Default::default() });
+        assert_eq!(client.get("/api/overview")["keyring"]["status"], "unavailable");
+        backend.add_unmanaged_runtime(&active, Accelerator::None);
+        backend.set_failures(MockFailures::default());
+        assert!(!backend.usage_poll_due());
+
+        tokio::runtime::Handle::current().block_on(async {
+            tokio::time::timeout(TIMEOUT, client.web.subscribe().wait_for(|snapshot| {
+                snapshot.accounts_error.is_none()
+            })).await.unwrap().unwrap();
+        });
+        assert_eq!(backend.runtime_listings(), listed);
+
+        let recovered = client.get("/api/overview");
+        assert_eq!(recovered["keyring"]["status"], "ready");
+        assert_eq!(recovered["usage"][0]["snapshot"]["assignments"], 4);
+        assert_eq!(recovered["unmanaged_runtimes"]["count"], 2);
+        println!("Background account recovery left runtime data cached; overview immediately showed 4 active-account assignments and 2 unmanaged runtimes.");
+    }).await;
 }

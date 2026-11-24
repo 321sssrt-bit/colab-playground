@@ -34,44 +34,30 @@ impl WebState {
     }
 
     pub(super) fn refresh_overview(&self, backend: &dyn Backend, cancel: &CancelToken) {
-        let previous = self.snapshot();
         // An importable keyring module does not tell us whether the keyring is unlocked.
         let accounts = backend.accounts(cancel);
-        let changed = accounts.as_ref().is_ok_and(|view| {
-            previous.accounts_error.is_some()
-                || previous.accounts.as_ref().is_none_or(|prior| {
-                    !prior
-                        .accounts
-                        .iter()
-                        .map(|account| &account.id)
-                        .eq(view.accounts.iter().map(|account| &account.id))
-                })
-        });
         let ready = accounts.is_ok();
         self.record_accounts(accounts);
         if !ready {
             return;
         }
 
-        if changed || previous.usage.is_empty() {
-            let usage = backend
-                .refresh_usage(&[], cancel)
-                .unwrap_or_else(|_| backend.usage());
-            self.update(|snapshot| {
-                let changed = snapshot.usage != usage;
-                snapshot.usage = usage;
-                changed
-            });
-        }
-        if changed
-            || previous.runtimes_error.is_some()
-            || previous
-                .runtimes
-                .as_ref()
-                .is_none_or(|view| !view.errors.is_empty())
-        {
-            self.record_runtimes(backend.runtimes(cancel));
-        }
+        let usage = backend.refresh_usage(&[], cancel).unwrap_or_else(|error| {
+            let mut usage = backend.usage();
+            for view in &mut usage {
+                if let Some(snapshot) = &mut view.snapshot {
+                    snapshot.stale = true;
+                }
+                view.last_error = Some(error.clone());
+            }
+            usage
+        });
+        self.update(|snapshot| {
+            let changed = snapshot.usage != usage;
+            snapshot.usage = usage;
+            changed
+        });
+        self.record_runtimes(backend.runtimes(cancel));
     }
 
     pub(super) fn clear_overview(&self) {
