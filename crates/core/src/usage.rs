@@ -223,6 +223,11 @@ struct Split {
     /// What the sessions burn together beyond their estimates, such as what
     /// the sessions that stopped were estimated at beyond what they burned.
     owed: f64,
+    /// A reading in which nothing came or went and the rate held has
+    /// followed the one the shares were taken in, so that rate was all of
+    /// what the sessions burn.
+    #[serde(default)]
+    confirmed: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -250,6 +255,10 @@ pub struct RateAttribution {
     /// that every other estimate is worked out as before.
     #[serde(default)]
     measured: BTreeMap<String, f64>,
+    /// Nothing came or went in the last reading and the rate held, so a
+    /// change of the rate in the next one is what comes or goes in it.
+    #[serde(default)]
+    steady: bool,
 }
 
 impl RateAttribution {
@@ -290,18 +299,6 @@ impl RateAttribution {
             }
         });
         self.measured.retain(|name, _| live.contains(name));
-        let mut broken = BTreeSet::new();
-        let mut owed = 0.0;
-        let mut stopped_in_one_split = false;
-        for split in &mut self.splits {
-            let before = split.sessions.len();
-            split.sessions.retain(|name| live.contains(name));
-            if split.sessions.len() < before {
-                stopped_in_one_split = before - split.sessions.len() == stopped;
-                broken.extend(split.sessions.iter().cloned());
-                owed += split.owed;
-            }
-        }
         let started: Vec<String> = live
             .iter()
             .filter(|n| !self.rates.contains_key(*n))
@@ -321,25 +318,55 @@ impl RateAttribution {
         let fall = self.last_rate.map_or(0.0, |prev| prev - rate);
         let rose = fall < -NO_RATE;
         let all_known = self.rates.values().all(|r| r.is_some_and(|r| r > NO_RATE));
+        // A session without an estimate burns a rate that has yet to show.
+        let yet_to_show = self.unshown || !all_known;
+        let quiet = started.is_empty() && stopped == 0 && unmanaged_steady;
+        let still = quiet && self.last_rate.is_some() && fall.abs() <= NO_RATE;
+        if still {
+            for split in &mut self.splits {
+                split.confirmed = true;
+            }
+        } else {
+            // The rate the shares were taken of may have held part of what
+            // was there, or more than that.
+            self.splits.retain(|split| split.confirmed);
+        }
+        let mut broken = BTreeSet::new();
+        let mut owed = 0.0;
+        let mut stopped_in_one_split = false;
+        for split in &mut self.splits {
+            let before = split.sessions.len();
+            split.sessions.retain(|name| live.contains(name));
+            if split.sessions.len() < before {
+                stopped_in_one_split = before - split.sessions.len() == stopped;
+                broken.extend(split.sessions.iter().cloned());
+                owed += split.owed;
+            }
+        }
         if started.is_empty()
             && stopped_in_one_split
             && unmanaged_steady
-            && all_known
             && !self.lagging
-            && !self.unshown
+            && !yet_to_show
+            && self.steady
             && fall > NO_RATE
         {
             // The fall is what the stopped sessions really burned.
             self.settle(broken, owed + freed - fall);
         } else if delta_share.is_some()
             && unmanaged_steady
-            && !self.unshown
+            && !yet_to_show
+            && self.steady
             && (stopped == 0 || stopped_in_one_split)
         {
             // A start beside a stop in a split is measured against that
             // split's guess of what stopped, so it is only as good as the
             // guess. Beside any other stop nothing tells how good it is.
-            self.regroup(started.iter().chain(&broken).cloned().collect(), owed);
+            self.regroup(
+                started.iter().chain(&broken).cloned().collect(),
+                owed,
+                false,
+            );
         } else {
             // Nothing measured what the split lost, so what is left of it no
             // longer adds up to what its sessions burn.
@@ -354,8 +381,8 @@ impl RateAttribution {
             self.lagging = true;
         }
         // A rise in which nothing came or went is what came earlier showing.
-        let late_rise = rose && !came && stopped == 0 && unmanaged_steady;
-        if late_rise && !self.unshown && all_known {
+        let late_rise = rose && quiet;
+        if late_rise && !yet_to_show {
             // Nothing was known to be yet to show, so an earlier rise held
             // only part of what came, and the shares taken of it are not
             // what their sessions burn together.
@@ -368,7 +395,7 @@ impl RateAttribution {
             self.unshown = true;
         } else if came && rose {
             // The rise may be what came now, what came earlier, or both.
-            self.mixed = self.unshown;
+            self.mixed = yet_to_show;
         } else if late_rise || assignments == 0 {
             self.unshown = false;
             self.mixed = false;
@@ -402,11 +429,13 @@ impl RateAttribution {
                     && unmanaged == 0
                 {
                     let owed = burned - share * unknown.len() as f64;
-                    self.regroup(unknown.into_iter().collect(), owed);
+                    self.regroup(unknown.into_iter().collect(), owed, false);
                 }
             }
         }
         self.splits.retain(|split| split.sessions.len() > 1);
+        // An empty account that still burns has a fall yet to show.
+        self.steady = still || (assignments == 0 && rate <= NO_RATE);
         self.unmanaged = Some(unmanaged);
         self.last_rate = Some(rate);
     }
@@ -415,7 +444,7 @@ impl RateAttribution {
     /// one left. While several are left, nothing tells which of them burns it.
     fn settle(&mut self, left: BTreeSet<String>, owed: f64) {
         if left.len() > 1 {
-            return self.regroup(left, owed);
+            return self.regroup(left, owed, true);
         }
         if let Some(name) = left.first()
             && let Some(Some(r)) = self.rates.get(name)
@@ -432,9 +461,13 @@ impl RateAttribution {
         }
     }
 
-    fn regroup(&mut self, sessions: BTreeSet<String>, owed: f64) {
+    fn regroup(&mut self, sessions: BTreeSet<String>, owed: f64, confirmed: bool) {
         self.ungroup(&sessions);
-        self.splits.push(Split { sessions, owed });
+        self.splits.push(Split {
+            sessions,
+            owed,
+            confirmed,
+        });
     }
 
     /// Estimated rate of a session (CU/h).
@@ -674,8 +707,200 @@ mod tests {
         // An A100 (11.8) and a T4 (1.76) start in the same reading.
         a.observe(13.56, 2, &set(&["a100", "t4"]));
         assert_eq!(a.rate_of("t4"), Some(6.78));
+        // A reading in which nothing comes or goes and the rate holds: the
+        // rise was all of what the two burn.
+        a.observe(13.56, 2, &set(&["a100", "t4"]));
         a.observe(1.76, 1, &set(&["t4"]));
         assert!((a.rate_of("t4").unwrap() - 1.76).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_rise_nothing_explains_drops_the_splits() {
+        // An A100 (11.77) and an H100 (18.3) start together, and the
+        // account rate shows the H100 alone for two readings.
+        let mut a = RateAttribution::default();
+        a.observe(0.0, 0, &set(&[]));
+        a.observe(18.30, 2, &set(&["a100", "h100"]));
+        a.observe(18.30, 2, &set(&["a100", "h100"]));
+        let share = a.rate_of("h100");
+        a.observe(30.07, 2, &set(&["a100", "h100"]));
+        a.observe(30.07, 2, &set(&["a100", "h100"]));
+        // The fall as the A100 stops is more than the shares were taken of.
+        a.observe(18.30, 1, &set(&["h100"]));
+        assert_eq!(a.rate_of("h100"), share);
+    }
+
+    #[test]
+    fn a_stop_beside_a_stop_outside_the_split_is_not_measured() {
+        let mut a = RateAttribution::default();
+        a.observe(0.0, 0, &set(&[]));
+        a.observe(11.8, 1, &set(&["a100"]));
+        a.observe(11.8, 1, &set(&["a100"]));
+        // A T4 (1.76) and a CPU (0.08) start in the same reading.
+        a.observe(13.64, 3, &set(&["a100", "cpu", "t4"]));
+        let share = a.rate_of("cpu");
+        a.observe(13.64, 3, &set(&["a100", "cpu", "t4"]));
+        // The T4 and the A100 stop in the same reading.
+        a.observe(0.08, 1, &set(&["cpu"]));
+        assert_eq!(a.rate_of("cpu"), share);
+    }
+
+    #[test]
+    fn a_stop_as_the_rest_of_a_rise_shows_is_not_measured() {
+        let mut a = RateAttribution::default();
+        a.observe(0.0, 0, &set(&[]));
+        a.observe(9.64, 2, &set(&["l4a", "l4b"]));
+        a.observe(9.64, 2, &set(&["l4a", "l4b"]));
+        let share = a.rate_of("l4b");
+        // Two T4s (1.76 each) start, and the account rate shows one of them.
+        a.observe(11.40, 4, &set(&["l4a", "l4b", "t4a", "t4b"]));
+        // An L4 stops as the other shows: the fall is 3.06.
+        a.observe(8.34, 3, &set(&["l4b", "t4a", "t4b"]));
+        assert_eq!(a.rate_of("l4b"), share);
+    }
+
+    #[test]
+    fn a_stop_as_an_unmanaged_runtime_shows_two_readings_late_is_not_measured() {
+        let mut a = RateAttribution::default();
+        a.observe(0.0, 0, &set(&[]));
+        a.observe(9.64, 2, &set(&["l4a", "l4b"]));
+        a.observe(9.64, 2, &set(&["l4a", "l4b"]));
+        let share = a.rate_of("l4b");
+        // An unmanaged T4 (1.76) comes; the account rate lags behind it.
+        a.observe(9.64, 3, &set(&["l4a", "l4b"]));
+        a.observe(9.64, 3, &set(&["l4a", "l4b"]));
+        // An L4 stops as the T4's rate shows: the fall is 3.06.
+        a.observe(6.58, 2, &set(&["l4b"]));
+        assert_eq!(a.rate_of("l4b"), share);
+    }
+
+    #[test]
+    fn starts_measured_as_an_unmanaged_runtime_comes_are_not_a_split() {
+        // Two L4s (4.82 each) start in the reading in which an unmanaged T4
+        // (1.76) comes: 5.70 each.
+        let mut a = RateAttribution::default();
+        a.observe(0.0, 0, &set(&[]));
+        a.observe(11.40, 3, &set(&["l4a", "l4b"]));
+        let share = a.rate_of("l4b");
+        a.observe(11.40, 3, &set(&["l4a", "l4b"]));
+        a.observe(6.58, 2, &set(&["l4b"]));
+        assert_eq!(a.rate_of("l4b"), share);
+    }
+
+    #[test]
+    fn starts_measured_beside_sessions_without_an_estimate_are_not_a_split() {
+        // The app starts while an A100 (11.77) and an H100 (18.3) run, and
+        // the account rate shows neither for two readings.
+        let mut a = RateAttribution::default();
+        a.observe(0.0, 2, &set(&["a100", "h100"]));
+        a.observe(0.0, 2, &set(&["a100", "h100"]));
+        // Two T4s (1.76 each) start as it shows them: 16.795 each.
+        a.observe(33.59, 4, &set(&["a100", "h100", "t4a", "t4b"]));
+        let share = a.rate_of("t4a");
+        a.observe(33.59, 4, &set(&["a100", "h100", "t4a", "t4b"]));
+        a.observe(31.83, 3, &set(&["a100", "h100", "t4a"]));
+        assert_eq!(a.rate_of("t4a"), share);
+    }
+
+    #[test]
+    fn starts_on_an_empty_account_that_still_burns_are_not_a_split() {
+        // The app starts while an A100 (11.77) and a CPU (0.08) run.
+        let mut a = RateAttribution::default();
+        a.observe(11.85, 2, &set(&["a100", "cpu"]));
+        a.observe(11.85, 2, &set(&["a100", "cpu"]));
+        // Both stop, a reading apart, and the account rate falls a reading
+        // late for each.
+        a.observe(11.85, 1, &set(&["a100"]));
+        a.observe(11.77, 0, &set(&[]));
+        // Two H100s (18.3 each) start as it falls for the A100: 12.415 each.
+        a.observe(36.60, 2, &set(&["h1", "h2"]));
+        let share = a.rate_of("h2");
+        a.observe(36.60, 2, &set(&["h1", "h2"]));
+        a.observe(18.30, 1, &set(&["h2"]));
+        assert_eq!(a.rate_of("h2"), share);
+    }
+
+    #[test]
+    fn an_empty_account_has_nothing_yet_to_show() {
+        let mut a = RateAttribution::default();
+        a.observe(0.0, 0, &set(&[]));
+        // A session starts and stops before the account rate shows it.
+        a.observe(0.0, 1, &set(&["cpu"]));
+        a.observe(0.0, 0, &set(&[]));
+        a.observe(13.56, 2, &set(&["a100", "t4"]));
+        a.observe(13.56, 2, &set(&["a100", "t4"]));
+        a.observe(1.76, 1, &set(&["t4"]));
+        assert!((a.rate_of("t4").unwrap() - 1.76).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_stop_right_after_the_shares_were_taken_is_not_measured() {
+        let mut a = RateAttribution::default();
+        a.observe(0.0, 0, &set(&[]));
+        a.observe(13.56, 2, &set(&["a100", "t4"]));
+        // Nothing has shown yet that the rise was all of what the two burn.
+        a.observe(1.76, 1, &set(&["t4"]));
+        assert_eq!(a.rate_of("t4"), Some(6.78));
+    }
+
+    #[test]
+    fn a_first_reading_that_lacks_a_rate_is_not_a_split() {
+        // The app starts while an A100 (11.77) and an H100 (18.3) run, and
+        // the account rate has yet to show the A100.
+        let mut a = RateAttribution::default();
+        a.observe(18.30, 2, &set(&["a100", "h100"]));
+        let share = a.rate_of("h100");
+        // An L4 (4.82) starts as the A100's rate shows, then the A100 stops.
+        a.observe(34.89, 3, &set(&["a100", "h100", "l4"]));
+        a.observe(34.89, 3, &set(&["a100", "h100", "l4"]));
+        a.observe(23.12, 2, &set(&["h100", "l4"]));
+        assert_eq!(a.rate_of("h100"), share);
+    }
+
+    #[test]
+    fn starts_measured_right_after_a_change_are_not_a_split() {
+        // An A100 (11.77) and an L4 (4.82) start together, and the account
+        // rate shows the L4 alone.
+        let mut a = RateAttribution::default();
+        a.observe(0.0, 0, &set(&[]));
+        a.observe(4.82, 2, &set(&["a100", "l4"]));
+        // Two T4s (1.76 each) start as the A100's rate shows: 7.645 each.
+        a.observe(20.11, 4, &set(&["a100", "l4", "t4a", "t4b"]));
+        let share = a.rate_of("t4a");
+        a.observe(20.11, 4, &set(&["a100", "l4", "t4a", "t4b"]));
+        a.observe(18.35, 3, &set(&["a100", "l4", "t4a"]));
+        assert_eq!(a.rate_of("t4a"), share);
+    }
+
+    #[test]
+    fn a_stop_right_after_a_change_is_not_measured() {
+        // An H100 (18.3) runs; another and an A100 (11.77) start together,
+        // and the account rate shows the H100 alone: 9.15 each.
+        let mut a = RateAttribution::default();
+        a.observe(18.30, 1, &set(&["h1"]));
+        a.observe(18.30, 1, &set(&["h1"]));
+        a.observe(36.60, 3, &set(&["a100", "h1", "h2"]));
+        let share = a.rate_of("h2");
+        // A CPU (0.08) starts as the A100's rate shows, then the A100 stops.
+        a.observe(48.45, 4, &set(&["a100", "cpu", "h1", "h2"]));
+        a.observe(36.68, 3, &set(&["cpu", "h1", "h2"]));
+        assert_eq!(a.rate_of("h2"), share);
+    }
+
+    #[test]
+    fn a_rise_beside_a_start_is_not_all_of_what_sessions_without_an_estimate_burn() {
+        // The app starts while an H100 (18.3) and an A100 (11.77) run, and
+        // the account rate shows neither.
+        let mut a = RateAttribution::default();
+        a.observe(0.0, 2, &set(&["a100", "h100"]));
+        // Another H100 starts as their rates show, and is taken for 30.07.
+        a.observe(30.07, 3, &set(&["a100", "h100", "h2"]));
+        // Its own rate shows: the first two share 18.30 and burn 30.07.
+        a.observe(48.37, 3, &set(&["a100", "h100", "h2"]));
+        let share = a.rate_of("h100");
+        a.observe(48.37, 3, &set(&["a100", "h100", "h2"]));
+        a.observe(36.60, 2, &set(&["h100", "h2"]));
+        assert_eq!(a.rate_of("h100"), share);
     }
 
     #[test]
@@ -683,9 +908,11 @@ mod tests {
         let mut a = RateAttribution::default();
         a.observe(0.0, 0, &set(&[]));
         a.observe(11.8, 1, &set(&["a100"]));
+        a.observe(11.8, 1, &set(&["a100"]));
         // A T4 (1.76) and a CPU (0.08) start in the same reading.
         a.observe(13.64, 3, &set(&["a100", "cpu", "t4"]));
         assert!((a.rate_of("cpu").unwrap() - 0.92).abs() < 1e-9);
+        a.observe(13.64, 3, &set(&["a100", "cpu", "t4"]));
         a.observe(11.88, 2, &set(&["a100", "cpu"]));
         assert!((a.rate_of("cpu").unwrap() - 0.08).abs() < 1e-9);
         assert_eq!(a.rate_of("a100"), Some(11.8));
@@ -696,12 +923,14 @@ mod tests {
         // The app starts while an A100 (11.8), a T4 (1.76) and a CPU (0.08) run.
         let mut a = RateAttribution::default();
         a.observe(13.64, 3, &set(&["a100", "cpu", "t4"]));
+        a.observe(13.64, 3, &set(&["a100", "cpu", "t4"]));
         let share = a.rate_of("t4");
         // The CPU stops. Raising both shares to 6.78 would take the T4
         // further from what it burns.
         a.observe(13.56, 2, &set(&["a100", "t4"]));
         assert_eq!(a.rate_of("a100"), share);
         assert_eq!(a.rate_of("t4"), share);
+        a.observe(13.56, 2, &set(&["a100", "t4"]));
         a.observe(1.76, 1, &set(&["t4"]));
         assert!((a.rate_of("t4").unwrap() - 1.76).abs() < 1e-9);
     }
@@ -776,9 +1005,12 @@ mod tests {
         // The app starts while two L4s (4.82 each) run; a T4 (1.76) starts.
         let mut a = RateAttribution::default();
         a.observe(9.64, 2, &set(&["l4a", "l4b"]));
+        a.observe(9.64, 2, &set(&["l4a", "l4b"]));
         let share = a.rate_of("l4a");
         a.observe(11.40, 3, &set(&["l4a", "l4b", "t4"]));
+        a.observe(11.40, 3, &set(&["l4a", "l4b", "t4"]));
         // The T4 stops; the account rate does not fall for it yet.
+        a.observe(11.40, 2, &set(&["l4a", "l4b"]));
         a.observe(11.40, 2, &set(&["l4a", "l4b"]));
         // The fall as an L4 stops holds what the T4 burned as well.
         a.observe(4.82, 1, &set(&["l4a"]));
@@ -791,9 +1023,11 @@ mod tests {
         // (1.76): the L4 is taken for 3.29.
         let mut a = RateAttribution::default();
         a.observe(6.58, 2, &set(&["l4"]));
+        a.observe(6.58, 2, &set(&["l4"]));
         // The L4 stops as two L4s start, measured against that guess.
         a.observe(11.40, 3, &set(&["l4a", "l4b"]));
         let share = a.rate_of("l4a");
+        a.observe(11.40, 3, &set(&["l4a", "l4b"]));
         a.observe(6.58, 2, &set(&["l4a"]));
         assert_eq!(a.rate_of("l4a"), share);
     }
@@ -802,6 +1036,7 @@ mod tests {
     fn a_measured_session_leaves_every_other_estimate_as_it_was() {
         // The app starts while a CPU (0.08) and an H100 (18.3) run: 9.19 each.
         let mut a = RateAttribution::default();
+        a.observe(18.38, 2, &set(&["cpu", "h100"]));
         a.observe(18.38, 2, &set(&["cpu", "h100"]));
         a.observe(18.30, 1, &set(&["h100"]));
         assert!((a.rate_of("h100").unwrap() - 18.30).abs() < 1e-9);
@@ -911,8 +1146,10 @@ mod tests {
         let mut a = RateAttribution::default();
         a.observe(0.0, 0, &set(&[]));
         a.observe(16.62, 2, &set(&["a100", "l4"]));
+        a.observe(16.62, 2, &set(&["a100", "l4"]));
         // An unmanaged L4 starts; the account rate lags behind it, then shows it.
         a.observe(16.62, 3, &set(&["a100", "l4"]));
+        a.observe(21.44, 3, &set(&["a100", "l4"]));
         a.observe(21.44, 3, &set(&["a100", "l4"]));
         a.observe(9.64, 2, &set(&["l4"]));
         assert!((a.rate_of("l4").unwrap() - 4.82).abs() < 1e-9);
@@ -935,17 +1172,23 @@ mod tests {
 
     #[test]
     fn starts_measured_as_an_unmanaged_runtime_shows_are_not_a_split() {
-        // An unmanaged CPU (0.08) runs; an unmanaged T4 (1.76) starts and the
-        // account rate lags behind it.
+        // An unmanaged T4 (1.76) comes; the account rate lags two readings
+        // behind it.
         let mut a = RateAttribution::default();
-        a.observe(0.08, 1, &set(&[]));
-        a.observe(0.08, 2, &set(&[]));
+        a.observe(0.0, 0, &set(&[]));
+        a.observe(0.0, 1, &set(&[]));
+        a.observe(0.0, 1, &set(&[]));
         // Two L4s (4.82 each) start as the T4's rate shows: 5.70 each.
-        a.observe(11.48, 4, &set(&["l4a", "l4b"]));
+        a.observe(11.40, 3, &set(&["l4a", "l4b"]));
         let share = a.rate_of("l4a");
+        a.observe(11.40, 3, &set(&["l4a", "l4b"]));
+        // A CPU (0.08) starts, and its rate shows a reading late.
+        a.observe(11.40, 4, &set(&["cpu", "l4a", "l4b"]));
+        a.observe(11.48, 4, &set(&["cpu", "l4a", "l4b"]));
+        a.observe(11.48, 4, &set(&["cpu", "l4a", "l4b"]));
         // The rise held the T4, so the fall as an L4 stops does not tell
         // what the other burns.
-        a.observe(6.66, 3, &set(&["l4a"]));
+        a.observe(6.66, 3, &set(&["cpu", "l4a"]));
         assert_eq!(a.rate_of("l4a"), share);
     }
 
@@ -953,6 +1196,7 @@ mod tests {
     fn shares_taken_beside_an_unmanaged_runtime_stay_when_a_session_stops() {
         // The app starts while two T4s (1.76 each) run beside an unmanaged A100 (11.8).
         let mut a = RateAttribution::default();
+        a.observe(15.32, 3, &set(&["t4a", "t4b"]));
         a.observe(15.32, 3, &set(&["t4a", "t4b"]));
         let share = a.rate_of("t4b");
         // The fall measures the T4 that stops, but its share held part of
@@ -968,6 +1212,7 @@ mod tests {
         a.observe(0.0, 2, &set(&["a100", "t4"]));
         a.observe(13.56, 2, &set(&["a100", "t4"]));
         assert_eq!(a.rate_of("a100"), Some(6.78));
+        a.observe(13.56, 2, &set(&["a100", "t4"]));
         a.observe(11.8, 1, &set(&["a100"]));
         assert!((a.rate_of("a100").unwrap() - 11.8).abs() < 1e-9);
     }
@@ -978,8 +1223,10 @@ mod tests {
         a.observe(0.0, 0, &set(&[]));
         // Two CPUs (0.08 and 0.32), then an A100 (18.0) and a T4 (2.0).
         a.observe(0.4, 2, &set(&["cpu1", "cpu2"]));
+        a.observe(0.4, 2, &set(&["cpu1", "cpu2"]));
         a.observe(20.4, 4, &set(&["a100", "cpu1", "cpu2", "t4"]));
         assert_eq!(a.rate_of("t4"), Some(10.0));
+        a.observe(20.4, 4, &set(&["a100", "cpu1", "cpu2", "t4"]));
         a.observe(2.4, 3, &set(&["cpu1", "cpu2", "t4"]));
         assert!((a.rate_of("t4").unwrap() - 2.0).abs() < 1e-9);
         assert_eq!(a.rate_of("cpu1"), Some(0.2));
@@ -991,11 +1238,14 @@ mod tests {
         let mut a = RateAttribution::default();
         a.observe(0.0, 0, &set(&[]));
         a.observe(11.8, 1, &set(&["a100"]));
+        a.observe(11.8, 1, &set(&["a100"]));
         // A T4 (1.76) and a CPU (0.08) start in the same reading.
+        a.observe(13.64, 3, &set(&["a100", "cpu", "t4"]));
         a.observe(13.64, 3, &set(&["a100", "cpu", "t4"]));
         // The CPU stops and an L4 (1.54) starts: it is taken for 1.54 - 0.08 + 0.92.
         a.observe(15.1, 3, &set(&["a100", "l4", "t4"]));
         assert!((a.rate_of("l4").unwrap() - 2.38).abs() < 1e-9);
+        a.observe(15.1, 3, &set(&["a100", "l4", "t4"]));
         a.observe(13.34, 2, &set(&["a100", "l4"]));
         assert!((a.rate_of("l4").unwrap() - 1.54).abs() < 1e-9);
         assert_eq!(a.rate_of("a100"), Some(11.8));
@@ -1006,6 +1256,7 @@ mod tests {
         let mut a = RateAttribution::default();
         a.observe(0.0, 0, &set(&[]));
         a.observe(13.56, 2, &set(&["a100", "t4"]));
+        a.observe(13.56, 2, &set(&["a100", "t4"]));
         a.observe(13.56, 1, &set(&["t4"]));
         assert_eq!(a.rate_of("t4"), Some(6.78));
     }
@@ -1015,6 +1266,8 @@ mod tests {
         let mut a = RateAttribution::default();
         // An unmanaged CPU burns 0.08.
         a.observe(0.08, 1, &set(&[]));
+        a.observe(0.08, 1, &set(&[]));
+        a.observe(3.6, 3, &set(&["a", "b"]));
         a.observe(3.6, 3, &set(&["a", "b"]));
         // It stops in the reading in which one of the two T4s does.
         a.observe(1.76, 1, &set(&["b"]));
@@ -1026,6 +1279,8 @@ mod tests {
         let mut a = RateAttribution::default();
         // Two unmanaged runtimes burn 11.8 and 0.5.
         a.observe(12.3, 2, &set(&[]));
+        a.observe(12.3, 2, &set(&[]));
+        a.observe(14.3, 4, &set(&["a", "b"]));
         a.observe(14.3, 4, &set(&["a", "b"]));
         // The first of them stops and another starts in the reading in which
         // one of the two sessions (1.0 each) does.
