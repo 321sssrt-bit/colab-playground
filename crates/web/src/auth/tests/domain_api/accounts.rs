@@ -141,6 +141,17 @@ async fn age_marks_a_cached_usage_sample_stale_even_with_no_fetch_failure() {
         assert_eq!(aged["usage"][0]["snapshot"]["balance_cu"], 100.0);
         assert!(aged["usage"][0]["last_error"].is_null());
         assert_eq!(client.get(ACCOUNTS)["usage"], aged["usage"]);
+        backend.set_failures(MockFailures {
+            usage_fetch_fails: true,
+            ..Default::default()
+        });
+        let adopted = mutate(
+            &client,
+            "/api/accounts/adopt",
+            &account_action(&client),
+            StatusCode::OK,
+        );
+        assert_eq!(adopted["usage"], aged["usage"][0]["snapshot"]);
     })
     .await;
 }
@@ -271,6 +282,10 @@ async fn login_failure_cancel_and_success_publish_state_and_release_the_slot() {
         );
         assert_eq!(stale["error"]["kind"], "login_cancelled");
 
+        backend.set_failures(MockFailures {
+            usage_fetch_fails: true,
+            ..Default::default()
+        });
         let login_id = begin_login(&client);
         let saved = mutate(
             &client,
@@ -283,6 +298,20 @@ async fn login_failure_cancel_and_success_publish_state_and_release_the_slot() {
         });
         assert_ne!(saved["id"], original);
         assert!(finished["login_id"].is_null());
+        let new_account = finished["accounts"]["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|account| account["id"] == saved["id"])
+            .unwrap();
+        let new_usage = finished["usage"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|usage| usage["account"] == saved["id"])
+            .unwrap();
+        assert_eq!(&saved, new_account);
+        assert_eq!(saved["usage"], new_usage["snapshot"]);
         assert_eq!(
             finished["accounts"]["accounts"].as_array().unwrap().len(),
             2

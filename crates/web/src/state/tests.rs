@@ -75,6 +75,46 @@ async fn wait_event<T: Send + 'static>(
 }
 
 #[tokio::test]
+async fn first_account_snapshot_marks_disk_usage_stale_before_a_live_read() {
+    use colab_playground_core::{accounts::AccountStore, guard::USAGE_STALE_AFTER};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("accounts.json");
+    let (config, _) = MockConfig::headless(MockScenario::single());
+    let before_restart = MockBackend::new(config.clone());
+    before_restart
+        .refresh_usage(&[], &CancelToken::new())
+        .unwrap();
+    let mut accounts = before_restart.accounts(&CancelToken::new()).unwrap();
+    AccountStore::load(&path)
+        .unwrap()
+        .upsert(accounts.accounts.remove(0))
+        .unwrap();
+    accounts.accounts = AccountStore::load(&path).unwrap().all().to_vec();
+    let disk_sample = accounts.accounts[0].usage.unwrap();
+    assert!(disk_sample.is_fresh(before_restart.now(), USAGE_STALE_AFTER));
+
+    let new_backend = MockBackend::new(MockConfig {
+        scenario: MockScenario::signed_out(),
+        ..config
+    });
+    let state = WebState::start(Arc::new(new_backend)).await.unwrap();
+    assert!(ready(&state).await.usage.is_empty());
+    let mut snapshots = state.subscribe();
+    state.record_accounts(Ok(accounts));
+    snapshots.changed().await.unwrap();
+    let snapshot = snapshots.borrow_and_update().clone();
+    let reading = snapshot.usage[0].snapshot.unwrap();
+    assert!(reading.stale);
+    assert_eq!(reading.balance_cu, disk_sample.balance_cu);
+    assert_eq!(
+        snapshot.accounts.as_ref().unwrap().accounts[0].usage,
+        Some(reading)
+    );
+    assert!(state.shutdown(TEST_TIMEOUT).await.completed);
+}
+
+#[tokio::test]
 async fn account_metadata_cannot_replace_a_stale_usage_sample_with_a_fresh_copy() {
     let (config, _) = MockConfig::headless(MockScenario::single());
     let backend = Arc::new(MockBackend::new(config));

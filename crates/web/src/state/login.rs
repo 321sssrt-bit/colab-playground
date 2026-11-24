@@ -108,17 +108,13 @@ impl WebState {
                 }
                 _ => pending.flow.cancel().map(|()| None),
             };
-            let saved = matches!(&result, Ok(Some(_)));
-            if saved {
+            if matches!(&result, Ok(Some(_))) {
                 let _ = job.cancel.commit();
             }
             let backend = &job.state.0.backend;
             job.state
                 .record_accounts(backend.accounts(&CancelToken::new()));
-            if saved {
-                job.state.record_usage(backend.usage());
-            }
-            result
+            result.map(|account| account.map(|account| job.state.published_account(account)))
         });
         Ok(Submission::Started { id, job })
     }

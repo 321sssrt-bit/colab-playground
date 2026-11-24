@@ -61,10 +61,22 @@ impl WebState {
             move |_, backend, cancel| {
                 let result = backend.adopt_active_account(cancel);
                 state.record_accounts(backend.accounts(&CancelToken::new()));
-                state.record_usage(backend.usage());
-                result
+                result.map(|account| state.published_account(account))
             },
         )
+    }
+
+    pub(super) fn published_account(&self, mut account: Account) -> Account {
+        if let Some(saved) = self
+            .accounts_snapshot()
+            .accounts
+            .as_ref()
+            .and_then(|view| view.accounts.iter().find(|saved| saved.id == account.id))
+        {
+            return saved.clone();
+        }
+        account.usage = account.usage.map(super::polling::stale_sample);
+        account
     }
 
     pub fn remove_account(
@@ -94,7 +106,6 @@ impl WebState {
                 }
                 let result = backend.remove_account(&id, cancel);
                 state.record_accounts(backend.accounts(&CancelToken::new()));
-                state.record_usage(backend.usage());
                 result
             },
         )

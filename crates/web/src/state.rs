@@ -479,18 +479,33 @@ impl WebState {
         let now = self.0.backend.now();
         self.update(|snapshot| match result {
             Ok(mut view) => {
-                for account in &mut view.accounts {
-                    if let Some(usage) = snapshot
-                        .usage
-                        .iter()
-                        .find(|usage| usage.account == account.id)
-                    {
+                let usage = view
+                    .accounts
+                    .iter_mut()
+                    .map(|account| {
+                        let mut usage = snapshot
+                            .usage
+                            .iter()
+                            .find(|usage| usage.account == account.id)
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                colab_playground_core::backend::usage_view(
+                                    &account.id,
+                                    account.email.clone(),
+                                    &colab_playground_core::usage::AccountUsage {
+                                        snapshot: account.usage.map(polling::stale_sample),
+                                        ..Default::default()
+                                    },
+                                    0,
+                                )
+                            });
+                        if let Some(sample) = &mut usage.snapshot {
+                            polling::expire_sample(sample, now);
+                        }
                         account.usage = usage.snapshot;
-                    }
-                    if let Some(sample) = &mut account.usage {
-                        polling::expire_sample(sample, now);
-                    }
-                }
+                        usage
+                    })
+                    .collect();
                 if snapshot.account.active != view.active {
                     snapshot.account.revision += 1;
                     snapshot.account.active.clone_from(&view.active);
@@ -502,8 +517,10 @@ impl WebState {
                     }
                 }
                 let changed = snapshot.accounts_error.take().is_some()
-                    || snapshot.accounts.as_ref() != Some(&view);
+                    || snapshot.accounts.as_ref() != Some(&view)
+                    || snapshot.usage != usage;
                 snapshot.accounts = Some(view);
+                snapshot.usage = usage;
                 changed
             }
             Err(error) => {

@@ -81,9 +81,9 @@ impl WebState {
                     if let Some(view) = usage.iter_mut().find(|view| view.account == account.id) {
                         // After a restart, the account store can hold the only known sample.
                         if view.snapshot.is_none()
-                            && let Some(mut sample) = account.usage
+                            && let Some(sample) = account.usage
                         {
-                            sample.stale = true;
+                            let sample = stale_sample(sample);
                             view.eta = sample.eta();
                             view.snapshot = Some(sample);
                         }
@@ -226,4 +226,9 @@ pub(super) fn expire_sample(sample: &mut UsageSnapshot, now: SystemTime) -> bool
     let expired = !sample.is_fresh(now, USAGE_STALE_AFTER) && !sample.stale;
     sample.stale |= expired;
     expired
+}
+
+pub(super) fn stale_sample(mut sample: UsageSnapshot) -> UsageSnapshot {
+    sample.stale = true;
+    sample
 }
