@@ -1,4 +1,8 @@
 pub(super) const MESSAGES: colab_playground_shared::i18n::Messages = &[
+    (
+        super::PROVISION_NOT_FOUND,
+        "找不到這次工作階段的建立記錄，或建立已結束。",
+    ),
     ("confirm.hold", "再按一次以確認"),
     ("confirm.twice", "再點一次以確認"),
     ("copy.button", "複製"),

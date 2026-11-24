@@ -1,4 +1,8 @@
 pub(super) const MESSAGES: colab_playground_shared::i18n::Messages = &[
+    (
+        super::PROVISION_NOT_FOUND,
+        "セッションの作成が終了したか、記録が見つかりません。",
+    ),
     ("confirm.hold", "もう一度押して確認"),
     ("confirm.twice", "もう一度クリックして確認"),
     ("copy.button", "コピー"),
