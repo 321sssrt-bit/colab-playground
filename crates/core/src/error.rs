@@ -77,6 +77,8 @@ pub enum ErrorKind {
     SessionLimitReached,
     /// Another account operation holds the credential slot; retry shortly.
     Busy,
+    /// Another instance holds the app's data directory lock. Param: `path`.
+    DataDirInUse,
     /// Hardware never matched the requested spec within `max_attempts`.
     /// Params: `attempts`, `gpu`, `vram_mib`.
     ProvisionExhausted,
@@ -160,9 +162,11 @@ impl ErrorKind {
             }
             // For the update kinds another attempt would fetch the same files; the app offers
             // what is left itself.
-            K::PluginExists | K::Cancelled | K::UpdateUnverified | K::UpdateUnavailable => {
-                NextStep::None
-            }
+            K::PluginExists
+            | K::Cancelled
+            | K::UpdateUnverified
+            | K::UpdateUnavailable
+            | K::DataDirInUse => NextStep::None,
             K::Unsupported | K::CommandTooLong | K::Parse | K::Io | K::Other => {
                 NextStep::ReportProblem
             }

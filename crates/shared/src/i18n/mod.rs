@@ -298,6 +298,7 @@ catalog_keys! {
     ERR_COMMAND_TOO_LONG => "app.err.command_too_long",
     ERR_SESSION_LIMIT => "app.err.session_limit",
     ERR_BUSY => "app.err.busy",
+    ERR_DATA_DIR_IN_USE => "app.err.data_dir_in_use",
     ERR_PROVISION_EXHAUSTED => "app.err.provision_exhausted",
     ERR_ORPHAN_SUSPECTED => "app.err.orphan_suspected",
     ERR_MANIFEST_INVALID => "app.err.manifest_invalid",

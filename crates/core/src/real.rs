@@ -2057,7 +2057,11 @@ impl Backend for RealBackend {
             return Ok(());
         };
         if !relaunch.launcher {
-            return Host::Local.launch_detached(&relaunch.program, &relaunch.args);
+            return Host::Local.launch_detached(
+                &relaunch.program,
+                &relaunch.args,
+                &[(updater::RESTART_ENV, "1")],
+            );
         }
         let program = relaunch.program.to_string_lossy();
         let out = Host::Local.run_program(
