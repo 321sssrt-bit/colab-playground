@@ -549,6 +549,10 @@ pub(super) const MESSAGES: Messages = &[
     ),
     (ERR_BUSY, "別のアカウント操作を実行中です。"),
     (
+        ERR_DATA_DIR_IN_USE,
+        "別の Colab Playground インスタンスが {path} を使用しています。閉じてからもう一度お試しください。",
+    ),
+    (
         ERR_PROVISION_EXHAUSTED,
         "{attempts} 回試行しましたが、要求したハードウェアを得られませんでした。",
     ),

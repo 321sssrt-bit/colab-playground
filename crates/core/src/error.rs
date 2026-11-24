@@ -77,6 +77,8 @@ pub enum ErrorKind {
     SessionLimitReached,
     /// Another account operation holds the credential slot; retry shortly.
     Busy,
+    /// Another instance holds the app's data directory lock. Param: `path`.
+    DataDirInUse,
     /// Hardware never matched the requested spec within `max_attempts`.
     /// Params: `attempts`, `gpu`, `vram_mib`.
     ProvisionExhausted,
@@ -141,6 +143,7 @@ impl ErrorKind {
             | K::ConnectionLost
             | K::ExecTimeout
             | K::Busy
+            | K::DataDirInUse
             | K::Timeout
             | K::RateLimited => NextStep::RetryLater,
             K::SshBusy => NextStep::CloseOtherConnection,

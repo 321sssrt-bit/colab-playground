@@ -501,6 +501,10 @@ pub(super) const MESSAGES: Messages = &[
     ),
     (ERR_BUSY, "Another account task is running."),
     (
+        ERR_DATA_DIR_IN_USE,
+        "Another Colab Playground instance is using {path}. Close it and try again.",
+    ),
+    (
         ERR_PROVISION_EXHAUSTED,
         "No attempt got the requested hardware ({attempts} tries).",
     ),

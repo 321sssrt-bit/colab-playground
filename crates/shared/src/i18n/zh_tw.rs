@@ -422,6 +422,10 @@ pub(super) const MESSAGES: Messages = &[
     ),
     (ERR_BUSY, "另一個帳號工作正在進行。"),
     (
+        ERR_DATA_DIR_IN_USE,
+        "另一個 Colab Playground 執行個體正在使用 {path}。請關閉後再試一次。",
+    ),
+    (
         ERR_PROVISION_EXHAUSTED,
         "嘗試了 {attempts} 次，都沒有取得所需的硬體。",
     ),

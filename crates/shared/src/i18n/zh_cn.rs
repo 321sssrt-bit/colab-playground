@@ -414,6 +414,10 @@ pub(super) const MESSAGES: Messages = &[
     ),
     (ERR_BUSY, "另一个账号任务正在进行。"),
     (
+        ERR_DATA_DIR_IN_USE,
+        "另一个 Colab Playground 实例正在使用 {path}。请关闭它后重试。",
+    ),
+    (
         ERR_PROVISION_EXHAUSTED,
         "尝试了 {attempts} 次，都没有获得所需的硬件。",
     ),

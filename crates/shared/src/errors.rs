@@ -75,6 +75,7 @@ pub fn kind_key(kind: ErrorKind) -> Option<&'static str> {
         K::CommandTooLong => keys::ERR_COMMAND_TOO_LONG,
         K::SessionLimitReached => keys::ERR_SESSION_LIMIT,
         K::Busy => keys::ERR_BUSY,
+        K::DataDirInUse => keys::ERR_DATA_DIR_IN_USE,
         K::ProvisionExhausted => keys::ERR_PROVISION_EXHAUSTED,
         K::OrphanSuspected => keys::ERR_ORPHAN_SUSPECTED,
         K::ManifestInvalid => keys::ERR_MANIFEST_INVALID,
