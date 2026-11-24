@@ -64,6 +64,9 @@ async fn http_checks_origins_and_revokes_open_streams_on_rotation() {
             ],
         ),
         state.clone(),
+        crate::api::WebSettings::load(colab_playground_shared::settings::SettingsStore::new(Some(
+            dir.path().to_path_buf(),
+        ))),
     );
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
@@ -305,3 +308,5 @@ async fn http_checks_origins_and_revokes_open_streams_on_rotation() {
 
     server.abort();
 }
+
+mod domain_api;

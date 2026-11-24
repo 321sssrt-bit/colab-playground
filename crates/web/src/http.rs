@@ -9,15 +9,21 @@ use axum::{
     extract::{DefaultBodyLimit, Extension, Request, State, rejection::JsonRejection},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header, uri::Authority},
     middleware::{self, Next},
-    response::{IntoResponse, Response, Sse, sse::Event},
+    response::{
+        IntoResponse, Response, Sse,
+        sse::{Event, KeepAlive},
+    },
     routing::{get, post},
 };
 use colab_playground_web::state::WebState;
-use futures_util::stream;
+use futures_util::{Stream, StreamExt as _, stream};
 use serde::{Deserialize, Serialize, de::IgnoredAny};
 use tokio::sync::watch;
 
-use crate::auth::{Auth, SESSION_LIFETIME, Session};
+use crate::{
+    api::{self, WebSettings},
+    auth::{Auth, SESSION_LIFETIME, Session},
+};
 
 const HTTP_PORT: u16 = 80;
 const HTTPS_PORT: u16 = 443;
@@ -183,10 +189,11 @@ fn unique_header(headers: &HeaderMap, name: HeaderName) -> Option<&str> {
 }
 
 #[derive(Clone)]
-struct StateData {
+pub(crate) struct StateData {
     auth: Arc<Auth>,
     key_changes: watch::Receiver<()>,
-    web: WebState,
+    pub(crate) web: WebState,
+    pub(crate) settings: WebSettings,
 }
 
 pub fn router(
@@ -194,11 +201,13 @@ pub fn router(
     key_changes: watch::Receiver<()>,
     origins: Origins,
     web: WebState,
+    settings: WebSettings,
 ) -> Router {
     let state = StateData {
         auth: Arc::new(auth),
         key_changes,
         web,
+        settings,
     };
     let protected = Router::new()
         .route("/api/session", get(|| async { StatusCode::NO_CONTENT }))
@@ -208,6 +217,7 @@ pub fn router(
             EVENTS,
             post(events).layer(DefaultBodyLimit::max(KEY_BODY_LIMIT)),
         )
+        .merge(api::routes())
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer,
@@ -315,45 +325,53 @@ async fn events(
     if let Err(rejection) = payload {
         return rejection.status().into_response();
     }
-    let snapshots = state.web.subscribe();
+    let snapshots = stream::unfold(
+        (state.web.subscribe(), true),
+        |(mut snapshots, first)| async move {
+            if !first {
+                snapshots.changed().await.ok()?;
+            }
+            let snapshot = snapshots.borrow_and_update().clone();
+            let event = Event::default()
+                .event("snapshot")
+                .id(snapshot.version.to_string())
+                .json_data(&*snapshot);
+            Some((event, (snapshots, false)))
+        },
+    );
+    authenticated_events(state, session, snapshots)
+}
+
+pub(crate) fn authenticated_events(
+    state: StateData,
+    session: Session,
+    events: impl Stream<Item = Result<Event, axum::Error>> + Send + 'static,
+) -> Response {
+    let shutdown = state.web.subscribe();
+    let mut interval = tokio::time::interval(WATCH_FALLBACK);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let stream = stream::unfold(
-        (state, snapshots, None),
-        move |(mut state, mut snapshots, next_heartbeat)| async move {
-            let mut send_snapshot = next_heartbeat.is_none();
+        (state, shutdown, Box::pin(events), interval),
+        move |(mut state, mut shutdown, mut events, mut interval)| async move {
             loop {
-                if !send_snapshot {
-                    let next_heartbeat = next_heartbeat.expect("stream started");
-                    tokio::select! {
-                        Ok(()) = snapshots.changed() => send_snapshot = true,
-                        Ok(()) = state.key_changes.changed() => {}
-                        _ = tokio::time::sleep(WATCH_FALLBACK) => {}
-                        _ = tokio::time::sleep_until(next_heartbeat) => {}
-                        _ = tokio::time::sleep_until(session.expires) => return None,
-                    }
-                }
-                if !state.auth.is_live(session).await || snapshots.borrow().shutting_down {
+                let event = tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep_until(session.expires) => return None,
+                    _ = shutdown.wait_for(|snapshot| snapshot.shutting_down) => return None,
+                    Ok(()) = state.key_changes.changed() => None,
+                    _ = interval.tick() => None,
+                    event = events.next() => Some(event?),
+                };
+                if !state.auth.is_live(session).await || shutdown.borrow().shutting_down {
                     return None;
                 }
-                let now = tokio::time::Instant::now();
-                if send_snapshot {
-                    let snapshot = snapshots.borrow_and_update().clone();
-                    if snapshot.shutting_down {
-                        return None;
-                    }
-                    let event = Event::default()
-                        .event("snapshot")
-                        .id(snapshot.version.to_string())
-                        .json_data(&*snapshot);
-                    return Some((event, (state, snapshots, Some(now + HEARTBEAT))));
-                }
-                if next_heartbeat.is_some_and(|deadline| now >= deadline) {
-                    return Some((
-                        Ok::<_, axum::Error>(Event::default().comment("keep-alive")),
-                        (state, snapshots, Some(now + HEARTBEAT)),
-                    ));
+                if let Some(event) = event {
+                    return Some((event, (state, shutdown, events, interval)));
                 }
             }
         },
     );
-    Sse::new(stream).into_response()
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(HEARTBEAT).text("keep-alive"))
+        .into_response()
 }

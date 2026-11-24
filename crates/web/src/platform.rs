@@ -103,3 +103,14 @@ impl ShutdownSignals {
 pub fn force_exit(code: u8) -> ! {
     std::process::exit(i32::from(code))
 }
+
+pub fn headless_secret_service() -> bool {
+    cfg!(target_os = "linux")
+        && ["DISPLAY", "WAYLAND_DISPLAY"]
+            .iter()
+            .all(|name| std::env::var_os(name).is_none_or(|value| value.is_empty()))
+}
+
+pub fn uses_wsl() -> bool {
+    matches!(Host::detect(), Host::Wsl { .. })
+}
