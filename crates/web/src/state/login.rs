@@ -4,7 +4,7 @@ use tokio::time::{Instant, sleep_until};
 use super::*;
 
 pub(super) struct PendingLogin {
-    id: u64,
+    pub(super) id: u64,
     expires: Instant,
     pub(super) flow: Box<dyn LoginFlow>,
 }
@@ -21,11 +21,15 @@ impl WebState {
             Operation::Login,
             Access::AccountWrite(account),
             false,
-            move |backend, cancel| {
+            move |id, backend, cancel| {
                 let flow = backend.begin_add_account(cancel)?;
                 let auth_url = flow.auth_url().to_owned();
                 let mut control = state.lock();
-                let id = control.next_id;
+                if control.shutting_down || cancel.commit().is_err() {
+                    drop(control);
+                    flow.cancel()?;
+                    return Err(Error::cancelled());
+                }
                 let expires = Instant::now() + state.0.login_inactivity;
                 control.login = Some(PendingLogin { id, expires, flow });
                 drop(control);

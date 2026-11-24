@@ -66,7 +66,7 @@ pub struct Snapshot {
     pub guard: Option<GuardReport>,
     pub guard_error: Option<ErrorKind>,
     pub operations: Vec<PendingOperation>,
-    pub login_pending: bool,
+    pub login_id: Option<u64>,
     pub shutting_down: bool,
 }
 
@@ -83,6 +83,7 @@ pub struct WebState(Arc<Inner>);
 struct Inner {
     backend: Arc<dyn Backend>,
     control: Mutex<Control>,
+    poll_slot: Mutex<()>,
     snapshots: watch::Sender<Arc<Snapshot>>,
     refresh: Notify,
     drained: Notify,
@@ -109,6 +110,7 @@ struct Running {
 enum Slot {
     Independent,
     Shared,
+    Poll,
     Exclusive,
 }
 
@@ -168,12 +170,13 @@ impl WebState {
             guard: None,
             guard_error: None,
             operations: Vec::new(),
-            login_pending: false,
+            login_id: None,
             shutting_down: false,
         }));
         let state = Self(Arc::new(Inner {
             backend,
             control: Mutex::default(),
+            poll_slot: Mutex::default(),
             snapshots,
             refresh: Notify::new(),
             drained: Notify::new(),
@@ -199,7 +202,12 @@ impl WebState {
         access: Access,
         work: impl FnOnce(&dyn Backend, &CancelToken) -> Result<T> + Send + 'static,
     ) -> Result<Submission<T>> {
-        self.start_job(Operation::Domain { name, key }, access, false, work)
+        self.start_job(
+            Operation::Domain { name, key },
+            access,
+            false,
+            move |_, backend, cancel| work(backend, cancel),
+        )
     }
 
     pub fn provision(
@@ -217,7 +225,7 @@ impl WebState {
             },
             Access::Account(account),
             true,
-            move |backend, cancel| {
+            move |_, backend, cancel| {
                 run_allocation(backend, cancel, &active, &session, || {
                     backend.provision(spec, events, cancel)
                 })
@@ -257,7 +265,7 @@ impl WebState {
             },
             Access::Account(account),
             allocating,
-            move |backend, cancel| {
+            move |_, backend, cancel| {
                 let run = || backend.run_plugin(spec, events, cancel);
                 if let Some(target) = existing {
                     let view = list_account(backend, cancel, &target.account)?;
@@ -282,7 +290,7 @@ impl WebState {
             Operation::SwitchAccount { to: to.clone() },
             Access::AccountWrite(account),
             false,
-            move |backend, cancel| {
+            move |_, backend, cancel| {
                 let result = backend.switch_account(&to, cancel);
                 state.record_accounts(result.clone());
                 result
@@ -334,12 +342,12 @@ impl WebState {
                     })
                 })
                 .collect();
-            let login_pending = control.login.is_some();
+            let login_id = control.login.as_ref().map(|login| login.id);
             let changed = snapshot.operations != operations
-                || snapshot.login_pending != login_pending
+                || snapshot.login_id != login_id
                 || snapshot.shutting_down != control.shutting_down;
             snapshot.operations = operations;
-            snapshot.login_pending = login_pending;
+            snapshot.login_id = login_id;
             snapshot.shutting_down = control.shutting_down;
             changed
         });
@@ -350,7 +358,7 @@ impl WebState {
         operation: Operation,
         access: Access,
         allocating: bool,
-        work: impl FnOnce(&dyn Backend, &CancelToken) -> Result<T> + Send + 'static,
+        work: impl FnOnce(u64, &dyn Backend, &CancelToken) -> Result<T> + Send + 'static,
     ) -> Result<Submission<T>> {
         let mut control = self.lock();
         if control.shutting_down {
@@ -384,10 +392,13 @@ impl WebState {
         let job = self.reserve(&mut control, Some(operation), slot, allocating);
         let expected = expected.cloned();
         Ok(self.launch(job, move |job| {
+            // An account write is visible and reserves the slot while the current poll finishes.
+            let _poll = (slot == Slot::Exclusive).then(|| job.state.lock_poll_slot());
+            job.cancel.check()?;
             if let Some(expected) = expected {
                 job.state.verify_account(&expected, &job.cancel)?;
             }
-            work(&*job.state.0.backend, &job.cancel)
+            work(job.id, &*job.state.0.backend, &job.cancel)
         }))
     }
 
@@ -406,18 +417,25 @@ impl WebState {
     }
 
     fn verify_account(&self, expected: &AccountContext, cancel: &CancelToken) -> Result<()> {
-        let result = self.0.backend.accounts(cancel);
-        if result
-            .as_ref()
-            .is_ok_and(|view| view.active == expected.active)
-        {
-            return self.check_account_context(expected);
+        match self.0.backend.accounts(cancel) {
+            Ok(view) => {
+                self.record_accounts(Ok(view));
+                self.check_account_context(expected)
+            }
+            Err(error) => {
+                if !error.is(ErrorKind::Cancelled) {
+                    self.record_accounts(Err(Error::new(error.kind)));
+                }
+                Err(error)
+            }
         }
-        let error = result.as_ref().err().map(|error| error.kind);
-        if error != Some(ErrorKind::Cancelled) {
-            self.record_accounts(result);
-        }
-        Err(Error::new(error.unwrap_or(ErrorKind::AccountNotActive)))
+    }
+
+    fn lock_poll_slot(&self) -> MutexGuard<'_, ()> {
+        self.0
+            .poll_slot
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
     }
 
     fn record_accounts(&self, result: Result<AccountsView>) {
@@ -492,7 +510,7 @@ impl Control {
         !self.shutting_down
             && match slot {
                 Slot::Independent => true,
-                Slot::Shared => {
+                Slot::Shared | Slot::Poll => {
                     self.login.is_none()
                         && !self
                             .running
@@ -504,7 +522,7 @@ impl Control {
                         && self
                             .running
                             .values()
-                            .all(|job| job.access == Slot::Independent)
+                            .all(|job| matches!(job.access, Slot::Independent | Slot::Poll))
                 }
             }
     }

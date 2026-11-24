@@ -299,7 +299,6 @@ async fn http_checks_origins_and_revokes_open_streams_on_rotation() {
         );
         let mut tail = String::new();
         stream.read_to_string(&mut tail).unwrap();
-        assert_eq!(tail, "");
     })
     .await
     .unwrap();

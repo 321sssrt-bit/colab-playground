@@ -17,14 +17,19 @@ impl WebState {
                 _ = self.0.refresh.notified() => true,
                 _ = timer.tick() => false,
             };
-            let job = {
-                let mut control = self.lock();
-                if !control.available(Slot::Shared) {
-                    continue;
-                }
-                self.reserve(&mut control, None, Slot::Shared, false)
-            };
-            let _ = spawn_blocking(move || poll_backend(&job, refresh)).await;
+            let state = self.clone();
+            let _ = spawn_blocking(move || {
+                let _poll = state.lock_poll_slot();
+                let job = {
+                    let mut control = state.lock();
+                    if !control.available(Slot::Poll) {
+                        return;
+                    }
+                    state.reserve(&mut control, None, Slot::Poll, false)
+                };
+                poll_backend(&job, refresh);
+            })
+            .await;
         }
     }
 
@@ -52,7 +57,7 @@ fn poll_backend(job: &Job, refresh: bool) {
     if refresh || due || snapshot.accounts.is_none() || snapshot.accounts_error.is_some() {
         state.record_accounts(backend.accounts(cancel));
     }
-    if due
+    if (refresh || due)
         && state
             .snapshot()
             .accounts
@@ -82,7 +87,7 @@ fn poll_backend(job: &Job, refresh: bool) {
             .map(|usage| usage.account)
             .filter(|account| !covered.contains(account))
             .collect();
-        if !uncovered.is_empty() && backend.usage_poll_due() {
+        if !uncovered.is_empty() && (refresh || backend.usage_poll_due()) {
             let _ = backend.refresh_usage(&uncovered, cancel);
         }
         let usage = backend.usage();

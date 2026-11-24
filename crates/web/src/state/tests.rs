@@ -161,7 +161,7 @@ async fn login_timeout_rolls_back_and_releases_the_slot() {
     let (_, job) = started(state.begin_login(account.clone()).unwrap());
     let prompt = job.await.unwrap().unwrap();
     assert!(prompt.auth_url.starts_with("https://"));
-    assert!(state.snapshot().login_pending);
+    assert_eq!(state.snapshot().login_id, Some(prompt.id));
     rejected(
         state.switch_account(account.clone(), other.clone()),
         ErrorKind::Busy,
@@ -179,7 +179,7 @@ async fn login_timeout_rolls_back_and_releases_the_slot() {
     })
     .await
     .unwrap();
-    assert!(!state.snapshot().login_pending);
+    assert!(state.snapshot().login_id.is_none());
     rejected(
         state.submit_login(prompt.id, "expired".into()),
         ErrorKind::LoginCancelled,
@@ -330,4 +330,121 @@ async fn shutdown_reports_unknown_when_a_worker_cannot_finish_within_the_grace_p
         ),
         ErrorKind::Cancelled,
     );
+}
+
+struct HoldStep {
+    clock: colab_playground_core::clock::ManualClock,
+    steps: std::sync::atomic::AtomicUsize,
+    reached: mpsc::Sender<()>,
+    release: Mutex<mpsc::Receiver<()>>,
+}
+
+impl colab_playground_core::clock::Clock for HoldStep {
+    fn now(&self) -> std::time::SystemTime {
+        self.clock.now()
+    }
+
+    fn sleep(&self, duration: Duration, cancel: &CancelToken) -> Result<()> {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        self.clock.sleep(duration, cancel)?;
+        if self
+            .steps
+            .try_update(SeqCst, SeqCst, |steps| steps.checked_sub(1))
+            == Ok(1)
+        {
+            self.reached.send(()).unwrap();
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(TEST_TIMEOUT)
+                .unwrap();
+        }
+        Ok(())
+    }
+}
+
+async fn demo_with_held_step() -> (
+    WebState,
+    Arc<MockBackend>,
+    Arc<HoldStep>,
+    mpsc::Receiver<()>,
+    mpsc::Sender<()>,
+) {
+    let (mut config, clock) = MockConfig::headless(MockScenario::demo());
+    let (reached, at_step) = mpsc::channel();
+    let (resume, release) = mpsc::channel();
+    let step = Arc::new(HoldStep {
+        clock,
+        steps: 0.into(),
+        reached,
+        release: Mutex::new(release),
+    });
+    config.clock = step.clone();
+    let backend = Arc::new(MockBackend::new(config));
+    let state = WebState::start(backend.clone()).await.unwrap();
+    ready(&state).await;
+    (state, backend, step, at_step, resume)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_account_write_is_accepted_while_a_background_poll_finishes() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let (state, _, step, at_step, resume) = demo_with_held_step().await;
+    step.steps.store(1, SeqCst);
+    state.0.refresh.notify_one();
+    at_step.recv_timeout(TEST_TIMEOUT).unwrap();
+    let snapshot = state.snapshot();
+    let to = snapshot.accounts.as_ref().unwrap().accounts[1].id.clone();
+
+    let (id, job) = started(
+        state
+            .switch_account(snapshot.account.clone(), to.clone())
+            .unwrap(),
+    );
+    assert_eq!(state.snapshot().operations[0].id, id);
+    assert!(!job.is_finished());
+    resume.send(()).unwrap();
+    assert_eq!(job.await.unwrap().unwrap().active, Some(to));
+    assert!(state.shutdown(TEST_TIMEOUT).await.completed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn login_keeps_its_job_id_and_rolls_back_if_cancelled_while_opening() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let (state, backend, step, at_step, resume) = demo_with_held_step().await;
+    let account = state.snapshot().account.clone();
+
+    step.steps.store(2, SeqCst);
+    let (id, login) = started(state.begin_login(account.clone()).unwrap());
+    at_step.recv_timeout(TEST_TIMEOUT).unwrap();
+    let (other, job) = started(
+        state
+            .start_operation("other", String::new(), Access::Independent, |_, _| Ok(()))
+            .unwrap(),
+    );
+    assert_ne!(id, other);
+    resume.send(()).unwrap();
+    job.await.unwrap().unwrap();
+    let prompt = login.await.unwrap().unwrap();
+    assert_eq!(prompt.id, id);
+    assert_eq!(state.snapshot().login_id, Some(id));
+    let (_, rollback) = started(state.cancel_login(prompt.id).unwrap());
+    rollback.await.unwrap().unwrap();
+    ready(&state).await;
+
+    step.steps.store(2, SeqCst);
+    let (id, login) = started(state.begin_login(account.clone()).unwrap());
+    at_step.recv_timeout(TEST_TIMEOUT).unwrap();
+    assert!(state.cancel(id));
+    resume.send(()).unwrap();
+    assert!(matches!(login.await.unwrap(), Err(error) if error.is(ErrorKind::Cancelled)));
+    assert!(state.snapshot().login_id.is_none());
+    assert_eq!(
+        backend.accounts(&CancelToken::new()).unwrap().active,
+        account.active
+    );
+    assert!(state.shutdown(TEST_TIMEOUT).await.completed);
 }
