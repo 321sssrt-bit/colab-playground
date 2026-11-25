@@ -620,6 +620,10 @@
   gap: var(--space-0p5);
 }
 
+.session-stat:first-child {
+  flex: 1.6 1 calc(var(--label-width) * 1.5);
+}
+
 .session-stat-label {
   font-size: var(--text-sm);
   color: var(--color-fg-muted);
@@ -676,6 +680,13 @@
 .forward-addr {
   color: var(--color-fg);
   overflow-wrap: anywhere;
+}
+
+.forward-row-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-0p5);
+  flex: none;
 }
 
 .forward-item-notes {
@@ -891,6 +902,7 @@
   }
 
   .prov-row-info {
+    flex: 0 0 auto;
     min-width: 0;
   }
 

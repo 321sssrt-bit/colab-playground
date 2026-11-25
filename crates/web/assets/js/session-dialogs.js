@@ -482,9 +482,13 @@ export function renderForwardRow(forward, { onAfterClose = null } = {}) {
     tunnelStateBadge(forward),
     isAllInterfaces ? badge(t("web.forward.bind_badge_all"), "warning") : null,
     el("span", { className: "forward-addr mono" }, `${displayAddr} → ${spec.remote_port ?? ""}`),
-    !terminal ? copyBtn : null,
-    !terminal ? openLink : null,
-    closeBtn
+    el(
+      "span",
+      { className: "forward-row-actions" },
+      !terminal ? copyBtn : null,
+      !terminal ? openLink : null,
+      closeBtn
+    )
   );
 
   const notes = [];
