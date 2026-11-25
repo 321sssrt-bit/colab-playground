@@ -1,4 +1,4 @@
-import { useCallback, useEffect } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 import { AppShell } from "./components/AppShell.tsx";
 import { BrandIcon } from "./components/Icons.tsx";
@@ -39,12 +39,14 @@ export function App() {
   const theme = useTheme();
   const { route, navigate } = useRouter();
   const toasts = useToasts();
+  const [modalDrawerOpen, setModalDrawerOpen] = useState(false);
   const { t } = i18n;
 
   useEffect(() => {
     if (storeState.authStatus !== "authenticated") {
       preferenceSync.cancelPending();
       toastStore.clear();
+      setModalDrawerOpen(false);
       return;
     }
 
@@ -135,14 +137,16 @@ export function App() {
         route={route}
         snapshot={storeState.snapshot}
         connectionStatus={storeState.connectionStatus}
+        reconnectAttempt={storeState.reconnectAttempt}
         locale={i18n.locale}
         t={t}
         onNavigate={navigate}
         onSignOut={handleSignOut}
+        onModalDrawerChange={setModalDrawerOpen}
       >
         {renderRoutePage(route, pageProps)}
       </AppShell>
-      <ToastViewport toasts={toasts} t={t} onDismiss={dismissToast} />
+      <ToastViewport toasts={toasts} t={t} inert={modalDrawerOpen} onDismiss={dismissToast} />
     </div>
   );
 }

@@ -10,6 +10,7 @@ import { AlertIcon, CheckCircleIcon, CloseIcon, InfoIcon } from "./Icons.tsx";
 export interface ToastViewportProps {
   readonly toasts: readonly ToastItem[];
   readonly t: TranslateFn;
+  readonly inert?: boolean;
   readonly onDismiss: (id: number) => void;
 }
 
@@ -30,9 +31,15 @@ function renderToneIcon(tone: ToastTone) {
   return <InfoIcon />;
 }
 
-export function ToastViewport({ toasts, t, onDismiss }: ToastViewportProps) {
+export function ToastViewport({ toasts, t, inert = false, onDismiss }: ToastViewportProps) {
   return (
-    <div className="toast-viewport" aria-live="polite" aria-relevant="additions text">
+    <div
+      className="toast-viewport"
+      aria-live="polite"
+      aria-relevant="additions text"
+      aria-hidden={inert ? "true" : undefined}
+      inert={inert || undefined}
+    >
       {toasts.map((toast) => {
         const urgent = toast.tone === "danger" || toast.tone === "warning";
         return (

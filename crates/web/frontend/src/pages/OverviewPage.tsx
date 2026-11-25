@@ -2,12 +2,20 @@
  * Overview route entry module (minimal live summary until full Overview migration).
  */
 
-import { formatCu, formatCuRate, resolveActiveAccount } from "../lib/format.ts";
+import {
+  evaluateUsageFreshness,
+  formatCu,
+  formatCuRate,
+  resolveActiveAccount,
+  useUsageClockSecs,
+} from "../lib/format.ts";
 import type { PageProps } from "./types.ts";
 
 export function OverviewPage({ snapshot, locale, t }: PageProps) {
+  const nowSecs = useUsageClockSecs();
   const active = resolveActiveAccount(snapshot, t);
   const usageSnap = active.usageSnapshot;
+  const freshness = evaluateUsageFreshness(active, nowSecs);
   const runtimeCount = snapshot?.runtimes?.runtimes.length ?? null;
 
   const balanceText =
@@ -46,6 +54,9 @@ export function OverviewPage({ snapshot, locale, t }: PageProps) {
                     : t("app.shell.account.signed_out")}
                 </p>
               </div>
+              {freshness?.outdated && (
+                <span className="badge badge-warning">{t("app.usage.outdated")}</span>
+              )}
             </div>
 
             <div className="kpi-grid">
@@ -53,9 +64,6 @@ export function OverviewPage({ snapshot, locale, t }: PageProps) {
                 <span className="kpi-label">{t("app.summary.balance")}</span>
                 <div className="kpi-value-row">
                   <span className="kpi-value">{balanceText}</span>
-                  {usageSnap?.stale && (
-                    <span className="badge badge-warning">{t("app.usage.outdated")}</span>
-                  )}
                 </div>
               </div>
 

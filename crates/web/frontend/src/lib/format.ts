@@ -3,6 +3,8 @@
  * ages, active account identity, and the shell usage badge.
  */
 
+import { useEffect, useState } from "react";
+
 import type { TranslateFn } from "./i18n.ts";
 import type { AccountId, AccountUsageView, Locale, Snapshot, UsageSnapshot } from "./types.ts";
 
@@ -10,6 +12,8 @@ const SECS_PER_MINUTE = 60;
 const SECS_PER_HOUR = 3600;
 const SECS_PER_DAY = 86_400;
 const USAGE_OLD_THRESHOLD_SECS = 600;
+const USAGE_CLOCK_INTERVAL_MS = 30_000;
+const MS_PER_SECOND = 1000;
 const CU_MIN_FRACTION_DIGITS = 1;
 const CU_MAX_FRACTION_DIGITS = 2;
 
@@ -27,6 +31,36 @@ export interface UsageBadgeModel {
   readonly tooltip: string;
   readonly tone: "neutral" | "warning";
   readonly outdated: boolean;
+}
+
+export interface UsageFreshness {
+  readonly ageSecs: number;
+  readonly isStale: boolean;
+  readonly isOld: boolean;
+  readonly outdated: boolean;
+}
+
+function readNowSecs(): number {
+  return Math.floor(Date.now() / MS_PER_SECOND);
+}
+
+/**
+ * React hook returning the current Unix timestamp in seconds, updated periodically
+ * so usage age tooltips and staleness thresholds converge even while offline.
+ */
+export function useUsageClockSecs(): number {
+  const [nowSecs, setNowSecs] = useState<number>(readNowSecs);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      setNowSecs(readNowSecs());
+    }, USAGE_CLOCK_INTERVAL_MS);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  return nowSecs;
 }
 
 function formatNumber(value: number, locale: Locale): string {
@@ -131,6 +165,29 @@ export function resolveActiveAccount(
 }
 
 /**
+ * Evaluates whether an active account's usage reading is stale (failed refresh)
+ * or old (past the freshness threshold).
+ */
+export function evaluateUsageFreshness(
+  active: ActiveAccountSummary,
+  nowSecs: number,
+): UsageFreshness | null {
+  const snap = active.usageSnapshot;
+  if (!active.signedIn || snap === null) {
+    return null;
+  }
+  const ageSecs = Math.max(0, Math.floor(nowSecs - snap.fetched_at));
+  const isStale = snap.stale || (active.usage?.last_error ?? null) !== null;
+  const isOld = ageSecs >= USAGE_OLD_THRESHOLD_SECS;
+  return {
+    ageSecs,
+    isStale,
+    isOld,
+    outdated: isStale || isOld,
+  };
+}
+
+/**
  * Formats the shell compute-unit usage badge and its hover/accessible tooltip.
  * Unknown usage is never treated as zero; stale or old readings are flagged.
  */
@@ -141,8 +198,9 @@ export function buildUsageBadge(
   t: TranslateFn,
 ): UsageBadgeModel {
   const snap = active.usageSnapshot;
-  if (!active.signedIn || snap === null) {
-    const hasError = active.usage?.last_error !== null && active.usage?.last_error !== undefined;
+  const freshness = evaluateUsageFreshness(active, nowSecs);
+  if (!active.signedIn || snap === null || freshness === null) {
+    const hasError = (active.usage?.last_error ?? null) !== null;
     const tipLines = [t("app.shell.usage.hint"), t("app.usage.tip.unknown")];
     if (hasError) {
       tipLines.push(t("app.usage.tip.stale"));
@@ -158,12 +216,7 @@ export function buildUsageBadge(
   const balance = formatCu(snap.balance_cu, locale, t);
   const rate = formatCuRate(snap.rate_cu_per_hour, locale, t);
   const baseText = t("app.usage.badge", { balance, rate });
-
-  const ageSecs = Math.max(0, Math.floor(nowSecs - snap.fetched_at));
-  const isStale = snap.stale || (active.usage?.last_error ?? null) !== null;
-  const isOld = ageSecs >= USAGE_OLD_THRESHOLD_SECS;
-  const outdated = isStale || isOld;
-  const text = outdated ? `${baseText} (${t("app.usage.outdated")})` : baseText;
+  const text = freshness.outdated ? `${baseText} (${t("app.usage.outdated")})` : baseText;
 
   const tipLines: string[] = [];
   if (snap.balance_cu <= 0) {
@@ -176,17 +229,17 @@ export function buildUsageBadge(
     tipLines.push(t("app.shell.usage.hint"));
   }
 
-  tipLines.push(t("app.usage.tip.updated", { age: formatRelativeAge(ageSecs, t) }));
-  if (isStale) {
+  tipLines.push(t("app.usage.tip.updated", { age: formatRelativeAge(freshness.ageSecs, t) }));
+  if (freshness.isStale) {
     tipLines.push(t("app.usage.tip.stale"));
-  } else if (isOld) {
+  } else if (freshness.isOld) {
     tipLines.push(t("app.usage.tip.old"));
   }
 
   return {
     text,
     tooltip: tipLines.join("\n"),
-    tone: outdated || snap.balance_cu <= 0 ? "warning" : "neutral",
-    outdated,
+    tone: freshness.outdated || snap.balance_cu <= 0 ? "warning" : "neutral",
+    outdated: freshness.outdated,
   };
 }
