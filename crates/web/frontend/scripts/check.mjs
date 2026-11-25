@@ -505,7 +505,7 @@ function lookupFiniteTable(scope, name) {
   return undefined;
 }
 
-function checkRenderedStrings(sourceFile, expr, onLiteral) {
+function checkRenderedStrings(expr, onLiteral) {
   const node = unwrapExpression(expr);
   if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) {
     onLiteral(node, node.text);
@@ -514,14 +514,14 @@ function checkRenderedStrings(sourceFile, expr, onLiteral) {
   if (ts.isTemplateExpression(node)) {
     onLiteral(node, node.head.text);
     for (const span of node.templateSpans) {
-      checkRenderedStrings(sourceFile, span.expression, onLiteral);
+      checkRenderedStrings(span.expression, onLiteral);
       onLiteral(span.literal, span.literal.text);
     }
     return;
   }
   if (ts.isConditionalExpression(node)) {
-    checkRenderedStrings(sourceFile, node.whenTrue, onLiteral);
-    checkRenderedStrings(sourceFile, node.whenFalse, onLiteral);
+    checkRenderedStrings(node.whenTrue, onLiteral);
+    checkRenderedStrings(node.whenFalse, onLiteral);
     return;
   }
   if (ts.isBinaryExpression(node)) {
@@ -531,22 +531,22 @@ function checkRenderedStrings(sourceFile, expr, onLiteral) {
       op === ts.SyntaxKind.BarBarToken ||
       op === ts.SyntaxKind.QuestionQuestionToken
     ) {
-      checkRenderedStrings(sourceFile, node.left, onLiteral);
-      checkRenderedStrings(sourceFile, node.right, onLiteral);
+      checkRenderedStrings(node.left, onLiteral);
+      checkRenderedStrings(node.right, onLiteral);
     } else if (op === ts.SyntaxKind.AmpersandAmpersandToken) {
-      checkRenderedStrings(sourceFile, node.right, onLiteral);
+      checkRenderedStrings(node.right, onLiteral);
     }
     return;
   }
   if (ts.isArrayLiteralExpression(node)) {
     for (const elem of node.elements) {
-      checkRenderedStrings(sourceFile, elem, onLiteral);
+      checkRenderedStrings(elem, onLiteral);
     }
   }
 }
 
 function checkNoProseInExpr(sourceFile, expr, context) {
-  checkRenderedStrings(sourceFile, expr, (literalNode, text) => {
+  checkRenderedStrings(expr, (literalNode, text) => {
     if (isProse(text)) {
       reportNode(
         sourceFile,
@@ -559,7 +559,7 @@ function checkNoProseInExpr(sourceFile, expr, context) {
 }
 
 function checkNoJavascriptUrlInExpr(sourceFile, expr, context) {
-  checkRenderedStrings(sourceFile, expr, (literalNode, text) => {
+  checkRenderedStrings(expr, (literalNode, text) => {
     if (isJavascriptUrl(text)) {
       reportNode(
         sourceFile,
@@ -619,7 +619,7 @@ function checkNoColorInExpr(sourceFile, expr, context, scope, seen = new Set()) 
       return;
     }
   }
-  checkRenderedStrings(sourceFile, node, (literalNode, text) => {
+  checkRenderedStrings(node, (literalNode, text) => {
     if (hasHardcodedColor(text)) {
       reportNode(sourceFile, literalNode, "color", `hardcoded color in ${context}: "${text}"`);
     }

@@ -50,10 +50,7 @@ function isActiveViteDevOrigin(
     return false;
   }
   const normalizedHost = requestHost.toLowerCase();
-  return (
-    normalizedHost === parsed.host.toLowerCase() ||
-    (localPort === 80 && normalizedHost === parsed.hostname.toLowerCase())
-  );
+  return normalizedHost === parsed.host.toLowerCase();
 }
 
 function rejectForeignOrigin(
