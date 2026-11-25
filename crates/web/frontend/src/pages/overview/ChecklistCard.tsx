@@ -149,7 +149,7 @@ export function ChecklistCard({
     if (el !== null && stickToBottomRef.current) {
       el.scrollTop = el.scrollHeight;
     }
-  }, [installLines.length]);
+  }, [installLines]);
 
   const handleLogScroll = useCallback(() => {
     const el = logRef.current;
@@ -306,19 +306,21 @@ export function ChecklistCard({
   }
 
   let cliDescription: string | null = null;
-  if (checklist.cliStatus === "waiting") {
-    cliDescription = t("app.step.waiting");
-  } else if (checklist.cliStatus === "done" && overview !== null) {
-    cliDescription = overview.environment.colab_version
-      ? t("app.step.cli.done", { version: overview.environment.colab_version })
-      : t("app.step.cli.done_unknown");
-  } else if (checklist.cliStatus === "todo" && !installing) {
-    if (installPhase === "done") {
-      cliDescription = t("app.install.done");
-    } else if (installPhase === "cancelled") {
-      cliDescription = t("app.install.cancelled");
-    } else {
-      cliDescription = t("app.step.cli.todo");
+  if (!installing) {
+    if (checklist.cliStatus === "waiting") {
+      cliDescription = t("app.step.waiting");
+    } else if (checklist.cliStatus === "done" && overview !== null) {
+      cliDescription = overview.environment.colab_version
+        ? t("app.step.cli.done", { version: overview.environment.colab_version })
+        : t("app.step.cli.done_unknown");
+    } else if (checklist.cliStatus === "todo") {
+      if (installPhase === "done") {
+        cliDescription = t("app.install.done");
+      } else if (installPhase === "cancelled") {
+        cliDescription = t("app.install.cancelled");
+      } else {
+        cliDescription = t("app.step.cli.todo");
+      }
     }
   }
 
@@ -477,102 +479,100 @@ export function ChecklistCard({
             <p className="checklist-title">{t("app.step.cli.title")}</p>
             {cliDescription !== null && <p className="checklist-desc">{cliDescription}</p>}
 
-            {checklist.cliStatus === "todo" && (
-              <>
-                {installing ? (
-                  <div className="checklist-actions">
-                    <div className="busy-line" role="status" aria-live="polite">
-                      <span className="spinner" aria-hidden="true" />
-                      <span>{t("app.install.running")}</span>
-                    </div>
-                    <button
-                      type="button"
-                      className="btn btn-sm"
-                      data-install-cancel="true"
-                      disabled={activeInstallId === null || cancelling || shuttingDown}
-                      onClick={() => {
-                        void handleCancelInstall();
-                      }}
-                    >
-                      {cancelling && <span className="spinner" aria-hidden="true" />}
-                      <span>{t(cancelling ? "app.install.cancelling" : "app.action.cancel")}</span>
-                    </button>
-                  </div>
-                ) : (
-                  <>
-                    {installPhase === "failed" && installError !== null && (
-                      <div className="alert alert-danger" role="alert">
-                        <span className="alert-icon icon-danger">
-                          <AlertIcon />
-                        </span>
-                        <div className="alert-text">
-                          <p className="alert-title">{t("app.install.failed")}</p>
-                          <p className="alert-body">{installError.message}</p>
-                          {installError.hint !== null && (
-                            <p className="alert-body">{installError.hint}</p>
-                          )}
-                          <div className="alert-actions">
-                            <button
-                              type="button"
-                              className="btn btn-sm"
-                              disabled={shuttingDown}
-                              onClick={() => {
-                                void handleStartInstall();
-                              }}
-                            >
-                              {t("app.action.retry")}
-                            </button>
-                          </div>
-                        </div>
-                      </div>
-                    )}
-
-                    <div className="checklist-actions">
-                      {offeredMethods.length > 1 ? (
-                        <>
-                          <label htmlFor={methodSelectId} className="caption">
-                            {t("app.install.method_label")}
-                          </label>
-                          <select
-                            id={methodSelectId}
-                            className="select select-sm select-inline"
-                            data-install-method="true"
-                            value={selectedMethod}
+            {installing ? (
+              <div className="checklist-actions">
+                <div className="busy-line" role="status" aria-live="polite">
+                  <span className="spinner" aria-hidden="true" />
+                  <span>{t("app.install.running")}</span>
+                </div>
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  data-install-cancel="true"
+                  disabled={activeInstallId === null || cancelling || shuttingDown}
+                  onClick={() => {
+                    void handleCancelInstall();
+                  }}
+                >
+                  {cancelling && <span className="spinner" aria-hidden="true" />}
+                  <span>{t(cancelling ? "app.install.cancelling" : "app.action.cancel")}</span>
+                </button>
+              </div>
+            ) : (
+              checklist.cliStatus === "todo" && (
+                <>
+                  {installPhase === "failed" && installError !== null && (
+                    <div className="alert alert-danger" role="alert">
+                      <span className="alert-icon icon-danger">
+                        <AlertIcon />
+                      </span>
+                      <div className="alert-text">
+                        <p className="alert-title">{t("app.install.failed")}</p>
+                        <p className="alert-body">{installError.message}</p>
+                        {installError.hint !== null && (
+                          <p className="alert-body">{installError.hint}</p>
+                        )}
+                        <div className="alert-actions">
+                          <button
+                            type="button"
+                            className="btn btn-sm"
                             disabled={shuttingDown}
-                            onChange={(event) => {
-                              const next = event.target.value as InstallMethod;
-                              if (offeredMethods.includes(next)) {
-                                setPreferredMethod(next);
-                              }
+                            onClick={() => {
+                              void handleStartInstall();
                             }}
                           >
-                            {offeredMethods.map((method) => (
-                              <option key={method} value={method}>
-                                {formatInstallMethod(method, t)}
-                              </option>
-                            ))}
-                          </select>
-                        </>
-                      ) : (
-                        <span className="caption">{formatInstallMethod(selectedMethod, t)}</span>
-                      )}
-
-                      <button
-                        type="button"
-                        className="btn btn-primary btn-sm"
-                        data-install-start="true"
-                        disabled={shuttingDown}
-                        onClick={() => {
-                          void handleStartInstall();
-                        }}
-                      >
-                        <DownloadIcon />
-                        <span>{t("app.install.start")}</span>
-                      </button>
+                            {t("app.action.retry")}
+                          </button>
+                        </div>
+                      </div>
                     </div>
-                  </>
-                )}
-              </>
+                  )}
+
+                  <div className="checklist-actions">
+                    {offeredMethods.length > 1 ? (
+                      <>
+                        <label htmlFor={methodSelectId} className="caption">
+                          {t("app.install.method_label")}
+                        </label>
+                        <select
+                          id={methodSelectId}
+                          className="select select-sm select-inline"
+                          data-install-method="true"
+                          value={selectedMethod}
+                          disabled={shuttingDown}
+                          onChange={(event) => {
+                            const next = event.target.value as InstallMethod;
+                            if (offeredMethods.includes(next)) {
+                              setPreferredMethod(next);
+                            }
+                          }}
+                        >
+                          {offeredMethods.map((method) => (
+                            <option key={method} value={method}>
+                              {formatInstallMethod(method, t)}
+                            </option>
+                          ))}
+                        </select>
+                      </>
+                    ) : (
+                      <span className="caption">{formatInstallMethod(selectedMethod, t)}</span>
+                    )}
+
+                    <button
+                      type="button"
+                      className="btn btn-primary btn-sm"
+                      data-install-start="true"
+                      disabled={shuttingDown}
+                      onClick={() => {
+                        void handleStartInstall();
+                      }}
+                    >
+                      <DownloadIcon />
+                      <span>{t("app.install.start")}</span>
+                    </button>
+                  </div>
+                </>
+              )
             )}
 
             {installLines.length > 0 && (

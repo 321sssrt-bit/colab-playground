@@ -269,8 +269,18 @@ export function deriveChecklist(
   overview: OverviewResponse | null,
   probeError: FormattedApiError | null,
   probing: boolean,
+  installing = false,
 ): ChecklistModel {
   if (overview === null) {
+    if (installing) {
+      return {
+        complete: false,
+        hostStatus: "checking",
+        cliStatus: "checking",
+        keyringStatus: "waiting",
+        signinStatus: "waiting",
+      };
+    }
     return {
       complete: false,
       hostStatus: probeError !== null ? "failed" : "checking",
@@ -397,8 +407,9 @@ export function summarizeCrossAccountRuntimes(
 }
 
 /**
- * Combines per-account usage unmanaged warnings with `/api/overview`'s
- * `unmanaged_runtimes` summary so incomplete runtime listings are never silent.
+ * Builds the unmanaged-runtime warning from live SSE snapshot data once
+ * available, falling back to `/api/overview`'s initial summary only before the
+ * first snapshot arrives so stopping a runtime elsewhere clears it immediately.
  */
 export function buildOverviewUnmanagedWarning(
   accountsView: AccountsView | null,
@@ -407,27 +418,33 @@ export function buildOverviewUnmanagedWarning(
   nowSecs: number,
   t: TranslateFn,
 ): UnmanagedWarningView | null {
-  let primary: UnmanagedWarningView | null = null;
-  if (accountsView !== null && snapshot !== null) {
+  if (snapshot !== null && accountsView !== null) {
     const rows = buildAccountRows(accountsView, snapshot, nowSecs, t);
-    primary = buildUnmanagedWarning(rows, t);
-  }
+    const primary = buildUnmanagedWarning(rows, t);
+    const liveIncomplete =
+      snapshot.runtimes_error !== null ||
+      (snapshot.runtimes !== null && snapshot.runtimes.errors.length > 0);
 
-  if (primary !== null) {
-    if (
-      overviewUnmanaged !== null &&
-      overviewUnmanaged.incomplete &&
-      overviewUnmanaged.warning_key !== null
-    ) {
-      const extra = t(overviewUnmanaged.warning_key);
-      if (extra && !primary.body.includes(extra)) {
-        return {
-          title: primary.title,
-          body: `${primary.body}\n${extra}`,
-        };
+    if (primary !== null) {
+      if (liveIncomplete) {
+        const extra = t("web.runtimes.unmanaged_unknown");
+        if (extra && !primary.body.includes(extra)) {
+          return {
+            title: primary.title,
+            body: `${primary.body}\n${extra}`,
+          };
+        }
       }
+      return primary;
     }
-    return primary;
+
+    if (liveIncomplete) {
+      return {
+        title: t("app.unmanaged.unknown_title"),
+        body: t("web.runtimes.unmanaged_unknown"),
+      };
+    }
+    return null;
   }
 
   if (overviewUnmanaged === null || overviewUnmanaged.warning_key === null) {

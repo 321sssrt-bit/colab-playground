@@ -109,13 +109,7 @@ export function OverviewPage({ snapshot, locale, t, navigate, pushToast }: PageP
           snapshot.accounts_error ?? "",
         ].join(":");
 
-  const prevAccountSyncKeyRef = useRef<string | null>(null);
-
   useEffect(() => {
-    if (prevAccountSyncKeyRef.current === accountSyncKey) {
-      return;
-    }
-    prevAccountSyncKeyRef.current = accountSyncKey;
     const controller = new AbortController();
     void loadOverview(controller.signal);
     return () => {
@@ -198,15 +192,16 @@ export function OverviewPage({ snapshot, locale, t, navigate, pushToast }: PageP
     }
   }, [adopting, handleCheckAgain, overview, pushToast, snapshot, t]);
 
-  const checklist = useMemo(
-    () => deriveChecklist(overview, probeError, probing),
-    [overview, probeError, probing],
-  );
   const runningInstallOp = useMemo(() => findRunningInstallOp(snapshot), [snapshot]);
+  const checklist = useMemo(
+    () => deriveChecklist(overview, probeError, probing, runningInstallOp !== null),
+    [overview, probeError, probing, runningInstallOp],
+  );
   const accountChangeBlocked = isAccountChangeBlocked(snapshot);
   const shuttingDown = snapshot?.shutting_down === true;
 
-  const initialLoading = overview === null && probeError === null && probing;
+  const initialLoading =
+    overview === null && probeError === null && probing && runningInstallOp === null;
 
   return (
     <>
