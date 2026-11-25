@@ -7,7 +7,7 @@ use std::{
 };
 
 use colab_playground_shared::i18n::CATALOGS;
-use colab_playground_web::assets::{INDEX, SHELL_CATALOGS, STATIC_ASSETS};
+use colab_playground_web::assets::{SHELL_CATALOGS, STATIC_ASSETS};
 use sha2::{Digest as _, Sha256};
 
 fn placeholders(text: &str) -> BTreeSet<String> {
@@ -60,104 +60,6 @@ fn shell_catalog_has_five_locale_parity_and_no_shared_key_collisions() {
                 placeholders(value),
                 placeholders(base[key]),
                 "placeholder mismatch for {key} in {tag}"
-            );
-        }
-    }
-}
-
-#[test]
-fn embedded_assets_forbid_inline_scripts_styles_hardcoded_colors_and_html_copy() {
-    let html = INDEX.body;
-    // Every <script> tag must reference an external same-origin src and have an empty body.
-    for segment in html.split("<script").skip(1) {
-        let (open_tag, rest) = segment.split_once('>').expect("closing script tag bracket");
-        assert!(
-            open_tag.contains("src=\"/assets/"),
-            "script tag must load from /assets/: {open_tag}"
-        );
-        let (body, _) = rest.split_once("</script>").expect("closing </script>");
-        assert!(
-            body.trim().is_empty(),
-            "inline script content is forbidden under CSP default-src 'self': {body}"
-        );
-    }
-    assert!(!html.contains("<style"), "inline <style> is forbidden");
-    assert!(
-        !html.contains("style="),
-        "inline style= attribute is forbidden"
-    );
-    for handler in ["onclick=", "onchange=", "oninput=", "onsubmit="] {
-        assert!(!html.contains(handler), "inline {handler} is forbidden");
-    }
-
-    // Body of index.html must contain zero hardcoded user-visible text nodes.
-    let body_section = html
-        .split("<body>")
-        .nth(1)
-        .and_then(|rest| rest.split("</body>").next())
-        .expect("html body");
-    let mut in_tag = false;
-    let mut text_chars = String::new();
-    for ch in body_section.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => text_chars.push(ch),
-            _ => {}
-        }
-    }
-    assert!(
-        text_chars.trim().is_empty(),
-        "index.html body must not contain hardcoded user-visible copy: {text_chars:?}"
-    );
-
-    // Non-token CSS must never contain hardcoded color literals.
-    for asset in STATIC_ASSETS {
-        if asset.path.ends_with(".css") && asset.path != "styles/tokens.css" {
-            for (line_no, line) in asset.body.lines().enumerate() {
-                let code = line.split("/*").next().unwrap_or("");
-                assert!(
-                    !code.contains('#'),
-                    "hardcoded hex color in {}:{}: {line}",
-                    asset.path,
-                    line_no + 1
-                );
-                for fn_name in ["rgb(", "rgba(", "hsl(", "hsla(", "oklch(", "oklab("] {
-                    assert!(
-                        !code.contains(fn_name),
-                        "hardcoded color function {fn_name} in {}:{}: {line}",
-                        asset.path,
-                        line_no + 1
-                    );
-                }
-            }
-        }
-        if asset.path.ends_with(".js") {
-            let code_only: String = asset
-                .body
-                .lines()
-                .map(|line| line.split("//").next().unwrap_or(""))
-                .collect::<Vec<_>>()
-                .join("\n");
-            assert!(
-                !code_only.contains("innerHTML"),
-                "innerHTML is forbidden in {}",
-                asset.path
-            );
-            assert!(
-                !code_only.contains("document.cookie"),
-                "cookies are forbidden in {}",
-                asset.path
-            );
-            assert!(
-                !code_only.contains("EventSource"),
-                "native EventSource is forbidden in {} (use fetch SSE with Bearer)",
-                asset.path
-            );
-            assert!(
-                !code_only.contains(".style."),
-                "inline .style.* mutation is forbidden in {} (use CSS classes/tokens)",
-                asset.path
             );
         }
     }

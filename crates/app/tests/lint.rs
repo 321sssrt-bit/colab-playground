@@ -4,8 +4,7 @@
 //!   (`theme.label_width() * 0.75`) gets past the sizes banned in `clippy.toml`.
 //! - A target OS named outside the modules that own what differs per OS (`docs/DESIGN.md`,
 //!   "Goals and non-goals (v1)"). The compiler sees only its own OS's side of a `cfg`; the
-//!   source shows every side on every OS. The core crate is read from here, where `syn` already
-//!   is.
+//!   source shows every side on every OS. The workspace is read from here, where `syn` already is.
 //!
 //! A test binary of its own costs little here: it uses neither gpui nor Ely, so it links neither.
 
@@ -193,13 +192,14 @@ fn in_a_macro_a_const_still_names_its_number() {
 }
 
 /// Only these files may name a target OS.
-const OS_HOMES: [&str; 3] = [
+const OS_HOMES: [&str; 4] = [
     // The app's per-OS module.
     "crates/app/src/platform.rs",
     // The `Host` abstraction: where commands run.
     "crates/core/src/host.rs",
     // Where data lives: it makes files owner-only, which only unix can express.
     "crates/core/src/paths.rs",
+    "crates/web/src/platform.rs",
 ];
 
 /// Identifiers, not text: `windows_subsystem`, `feature = "windows"` and a "Windows" in a
@@ -456,8 +456,8 @@ fn os_names(files: &[(String, String)]) -> Vec<String> {
 #[test]
 fn only_the_platform_modules_name_a_target_os() {
     let mut files = Vec::new();
-    for dir in ["crates/app/src", "crates/core/src"] {
-        for path in sources(&workspace().join(dir)) {
+    for package in ["app", "core", "shared", "web"] {
+        for path in sources(&workspace().join("crates").join(package).join("src")) {
             files.push((shown(&path), read(&path)));
         }
     }
@@ -472,8 +472,7 @@ fn only_the_platform_modules_name_a_target_os() {
     assert!(
         hits.is_empty(),
         "Code outside the modules that own what differs per OS names a target OS. Move what \
-         differs into `crates/app/src/platform.rs` (app) or behind `Host` in \
-         `crates/core/src/host.rs` (core), and call that from here.\n{}",
+         differs behind `Host` in core or into the platform module in app or web.\n{}",
         hits.join("\n")
     );
 }

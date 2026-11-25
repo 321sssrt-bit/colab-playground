@@ -84,8 +84,9 @@ The app checks GitHub for a newer release, and installs it when you ask.
 
 - Rust: the version in `rust-version` under `[workspace.package]` in
   [`Cargo.toml`](../Cargo.toml), or newer.
-- Linux build: `libxkbcommon-x11-dev` and `libfontconfig-dev` (Ubuntu package names). Windows and
-  macOS need nothing beyond the Rust toolchain.
+- Linux desktop build: `libxkbcommon-x11-dev` and `libfontconfig-dev` (Ubuntu package names).
+  The [Web Server](#headless-web-server) builds with Cargo on Linux without desktop libraries.
+  Windows and macOS need nothing beyond the Rust toolchain.
 - Real mode only: on Windows, WSL with a Linux distribution; inside it (or locally on macOS and
   Linux) `bash`, `ssh` for port forwarding, a keyring the CLI can use, and either the Colab CLI
   (`colab`, package `google-colab-cli`) or `uv` / `python3` to install it. Installing plugins from
@@ -137,6 +138,84 @@ cargo run -p colab-playground -- --mock-scenario signed-out --mock-fail cli-miss
 
 Demo mode still reads and writes the normal settings file; set `COLAB_PLAYGROUND_CONFIG_DIR` to
 another folder to keep experiments apart.
+
+## Headless Web Server
+
+Start with demo data from a checkout. Run the command in an interactive terminal on the server.
+
+```sh
+cargo run -p colab-playground-web --locked -- --mock --no-open
+```
+
+Sign in at `http://127.0.0.1:3000` with the Web access key printed on first launch. Save the key
+somewhere private. Later starts reuse the key. Use the same backend as the running server when
+rotating it from a second interactive terminal:
+
+```sh
+cargo run -p colab-playground-web --locked -- rotate-token --mock
+```
+
+Rotation prints the replacement once and revokes the previous key, signed-in browser sessions,
+and open event streams. Use `rotate-token --real` to rotate the real-mode key. A server with
+an existing key can restart without an interactive terminal.
+
+| Option | Effect |
+| --- | --- |
+| `--host IP` | Listen on this IP address. The default is `127.0.0.1`. |
+| `--port PORT` | Listen on this port. The default is `3000`. Use `0` to pick a free port and read it from the startup message. |
+| `--no-open` | Skip opening a browser on the server. |
+| `--trusted-host [http[s]://]HOST[:PORT]` | Accept the specified browser-facing host and origin. Repeat for each origin. Without a scheme, it uses HTTP and defaults to the listen port. With a scheme, it defaults to that scheme's standard port. |
+| `--mock`, `--real` | Select demo data or the real CLI. The [build mode and environment defaults](#build-and-run) are shared with the desktop app. |
+| `--mock-scenario`, `--mock-fail` | Use the same [demo scenarios and failure options](#demo-data). |
+| `--help`, `-h` | Print the command help. |
+
+Only one desktop app or Web Server can use the same data directory at a time, even on different
+ports. Stop the other instance before starting in real mode. For separate demo servers, give each
+one a different `COLAB_PLAYGROUND_CONFIG_DIR`. Closing a browser leaves the server, guards and
+forwards running. Stop the server with Ctrl+C. To end runtime billing, use **Stop all and verify**
+from the browser before stopping the server.
+
+### Remote access and forwarded ports
+
+Keep the Web Server on loopback for SSH access. From the browser's machine, run:
+
+```sh
+ssh -N -L 3000:127.0.0.1:3000 user@server
+```
+
+Then visit `http://127.0.0.1:3000` in your browser. With a TLS reverse proxy, keep the HTTP
+listener private, pass `--trusted-host https://console.example.com` for the public URL, and
+preserve the browser's `Host` and `Origin` headers. Direct plain HTTP on a network sends
+credentials in clear text.
+
+`ForwardBind` controls where each individual Forward listens. **Loopback** is the default for
+manual and plugin forwards and is reachable on the server. Use a separate SSH local forward
+for a browser on another machine. **All interfaces** binds the forwarded port to `0.0.0.0`
+and is available when the Web Server listens on a non-loopback IP on Linux or macOS.
+Windows/WSL supports loopback forwards. The Web access key and the console's TLS proxy protect
+the console only. Anyone who can reach a forwarded port can connect directly to its service.
+Limit network access with the server firewall and use the downstream service's authentication.
+
+### Keyring preflight on headless Linux
+
+Real mode needs a D-Bus user session and an unlocked Secret Service keyring. Run these checks
+as the same user and in the same session that will launch the Web Server:
+
+```sh
+busctl --user call org.freedesktop.secrets /org/freedesktop/secrets \
+  org.freedesktop.Secret.Service ReadAlias s default
+
+# Replace COLLECTION_PATH with the object path returned above.
+busctl --user get-property org.freedesktop.secrets COLLECTION_PATH \
+  org.freedesktop.Secret.Collection Locked
+```
+
+The first command should return a collection path beginning with
+`/org/freedesktop/secrets/collection/`. The second should return `b false`. If the bus or service
+is unavailable, start the user session and Secret Service provider. If the result is `/` or
+`b true`, create or unlock the default keyring with that provider. Start the Web Server from the
+session that can reach the unlocked keyring and check **Overview → OS keyring** before signing in.
+Keep credentials in the OS keyring.
 
 ## Where things are stored
 
