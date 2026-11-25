@@ -6,7 +6,9 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, DefaultBodyLimit, Extension, Request, State, rejection::JsonRejection},
+    extract::{
+        ConnectInfo, DefaultBodyLimit, Extension, Path, Request, State, rejection::JsonRejection,
+    },
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header, uri::Authority},
     middleware::{self, Next},
     response::{
@@ -15,7 +17,7 @@ use axum::{
     },
     routing::{get, post},
 };
-use colab_playground_web::state::WebState;
+use colab_playground_web::{assets, state::WebState};
 use futures_util::{Stream, StreamExt as _, stream};
 use serde::{Deserialize, Serialize, de::IgnoredAny};
 use tokio::sync::watch;
@@ -23,6 +25,7 @@ use tokio::sync::watch;
 use crate::{
     api::{self, WebSettings},
     auth::{Auth, SESSION_LIFETIME, Session},
+    i18n,
 };
 
 const HTTP_PORT: u16 = 80;
@@ -245,7 +248,10 @@ pub fn router(
             require_bearer,
         ));
     Router::new()
-        .route("/", get(|| async { StatusCode::NO_CONTENT }))
+        .route("/", get(index))
+        .route("/favicon.ico", get(favicon))
+        .route("/assets/i18n/{file}", get(public_dictionary))
+        .route("/assets/{*path}", get(static_asset))
         .route(
             "/api/login",
             post(login).layer(DefaultBodyLimit::max(KEY_BODY_LIMIT)),
@@ -256,6 +262,48 @@ pub fn router(
             check_origin,
         ))
         .with_state(state)
+}
+
+fn asset_response(asset: assets::Asset) -> Response {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, asset.content_type),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        asset.body,
+    )
+        .into_response()
+}
+
+async fn index() -> Response {
+    asset_response(assets::INDEX)
+}
+
+async fn favicon() -> Response {
+    asset_response(assets::FAVICON)
+}
+
+async fn static_asset(Path(path): Path<String>) -> Response {
+    match assets::lookup(&path) {
+        Some(asset) => asset_response(asset),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn public_dictionary(Path(file): Path<String>) -> Response {
+    let Some(locale) = file.strip_suffix(".json") else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let (Some(mut merged), Some(shell)) =
+        (i18n::dictionary(locale), assets::shell_messages(locale))
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    for &(key, value) in shell {
+        merged.insert(key, value);
+    }
+    Json(merged).into_response()
 }
 
 async fn check_origin(

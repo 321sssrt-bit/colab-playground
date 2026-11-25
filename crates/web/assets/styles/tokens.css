@@ -1,0 +1,307 @@
+/* Single source of design tokens: 1:1 mirror of Ely Palette::light(false), Palette::dark(false), and tokens.rs. */
+
+:root {
+  color-scheme: light dark;
+
+  /* Raw Ely Light Palette (Palette::light(false)) */
+  --raw-bg-light: #fcfaf7;
+  --raw-surface-light: #ffffff;
+  --raw-sunken-light: #f6f4f1;
+  --raw-overlay-light: #ffffff;
+  --raw-hover-light: #f2f0ed;
+  --raw-active-light: #e9e7e5;
+  --raw-border-light: #e1dfdd;
+  --raw-border-strong-light: #cccac8;
+  --raw-fg-light: #181613;
+  --raw-fg-muted-light: #605d5a;
+  --raw-fg-subtle-light: #696764;
+  --raw-fg-disabled-light: #acaaa8;
+  --raw-accent-light: #181613;
+  --raw-accent-hover-light: #302d2b;
+  --raw-on-accent-light: #fcfaf7;
+  --raw-focus-light: #3772bb;
+  --raw-link-light: #2863ab;
+  --raw-success-light: #267b4c;
+  --raw-success-subtle-light: #e7f9ec;
+  --raw-warning-light: #a25f12;
+  --raw-warning-subtle-light: #fef2dd;
+  --raw-danger-light: #ba3e38;
+  --raw-danger-subtle-light: #ffefec;
+  --raw-info-light: #2e69b2;
+  --raw-info-subtle-light: #ebf4ff;
+  --raw-backdrop-light: rgba(24, 22, 19, 0.32);
+  --raw-scrollbar-track-light: #f6f4f1;
+  --raw-scrollbar-thumb-light: #cccac8;
+
+  /* Raw Ely Dark Palette (Palette::dark(false)) */
+  --raw-bg-dark: #252525;
+  --raw-surface-dark: #2c2c2c;
+  --raw-sunken-dark: #202020;
+  --raw-overlay-dark: #323232;
+  --raw-hover-dark: #383838;
+  --raw-active-dark: #3f3f3f;
+  --raw-border-dark: #3f3f3f;
+  --raw-border-strong-dark: #555555;
+  --raw-fg-dark: #f3f1f0;
+  --raw-fg-muted-dark: #c4c2c0;
+  --raw-fg-subtle-dark: #acaaa8;
+  --raw-fg-disabled-dark: #5c5a58;
+  --raw-accent-dark: #f3f1f0;
+  --raw-accent-hover-dark: #d9d7d5;
+  --raw-on-accent-dark: #252525;
+  --raw-focus-dark: #69a1e8;
+  --raw-link-dark: #7eb1f3;
+  --raw-success-dark: #6bbc89;
+  --raw-success-subtle-dark: #182c1f;
+  --raw-warning-dark: #e8b45e;
+  --raw-warning-subtle-dark: #342611;
+  --raw-danger-dark: #e5756e;
+  --raw-danger-subtle-dark: #3a1d1b;
+  --raw-info-dark: #77abec;
+  --raw-info-subtle-dark: #19273a;
+  --raw-backdrop-dark: rgba(0, 0, 0, 0.5);
+  --raw-scrollbar-track-dark: #202020;
+  --raw-scrollbar-thumb-dark: #555555;
+
+  /* Semantic colors: light defaults with media-query fallback for browsers without light-dark() */
+  --color-bg: var(--raw-bg-light);
+  --color-surface: var(--raw-surface-light);
+  --color-sunken: var(--raw-sunken-light);
+  --color-overlay: var(--raw-overlay-light);
+  --color-hover: var(--raw-hover-light);
+  --color-active: var(--raw-active-light);
+  --color-border: var(--raw-border-light);
+  --color-border-strong: var(--raw-border-strong-light);
+  --color-fg: var(--raw-fg-light);
+  --color-fg-muted: var(--raw-fg-muted-light);
+  --color-fg-subtle: var(--raw-fg-subtle-light);
+  --color-fg-disabled: var(--raw-fg-disabled-light);
+  --color-accent: var(--raw-accent-light);
+  --color-accent-hover: var(--raw-accent-hover-light);
+  --color-on-accent: var(--raw-on-accent-light);
+  --color-focus: var(--raw-focus-light);
+  --color-link: var(--raw-link-light);
+  --color-success: var(--raw-success-light);
+  --color-success-subtle: var(--raw-success-subtle-light);
+  --color-warning: var(--raw-warning-light);
+  --color-warning-subtle: var(--raw-warning-subtle-light);
+  --color-danger: var(--raw-danger-light);
+  --color-danger-subtle: var(--raw-danger-subtle-light);
+  --color-info: var(--raw-info-light);
+  --color-info-subtle: var(--raw-info-subtle-light);
+  --color-backdrop: var(--raw-backdrop-light);
+  --color-scrollbar-track: var(--raw-scrollbar-track-light);
+  --color-scrollbar-thumb: var(--raw-scrollbar-thumb-light);
+
+  /* Elevations (Ely tokens.rs Elevation::Raised / Floating / Modal) */
+  --shadow-raised: 0 1px 2px rgba(24, 22, 19, 0.06);
+  --shadow-floating: 0 1px 2px rgba(24, 22, 19, 0.04), 0 6px 16px rgba(24, 22, 19, 0.08);
+  --shadow-modal: 0 2px 4px rgba(24, 22, 19, 0.04), 0 16px 40px rgba(24, 22, 19, 0.14);
+
+  /* Typography (Ely tokens.rs TextSize: 11/12/13/14/16/20/24px) */
+  --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Hiragino Kaku Gothic ProN", "Apple SD Gothic Neo", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  --text-xs: 0.6875rem;
+  --text-sm: 0.75rem;
+  --text-base: 0.8125rem;
+  --text-md: 0.875rem;
+  --text-lg: 1rem;
+  --text-xl: 1.25rem;
+  --text-2xl: 1.5rem;
+  --leading-tight: 1.25;
+  --leading-normal: 1.45;
+
+  /* Spacing scale */
+  --space-0: 0;
+  --space-0p5: 0.125rem;
+  --space-1: 0.25rem;
+  --space-1p5: 0.375rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.25rem;
+  --space-6: 1.5rem;
+  --space-8: 2rem;
+  --space-10: 2.5rem;
+
+  /* Radii (Ely tokens.rs Radius: 4/6/8/12px) */
+  --radius-sm: 0.25rem;
+  --radius-md: 0.375rem;
+  --radius-lg: 0.5rem;
+  --radius-xl: 0.75rem;
+  --radius-full: 9999px;
+
+  /* Borders & Focus */
+  --border-width: 1px;
+  --focus-width: 2px;
+  --focus-offset: 2px;
+  --tab-indicator-width: 0.125rem;
+
+  /* Control sizes & Icons (Ely tokens.rs ControlSize 24/28/32px, IconSize 12/14/16px) */
+  --control-height-sm: 1.5rem;
+  --control-height-md: 1.75rem;
+  --control-height-lg: 2rem;
+  --control-pad-sm: 0.5rem;
+  --control-pad-md: 0.75rem;
+  --control-pad-lg: 1rem;
+  --badge-height: 1.125rem;
+  --touch-min: 2.75rem;
+  --icon-xs: 0.75rem;
+  --icon-sm: 0.875rem;
+  --icon-md: 1rem;
+
+  /* Layout metrics (Ely tokens.rs) */
+  --sidebar-width: 15rem;
+  --titlebar-height: 2rem;
+  --mobile-topbar-height: 3rem;
+  --content-max-width: 75rem;
+  --dialog-width: 27.5rem;
+  --label-width: 10rem;
+  --menu-width: 12.5rem;
+  --log-height: 17.5rem;
+  --input-num-width: 4.75rem;
+  --config-path-max: 22rem;
+  --z-topbar: 20;
+  --z-drawer-backdrop: 30;
+  --z-drawer: 40;
+
+  accent-color: var(--color-accent);
+  scrollbar-color: var(--color-scrollbar-thumb) var(--color-scrollbar-track);
+}
+
+:root:has(> head > meta[name="color-scheme"][content="dark"]),
+:root[data-theme="dark"] {
+  color-scheme: dark;
+}
+
+:root:has(> head > meta[name="color-scheme"][content="light"]),
+:root[data-theme="light"] {
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --color-bg: var(--raw-bg-dark);
+    --color-surface: var(--raw-surface-dark);
+    --color-sunken: var(--raw-sunken-dark);
+    --color-overlay: var(--raw-overlay-dark);
+    --color-hover: var(--raw-hover-dark);
+    --color-active: var(--raw-active-dark);
+    --color-border: var(--raw-border-dark);
+    --color-border-strong: var(--raw-border-strong-dark);
+    --color-fg: var(--raw-fg-dark);
+    --color-fg-muted: var(--raw-fg-muted-dark);
+    --color-fg-subtle: var(--raw-fg-subtle-dark);
+    --color-fg-disabled: var(--raw-fg-disabled-dark);
+    --color-accent: var(--raw-accent-dark);
+    --color-accent-hover: var(--raw-accent-hover-dark);
+    --color-on-accent: var(--raw-on-accent-dark);
+    --color-focus: var(--raw-focus-dark);
+    --color-link: var(--raw-link-dark);
+    --color-success: var(--raw-success-dark);
+    --color-success-subtle: var(--raw-success-subtle-dark);
+    --color-warning: var(--raw-warning-dark);
+    --color-warning-subtle: var(--raw-warning-subtle-dark);
+    --color-danger: var(--raw-danger-dark);
+    --color-danger-subtle: var(--raw-danger-subtle-dark);
+    --color-info: var(--raw-info-dark);
+    --color-info-subtle: var(--raw-info-subtle-dark);
+    --color-backdrop: var(--raw-backdrop-dark);
+    --color-scrollbar-track: var(--raw-scrollbar-track-dark);
+    --color-scrollbar-thumb: var(--raw-scrollbar-thumb-dark);
+    --shadow-raised: 0 1px 2px rgba(0, 0, 0, 0.4);
+    --shadow-floating: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.45);
+    --shadow-modal: 0 4px 8px rgba(0, 0, 0, 0.3), 0 20px 48px rgba(0, 0, 0, 0.55);
+  }
+}
+
+:root[data-theme="dark"] {
+  --color-bg: var(--raw-bg-dark);
+  --color-surface: var(--raw-surface-dark);
+  --color-sunken: var(--raw-sunken-dark);
+  --color-overlay: var(--raw-overlay-dark);
+  --color-hover: var(--raw-hover-dark);
+  --color-active: var(--raw-active-dark);
+  --color-border: var(--raw-border-dark);
+  --color-border-strong: var(--raw-border-strong-dark);
+  --color-fg: var(--raw-fg-dark);
+  --color-fg-muted: var(--raw-fg-muted-dark);
+  --color-fg-subtle: var(--raw-fg-subtle-dark);
+  --color-fg-disabled: var(--raw-fg-disabled-dark);
+  --color-accent: var(--raw-accent-dark);
+  --color-accent-hover: var(--raw-accent-hover-dark);
+  --color-on-accent: var(--raw-on-accent-dark);
+  --color-focus: var(--raw-focus-dark);
+  --color-link: var(--raw-link-dark);
+  --color-success: var(--raw-success-dark);
+  --color-success-subtle: var(--raw-success-subtle-dark);
+  --color-warning: var(--raw-warning-dark);
+  --color-warning-subtle: var(--raw-warning-subtle-dark);
+  --color-danger: var(--raw-danger-dark);
+  --color-danger-subtle: var(--raw-danger-subtle-dark);
+  --color-info: var(--raw-info-dark);
+  --color-info-subtle: var(--raw-info-subtle-dark);
+  --color-backdrop: var(--raw-backdrop-dark);
+  --color-scrollbar-track: var(--raw-scrollbar-track-dark);
+  --color-scrollbar-thumb: var(--raw-scrollbar-thumb-dark);
+  --shadow-raised: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-floating: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.45);
+  --shadow-modal: 0 4px 8px rgba(0, 0, 0, 0.3), 0 20px 48px rgba(0, 0, 0, 0.55);
+}
+
+@supports (color: light-dark(white, black)) {
+  :root {
+    --color-bg: light-dark(var(--raw-bg-light), var(--raw-bg-dark));
+    --color-surface: light-dark(var(--raw-surface-light), var(--raw-surface-dark));
+    --color-sunken: light-dark(var(--raw-sunken-light), var(--raw-sunken-dark));
+    --color-overlay: light-dark(var(--raw-overlay-light), var(--raw-overlay-dark));
+    --color-hover: light-dark(var(--raw-hover-light), var(--raw-hover-dark));
+    --color-active: light-dark(var(--raw-active-light), var(--raw-active-dark));
+    --color-border: light-dark(var(--raw-border-light), var(--raw-border-dark));
+    --color-border-strong: light-dark(var(--raw-border-strong-light), var(--raw-border-strong-dark));
+    --color-fg: light-dark(var(--raw-fg-light), var(--raw-fg-dark));
+    --color-fg-muted: light-dark(var(--raw-fg-muted-light), var(--raw-fg-muted-dark));
+    --color-fg-subtle: light-dark(var(--raw-fg-subtle-light), var(--raw-fg-subtle-dark));
+    --color-fg-disabled: light-dark(var(--raw-fg-disabled-light), var(--raw-fg-disabled-dark));
+    --color-accent: light-dark(var(--raw-accent-light), var(--raw-accent-dark));
+    --color-accent-hover: light-dark(var(--raw-accent-hover-light), var(--raw-accent-hover-dark));
+    --color-on-accent: light-dark(var(--raw-on-accent-light), var(--raw-on-accent-dark));
+    --color-focus: light-dark(var(--raw-focus-light), var(--raw-focus-dark));
+    --color-link: light-dark(var(--raw-link-light), var(--raw-link-dark));
+    --color-success: light-dark(var(--raw-success-light), var(--raw-success-dark));
+    --color-success-subtle: light-dark(var(--raw-success-subtle-light), var(--raw-success-subtle-dark));
+    --color-warning: light-dark(var(--raw-warning-light), var(--raw-warning-dark));
+    --color-warning-subtle: light-dark(var(--raw-warning-subtle-light), var(--raw-warning-subtle-dark));
+    --color-danger: light-dark(var(--raw-danger-light), var(--raw-danger-dark));
+    --color-danger-subtle: light-dark(var(--raw-danger-subtle-light), var(--raw-danger-subtle-dark));
+    --color-info: light-dark(var(--raw-info-light), var(--raw-info-dark));
+    --color-info-subtle: light-dark(var(--raw-info-subtle-light), var(--raw-info-subtle-dark));
+    --color-backdrop: light-dark(var(--raw-backdrop-light), var(--raw-backdrop-dark));
+    --color-scrollbar-track: light-dark(var(--raw-scrollbar-track-light), var(--raw-scrollbar-track-dark));
+    --color-scrollbar-thumb: light-dark(var(--raw-scrollbar-thumb-light), var(--raw-scrollbar-thumb-dark));
+  }
+}
+
+@media (forced-colors: active) {
+  :root,
+  :root[data-theme="light"],
+  :root[data-theme="dark"],
+  :root:not([data-theme="light"]) {
+    --color-bg: Canvas;
+    --color-surface: Canvas;
+    --color-sunken: Canvas;
+    --color-overlay: Canvas;
+    --color-hover: Canvas;
+    --color-active: Canvas;
+    --color-fg: CanvasText;
+    --color-fg-muted: CanvasText;
+    --color-fg-subtle: CanvasText;
+    --color-border: CanvasText;
+    --color-border-strong: CanvasText;
+    --color-accent: Highlight;
+    --color-accent-hover: Highlight;
+    --color-on-accent: HighlightText;
+    --color-focus: Highlight;
+    --color-link: LinkText;
+  }
+}
