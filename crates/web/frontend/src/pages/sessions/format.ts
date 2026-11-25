@@ -19,7 +19,7 @@ import type {
 const MIB_PER_GIB = 1024;
 const SECS_PER_MINUTE = 60;
 const SECS_PER_HOUR = 3600;
-export const MAX_AUTO_STOP_SECS = 0xffffffff;
+const MAX_AUTO_STOP_SECS = 0xffffffff;
 export const MAX_HOURS_INPUT = 999;
 export const MAX_MINUTES_INPUT = 59;
 
@@ -85,14 +85,14 @@ export interface FormattedError {
   readonly hint: string | null;
 }
 
-export interface RuntimeGroup {
+interface RuntimeGroup {
   readonly account: string;
   readonly email: string | null;
   readonly active: boolean;
   readonly runtimes: readonly Runtime[];
 }
 
-export interface DurationParts {
+interface DurationParts {
   readonly hours: number;
   readonly minutes: number;
 }

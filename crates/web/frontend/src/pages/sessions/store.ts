@@ -30,10 +30,10 @@ import {
 } from "./api.ts";
 import { formatConcern, formatRuntimeCardLabel, runtimeKey } from "./format.ts";
 
-export const DEFAULT_REARM_SECS = 7200;
+const DEFAULT_REARM_SECS = 7200;
 const ENDED_LIMIT = 20;
 
-export type EndReason =
+type EndReason =
   | { readonly kind: "user" }
   | { readonly kind: "guard"; readonly concern: Concern }
   | { readonly kind: "vanished" };
@@ -51,7 +51,7 @@ interface ForwardLiveOverlay {
   readonly healthy?: boolean | null;
 }
 
-export interface SessionsLocalState {
+interface SessionsLocalState {
   readonly ended: readonly EndedRuntime[];
   readonly forwardAddressesById: Readonly<Record<number, ForwardAddresses>>;
   readonly forwardOverlaysById: Readonly<Record<number, ForwardLiveOverlay>>;

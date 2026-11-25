@@ -12,7 +12,7 @@ import { formatDuration } from "../../lib/format.ts";
 import type { TranslateFn } from "../../lib/i18n.ts";
 import type { UnixSecs } from "../../lib/types.ts";
 
-export const SESSION_TICK_INTERVAL_MS = 15_000;
+const SESSION_TICK_INTERVAL_MS = 15_000;
 const MS_PER_SECOND = 1000;
 
 interface ClockAnchor {
@@ -81,11 +81,7 @@ export function syncServerClock(sampledAtSecs: UnixSecs): void {
   emit();
 }
 
-export function getBackendNowSecs(): number {
-  return computeNowSecs();
-}
-
-export function useSessionClockSecs(): number {
+function useSessionClockSecs(): number {
   return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 }
 

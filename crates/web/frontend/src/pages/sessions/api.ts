@@ -23,7 +23,7 @@ export interface AccountFailureResponse {
   readonly error: ApiErrorPayload;
 }
 
-export interface SessionsListResponse {
+interface SessionsListResponse {
   readonly account_context: AccountContext;
   readonly sampled_at: UnixSecs;
   readonly runtimes: Runtime[];
@@ -44,24 +44,24 @@ export interface ForwardView extends TunnelInfo {
   readonly addresses?: ForwardAddresses | null;
 }
 
-export interface ClosedForwardResponse {
+interface ClosedForwardResponse {
   readonly billing_continues: boolean;
   readonly notice_key: string;
 }
 
-export type AutoStopAction =
+type AutoStopAction =
   | { readonly kind: "extend"; readonly seconds: number }
   | { readonly kind: "set"; readonly seconds: number }
   | { readonly kind: "cancel" };
 
-export interface AutoStopResponse {
+interface AutoStopResponse {
   readonly app_limit_seconds: number | null;
   readonly watchdog_armed: boolean;
   readonly watchdog: WatchdogInfo | null;
   readonly warning_key: string | null;
 }
 
-export interface OverviewReadinessResponse {
+interface OverviewReadinessResponse {
   readonly cli_installed: boolean;
 }
 
