@@ -6,6 +6,10 @@
   box-sizing: border-box;
 }
 
+[hidden] {
+  display: none !important;
+}
+
 html,
 body {
   margin: var(--space-0);
@@ -77,11 +81,6 @@ a:hover {
   flex: none;
   display: inline-block;
   vertical-align: middle;
-}
-
-.icon-xs {
-  width: var(--icon-xs);
-  height: var(--icon-xs);
 }
 
 .icon-md {
@@ -451,10 +450,6 @@ a:hover {
 
 .mono {
   font-family: var(--font-mono);
-}
-
-.muted {
-  color: var(--color-fg-muted);
 }
 
 /* Native modal dialog */
