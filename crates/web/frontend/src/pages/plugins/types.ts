@@ -1,5 +1,6 @@
 /**
- * Wire types for the Plugins management endpoints (`/api/plugins` and `/api/plugins/previews`).
+ * Wire types for the Plugins management endpoints (`/api/plugins`, `/api/plugins/previews`,
+ * and `/api/plugins/hf/token`).
  * Aligned with `crates/core/src/plugins.rs` and `crates/web/src/api/plugins.rs`.
  */
 
@@ -58,4 +59,8 @@ export interface PluginPreviewResponse {
   readonly script_bytes: number;
   readonly replaces_version: string | null;
   readonly warning_key: string;
+}
+
+export interface HfTokenStatus {
+  readonly saved: boolean;
 }
