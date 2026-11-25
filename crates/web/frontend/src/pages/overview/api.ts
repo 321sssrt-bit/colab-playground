@@ -90,8 +90,6 @@ export interface InstallStreamCallbacks {
   readonly onFinished?: (event: InstallFinishedEvent) => void;
 }
 
-export type ChecklistStepId = "host" | "cli" | "keyring" | "signin";
-
 export type ChecklistStepStatus = "checking" | "done" | "todo" | "waiting" | "failed";
 
 export interface ChecklistModel {
