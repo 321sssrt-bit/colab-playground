@@ -22,7 +22,7 @@ import {
   validateHealthPath,
   type FormattedError,
 } from "./format.ts";
-import { ForwardRow } from "./ForwardRow.tsx";
+import { ForwardRow, type ForwardClosedNotice } from "./ForwardRow.tsx";
 import { AlertTriangleIcon, LinkIcon, SmallAlertIcon, SmallInfoIcon } from "./Icons.tsx";
 import { recordForwardAddresses } from "./store.ts";
 
@@ -36,11 +36,14 @@ export interface ForwardDialogProps {
   readonly request: ForwardDialogRequest | null;
   readonly currentAccountContext: AccountContext | null;
   readonly forwardPolicy: ForwardPolicyView | null;
+  readonly forwardPolicyLoading: boolean;
+  readonly forwardPolicyError: unknown | null;
   readonly existingForwards: readonly ForwardView[];
   readonly t: TranslateFn;
   readonly pushToast: (toast: ToastInput) => number;
   readonly onClose: () => void;
   readonly onForwardChanged: () => void;
+  readonly onRetryForwardPolicy: () => void;
 }
 
 type InvalidField = "remote" | "local" | "health";
@@ -75,11 +78,14 @@ export function ForwardDialog({
   request,
   currentAccountContext,
   forwardPolicy,
+  forwardPolicyLoading,
+  forwardPolicyError,
   existingForwards,
   t,
   pushToast,
   onClose,
   onForwardChanged,
+  onRetryForwardPolicy,
 }: ForwardDialogProps) {
   const titleId = useId();
   const remotePortId = useId();
@@ -96,6 +102,7 @@ export function ForwardDialog({
   const remotePortRef = useRef<HTMLInputElement | null>(null);
   const localPortRef = useRef<HTMLInputElement | null>(null);
   const healthPathRef = useRef<HTMLInputElement | null>(null);
+  const closedNoticeRef = useRef<HTMLDivElement | null>(null);
   const activeRequestIdRef = useRef<number>(0);
 
   const [remotePortDraft, setRemotePortDraft] = useState(String(FORWARD_DEFAULT_PORT));
@@ -105,6 +112,7 @@ export function ForwardDialog({
   const [submitting, setSubmitting] = useState(false);
   const [validationIssue, setValidationIssue] = useState<ValidationIssue | null>(null);
   const [submitError, setSubmitError] = useState<FormattedError | null>(null);
+  const [closedNotice, setClosedNotice] = useState<ForwardClosedNotice | null>(null);
 
   // Initialize drafts strictly once per dialog open so live SSE snapshots never overwrite edits.
   useEffect(() => {
@@ -125,12 +133,19 @@ export function ForwardDialog({
     setSubmitting(false);
     setValidationIssue(null);
     setSubmitError(null);
+    setClosedNotice(null);
 
     if (dialog && !dialog.open) {
       dialog.returnValue = "";
       dialog.showModal();
     }
   }, [request?.id]);
+
+  useEffect(() => {
+    if (closedNotice) {
+      closedNoticeRef.current?.scrollIntoView({ block: "nearest" });
+    }
+  }, [closedNotice]);
 
   const handleDialogCancel = (event: SyntheticEvent<HTMLDialogElement>) => {
     event.preventDefault();
@@ -164,7 +179,14 @@ export function ForwardDialog({
       : t("web.forward.bind_loopback_listener")
     : null;
   const showDownstreamWarning = allInterfacesAllowed && effectiveBind === "all_interfaces";
-  const hasBindNotices = Boolean(restrictionMessage || showDownstreamWarning);
+  const showPolicyLoading = forwardPolicy === null && forwardPolicyLoading;
+  const formattedPolicyError =
+    forwardPolicy === null && !forwardPolicyLoading && forwardPolicyError
+      ? formatErrorMessage(forwardPolicyError, t)
+      : null;
+  const hasBindNotices = Boolean(
+    restrictionMessage || showDownstreamWarning || showPolicyLoading || formattedPolicyError,
+  );
 
   const sessionName = request?.runtime.id.name ?? "";
   const invalidField = validationIssue?.field ?? null;
@@ -215,6 +237,7 @@ export function ForwardDialog({
     setSubmitting(true);
     setValidationIssue(null);
     setSubmitError(null);
+    setClosedNotice(null);
 
     try {
       const created = await openForward({
@@ -293,6 +316,23 @@ export function ForwardDialog({
                 <div className="inline-msg inline-msg-warning">
                   <AlertTriangleIcon className="icon-xs icon-warning" />
                   <span className="inline-msg-text">{t("web.sessions.account_changed")}</span>
+                </div>
+              )}
+
+              {closedNotice && (
+                <div
+                  ref={closedNoticeRef}
+                  className="alert alert-info"
+                  role="status"
+                  data-forward-closed-notice="true"
+                >
+                  <span className="alert-icon icon-info">
+                    <SmallInfoIcon />
+                  </span>
+                  <div className="alert-text">
+                    <p className="alert-title">{closedNotice.title}</p>
+                    <p className="alert-body">{closedNotice.body}</p>
+                  </div>
                 </div>
               )}
 
@@ -484,6 +524,40 @@ export function ForwardDialog({
 
                 {hasBindNotices && (
                   <div id={bindNoticeId} className="forward-bind-notices">
+                    {showPolicyLoading && (
+                      <div className="busy-line" role="status" data-forward-policy-loading="true">
+                        <span className="spinner" aria-hidden="true" />
+                        <span>{t("web.settings.loading")}</span>
+                      </div>
+                    )}
+                    {formattedPolicyError && (
+                      <div
+                        className="alert alert-warning"
+                        role="alert"
+                        data-forward-policy-error="true"
+                      >
+                        <span className="alert-icon icon-warning">
+                          <AlertTriangleIcon />
+                        </span>
+                        <div className="alert-text">
+                          <p className="alert-title">{formattedPolicyError.message}</p>
+                          {formattedPolicyError.hint && (
+                            <p className="alert-body">{formattedPolicyError.hint}</p>
+                          )}
+                          <div className="alert-actions">
+                            <button
+                              type="button"
+                              className="btn btn-sm"
+                              data-forward-policy-retry="true"
+                              disabled={submitting}
+                              onClick={onRetryForwardPolicy}
+                            >
+                              {t("app.action.retry")}
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    )}
                     {restrictionMessage && (
                       <div
                         className="inline-msg inline-msg-info"
@@ -519,7 +593,12 @@ export function ForwardDialog({
                         forward={fw}
                         t={t}
                         pushToast={pushToast}
-                        onAfterClose={onForwardChanged}
+                        onAfterClose={(notice) => {
+                          if (notice) {
+                            setClosedNotice(notice);
+                          }
+                          onForwardChanged();
+                        }}
                       />
                     ))}
                   </div>

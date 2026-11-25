@@ -58,6 +58,8 @@ interface SessionsLocalState {
   readonly forwardAddressesById: Readonly<Record<number, ForwardAddresses>>;
   readonly forwardOverlaysById: Readonly<Record<number, ForwardLiveOverlay>>;
   readonly forwardPolicy: ForwardPolicyView | null;
+  readonly forwardPolicyLoading: boolean;
+  readonly forwardPolicyError: unknown | null;
   readonly rearmDurationSecs: number;
   readonly cliInstalled: boolean | null;
   readonly reconcileSeq: number;
@@ -68,6 +70,8 @@ const INITIAL_STATE: SessionsLocalState = {
   forwardAddressesById: {},
   forwardOverlaysById: {},
   forwardPolicy: null,
+  forwardPolicyLoading: false,
+  forwardPolicyError: null,
   rearmDurationSecs: DEFAULT_REARM_SECS,
   cliInstalled: null,
   reconcileSeq: 0,
@@ -230,20 +234,28 @@ function setForwardPolicy(policy: ForwardPolicyView | null): void {
   setState({ forwardPolicy: policy });
 }
 
-export function refreshOverviewHints(signal?: AbortSignal): Promise<ForwardPolicyView | null> {
+export function refreshOverviewHints(): Promise<ForwardPolicyView | null> {
   if (forwardPolicyInFlight) {
     return forwardPolicyInFlight;
   }
   const gen = apiClient.getSessionGeneration();
-  const promise = fetchOverviewReadiness(signal)
+  setState({ forwardPolicyLoading: true, forwardPolicyError: null });
+  const promise = fetchOverviewReadiness()
     .then((overview) => {
       if (apiClient.getSessionGeneration() === gen) {
         setCliInstalledHint(Boolean(overview.cli_installed));
         if (overview.forward_policy) {
           setForwardPolicy(overview.forward_policy);
         }
+        setState({ forwardPolicyLoading: false, forwardPolicyError: null });
       }
       return overview.forward_policy ?? null;
+    })
+    .catch((error: unknown) => {
+      if (apiClient.getSessionGeneration() === gen) {
+        setState({ forwardPolicyLoading: false, forwardPolicyError: error });
+      }
+      throw error;
     })
     .finally(() => {
       if (forwardPolicyInFlight === promise) {

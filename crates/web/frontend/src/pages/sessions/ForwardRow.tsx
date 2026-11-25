@@ -20,11 +20,16 @@ import {
 
 const COPY_FEEDBACK_MS = 2000;
 
+export interface ForwardClosedNotice {
+  readonly title: string;
+  readonly body: string;
+}
+
 export interface ForwardRowProps {
   readonly forward: ForwardView;
   readonly t: TranslateFn;
   readonly pushToast: (toast: ToastInput) => number;
-  readonly onAfterClose?: () => void;
+  readonly onAfterClose?: (notice?: ForwardClosedNotice) => void;
 }
 
 function renderStateBadge(forward: ForwardView, t: TranslateFn) {
@@ -106,15 +111,16 @@ export function ForwardRow({ forward, t, pushToast, onAfterClose }: ForwardRowPr
       if (apiClient.getSessionGeneration() !== gen) {
         return;
       }
+      const title = t("app.b2.forward_closed");
       const body = closed.notice_key
         ? t(closed.notice_key)
         : t("app.b2.forward_closed_billing");
       pushToast({
         tone: "info",
-        title: t("app.b2.forward_closed"),
+        title,
         body,
       });
-      onAfterClose?.();
+      onAfterClose?.({ title, body });
     } catch (error) {
       if (apiClient.getSessionGeneration() !== gen) {
         return;

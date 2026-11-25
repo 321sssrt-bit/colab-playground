@@ -98,7 +98,7 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
     void loadSessions();
     void refreshForwards(controller.signal).catch(() => {});
     void refreshRearmDuration(controller.signal).catch(() => {});
-    void refreshOverviewHints(controller.signal).catch(() => {});
+    void refreshOverviewHints().catch(() => {});
     return () => {
       controller.abort();
     };
@@ -259,6 +259,10 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
   const handleSwitchAccount = useCallback(() => {
     navigate("accounts");
   }, [navigate]);
+
+  const handleRetryForwardPolicy = useCallback(() => {
+    void refreshOverviewHints().catch(() => {});
+  }, []);
 
   const handleForwardChanged = useCallback(() => {
     void refreshForwards().catch(() => {});
@@ -553,11 +557,14 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
         request={forwardDialog}
         currentAccountContext={snapshot?.account ?? null}
         forwardPolicy={localState.forwardPolicy}
+        forwardPolicyLoading={localState.forwardPolicyLoading}
+        forwardPolicyError={localState.forwardPolicyError}
         existingForwards={forwardDialogForwards}
         t={t}
         pushToast={pushToast}
         onClose={() => setForwardDialog(null)}
         onForwardChanged={handleForwardChanged}
+        onRetryForwardPolicy={handleRetryForwardPolicy}
       />
 
       <StopRuntimeDialog
