@@ -28,6 +28,7 @@ export interface WebStoreOptions {
   readonly client?: ApiClient;
   readonly initialReconnectDelayMs?: number;
   readonly maxReconnectDelayMs?: number;
+  readonly stableConnectionMs?: number;
   readonly backoffMultiplier?: number;
   readonly jitterRatio?: number;
   readonly random?: () => number;
@@ -48,6 +49,7 @@ export interface WebStore {
 
 const DEFAULT_INITIAL_RECONNECT_DELAY_MS = 1000;
 const DEFAULT_MAX_RECONNECT_DELAY_MS = 30_000;
+const DEFAULT_STABLE_CONNECTION_MS = 5000;
 const DEFAULT_BACKOFF_MULTIPLIER = 2;
 const DEFAULT_JITTER_RATIO = 0.2;
 const MAX_BACKOFF_EXPONENT = 16;
@@ -136,6 +138,7 @@ export function createWebStore(options: WebStoreOptions = {}): WebStore {
   const initialReconnectDelayMs =
     options.initialReconnectDelayMs ?? DEFAULT_INITIAL_RECONNECT_DELAY_MS;
   const maxReconnectDelayMs = options.maxReconnectDelayMs ?? DEFAULT_MAX_RECONNECT_DELAY_MS;
+  const stableConnectionMs = options.stableConnectionMs ?? DEFAULT_STABLE_CONNECTION_MS;
   const backoffMultiplier = options.backoffMultiplier ?? DEFAULT_BACKOFF_MULTIPLIER;
   const jitterRatio = options.jitterRatio ?? DEFAULT_JITTER_RATIO;
   const random = options.random ?? Math.random;
@@ -154,6 +157,14 @@ export function createWebStore(options: WebStoreOptions = {}): WebStore {
   let runSeq = 0;
   let activeController: AbortController | null = null;
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
+  let stableTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const clearStableTimer = (): void => {
+    if (stableTimer !== null) {
+      clearTimer(stableTimer);
+      stableTimer = null;
+    }
+  };
 
   const setState = (patch: Partial<WebStoreState>): void => {
     const next: WebStoreState = { ...state, ...patch };
@@ -181,6 +192,7 @@ export function createWebStore(options: WebStoreOptions = {}): WebStore {
 
   const stopTransport = (): void => {
     runSeq += 1;
+    clearStableTimer();
     if (retryTimer !== null) {
       clearTimer(retryTimer);
       retryTimer = null;
@@ -263,7 +275,8 @@ export function createWebStore(options: WebStoreOptions = {}): WebStore {
 
     const controller = new AbortController();
     activeController = controller;
-    let receivedFrame = false;
+    let armedStableReset = false;
+    let streamStable = false;
 
     setState({
       connectionStatus: "connecting",
@@ -296,15 +309,33 @@ export function createWebStore(options: WebStoreOptions = {}): WebStore {
           if (!isRunLive(seq, generation)) {
             return;
           }
-          // Reset backoff only once a real frame arrives so 0-frame EOF loops still back off.
-          if (!receivedFrame) {
-            receivedFrame = true;
+          // Reset backoff only after the stream remains live past the stability window so
+          // proxies that drop right after the immediate first snapshot frame still back off.
+          if (!armedStableReset) {
+            armedStableReset = true;
             setState({
               connectionStatus: "connected",
-              reconnectAttempt: 0,
               nextRetryDelayMs: null,
               lastError: null,
             });
+            if (stableConnectionMs <= 0) {
+              streamStable = true;
+              setState({ reconnectAttempt: 0 });
+            } else {
+              clearStableTimer();
+              stableTimer = setTimer(() => {
+                stableTimer = null;
+                if (!isRunLive(seq, generation)) {
+                  return;
+                }
+                streamStable = true;
+                setState({
+                  reconnectAttempt: 0,
+                  nextRetryDelayMs: null,
+                  lastError: null,
+                });
+              }, stableConnectionMs);
+            }
           }
           if (frame.event === "snapshot") {
             const incoming = parseSnapshotData(frame.data);
@@ -327,6 +358,7 @@ export function createWebStore(options: WebStoreOptions = {}): WebStore {
         },
       });
 
+      clearStableTimer();
       if (activeController === controller) {
         activeController = null;
       }
@@ -334,10 +366,11 @@ export function createWebStore(options: WebStoreOptions = {}): WebStore {
       // Clean EOF while still authenticated (e.g. proxy drop, server shutdown, or session expiry)
       // enters backoff reconnect; an expired session will receive 401 on the next attempt and halt.
       if (isRunLive(seq, generation)) {
-        const nextAttempt = receivedFrame ? 1 : attempt + 1;
+        const nextAttempt = streamStable ? 1 : attempt + 1;
         scheduleReconnect(seq, generation, nextAttempt, null);
       }
     } catch (error) {
+      clearStableTimer();
       if (activeController === controller) {
         activeController = null;
       }
@@ -356,7 +389,7 @@ export function createWebStore(options: WebStoreOptions = {}): WebStore {
       if (apiError.isUnauthorized || apiError.isAbort) {
         return;
       }
-      const nextAttempt = receivedFrame ? 1 : attempt + 1;
+      const nextAttempt = streamStable ? 1 : attempt + 1;
       scheduleReconnect(seq, generation, nextAttempt, apiError);
     }
   };
