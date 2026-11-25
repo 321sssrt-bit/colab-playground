@@ -143,7 +143,6 @@ export interface PluginRunDetail {
   readonly provisions: boolean;
   readonly launched: boolean;
   readonly provisionAllocated: boolean;
-  readonly runId: string | null;
   readonly phase: PluginRunPhase;
   readonly provisionEvents: readonly ProvisionProgressEvent[];
   readonly latestProvisionAtMs: number;

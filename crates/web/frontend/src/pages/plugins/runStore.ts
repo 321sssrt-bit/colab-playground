@@ -42,8 +42,6 @@ const MAX_BACKOFF_EXPONENT = 8;
 
 export interface PluginRunsStoreState {
   readonly runs: readonly PluginRunSummary[];
-  readonly runsLoading: boolean;
-  readonly runsError: unknown | null;
   readonly selectedRunId: number | null;
   readonly activeRun: PluginRunDetail | null;
   readonly knownPhasesById: Readonly<Record<number, PluginRunPhase>>;
@@ -55,8 +53,6 @@ export interface PluginRunsStoreState {
 
 const INITIAL_STATE: PluginRunsStoreState = {
   runs: [],
-  runsLoading: false,
-  runsError: null,
   selectedRunId: null,
   activeRun: null,
   knownPhasesById: {},
@@ -240,7 +236,6 @@ function createInitialDetail(summary: PluginRunSummary): PluginRunDetail {
     provisions: summary.provisions,
     launched: !summary.provisions,
     provisionAllocated: false,
-    runId: null,
     phase: "running",
     provisionEvents: [],
     latestProvisionAtMs: Date.now(),
@@ -327,12 +322,10 @@ function applyRunFrame(runId: number, frame: SseFrame, wasAlreadyFinished: boole
       return false;
     }
     const session = typeof parsed.session === "string" ? parsed.session : null;
-    const vmRunId = typeof parsed.run_id === "string" ? parsed.run_id : null;
     updateActiveRun(runId, (prev) => ({
       ...prev,
       launched: true,
       session: session ?? prev.session,
-      runId: vmRunId ?? prev.runId,
       streamError: null,
     }));
     return false;
@@ -419,7 +412,6 @@ function applyRunFrame(runId: number, frame: SseFrame, wasAlreadyFinished: boole
       session: finished.run.session,
       provisions: finished.run.provisions,
       launched: prev.launched || finished.outcome !== null || !finished.run.provisions,
-      runId: finished.outcome?.run_id ?? prev.runId,
       phase: finished.phase,
       status: finished.outcome?.status ?? prev.status,
       outcome: finished.outcome,
@@ -587,7 +579,6 @@ export function refreshPluginRuns(options?: {
     return runsListInFlight;
   }
   const gen = apiClient.getSessionGeneration();
-  setState({ runsLoading: true, runsError: null });
 
   const promise = listPluginRuns()
     .then((runs) => {
@@ -596,11 +587,7 @@ export function refreshPluginRuns(options?: {
       if (apiClient.getSessionGeneration() !== gen) {
         return runs;
       }
-      setState({
-        runs,
-        runsLoading: false,
-        runsError: null,
-      });
+      setState({ runs });
 
       const newest = runs[0] ?? null;
       if (shouldConsiderAutoAttach && newest) {
@@ -629,11 +616,8 @@ export function refreshPluginRuns(options?: {
       }
       return runs;
     })
-    .catch((error: unknown) => {
+    .catch(() => {
       pendingAutoAttach = false;
-      if (apiClient.getSessionGeneration() === gen && !(error instanceof ApiError && error.isAbort)) {
-        setState({ runsLoading: false, runsError: error });
-      }
       return state.runs as PluginRunSummary[];
     })
     .finally(() => {

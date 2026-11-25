@@ -25,7 +25,6 @@ export interface ForwardLiveOverlay {
 }
 
 export interface ResolvedEndpointUrls {
-  readonly origin: string | null;
   readonly openUrl: string | null;
   readonly copyUrl: string | null;
   readonly openaiBaseUrl: string | null;
@@ -88,7 +87,6 @@ export function resolveEndpointAddresses(
 
   if (!origin) {
     return {
-      origin: null,
       openUrl: null,
       copyUrl: null,
       openaiBaseUrl: null,
@@ -102,7 +100,6 @@ export function resolveEndpointAddresses(
 
   if (endpoint.kind === "openai") {
     return {
-      origin,
       openUrl: origin,
       copyUrl: fullUrl,
       openaiBaseUrl: fullUrl,
@@ -112,7 +109,6 @@ export function resolveEndpointAddresses(
   }
 
   return {
-    origin,
     openUrl: fullUrl,
     copyUrl: fullUrl,
     openaiBaseUrl: null,
