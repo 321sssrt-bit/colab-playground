@@ -26,6 +26,9 @@ export const SUPPORTED_LOCALES: readonly Locale[] = [
 export const LANGUAGE_STORAGE_KEY = "cpg_language";
 
 const DEFAULT_LOCALE: Locale = "en-US";
+const INITIAL_RETRY_DELAY_MS = 500;
+const MAX_RETRY_DELAY_MS = 5000;
+const MAX_RETRY_EXPONENT = 4;
 
 export interface I18nState {
   readonly preference: LanguagePref;
@@ -40,8 +43,10 @@ export interface I18nStoreOptions {
   readonly fetchImpl?: typeof fetch;
   readonly storage?: Pick<Storage, "getItem" | "setItem" | "removeItem"> | null;
   readonly getBrowserLanguages?: () => readonly string[];
-  readonly doc?: Pick<Document, "documentElement" | "title"> | null;
+  readonly doc?: Pick<Document, "documentElement" | "title" | "visibilityState" | "addEventListener" | "removeEventListener"> | null;
   readonly win?: Pick<Window, "addEventListener" | "removeEventListener"> | null;
+  readonly setTimer?: (callback: () => void, delayMs: number) => ReturnType<typeof setTimeout>;
+  readonly clearTimer?: (id: ReturnType<typeof setTimeout>) => void;
 }
 
 export interface SetPreferenceOptions {
@@ -183,7 +188,8 @@ function readStoredLanguage(
   try {
     const raw = storage.getItem(LANGUAGE_STORAGE_KEY);
     if (isLanguagePref(raw)) {
-      return { pref: raw, stored: raw !== "system" };
+      // Distinguish an explicit stored "system" choice from an untouched fresh browser.
+      return { pref: raw, stored: true };
     }
   } catch {
     // Ignore storage read failures in restricted browser contexts.
@@ -199,18 +205,15 @@ function writeStoredLanguage(
     return;
   }
   try {
-    if (pref === "system") {
-      storage.removeItem(LANGUAGE_STORAGE_KEY);
-    } else {
-      storage.setItem(LANGUAGE_STORAGE_KEY, pref);
-    }
+    storage.setItem(LANGUAGE_STORAGE_KEY, pref);
   } catch {
     // Apply the preference in memory even when persistence is unavailable.
   }
 }
 
 /**
- * Creates a live localization store with dictionary caching and cross-tab sync.
+ * Creates a live localization store with dictionary caching, cold-load recovery,
+ * and cross-tab sync.
  */
 export function createI18nStore(options: I18nStoreOptions = {}): I18nStore {
   const storage = options.storage !== undefined ? options.storage : resolveDefaultStorage();
@@ -227,6 +230,8 @@ export function createI18nStore(options: I18nStoreOptions = {}): I18nStore {
       : typeof window !== "undefined"
         ? window
         : null;
+  const setTimer = options.setTimer ?? globalThis.setTimeout.bind(globalThis);
+  const clearTimer = options.clearTimer ?? globalThis.clearTimeout.bind(globalThis);
 
   const initial = readStoredLanguage(storage);
   const initialBrowserLocale = detectBrowserLocale(getBrowserLanguages());
@@ -240,7 +245,9 @@ export function createI18nStore(options: I18nStoreOptions = {}): I18nStore {
   let preferenceVersion = 0;
   let disposed = false;
   let requestSeq = 0;
+  let retryAttempt = 0;
   let activeController: AbortController | null = null;
+  let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
   let state: I18nState = {
     preference: initial.pref,
@@ -249,6 +256,13 @@ export function createI18nStore(options: I18nStoreOptions = {}): I18nStore {
     dict: null,
     loading: true,
     loadFailed: false,
+  };
+
+  const clearRetryTimer = (): void => {
+    if (retryTimer !== null) {
+      clearTimer(retryTimer);
+      retryTimer = null;
+    }
   };
 
   const applyDocumentMeta = (locale: Locale, dict: Dictionary | null): void => {
@@ -288,10 +302,28 @@ export function createI18nStore(options: I18nStoreOptions = {}): I18nStore {
     emit();
   };
 
+  const scheduleColdStartRetry = (locale: Locale): void => {
+    if (disposed || state.dict !== null) {
+      return;
+    }
+    clearRetryTimer();
+    const exponent = Math.min(retryAttempt, MAX_RETRY_EXPONENT);
+    const delayMs = Math.min(MAX_RETRY_DELAY_MS, INITIAL_RETRY_DELAY_MS * 2 ** exponent);
+    retryAttempt += 1;
+    retryTimer = setTimer(() => {
+      retryTimer = null;
+      if (disposed || state.dict !== null || state.locale !== locale) {
+        return;
+      }
+      ensureLocaleLoaded(locale, true);
+    }, delayMs);
+  };
+
   const ensureLocaleLoaded = (locale: Locale, forceFetch = false): void => {
     if (disposed) {
       return;
     }
+    clearRetryTimer();
     if (activeController !== null) {
       activeController.abort();
       activeController = null;
@@ -299,6 +331,7 @@ export function createI18nStore(options: I18nStoreOptions = {}): I18nStore {
 
     const cached = !forceFetch ? cache.get(locale) : undefined;
     if (cached) {
+      retryAttempt = 0;
       applyDocumentMeta(locale, cached);
       setState({
         locale,
@@ -325,6 +358,7 @@ export function createI18nStore(options: I18nStoreOptions = {}): I18nStore {
           return;
         }
         activeController = null;
+        retryAttempt = 0;
         cache.set(locale, loaded);
         applyDocumentMeta(locale, loaded);
         setState({
@@ -343,12 +377,13 @@ export function createI18nStore(options: I18nStoreOptions = {}): I18nStore {
           loading: false,
           loadFailed: true,
         });
+        scheduleColdStartRetry(locale);
       });
   };
 
   const updatePreference = (
     pref: LanguagePref,
-    opts: { persist: boolean; userInitiated: boolean },
+    opts: { persist: boolean; userInitiated: boolean; stored: boolean },
   ): void => {
     if (disposed) {
       return;
@@ -356,11 +391,12 @@ export function createI18nStore(options: I18nStoreOptions = {}): I18nStore {
     if (opts.persist) {
       writeStoredLanguage(storage, pref);
     }
-    hasStoredPreference = pref !== "system";
+    hasStoredPreference = opts.stored;
     if (opts.userInitiated) {
       preferenceVersion += 1;
       dirtyBeforeSync = true;
     }
+    retryAttempt = 0;
     const nextLocale = resolveLocale(pref, state.browserLocale);
     setState({ preference: pref, locale: nextLocale });
     ensureLocaleLoaded(nextLocale);
@@ -370,8 +406,9 @@ export function createI18nStore(options: I18nStoreOptions = {}): I18nStore {
     if (disposed || event.key !== LANGUAGE_STORAGE_KEY) {
       return;
     }
-    const nextPref = isLanguagePref(event.newValue) ? event.newValue : "system";
-    updatePreference(nextPref, { persist: false, userInitiated: false });
+    const stored = isLanguagePref(event.newValue);
+    const nextPref = stored ? event.newValue : "system";
+    updatePreference(nextPref, { persist: false, userInitiated: false, stored });
   };
 
   const onLanguageChange = (): void => {
@@ -382,12 +419,29 @@ export function createI18nStore(options: I18nStoreOptions = {}): I18nStore {
     const nextLocale = resolveLocale(state.preference, nextBrowserLocale);
     setState({ browserLocale: nextBrowserLocale, locale: nextLocale });
     if (state.preference === "system") {
+      retryAttempt = 0;
       ensureLocaleLoaded(nextLocale);
+    }
+  };
+
+  const retryIfFailed = (): void => {
+    if (disposed || !state.loadFailed || state.loading) {
+      return;
+    }
+    retryAttempt = 0;
+    ensureLocaleLoaded(state.locale, true);
+  };
+
+  const onVisibilityChange = (): void => {
+    if (doc && doc.visibilityState === "visible") {
+      retryIfFailed();
     }
   };
 
   win?.addEventListener("storage", onStorage);
   win?.addEventListener("languagechange", onLanguageChange);
+  win?.addEventListener("online", retryIfFailed);
+  doc?.addEventListener("visibilitychange", onVisibilityChange);
   ensureLocaleLoaded(initialLocale);
 
   return {
@@ -418,12 +472,13 @@ export function createI18nStore(options: I18nStoreOptions = {}): I18nStore {
       updatePreference(pref, {
         persist: true,
         userInitiated: opts.userInitiated ?? true,
+        stored: true,
       });
     },
 
     adoptFromServer(pref: LanguagePref): void {
       dirtyBeforeSync = false;
-      updatePreference(pref, { persist: true, userInitiated: false });
+      updatePreference(pref, { persist: true, userInitiated: false, stored: true });
     },
 
     shouldPushToServer(): boolean {
@@ -439,12 +494,15 @@ export function createI18nStore(options: I18nStoreOptions = {}): I18nStore {
 
     dispose(): void {
       disposed = true;
+      clearRetryTimer();
       if (activeController !== null) {
         activeController.abort();
         activeController = null;
       }
       win?.removeEventListener("storage", onStorage);
       win?.removeEventListener("languagechange", onLanguageChange);
+      win?.removeEventListener("online", retryIfFailed);
+      doc?.removeEventListener("visibilitychange", onVisibilityChange);
       listeners.clear();
     },
   };

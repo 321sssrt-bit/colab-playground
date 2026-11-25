@@ -1,12 +1,11 @@
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect } from "react";
 
 import { AlertIcon, BrandIcon } from "./components/Icons.tsx";
 import { PreferenceBar } from "./components/PreferenceBar.tsx";
-import { apiClient } from "./lib/api.ts";
-import { i18nStore, useI18n } from "./lib/i18n.ts";
-import { persistPreferencePatch, syncPreferencesOnLogin } from "./lib/preferences.ts";
+import { useI18n } from "./lib/i18n.ts";
+import { preferenceSync } from "./lib/preferences.ts";
 import { useWebStore, webStore } from "./lib/store.ts";
-import { themeStore, useTheme } from "./lib/theme.ts";
+import { useTheme } from "./lib/theme.ts";
 import type { AppearancePref, LanguagePref } from "./lib/types.ts";
 import { LoginPage } from "./pages/LoginPage.tsx";
 
@@ -16,55 +15,26 @@ export function App() {
   const theme = useTheme();
   const { t } = i18n;
 
-  const langPatchAbortRef = useRef<AbortController | null>(null);
-  const appearancePatchAbortRef = useRef<AbortController | null>(null);
-
   useEffect(() => {
     if (storeState.authStatus !== "authenticated") {
-      langPatchAbortRef.current?.abort();
-      langPatchAbortRef.current = null;
-      appearancePatchAbortRef.current?.abort();
-      appearancePatchAbortRef.current = null;
+      preferenceSync.cancelPending();
       return;
     }
 
     const controller = new AbortController();
-    void syncPreferencesOnLogin(apiClient, i18nStore, themeStore, controller.signal);
-    return () => controller.abort();
+    preferenceSync.syncSession(controller.signal);
+    return () => {
+      controller.abort();
+      preferenceSync.cancelPending();
+    };
   }, [storeState.authStatus]);
 
   const handleLanguageChange = useCallback((pref: LanguagePref) => {
-    i18nStore.setPreference(pref, { userInitiated: true });
-    if (!apiClient.isAuthenticated()) {
-      return;
-    }
-    const version = i18nStore.getVersion();
-    langPatchAbortRef.current?.abort();
-    const controller = new AbortController();
-    langPatchAbortRef.current = controller;
-    void persistPreferencePatch(apiClient, { language: pref }, controller.signal).then((saved) => {
-      if (saved && !controller.signal.aborted) {
-        i18nStore.markSynced(version);
-      }
-    });
+    preferenceSync.setLanguage(pref);
   }, []);
 
   const handleAppearanceChange = useCallback((pref: AppearancePref) => {
-    themeStore.setPreference(pref, { userInitiated: true });
-    if (!apiClient.isAuthenticated()) {
-      return;
-    }
-    const version = themeStore.getVersion();
-    appearancePatchAbortRef.current?.abort();
-    const controller = new AbortController();
-    appearancePatchAbortRef.current = controller;
-    void persistPreferencePatch(apiClient, { appearance: pref }, controller.signal).then(
-      (saved) => {
-        if (saved && !controller.signal.aborted) {
-          themeStore.markSynced(version);
-        }
-      },
-    );
+    preferenceSync.setAppearance(pref);
   }, []);
 
   const handleSignIn = useCallback(async (accessKey: string, signal: AbortSignal) => {
@@ -74,6 +44,22 @@ export function App() {
   const handleSignOut = useCallback(() => {
     webStore.signOut();
   }, []);
+
+  // Avoid rendering unlabeled form controls before the first dictionary loads.
+  if (i18n.dict === null) {
+    return (
+      <main className="login-page" aria-busy="true">
+        <div className="login-shell">
+          <section className="card login-card">
+            <div className="busy-line">
+              <BrandIcon />
+              <span className="spinner" aria-hidden="true" />
+            </div>
+          </section>
+        </div>
+      </main>
+    );
+  }
 
   if (storeState.authStatus !== "authenticated") {
     return (

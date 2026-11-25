@@ -70,7 +70,8 @@ function readStoredAppearance(
   try {
     const raw = storage.getItem(APPEARANCE_STORAGE_KEY);
     if (isAppearancePref(raw)) {
-      return { pref: raw, stored: raw !== "system" };
+      // Distinguish an explicit stored "system" choice from an untouched fresh browser.
+      return { pref: raw, stored: true };
     }
   } catch {
     // Ignore storage read failures in restricted browser contexts.
@@ -86,11 +87,7 @@ function writeStoredAppearance(
     return;
   }
   try {
-    if (pref === "system") {
-      storage.removeItem(APPEARANCE_STORAGE_KEY);
-    } else {
-      storage.setItem(APPEARANCE_STORAGE_KEY, pref);
-    }
+    storage.setItem(APPEARANCE_STORAGE_KEY, pref);
   } catch {
     // Apply the theme to the page even if persistence is blocked.
   }
@@ -137,7 +134,7 @@ export function createThemeStore(options: ThemeStoreOptions = {}): ThemeStore {
 
   const update = (
     pref: AppearancePref,
-    opts: { persist: boolean; userInitiated: boolean },
+    opts: { persist: boolean; userInitiated: boolean; stored: boolean },
   ): void => {
     if (disposed) {
       return;
@@ -145,7 +142,7 @@ export function createThemeStore(options: ThemeStoreOptions = {}): ThemeStore {
     if (opts.persist) {
       writeStoredAppearance(storage, pref);
     }
-    hasStoredPreference = pref !== "system";
+    hasStoredPreference = opts.stored;
     if (opts.userInitiated) {
       preferenceVersion += 1;
       dirtyBeforeSync = true;
@@ -161,8 +158,9 @@ export function createThemeStore(options: ThemeStoreOptions = {}): ThemeStore {
     if (disposed || event.key !== APPEARANCE_STORAGE_KEY) {
       return;
     }
-    const nextPref = isAppearancePref(event.newValue) ? event.newValue : "system";
-    update(nextPref, { persist: false, userInitiated: false });
+    const stored = isAppearancePref(event.newValue);
+    const nextPref = stored ? event.newValue : "system";
+    update(nextPref, { persist: false, userInitiated: false, stored });
   };
 
   win?.addEventListener("storage", onStorage);
@@ -187,12 +185,13 @@ export function createThemeStore(options: ThemeStoreOptions = {}): ThemeStore {
       update(pref, {
         persist: true,
         userInitiated: opts.userInitiated ?? true,
+        stored: true,
       });
     },
 
     adoptFromServer(pref: AppearancePref): void {
       dirtyBeforeSync = false;
-      update(pref, { persist: true, userInitiated: false });
+      update(pref, { persist: true, userInitiated: false, stored: true });
     },
 
     shouldPushToServer(): boolean {
