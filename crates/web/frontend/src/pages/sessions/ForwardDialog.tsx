@@ -279,6 +279,7 @@ export function ForwardDialog({
   const closedByAttr = {
     closedby: submitting ? "none" : "closerequest",
   } as Record<string, string>;
+  const activeRequestId = request?.id ?? 0;
 
   return (
     <dialog
@@ -291,6 +292,16 @@ export function ForwardDialog({
       onClose={handleDialogClose}
       {...closedByAttr}
     >
+      <div className="visually-hidden" role="status" aria-live="polite" aria-atomic="true">
+        {closedNotice && (
+          <>
+            <span>{closedNotice.title}</span>
+            <span>{" "}</span>
+            <span>{closedNotice.body}</span>
+          </>
+        )}
+      </div>
+
       {request && (
         <>
           <h1 id={titleId} className="dialog-title">
@@ -323,7 +334,6 @@ export function ForwardDialog({
                 <div
                   ref={closedNoticeRef}
                   className="alert alert-info"
-                  role="status"
                   data-forward-closed-notice="true"
                 >
                   <span className="alert-icon icon-info">
@@ -594,7 +604,7 @@ export function ForwardDialog({
                         t={t}
                         pushToast={pushToast}
                         onAfterClose={(notice) => {
-                          if (notice) {
+                          if (notice && activeRequestIdRef.current === activeRequestId) {
                             setClosedNotice(notice);
                           }
                           onForwardChanged();
