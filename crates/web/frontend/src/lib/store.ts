@@ -322,7 +322,6 @@ export function createWebStore(options: WebStoreOptions = {}): WebStore {
               streamStable = true;
               setState({ reconnectAttempt: 0 });
             } else {
-              clearStableTimer();
               stableTimer = setTimer(() => {
                 stableTimer = null;
                 if (!isRunLive(seq, generation)) {

@@ -500,17 +500,7 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
 
         streamOptions.onOpen?.();
 
-        await parseSseStream(
-          response.body,
-          (frame) => {
-            if (requestGeneration !== generation || streamAbort.signal.aborted) {
-              streamAbort.abort();
-              return;
-            }
-            streamOptions.onFrame(frame);
-          },
-          streamAbort.signal,
-        );
+        await parseSseStream(response.body, streamOptions.onFrame, streamAbort.signal);
       } catch (error) {
         if (error instanceof ApiError) {
           throw error;
