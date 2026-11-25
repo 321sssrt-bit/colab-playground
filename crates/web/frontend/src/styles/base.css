@@ -727,6 +727,11 @@ a:hover {
   animation: spin 0.8s linear infinite;
 }
 
+.btn-primary .spinner {
+  border-color: var(--color-border-strong);
+  border-top-color: var(--color-on-accent);
+}
+
 @keyframes spin {
   to {
     transform: rotate(360deg);
