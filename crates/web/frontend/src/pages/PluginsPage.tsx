@@ -111,6 +111,15 @@ export function PluginsPage({ snapshot, locale, t, pushToast }: PageProps) {
       if (!mountedRef.current) {
         return;
       }
+      // Reflect the committed server toggle immediately so a transient list refresh failure
+      // cannot revert the switch and trap the user from undoing the change.
+      setPlugins((prev) =>
+        prev === null
+          ? null
+          : prev.map((item) =>
+              item.manifest.id === id ? { ...item, enabled: nextEnabled } : item,
+            ),
+      );
       await fetchPlugins();
       void webStore.refreshSnapshot().catch(() => {});
     } catch (error) {

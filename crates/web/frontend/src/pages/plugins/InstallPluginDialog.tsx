@@ -54,10 +54,12 @@ export function InstallPluginDialog({
   const dialogRef = useRef<HTMLDialogElement | null>(null);
   const sourceInputRef = useRef<HTMLInputElement | null>(null);
   const previewNameRef = useRef<HTMLParagraphElement | null>(null);
-  const requestAbortRef = useRef<AbortController | null>(null);
+  const checkSeqRef = useRef(0);
+  const installAbortRef = useRef<AbortController | null>(null);
   const activePreviewIdRef = useRef<string | null>(null);
   const openRef = useRef(open);
   openRef.current = open;
+  const mountedRef = useRef(true);
 
   const [sourceText, setSourceText] = useState("");
   const [checkedSource, setCheckedSource] = useState("");
@@ -78,8 +80,9 @@ export function InstallPluginDialog({
   }, []);
 
   const resetForOpen = useCallback(() => {
-    requestAbortRef.current?.abort();
-    requestAbortRef.current = null;
+    checkSeqRef.current += 1;
+    installAbortRef.current?.abort();
+    installAbortRef.current = null;
     discardStagedPreview(activePreviewIdRef.current);
     setSourceText("");
     setCheckedSource("");
@@ -112,9 +115,12 @@ export function InstallPluginDialog({
   }, [open, phase]);
 
   useEffect(() => {
+    mountedRef.current = true;
     return () => {
-      requestAbortRef.current?.abort();
-      requestAbortRef.current = null;
+      mountedRef.current = false;
+      checkSeqRef.current += 1;
+      installAbortRef.current?.abort();
+      installAbortRef.current = null;
       discardStagedPreview(activePreviewIdRef.current);
     };
   }, [discardStagedPreview]);
@@ -130,8 +136,10 @@ export function InstallPluginDialog({
     if (dialog) {
       dialog.returnValue = "";
     }
-    requestAbortRef.current?.abort();
-    requestAbortRef.current = null;
+    // Invalidate any in-flight check without aborting its HTTP response so late previews get discarded.
+    checkSeqRef.current += 1;
+    installAbortRef.current?.abort();
+    installAbortRef.current = null;
     discardStagedPreview(activePreviewIdRef.current);
     setPreview(null);
     setPhase("source");
@@ -167,9 +175,7 @@ export function InstallPluginDialog({
       return;
     }
 
-    requestAbortRef.current?.abort();
-    const controller = new AbortController();
-    requestAbortRef.current = controller;
+    const seq = ++checkSeqRef.current;
 
     setSourceInvalid(false);
     setErrorMessage(null);
@@ -177,8 +183,10 @@ export function InstallPluginDialog({
     setCheckedSource(trimmed);
 
     try {
-      const result = await previewPlugin(parsePluginOrigin(trimmed), controller.signal);
-      if (controller.signal.aborted || !openRef.current) {
+      // Do not abort the preview request on cancel: the backend still finishes staging it, so
+      // receiving the late response lets us immediately DELETE its preview_id.
+      const result = await previewPlugin(parsePluginOrigin(trimmed));
+      if (!mountedRef.current || !openRef.current || seq !== checkSeqRef.current) {
         discardStagedPreview(result.preview_id);
         return;
       }
@@ -186,16 +194,17 @@ export function InstallPluginDialog({
       setPreview(result);
       setPhase("preview");
     } catch (error) {
-      if (controller.signal.aborted || (error instanceof ApiError && error.isAbort)) {
+      if (
+        !mountedRef.current ||
+        !openRef.current ||
+        seq !== checkSeqRef.current ||
+        (error instanceof ApiError && error.isAbort)
+      ) {
         return;
       }
       setPhase("source");
       setErrorMessage(formatPluginApiError(error, t));
       sourceInputRef.current?.focus();
-    } finally {
-      if (requestAbortRef.current === controller) {
-        requestAbortRef.current = null;
-      }
     }
   };
 
@@ -218,20 +227,20 @@ export function InstallPluginDialog({
       return;
     }
     const previewId = preview.preview_id;
-    requestAbortRef.current?.abort();
+    installAbortRef.current?.abort();
     const controller = new AbortController();
-    requestAbortRef.current = controller;
+    installAbortRef.current = controller;
 
     setErrorMessage(null);
     setPhase("installing");
 
     try {
       const installed = await installPluginPreview(previewId, controller.signal);
-      // The backend consumes the staged preview once installation succeeds.
+      // The backend consumes the staged preview once installation starts.
       if (activePreviewIdRef.current === previewId) {
         activePreviewIdRef.current = null;
       }
-      if (controller.signal.aborted) {
+      if (controller.signal.aborted || !mountedRef.current) {
         return;
       }
       setPreview(null);
@@ -244,14 +253,25 @@ export function InstallPluginDialog({
         onClose();
       }
     } catch (error) {
-      if (controller.signal.aborted || (error instanceof ApiError && error.isAbort)) {
+      if (
+        controller.signal.aborted ||
+        !mountedRef.current ||
+        (error instanceof ApiError && error.isAbort)
+      ) {
         return;
       }
-      setPhase("preview");
+      // Backend removes the staged preview as soon as installation enters commit, and another tab
+      // may also invalidate it; discard best-effort and return to source so the user re-checks.
+      discardStagedPreview(previewId);
+      setPreview(null);
+      setPhase("source");
       setErrorMessage(formatPluginApiError(error, t));
+      queueMicrotask(() => {
+        sourceInputRef.current?.focus();
+      });
     } finally {
-      if (requestAbortRef.current === controller) {
-        requestAbortRef.current = null;
+      if (installAbortRef.current === controller) {
+        installAbortRef.current = null;
       }
     }
   };
@@ -311,7 +331,7 @@ export function InstallPluginDialog({
         <form className="dialog-form" method="post" onSubmit={handleCheckSubmit} noValidate>
           <div className="dialog-body">
             <p className="dialog-caption" id={sourceHintId}>
-              {t("app.b2.plugin_install_hint")}
+              {t("web.plugins.source_required")}
             </p>
 
             <div className="field-group">
@@ -449,17 +469,6 @@ export function InstallPluginDialog({
                   <p className="alert-body">{warningText}</p>
                 </div>
               </div>
-
-              {errorMessage !== null && (
-                <div className="alert alert-danger" role="alert">
-                  <span className="alert-icon icon-danger">
-                    <AlertIcon />
-                  </span>
-                  <div className="alert-text">
-                    <p className="alert-body">{errorMessage}</p>
-                  </div>
-                </div>
-              )}
             </div>
 
             <div className="modal-actions">
