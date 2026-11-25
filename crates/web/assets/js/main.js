@@ -3,7 +3,7 @@ import {
   openAddAccountDialog,
   openSwitchAccountDialog,
 } from "./account-dialogs.js";
-import { alertBox, badge, clear, el } from "./components.js";
+import { alertBox, badge, clear, el, toastCard } from "./components.js";
 import { formatEmail, formatUsageBadge, formatUsageTip } from "./format.js";
 import { initI18n, onLocaleChange, t } from "./i18n.js";
 import { icon } from "./icons.js";
@@ -217,6 +217,7 @@ class AppShellController {
     this.drawerOpen = false;
 
     if (!state.authenticated) {
+      this.renderToastViewport();
       this.loginPage.mount(this.mountNode);
       this.updateTitle();
       return;
@@ -729,7 +730,7 @@ class AppShellController {
       )
     );
 
-    // Connection / shutdown / account-action feedback banner
+    // Connection / shutdown banner
     clear(this.bannerEl);
     if (state.snapshot?.shutting_down) {
       this.bannerEl.appendChild(
@@ -740,19 +741,28 @@ class AppShellController {
         alertBox({ tone: "warning", body: t("web.shell.reconnecting"), live: true })
       );
     }
-    if (state.accountNotice) {
-      this.bannerEl.appendChild(
-        alertBox({
-          tone: state.accountNotice.tone || "info",
-          body: state.accountNotice.message,
-          onDismiss: () => clearAccountNotice(),
-          live: true,
-        })
-      );
-    }
     this.bannerEl.hidden = this.bannerEl.childElementCount === 0;
 
+    this.renderToastViewport();
     this.updateTitle();
+  }
+
+  renderToastViewport() {
+    const viewport = document.getElementById("toast-viewport");
+    if (!viewport) return;
+    clear(viewport);
+    if (!state.authenticated || !state.accountNotice) {
+      viewport.hidden = true;
+      return;
+    }
+    viewport.hidden = false;
+    viewport.appendChild(
+      toastCard({
+        tone: state.accountNotice.tone || "info",
+        body: state.accountNotice.message,
+        onDismiss: () => clearAccountNotice(),
+      })
+    );
   }
 }
 

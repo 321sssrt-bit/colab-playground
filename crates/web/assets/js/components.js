@@ -117,6 +117,44 @@ export function alertBox({
   );
 }
 
+export function toastCard({ tone = "info", body, onDismiss = null } = {}) {
+  const iconMap = {
+    warning: "alertTriangle",
+    danger: "alertCircle",
+    success: "checkCircle",
+    info: "info",
+  };
+  const iconToneMap = {
+    warning: "icon-md icon-warning",
+    danger: "icon-md icon-danger",
+    success: "icon-md icon-success",
+    info: "icon-md icon-info",
+  };
+  const dismissBtn = onDismiss
+    ? el(
+        "button",
+        {
+          type: "button",
+          className: "btn btn-sm btn-ghost btn-icon alert-dismiss",
+          "aria-label": t("app.action.dismiss"),
+          title: t("app.action.dismiss"),
+          onClick: onDismiss,
+        },
+        icon("x")
+      )
+    : null;
+  return el(
+    "div",
+    {
+      className: "toast-card",
+      role: tone === "danger" ? "alert" : "status",
+    },
+    el("span", { className: "alert-icon" }, icon(iconMap[tone] || "info", iconToneMap[tone] || "icon-md icon-info")),
+    el("div", { className: "toast-body" }, body),
+    dismissBtn
+  );
+}
+
 export function inlineMessage({ tone = "info", text } = {}) {
   const iconMap = {
     warning: "alertTriangle",

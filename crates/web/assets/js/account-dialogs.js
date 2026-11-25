@@ -12,6 +12,7 @@ import {
   beginAccountLogin,
   cancelAccountLogin,
   confirmAccountSwitch,
+  fetchInitialSnapshot,
   previewAccountSwitch,
   removeAccount,
   setAccountNotice,
@@ -49,6 +50,7 @@ function isBusy(dialog) {
       dialog.phase === "submitting" ||
       dialog.phase === "cancelling" ||
       dialog.phase === "rolling_back" ||
+      (dialog.phase === "expired" && Boolean(dialog.rollbackRunning)) ||
       dialog.cancellingExisting
     );
   }
@@ -313,12 +315,14 @@ async function submitAddCode() {
     if (gen !== dialogGeneration || !activeDialog || activeDialog.kind !== "add") return;
     activeDialog.codeDraft = "";
     if (err?.payload?.error?.kind === "login_cancelled") {
+      void fetchInitialSnapshot();
       if (hasLoginRollbackOp(state.snapshot, loginId)) {
         activeDialog.phase = "rolling_back";
         activeDialog.loginId = loginId;
       } else {
         activeDialog.phase = "expired";
         activeDialog.loginId = null;
+        activeDialog.rollbackRunning = hasAnyLoginOp(state.snapshot);
       }
     } else {
       activeDialog.loginId = null;
@@ -698,6 +702,8 @@ function renderAddDialog(dialog, model) {
   }
 
   if (model.phase === "expired") {
+    const rollbackRunning = hasAnyLoginOp(state.snapshot);
+    model.rollbackRunning = rollbackRunning;
     dialog.append(
       title,
       el(
@@ -709,7 +715,9 @@ function renderAddDialog(dialog, model) {
           body: t("web.add.expired_or_cancelled"),
           live: true,
         }),
-        el("p", { className: "dialog-caption" }, t("app.add.rolled_back"))
+        rollbackRunning
+          ? busyLine(t("web.add.cancelling"))
+          : el("p", { className: "dialog-caption" }, t("app.add.rolled_back"))
       ),
       el(
         "div",
@@ -719,6 +727,7 @@ function renderAddDialog(dialog, model) {
           {
             type: "button",
             className: "btn btn-ghost",
+            disabled: rollbackRunning,
             onClick: () => closeDialogNow(),
           },
           t("app.action.close")
@@ -729,7 +738,8 @@ function renderAddDialog(dialog, model) {
             type: "button",
             className: "btn btn-primary",
             dataset: { addStartAgain: "true" },
-            autofocus: true,
+            disabled: rollbackRunning,
+            autofocus: !rollbackRunning,
             onClick: () => {
               void startAddFlow();
             },
@@ -1011,6 +1021,15 @@ export function initAccountDialogs() {
         if (!hasLoginRollbackOp(state.snapshot, activeDialog.loginId)) {
           activeDialog.phase = "expired";
           activeDialog.loginId = null;
+          activeDialog.rollbackRunning = hasAnyLoginOp(state.snapshot);
+          renderActiveDialog();
+        }
+        return;
+      }
+      if (activeDialog.phase === "expired") {
+        const running = hasAnyLoginOp(state.snapshot);
+        if (running !== Boolean(activeDialog.rollbackRunning)) {
+          activeDialog.rollbackRunning = running;
           renderActiveDialog();
         }
       }

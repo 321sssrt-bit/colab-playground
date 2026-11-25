@@ -158,6 +158,7 @@
   --mobile-topbar-height: 3rem;
   --content-max-width: 75rem;
   --dialog-width: 27.5rem;
+  --toast-width: 22.5rem;
   --label-width: 10rem;
   --prose-width: 20rem;
   --usage-figure-min: 7.5rem;
@@ -169,6 +170,7 @@
   --z-drawer-backdrop: 30;
   --z-drawer: 40;
   --z-menu: 50;
+  --z-toast: 60;
 
   accent-color: var(--color-accent);
   scrollbar-color: var(--color-scrollbar-thumb) var(--color-scrollbar-track);
