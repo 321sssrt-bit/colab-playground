@@ -283,17 +283,23 @@
 }
 
 @media (forced-colors: active) {
-  :root {
+  :root,
+  :root[data-theme="light"],
+  :root[data-theme="dark"],
+  :root:not([data-theme="light"]) {
     --color-bg: Canvas;
     --color-surface: Canvas;
     --color-sunken: Canvas;
     --color-overlay: Canvas;
+    --color-hover: Canvas;
+    --color-active: Canvas;
     --color-fg: CanvasText;
     --color-fg-muted: CanvasText;
     --color-fg-subtle: CanvasText;
     --color-border: CanvasText;
     --color-border-strong: CanvasText;
     --color-accent: Highlight;
+    --color-accent-hover: Highlight;
     --color-on-accent: HighlightText;
     --color-focus: Highlight;
     --color-link: LinkText;

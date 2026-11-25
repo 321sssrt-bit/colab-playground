@@ -290,18 +290,21 @@
 
 .settings-row {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
-  gap: var(--space-4);
+  column-gap: var(--space-4);
+  row-gap: var(--space-2);
   padding-block: var(--space-3);
-  border-top: var(--border-width) solid var(--color-border);
+  border-bottom: var(--border-width) solid var(--color-border);
 }
 
 .settings-row:first-child {
-  border-top: var(--border-width) solid var(--color-border);
+  padding-top: var(--space-2);
 }
 
 .settings-row:last-child {
+  border-bottom: none;
   padding-bottom: var(--space-0);
 }
 

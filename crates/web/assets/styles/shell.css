@@ -213,13 +213,13 @@
   margin-inline: auto;
 }
 
-/* Ely Page frame: max-w 1200px, px-10 (40px), py-8 (32px), gap-8 (32px) */
+/* Ely Page frame: 32px title-strip top offset + max-w 1200px, px-10 (40px), py-8 (32px), gap-8 (32px) */
 .page-host {
   flex: 1;
   width: 100%;
   max-width: var(--content-max-width);
   margin-inline: auto;
-  padding: var(--space-8) var(--space-10) var(--space-10);
+  padding: calc(var(--titlebar-height) + var(--space-8)) var(--space-10) var(--space-10);
   display: flex;
   flex-direction: column;
   gap: var(--space-8);

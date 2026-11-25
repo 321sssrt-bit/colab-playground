@@ -146,35 +146,72 @@ export function createOverviewPage({ navigate }) {
   }
 
   function renderUnmanagedAlert(overview) {
-    const unmanaged = overview?.unmanaged_runtimes;
-    if (!unmanaged || !unmanaged.warning_key) {
+    const accountsList = state.snapshot?.accounts?.accounts || overview?.accounts?.accounts || [];
+    const accountEmail = (accountId) => {
+      const found = accountsList.find((a) => a.id === accountId);
+      return formatEmail(found?.email);
+    };
+
+    const hasLiveRuntimes = Boolean(state.snapshot && (state.snapshot.runtimes || state.snapshot.runtimes_error));
+    let title = null;
+    let body = null;
+
+    if (hasLiveRuntimes) {
+      const runtimesView = state.snapshot.runtimes;
+      const runtimesErr = state.snapshot.runtimes_error;
+      if (runtimesErr) {
+        title = t("app.unmanaged.unknown_title");
+        body =
+          accountsList.length > 0
+            ? accountsList
+                .map((a) => t("app.unmanaged.unknown", { email: formatEmail(a.email) }))
+                .join("\n")
+            : t("web.runtimes.unmanaged_unknown");
+      } else if (runtimesView) {
+        const lines = [];
+        const counts = new Map();
+        for (const runtime of runtimesView.runtimes || []) {
+          if (runtime && runtime.managed === false) {
+            const key = runtime.id?.account || runtime.account_email || "";
+            const entry = counts.get(key) || {
+              email: runtime.account_email ?? accountsList.find((a) => a.id === key)?.email,
+              count: 0,
+            };
+            entry.count += 1;
+            counts.set(key, entry);
+          }
+        }
+        for (const { email, count } of counts.values()) {
+          const label = formatEmail(email);
+          lines.push(
+            count === 1
+              ? t("app.unmanaged.one", { email: label })
+              : t("app.unmanaged.many", { count, email: label })
+          );
+        }
+        for (const err of runtimesView.errors || []) {
+          lines.push(t("app.unmanaged.unknown", { email: accountEmail(err.account) }));
+        }
+        if (lines.length === 0) {
+          return null;
+        }
+        title = counts.size > 0 ? t("app.unmanaged.title") : t("app.unmanaged.unknown_title");
+        body = lines.join("\n");
+      }
+    } else {
+      const unmanaged = overview?.unmanaged_runtimes;
+      if (!unmanaged || !unmanaged.warning_key) {
+        return null;
+      }
+      title = unmanaged.incomplete
+        ? t("app.unmanaged.unknown_title")
+        : t("app.unmanaged.title");
+      body = t(unmanaged.warning_key, { count: unmanaged.count ?? 0 });
+    }
+
+    if (!title || !body) {
       return null;
     }
-    let body = t(unmanaged.warning_key, { count: unmanaged.count ?? 0 });
-    if (!unmanaged.incomplete && Array.isArray(state.snapshot?.runtimes?.runtimes)) {
-      const counts = new Map();
-      for (const runtime of state.snapshot.runtimes.runtimes) {
-        if (runtime && runtime.managed === false) {
-          const key = runtime.id?.account || runtime.account_email || "";
-          const entry = counts.get(key) || { email: runtime.account_email, count: 0 };
-          entry.count += 1;
-          counts.set(key, entry);
-        }
-      }
-      if (counts.size > 0) {
-        body = Array.from(counts.values())
-          .map(({ email, count }) => {
-            const label = formatEmail(email);
-            return count === 1
-              ? t("app.unmanaged.one", { email: label })
-              : t("app.unmanaged.many", { count, email: label });
-          })
-          .join("\n");
-      }
-    }
-    const title = unmanaged.incomplete
-      ? t("app.unmanaged.unknown_title")
-      : t("app.unmanaged.title");
     return alertBox({
       tone: "warning",
       title,
