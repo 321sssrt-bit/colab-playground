@@ -5,6 +5,28 @@
 
 export type BackendKind = "real" | "mock";
 
+export type Locale = "en-US" | "zh-CN" | "zh-TW" | "ja-JP" | "ko-KR";
+
+export type LanguagePref = "system" | Locale;
+
+export type AppearancePref = "system" | "light" | "dark";
+
+export interface SettingsView {
+  language: LanguagePref;
+  appearance: AppearancePref;
+  defaults: Record<string, unknown>;
+  config_dir: string | null;
+  load_status: "no_config_dir" | "missing" | "loaded" | "corrupt";
+  corrupt_backup: string | null;
+  reset_defaults: string[];
+}
+
+export interface SettingsPatch {
+  language?: LanguagePref;
+  appearance?: AppearancePref;
+  defaults?: Record<string, unknown>;
+}
+
 export type AccountId = string;
 
 export type TunnelId = number;
