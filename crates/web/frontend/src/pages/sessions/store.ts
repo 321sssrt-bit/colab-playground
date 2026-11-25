@@ -12,6 +12,7 @@ import { apiClient } from "../../lib/api.ts";
 import type { TranslateFn } from "../../lib/i18n.ts";
 import type { ToastInput } from "../../lib/toast.ts";
 import type {
+  AccountId,
   Concern,
   Locale,
   Runtime,
@@ -69,6 +70,7 @@ const INITIAL_STATE: SessionsLocalState = {
 let state: SessionsLocalState = INITIAL_STATE;
 let seenGuardStoppedKeys = new Set<string>();
 let seenVanishedKeys = new Set<string>();
+let lastKnownRuntimesByAccount = new Map<AccountId, readonly Runtime[]>();
 let latestSnapshotVersion = 0;
 let forwardsInFlight: Promise<ForwardView[]> | null = null;
 let settingsInFlight: Promise<number> | null = null;
@@ -92,6 +94,7 @@ function setState(patch: Partial<SessionsLocalState>): void {
 function resetLocalState(): void {
   seenGuardStoppedKeys = new Set<string>();
   seenVanishedKeys = new Set<string>();
+  lastKnownRuntimesByAccount = new Map<AccountId, readonly Runtime[]>();
   latestSnapshotVersion = 0;
   forwardsInFlight = null;
   settingsInFlight = null;
@@ -234,7 +237,12 @@ export function observeSnapshotTransitions(
   const nextRuntimes = nextSnapshot.runtimes?.runtimes ?? [];
   const accounts = nextSnapshot.accounts?.accounts ?? prevSnapshot?.accounts?.accounts ?? [];
   const lookupInfo = (ref: RuntimeRef): { label: string; email: string | null } => {
-    const matched = prevRuntimes.find((rt) => runtimeKey(rt.id) === runtimeKey(ref));
+    const key = runtimeKey(ref);
+    let matched = prevRuntimes.find((rt) => runtimeKey(rt.id) === key);
+    if (!matched) {
+      const baseline = lastKnownRuntimesByAccount.get(ref.account);
+      matched = baseline?.find((rt) => runtimeKey(rt.id) === key);
+    }
     const acct = accounts.find((a) => a.id === ref.account);
     return {
       label: matched ? formatRuntimeCardLabel(matched) : (ref.name ?? ref.endpoint),
@@ -293,40 +301,71 @@ export function observeSnapshotTransitions(
     }
   }
 
-  // If a manual Refresh reconciled the ledger before the next Guard poll, detect
-  // runtimes that disappeared from accounts whose listing succeeded without error.
-  if (
-    prevSnapshot?.runtimes &&
-    nextSnapshot.runtimes &&
-    nextSnapshot.runtimes_error === null
-  ) {
+  // Keep each account's last successful runtime list so a transient per-account
+  // listing error does not drop the baseline needed to detect vanished runtimes
+  // when a subsequent manual refresh reconciles the ledger ahead of a Guard round.
+  const hasAccountsList = nextSnapshot.accounts !== null;
+  const savedAccounts = new Set(accounts.map((a) => a.id));
+  if (hasAccountsList) {
+    for (const accountId of lastKnownRuntimesByAccount.keys()) {
+      if (!savedAccounts.has(accountId)) {
+        lastKnownRuntimesByAccount.delete(accountId);
+      }
+    }
+  }
+
+  if (nextSnapshot.runtimes && nextSnapshot.runtimes_error === null) {
     const erroredAccounts = new Set(nextSnapshot.runtimes.errors.map((e) => e.account));
-    const savedAccounts = new Set(accounts.map((a) => a.id));
-    const liveKeys = new Set(nextRuntimes.map((rt) => runtimeKey(rt.id)));
-    for (const prevRt of prevRuntimes) {
-      const rtKey = runtimeKey(prevRt.id);
-      if (liveKeys.has(rtKey) || guardHandledRuntimeKeys.has(rtKey)) {
+    const nextByAccount = new Map<AccountId, Runtime[]>();
+    for (const rt of nextRuntimes) {
+      const list = nextByAccount.get(rt.id.account);
+      if (list) {
+        list.push(rt);
+      } else {
+        nextByAccount.set(rt.id.account, [rt]);
+      }
+    }
+
+    const accountsToCompare = new Set<AccountId>([
+      ...savedAccounts,
+      ...nextByAccount.keys(),
+    ]);
+    for (const accountId of accountsToCompare) {
+      if (erroredAccounts.has(accountId)) {
         continue;
       }
-      if (erroredAccounts.has(prevRt.id.account) || !savedAccounts.has(prevRt.id.account)) {
-        continue;
+      const nextList = nextByAccount.get(accountId) ?? [];
+      const prevList = lastKnownRuntimesByAccount.get(accountId);
+      if (prevList !== undefined) {
+        const liveKeys = new Set(nextList.map((rt) => runtimeKey(rt.id)));
+        for (const prevRt of prevList) {
+          const rtKey = runtimeKey(prevRt.id);
+          if (
+            liveKeys.has(rtKey) ||
+            guardHandledRuntimeKeys.has(rtKey) ||
+            seenVanishedKeys.has(rtKey)
+          ) {
+            continue;
+          }
+          seenVanishedKeys.add(rtKey);
+          const label = formatRuntimeCardLabel(prevRt);
+          recordEndedRuntime({
+            runtime: prevRt.id,
+            label,
+            email:
+              prevRt.account_email ??
+              accounts.find((a) => a.id === prevRt.id.account)?.email ??
+              null,
+            reason: { kind: "vanished" },
+          });
+          pushToast({
+            tone: "info",
+            title: t("app.b2.vanished_title", { name: label }),
+            body: t("app.b2.ended_vanished"),
+          });
+        }
       }
-      if (seenVanishedKeys.has(rtKey)) {
-        continue;
-      }
-      seenVanishedKeys.add(rtKey);
-      const label = formatRuntimeCardLabel(prevRt);
-      recordEndedRuntime({
-        runtime: prevRt.id,
-        label,
-        email: prevRt.account_email ?? accounts.find((a) => a.id === prevRt.id.account)?.email ?? null,
-        reason: { kind: "vanished" },
-      });
-      pushToast({
-        tone: "info",
-        title: t("app.b2.vanished_title", { name: label }),
-        body: t("app.b2.ended_vanished"),
-      });
+      lastKnownRuntimesByAccount.set(accountId, nextList);
     }
   }
 }
