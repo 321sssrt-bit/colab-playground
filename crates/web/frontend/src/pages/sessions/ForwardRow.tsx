@@ -5,7 +5,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import { CloseIcon } from "../../components/Icons.tsx";
-import { ApiError } from "../../lib/api.ts";
+import { apiClient, ApiError } from "../../lib/api.ts";
 import type { TranslateFn } from "../../lib/i18n.ts";
 import type { ToastInput } from "../../lib/toast.ts";
 import { closeForward, type ForwardView } from "./api.ts";
@@ -20,11 +20,16 @@ import {
 
 const COPY_FEEDBACK_MS = 2000;
 
+export interface ForwardClosedNotice {
+  readonly title: string;
+  readonly body: string;
+}
+
 export interface ForwardRowProps {
   readonly forward: ForwardView;
   readonly t: TranslateFn;
   readonly pushToast: (toast: ToastInput) => number;
-  readonly onAfterClose?: () => void;
+  readonly onAfterClose?: (notice?: ForwardClosedNotice) => void;
 }
 
 function renderStateBadge(forward: ForwardView, t: TranslateFn) {
@@ -53,6 +58,7 @@ function renderStateBadge(forward: ForwardView, t: TranslateFn) {
 export function ForwardRow({ forward, t, pushToast, onAfterClose }: ForwardRowProps) {
   const [copied, setCopied] = useState(false);
   const [closing, setClosing] = useState(false);
+  const rowRef = useRef<HTMLDivElement | null>(null);
   const copyTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
@@ -64,6 +70,7 @@ export function ForwardRow({ forward, t, pushToast, onAfterClose }: ForwardRowPr
   }, []);
 
   const stateKind = forward.state.state;
+  const ready = stateKind === "up";
   const terminal = stateKind === "failed" || stateKind === "stopped";
   const addresses = forward.addresses ?? null;
   const openUrl = safeHttpUrl(addresses?.open_url);
@@ -76,7 +83,8 @@ export function ForwardRow({ forward, t, pushToast, onAfterClose }: ForwardRowPr
     if (!copyUrl) {
       return;
     }
-    const ok = await copyTextToClipboard(copyUrl);
+    // Pass the row element so the fallback selection copy stays inside any open modal <dialog>.
+    const ok = await copyTextToClipboard(copyUrl, rowRef.current);
     if (ok) {
       setCopied(true);
       pushToast({ tone: "info", body: t("web.shell.copied") });
@@ -96,19 +104,27 @@ export function ForwardRow({ forward, t, pushToast, onAfterClose }: ForwardRowPr
     if (closing) {
       return;
     }
+    const gen = apiClient.getSessionGeneration();
     setClosing(true);
     try {
       const closed = await closeForward(forward.id);
+      if (apiClient.getSessionGeneration() !== gen) {
+        return;
+      }
+      const title = t("app.b2.forward_closed");
       const body = closed.notice_key
         ? t(closed.notice_key)
         : t("app.b2.forward_closed_billing");
       pushToast({
         tone: "info",
-        title: t("app.b2.forward_closed"),
+        title,
         body,
       });
-      onAfterClose?.();
+      onAfterClose?.({ title, body });
     } catch (error) {
+      if (apiClient.getSessionGeneration() !== gen) {
+        return;
+      }
       if (!(error instanceof ApiError && error.isUnauthorized)) {
         pushToast({
           tone: "danger",
@@ -125,7 +141,12 @@ export function ForwardRow({ forward, t, pushToast, onAfterClose }: ForwardRowPr
   const hasNotes = Boolean(addresses?.notice_key || addresses?.warning_key || failedError);
 
   return (
-    <div className="forward-item" data-forward-row={String(forward.id)}>
+    <div
+      ref={rowRef}
+      className="forward-item"
+      data-forward-row={String(forward.id)}
+      data-forward-state={stateKind}
+    >
       <div className="forward-row-main">
         {renderStateBadge(forward, t)}
         {isAllInterfaces && (
@@ -151,7 +172,7 @@ export function ForwardRow({ forward, t, pushToast, onAfterClose }: ForwardRowPr
               </span>
             </button>
           )}
-          {!terminal && openUrl && (
+          {ready && openUrl && (
             <a
               href={openUrl}
               target="_blank"
@@ -183,13 +204,16 @@ export function ForwardRow({ forward, t, pushToast, onAfterClose }: ForwardRowPr
       {hasNotes && (
         <div className="forward-item-notes">
           {addresses?.notice_key && (
-            <div className="inline-msg inline-msg-info">
+            <div className="inline-msg inline-msg-info" data-forward-notice={addresses.notice_key}>
               <SmallInfoIcon className="icon-xs icon-info" />
               <span className="inline-msg-text">{t(addresses.notice_key)}</span>
             </div>
           )}
           {addresses?.warning_key && (
-            <div className="inline-msg inline-msg-warning">
+            <div
+              className="inline-msg inline-msg-warning"
+              data-forward-warning={addresses.warning_key}
+            >
               <AlertTriangleIcon className="icon-xs icon-warning" />
               <span className="inline-msg-text">{t(addresses.warning_key)}</span>
             </div>

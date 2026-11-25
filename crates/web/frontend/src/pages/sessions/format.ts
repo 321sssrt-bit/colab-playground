@@ -22,6 +22,10 @@ const SECS_PER_HOUR = 3600;
 const MAX_AUTO_STOP_SECS = 0xffffffff;
 export const MAX_HOURS_INPUT = 999;
 export const MAX_MINUTES_INPUT = 59;
+export const FORWARD_DEFAULT_PORT = 8000;
+const MIN_PORT = 1;
+const MAX_PORT = 65535;
+export const RESERVED_VM_PORT = 8080;
 
 const LIMIT_KEYS: Readonly<Record<Limit, string>> = {
   runtime: "app.b2.limit_runtime",
@@ -280,6 +284,31 @@ export function composeDurationSeconds(hoursText: string, minutesText: string): 
     return null;
   }
   return total;
+}
+
+export function parseForwardPort(raw: string): number | null {
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) {
+    return null;
+  }
+  const value = Number(trimmed);
+  if (!Number.isInteger(value) || value < MIN_PORT || value > MAX_PORT) {
+    return null;
+  }
+  return value;
+}
+
+export function validateHealthPath(
+  raw: string,
+): { readonly ok: true; readonly value: string | null } | { readonly ok: false } {
+  const trimmed = raw.trim();
+  if (trimmed === "") {
+    return { ok: true, value: null };
+  }
+  if (!trimmed.startsWith("/") || /[\s\p{Cc}]/u.test(trimmed)) {
+    return { ok: false };
+  }
+  return { ok: true, value: trimmed };
 }
 
 export function safeHttpUrl(raw: string | null | undefined): string | null {

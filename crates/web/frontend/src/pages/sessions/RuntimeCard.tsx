@@ -342,9 +342,7 @@ export function RuntimeCard({
                 </button>
               )}
 
-              {!named && !onRequestForward && (
-                <span className="caption">{t("app.b2.runtime_unnamed_reason")}</span>
-              )}
+              {!named && <span className="caption">{t("app.b2.runtime_unnamed_reason")}</span>}
             </>
           )}
         </div>

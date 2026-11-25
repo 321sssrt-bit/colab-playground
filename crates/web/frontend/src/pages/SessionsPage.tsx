@@ -11,11 +11,7 @@ import { AlertIcon, SessionsIcon } from "../components/Icons.tsx";
 import { ApiError } from "../lib/api.ts";
 import { webStore } from "../lib/store.ts";
 import type { GuardDecision, Runtime, Snapshot } from "../lib/types.ts";
-import {
-  fetchOverviewReadiness,
-  fetchSessions,
-  type AccountFailureResponse,
-} from "./sessions/api.ts";
+import { fetchSessions, type AccountFailureResponse } from "./sessions/api.ts";
 import {
   AutoStopDialog,
   type AutoStopDialogMode,
@@ -23,6 +19,10 @@ import {
 } from "./sessions/AutoStopDialog.tsx";
 import { syncServerClock } from "./sessions/clock.tsx";
 import { EndedCard } from "./sessions/EndedCard.tsx";
+import {
+  ForwardDialog,
+  type ForwardDialogRequest,
+} from "./sessions/ForwardDialog.tsx";
 import {
   formatEmail,
   formatErrorKind,
@@ -45,9 +45,9 @@ import {
   clearEndedRuntimes,
   observeSnapshotTransitions,
   refreshForwards,
+  refreshOverviewHints,
   refreshRearmDuration,
   selectForwardsForRuntime,
-  setCliInstalledHint,
   useSessionsLocalState,
 } from "./sessions/store.ts";
 import type { PageProps } from "./types.ts";
@@ -60,6 +60,7 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
     readonly AccountFailureResponse[] | null
   >(null);
   const [autoStopDialog, setAutoStopDialog] = useState<AutoStopDialogRequest | null>(null);
+  const [forwardDialog, setForwardDialog] = useState<ForwardDialogRequest | null>(null);
   const [stopRuntimeDialog, setStopRuntimeDialog] = useState<StopRuntimeDialogRequest | null>(null);
   const [stopAllDialogId, setStopAllDialogId] = useState<number | null>(null);
 
@@ -97,11 +98,7 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
     void loadSessions();
     void refreshForwards(controller.signal).catch(() => {});
     void refreshRearmDuration(controller.signal).catch(() => {});
-    void fetchOverviewReadiness(controller.signal)
-      .then((overview) => {
-        setCliInstalledHint(Boolean(overview.cli_installed));
-      })
-      .catch(() => {});
+    void refreshOverviewHints().catch(() => {});
     return () => {
       controller.abort();
     };
@@ -225,6 +222,25 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
     [snapshot?.account, localState.rearmDurationSecs],
   );
 
+  const openForwardModal = useCallback(
+    (runtime: Runtime) => {
+      if (!runtime.on_active_account || !runtime.id.name) {
+        return;
+      }
+      const ctx = snapshot?.account ?? { revision: 0, active: null };
+      dialogSeqRef.current += 1;
+      setForwardDialog({
+        id: dialogSeqRef.current,
+        runtime,
+        accountContext: { revision: ctx.revision, active: ctx.active },
+      });
+      if (localState.forwardPolicy === null) {
+        void refreshOverviewHints().catch(() => {});
+      }
+    },
+    [snapshot?.account, localState.forwardPolicy],
+  );
+
   const handleExtendAutoStop = useCallback(
     (runtime: Runtime) => openAutoStopModal(runtime, "extend"),
     [openAutoStopModal],
@@ -244,10 +260,21 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
     navigate("accounts");
   }, [navigate]);
 
-  const handleForwardClosed = useCallback(() => {
+  const handleRetryForwardPolicy = useCallback(() => {
+    void refreshOverviewHints().catch(() => {});
+  }, []);
+
+  const handleForwardChanged = useCallback(() => {
     void refreshForwards().catch(() => {});
     void webStore.refreshSnapshot().catch(() => {});
   }, []);
+
+  const forwardDialogForwards = useMemo(() => {
+    if (!forwardDialog || !snapshot) {
+      return [];
+    }
+    return selectForwardsForRuntime(forwardDialog.runtime, localState, snapshot);
+  }, [forwardDialog, localState, snapshot]);
 
   const handleAutoStopCompleted = useCallback(() => {
     void loadSessions();
@@ -492,8 +519,9 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
                                   onSetAutoStop={handleSetAutoStop}
                                   onCancelAutoStop={handleCancelAutoStop}
                                   onSwitchAccount={handleSwitchAccount}
-                                  onForwardClosed={handleForwardClosed}
+                                  onForwardClosed={handleForwardChanged}
                                   onRequestStop={openStopRuntimeModal}
+                                  onRequestForward={openForwardModal}
                                 />
                               );
                             })}
@@ -523,6 +551,20 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
         pushToast={pushToast}
         onClose={() => setAutoStopDialog(null)}
         onCompleted={handleAutoStopCompleted}
+      />
+
+      <ForwardDialog
+        request={forwardDialog}
+        currentAccountContext={snapshot?.account ?? null}
+        forwardPolicy={localState.forwardPolicy}
+        forwardPolicyLoading={localState.forwardPolicyLoading}
+        forwardPolicyError={localState.forwardPolicyError}
+        existingForwards={forwardDialogForwards}
+        t={t}
+        pushToast={pushToast}
+        onClose={() => setForwardDialog(null)}
+        onForwardChanged={handleForwardChanged}
+        onRetryForwardPolicy={handleRetryForwardPolicy}
       />
 
       <StopRuntimeDialog
