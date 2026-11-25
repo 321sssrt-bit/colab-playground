@@ -93,7 +93,7 @@ Users launch the Web Server from the command line (in the ergonomic style of `ki
 
 ### Backend HTTP/SSE server and embedded React + TypeScript + Vite frontend (ADR-0005, superseding ADR-0002)
 
-- Build the headless web crate on Rust `axum` with a React + TypeScript + Vite frontend (`crates/web/frontend/`, managed with `pnpm`) whose compiled static bundle (`dist/`) is embedded directly into the single Rust binary at compile time via `crates/web/build.rs`. See [`docs/SPEC-web-react-frontend.md`](SPEC-web-react-frontend.md) for the frontend build, static check, and CI contract.
+- Build the headless web crate on Rust `axum` with a React + TypeScript + Vite frontend (`crates/web/frontend/`, managed with `pnpm`) whose compiled static bundle (`dist/`) is embedded directly into the single Rust binary at compile time via `crates/web/build.rs`.
 - Keep all business math (spend integration, ETA, Guard evaluation, quantisation fitting, status formatting) on the Rust server; the browser layer renders server-computed state and dispatches user intents.
 - Use native `<dialog>` modals and existing theme CSS custom properties matching the desktop visual hierarchy and light/dark palettes; enforce `Content-Security-Policy: default-src 'self'`.
 - Publish full versioned state snapshots over SSE (rather than fragile incremental DOM patches) so reconnecting or newly opened Browser Clients converge immediately; isolate active form/modal state from background snapshot updates so typing is never clobbered.
