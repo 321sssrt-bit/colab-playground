@@ -93,6 +93,11 @@ pub const STATIC_ASSETS: &[Asset] = &[
         body: include_str!("../assets/js/components.js"),
     },
     Asset {
+        path: "js/account-dialogs.js",
+        content_type: JS,
+        body: include_str!("../assets/js/account-dialogs.js"),
+    },
+    Asset {
         path: "js/pages/login.js",
         content_type: JS,
         body: include_str!("../assets/js/pages/login.js"),
@@ -101,6 +106,11 @@ pub const STATIC_ASSETS: &[Asset] = &[
         path: "js/pages/overview.js",
         content_type: JS,
         body: include_str!("../assets/js/pages/overview.js"),
+    },
+    Asset {
+        path: "js/pages/accounts.js",
+        content_type: JS,
+        body: include_str!("../assets/js/pages/accounts.js"),
     },
     Asset {
         path: "js/pages/settings.js",
@@ -220,6 +230,33 @@ const SHELL_EN_US: Messages = &[
         "web.settings.update_available_generic",
         "A newer release is available on GitHub.",
     ),
+    (
+        "web.add.open_hint",
+        "Open Google sign-in in a new tab, complete sign-in, and paste the authorization code below.",
+    ),
+    ("web.add.open_link", "Open Google sign-in"),
+    (
+        "web.add.expired_or_cancelled",
+        "The sign-in timed out or was cancelled before a code was submitted.",
+    ),
+    (
+        "web.add.cancelled_notice",
+        "Sign-in cancelled. Your previous account is still active.",
+    ),
+    (
+        "web.add.cancelling",
+        "Cancelling sign-in and restoring your previous account…",
+    ),
+    (
+        "web.add.in_progress_other",
+        "Another sign-in is already active. Cancel it before starting a new one.",
+    ),
+    ("web.add.cancel_existing", "Cancel active sign-in"),
+    ("web.switch.review_again", "Refresh impact"),
+    (
+        "web.shell.copy_link_failed",
+        "Could not copy automatically. Select the link and copy it manually.",
+    ),
 ];
 
 const SHELL_ZH_CN: Messages = &[
@@ -283,6 +320,30 @@ const SHELL_ZH_CN: Messages = &[
         "web.settings.update_available_generic",
         "GitHub 上已有新版本可供下载。",
     ),
+    (
+        "web.add.open_hint",
+        "点击下方按钮在新标签页打开 Google 登录，完成授权后将授权码粘贴到输入框。",
+    ),
+    ("web.add.open_link", "打开 Google 登录"),
+    (
+        "web.add.expired_or_cancelled",
+        "本次登录在提交授权码前已超时或被取消。",
+    ),
+    (
+        "web.add.cancelled_notice",
+        "已取消登录，之前的账号仍保持活跃状态。",
+    ),
+    ("web.add.cancelling", "正在取消登录并恢复之前的账号…"),
+    (
+        "web.add.in_progress_other",
+        "已有另一项登录流程正在进行，请先取消后再开始新的登录。",
+    ),
+    ("web.add.cancel_existing", "取消进行中的登录"),
+    ("web.switch.review_again", "重新检查影响"),
+    (
+        "web.shell.copy_link_failed",
+        "无法自动复制，请选中链接后手动复制。",
+    ),
 ];
 
 const SHELL_ZH_TW: Messages = &[
@@ -345,6 +406,30 @@ const SHELL_ZH_TW: Messages = &[
     (
         "web.settings.update_available_generic",
         "GitHub 上已有新版本可供下載。",
+    ),
+    (
+        "web.add.open_hint",
+        "點選下方按鈕在新分頁開啟 Google 登入，完成授權後將授權碼貼上到輸入欄。",
+    ),
+    ("web.add.open_link", "開啟 Google 登入"),
+    (
+        "web.add.expired_or_cancelled",
+        "這次登入在送出授權碼前已逾時或被取消。",
+    ),
+    (
+        "web.add.cancelled_notice",
+        "已取消登入，先前的帳號仍保持使用中。",
+    ),
+    ("web.add.cancelling", "正在取消登入並還原先前的帳號…"),
+    (
+        "web.add.in_progress_other",
+        "已有另一個登入流程正在進行，請先取消再開始新的登入。",
+    ),
+    ("web.add.cancel_existing", "取消進行中的登入"),
+    ("web.switch.review_again", "重新檢查影響"),
+    (
+        "web.shell.copy_link_failed",
+        "無法自動複製，請選取連結後手動複製。",
     ),
 ];
 
@@ -423,6 +508,33 @@ const SHELL_JA_JP: Messages = &[
     (
         "web.settings.update_available_generic",
         "GitHub で新しいリリースが公開されています。",
+    ),
+    (
+        "web.add.open_hint",
+        "新しいタブで Google サインインを開き、認証完了後に表示された認証コードを下に貼り付けてください。",
+    ),
+    ("web.add.open_link", "Google サインインを開く"),
+    (
+        "web.add.expired_or_cancelled",
+        "コードを送信する前にサインインがタイムアウトまたはキャンセルされました。",
+    ),
+    (
+        "web.add.cancelled_notice",
+        "サインインをキャンセルしました。以前のアカウントが引き続き有効です。",
+    ),
+    (
+        "web.add.cancelling",
+        "サインインをキャンセルして以前のアカウントを復元しています…",
+    ),
+    (
+        "web.add.in_progress_other",
+        "別のサインインが進行中です。新しく始める前にキャンセルしてください。",
+    ),
+    ("web.add.cancel_existing", "進行中のサインインをキャンセル"),
+    ("web.switch.review_again", "影響を再確認"),
+    (
+        "web.shell.copy_link_failed",
+        "自動コピーできませんでした。リンクを選択して手動でコピーしてください。",
     ),
 ];
 
@@ -507,5 +619,32 @@ const SHELL_KO_KR: Messages = &[
     (
         "web.settings.update_available_generic",
         "GitHub에 새 릴리스가 있습니다.",
+    ),
+    (
+        "web.add.open_hint",
+        "새 탭에서 Google 로그인을 열고 인증을 마친 뒤 아래에 인증 코드를 붙여넣으세요.",
+    ),
+    ("web.add.open_link", "Google 로그인 열기"),
+    (
+        "web.add.expired_or_cancelled",
+        "코드를 제출하기 전에 로그인이 시간 초과되었거나 취소되었습니다.",
+    ),
+    (
+        "web.add.cancelled_notice",
+        "로그인을 취소했습니다. 이전 계정이 계속 활성 상태입니다.",
+    ),
+    (
+        "web.add.cancelling",
+        "로그인을 취소하고 이전 계정을 복원하는 중…",
+    ),
+    (
+        "web.add.in_progress_other",
+        "다른 로그인이 이미 진행 중입니다. 새 로그인을 시작하기 전에 먼저 취소하세요.",
+    ),
+    ("web.add.cancel_existing", "진행 중인 로그인 취소"),
+    ("web.switch.review_again", "영향 다시 확인"),
+    (
+        "web.shell.copy_link_failed",
+        "자동으로 복사할 수 없습니다. 링크를 선택해 직접 복사하세요.",
     ),
 ];

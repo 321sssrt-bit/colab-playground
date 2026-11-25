@@ -107,14 +107,106 @@ export function formatUsageBadge(usageView) {
   return { text: base, stale: false };
 }
 
+export function formatAge(fetchedAtSecs, nowSecs = Math.floor(Date.now() / 1000)) {
+  if (typeof fetchedAtSecs !== "number" || !Number.isFinite(fetchedAtSecs)) {
+    return t("app.summary.unknown");
+  }
+  const diff = Math.max(0, Math.floor(nowSecs - fetchedAtSecs));
+  if (diff < SECS_PER_MINUTE) {
+    return t("app.fmt.just_now");
+  }
+  if (diff < SECS_PER_HOUR) {
+    return t("app.fmt.minutes_ago", { n: Math.floor(diff / SECS_PER_MINUTE) });
+  }
+  if (diff < SECS_PER_DAY) {
+    return t("app.fmt.hours_ago", { n: Math.floor(diff / SECS_PER_HOUR) });
+  }
+  return t("app.fmt.days_ago", { n: Math.floor(diff / SECS_PER_DAY) });
+}
+
+export function formatUsageTip(usageView) {
+  const snap = usageView?.snapshot;
+  if (!snap) {
+    return t("app.usage.tip.unknown");
+  }
+  const lines = [t("app.shell.usage.hint")];
+  const etaSecs = usageView.eta;
+  if (etaSecs === null || etaSecs === undefined) {
+    lines.push(t("app.usage.tip.idle"));
+  } else if (etaSecs <= 0) {
+    lines.push(t("app.usage.tip.empty"));
+  } else {
+    lines.push(t("app.usage.tip.left", { time: formatDurationSecs(etaSecs) }));
+  }
+  lines.push(t("app.usage.tip.updated", { age: formatAge(snap.fetched_at) }));
+  if (snap.stale) {
+    lines.push(t("app.usage.tip.stale"));
+  }
+  return lines.join("\n");
+}
+
+export function formatRuntimeLabel(runtimeRef, runtimesList = []) {
+  if (!runtimeRef) return "";
+  const matched = Array.isArray(runtimesList)
+    ? runtimesList.find(
+        (rt) => rt?.id?.account === runtimeRef.account && rt?.id?.endpoint === runtimeRef.endpoint
+      )
+    : null;
+  if (matched?.id?.name) {
+    return matched.id.name;
+  }
+  if (runtimeRef.name) {
+    return runtimeRef.name;
+  }
+  if (matched?.hardware) {
+    return `${matched.hardware} · ${runtimeRef.endpoint}`;
+  }
+  return runtimeRef.endpoint || "";
+}
+
+const ERROR_KIND_KEYS = {
+  not_installed: "app.err.not_installed",
+  keyring_unavailable: "app.err.keyring_unavailable",
+  auth_required: "app.err.auth_required",
+  no_active_account: "app.err.no_active_account",
+  active_not_adopted: "app.err.active_not_adopted",
+  account_not_found: "app.err.account_not_found",
+  account_not_active: "app.err.account_not_active",
+  add_in_progress: "app.err.add_in_progress",
+  login_cancelled: "app.err.login_cancelled",
+  login_invalid_code: "app.err.login_invalid_code",
+  login_unverified: "app.err.login_unverified",
+  busy: "app.err.busy",
+  cancelled: "app.err.cancelled",
+  invalid_input: "app.err.invalid_input",
+  http: "app.err.http",
+  io: "app.err.io",
+};
+
+export function formatErrorKind(kind) {
+  if (!kind || typeof kind !== "string") {
+    return t("app.err.other");
+  }
+  const key = ERROR_KIND_KEYS[kind];
+  return key ? t(key) : t("app.err.other");
+}
+
 export function formatApiError(errPayload) {
-  if (!errPayload || typeof errPayload !== "object") {
+  if (!errPayload) {
+    return { message: t("app.err.other"), hint: null };
+  }
+  if (typeof errPayload === "string") {
+    return { message: formatErrorKind(errPayload), hint: null };
+  }
+  if (typeof errPayload !== "object") {
     return { message: t("app.err.other"), hint: null };
   }
   const err = errPayload.error || errPayload;
   const message = err.message_key
     ? t(err.message_key, err.args || null)
-    : t("app.err.other");
+    : err.kind
+      ? formatErrorKind(err.kind)
+      : t("app.err.other");
   const hint = err.hint_key ? t(err.hint_key, err.args || null) : null;
   return { message, hint };
 }

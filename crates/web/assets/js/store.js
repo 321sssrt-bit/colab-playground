@@ -10,6 +10,7 @@ let sseController = null;
 let reconnectTimer = null;
 let sseGeneration = 0;
 let authGeneration = 0;
+let overviewPromise = null;
 let pendingLoginLanguage = null;
 let pendingLoginAppearance = null;
 
@@ -43,6 +44,15 @@ export const state = {
     error: null,
     lines: [],
   },
+  accountsBusy: {
+    refresh: false,
+    adopt: false,
+    switch: false,
+    remove: false,
+  },
+  accountsUsageError: null,
+  dismissedRecovered: false,
+  accountNotice: null,
 };
 
 export function subscribe(fn) {
@@ -70,6 +80,7 @@ function stopSse() {
 
 export function handleSessionLost({ expired = true } = {}) {
   authGeneration += 1;
+  overviewPromise = null;
   stopSse();
   clearToken();
   state.authenticated = false;
@@ -90,6 +101,15 @@ export function handleSessionLost({ expired = true } = {}) {
     error: null,
     lines: [],
   };
+  state.accountsBusy = {
+    refresh: false,
+    adopt: false,
+    switch: false,
+    remove: false,
+  };
+  state.accountsUsageError = null;
+  state.dismissedRecovered = false;
+  state.accountNotice = null;
   emit("auth");
 }
 
@@ -209,26 +229,33 @@ async function startSseLoop() {
 
 export async function loadOverview({ silent = false } = {}) {
   if (!state.authenticated) return;
+  if (overviewPromise) {
+    return overviewPromise;
+  }
   const gen = authGeneration;
   if (!silent) {
     state.overviewLoading = true;
     state.overviewError = null;
     emit("overview");
   }
-  try {
-    const data = await apiRequest("/api/overview");
-    if (gen !== authGeneration || !state.authenticated) return;
-    state.overview = data;
-    state.overviewError = null;
-  } catch (err) {
-    if (gen !== authGeneration || (err && err.status === 401)) return;
-    state.overviewError = err?.payload || { error: {} };
-  } finally {
-    if (gen === authGeneration) {
-      state.overviewLoading = false;
-      emit("overview");
+  overviewPromise = (async () => {
+    try {
+      const data = await apiRequest("/api/overview");
+      if (gen !== authGeneration || !state.authenticated) return;
+      state.overview = data;
+      state.overviewError = null;
+    } catch (err) {
+      if (gen !== authGeneration || (err && err.status === 401)) return;
+      state.overviewError = err?.payload || { error: {} };
+    } finally {
+      if (gen === authGeneration) {
+        overviewPromise = null;
+        state.overviewLoading = false;
+        emit("overview");
+      }
     }
-  }
+  })();
+  return overviewPromise;
 }
 
 export async function loadPlugins() {
@@ -330,18 +357,139 @@ export async function loadUpdates() {
 }
 
 export async function refreshUsage() {
-  if (!state.authenticated) return;
-  await apiRequest("/api/accounts/usage/refresh", { method: "POST", body: {} });
-  await loadOverview({ silent: true });
+  return refreshAccountsUsage();
+}
+
+export async function refreshAccountsUsage() {
+  if (!state.authenticated || state.accountsBusy.refresh) return;
+  const gen = authGeneration;
+  state.accountsBusy.refresh = true;
+  state.accountsUsageError = null;
+  emit("accounts");
+  try {
+    await apiRequest("/api/accounts/usage/refresh", { method: "POST", body: {} });
+    if (gen !== authGeneration || !state.authenticated) return;
+    await fetchInitialSnapshot();
+  } catch (err) {
+    if (gen !== authGeneration || (err && err.status === 401)) return;
+    state.accountsUsageError = err?.payload || { error: {} };
+    throw err;
+  } finally {
+    if (gen === authGeneration) {
+      state.accountsBusy.refresh = false;
+      emit("accounts");
+    }
+  }
 }
 
 export async function adoptAccount() {
-  if (!state.authenticated || !state.snapshot) return;
-  await apiRequest("/api/accounts/adopt", {
+  if (!state.authenticated || state.accountsBusy.adopt) return;
+  const gen = authGeneration;
+  state.accountsBusy.adopt = true;
+  emit("accounts");
+  try {
+    await apiRequest("/api/accounts/adopt", {
+      method: "POST",
+      body: { account_context: getAccountContext() },
+    });
+    if (gen !== authGeneration || !state.authenticated) return;
+    await Promise.allSettled([fetchInitialSnapshot(), loadOverview({ silent: true })]);
+  } finally {
+    if (gen === authGeneration) {
+      state.accountsBusy.adopt = false;
+      emit("accounts");
+    }
+  }
+}
+
+export async function beginAccountLogin() {
+  return apiRequest("/api/accounts/login", {
     method: "POST",
-    body: { account_context: state.snapshot.account },
+    body: { account_context: getAccountContext() },
   });
-  await loadOverview({ silent: true });
+}
+
+export async function submitAccountLogin(loginId, code) {
+  const account = await apiRequest(`/api/accounts/login/${encodeURIComponent(loginId)}`, {
+    method: "POST",
+    body: { code },
+  });
+  void fetchInitialSnapshot();
+  if (!state.overview?.accounts?.active) {
+    void loadOverview({ silent: true });
+  }
+  return account;
+}
+
+export async function cancelAccountLogin(loginId) {
+  await apiRequest(`/api/accounts/login/${encodeURIComponent(loginId)}`, {
+    method: "DELETE",
+    body: {},
+  });
+  void fetchInitialSnapshot();
+}
+
+export async function previewAccountSwitch(accountId) {
+  return apiRequest(`/api/accounts/${encodeURIComponent(accountId)}/switch`);
+}
+
+export async function confirmAccountSwitch(accountId, approval) {
+  const gen = authGeneration;
+  state.accountsBusy.switch = true;
+  emit("accounts");
+  try {
+    const view = await apiRequest(`/api/accounts/${encodeURIComponent(accountId)}/switch`, {
+      method: "POST",
+      body: {
+        account_context: approval.account_context,
+        confirmation: approval.confirmation,
+      },
+    });
+    if (gen === authGeneration && state.authenticated) {
+      void fetchInitialSnapshot();
+    }
+    return view;
+  } finally {
+    if (gen === authGeneration) {
+      state.accountsBusy.switch = false;
+      emit("accounts");
+    }
+  }
+}
+
+export async function removeAccount(accountId) {
+  const gen = authGeneration;
+  state.accountsBusy.remove = true;
+  emit("accounts");
+  try {
+    await apiRequest(`/api/accounts/${encodeURIComponent(accountId)}`, {
+      method: "DELETE",
+      body: { account_context: getAccountContext() },
+    });
+    if (gen === authGeneration && state.authenticated) {
+      void fetchInitialSnapshot();
+    }
+  } finally {
+    if (gen === authGeneration) {
+      state.accountsBusy.remove = false;
+      emit("accounts");
+    }
+  }
+}
+
+export function dismissRecoveredNotice() {
+  state.dismissedRecovered = true;
+  emit("accounts");
+}
+
+export function setAccountNotice(notice) {
+  state.accountNotice = notice;
+  emit("accounts");
+}
+
+export function clearAccountNotice() {
+  state.accountNotice = null;
+  emit("accounts");
 }
 
 export async function startCliInstall(method) {
@@ -407,15 +555,121 @@ export async function cancelCliInstall() {
   }
 }
 
+export function getAccountsView() {
+  return state.snapshot?.accounts || state.overview?.accounts || null;
+}
+
+export function getAccountContext() {
+  if (state.snapshot?.account) {
+    return state.snapshot.account;
+  }
+  const view = getAccountsView();
+  return { revision: 0, active: view?.active || null };
+}
+
+export function getUsageList() {
+  if (Array.isArray(state.snapshot?.usage) && state.snapshot.usage.length > 0) {
+    return state.snapshot.usage;
+  }
+  return Array.isArray(state.overview?.usage) ? state.overview.usage : [];
+}
+
+export function getUsageForAccount(accountId, accountRecord = null) {
+  const entry = getUsageList().find((item) => item.account === accountId) || null;
+  if (entry && (entry.snapshot || entry.last_error)) {
+    return entry;
+  }
+  if (accountRecord?.usage) {
+    return {
+      account: accountId,
+      email: accountRecord.email || null,
+      snapshot: accountRecord.usage,
+      eta: entry?.eta ?? null,
+      unmanaged_runtimes: entry?.unmanaged_runtimes ?? 0,
+      ownership_verified: entry?.ownership_verified ?? false,
+      last_error: entry?.last_error ?? null,
+    };
+  }
+  return entry;
+}
+
+export function getAccountTotals() {
+  const view = getAccountsView();
+  const accounts = Array.isArray(view?.accounts) ? view.accounts : [];
+  let known = 0;
+  let unknown = 0;
+  let balanceCu = 0;
+  let rateCuPerHour = 0;
+  let runtimes = 0;
+
+  for (const account of accounts) {
+    const usage = getUsageForAccount(account.id, account);
+    const snap = usage?.snapshot || null;
+    if (snap) {
+      known += 1;
+      balanceCu += Number(snap.balance_cu) || 0;
+      rateCuPerHour += Number(snap.rate_cu_per_hour) || 0;
+      runtimes += Number(snap.assignments) || 0;
+    } else {
+      unknown += 1;
+    }
+  }
+
+  return { known, unknown, balanceCu, rateCuPerHour, runtimes };
+}
+
+export function getRemoveBlock(accountId) {
+  const view = getAccountsView();
+  if (view?.active === accountId) {
+    return "active";
+  }
+  const runtimes = state.snapshot?.runtimes?.runtimes;
+  if (Array.isArray(runtimes)) {
+    if (runtimes.some((rt) => rt?.id?.account === accountId)) {
+      return "running";
+    }
+    return null;
+  }
+  const account = (view?.accounts || []).find((a) => a.id === accountId) || null;
+  const usage = getUsageForAccount(accountId, account);
+  if ((usage?.snapshot?.assignments || 0) > 0) {
+    return "running";
+  }
+  return null;
+}
+
+export function getUnmanagedAccounts() {
+  const view = getAccountsView();
+  const accounts = Array.isArray(view?.accounts) ? view.accounts : [];
+  const items = [];
+  for (const account of accounts) {
+    const usage = getUsageForAccount(account.id, account);
+    if (!usage) continue;
+    const stale = Boolean(usage.snapshot?.stale);
+    if (!usage.ownership_verified && usage.snapshot) {
+      items.push({ email: account.email || usage.email || null, count: null, stale });
+    } else if ((usage.unmanaged_runtimes || 0) > 0) {
+      items.push({
+        email: account.email || usage.email || null,
+        count: usage.unmanaged_runtimes,
+        stale,
+      });
+    }
+  }
+  return items;
+}
+
 export function getActiveUsage() {
-  const usageList = state.snapshot?.usage?.length ? state.snapshot.usage : state.overview?.usage || [];
+  const usageList = getUsageList();
   const activeId = state.snapshot?.account?.active || state.overview?.accounts?.active || null;
   if (!activeId) return null;
-  return usageList.find((item) => item.account === activeId) || null;
+  const view = getAccountsView();
+  const record = (view?.accounts || []).find((a) => a.id === activeId) || null;
+  return usageList.find((item) => item.account === activeId) || (record?.usage ? getUsageForAccount(activeId, record) : null);
 }
 
 export function getActiveEmail() {
-  const accounts = state.snapshot?.accounts || state.overview?.accounts;
+  const accounts = getAccountsView();
   if (!accounts) return null;
   if (accounts.active_email) return accounts.active_email;
   if (!accounts.active) return null;
