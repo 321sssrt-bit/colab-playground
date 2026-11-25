@@ -1,3 +1,4 @@
+import type { IncomingMessage, ServerResponse } from "node:http";
 import { defineConfig, type ProxyOptions } from "vite";
 import react from "@vitejs/plugin-react";
 
@@ -12,6 +13,16 @@ function parseLoopbackTarget(raw: string): URL {
     );
   }
   return url;
+}
+
+function hasSingleOriginHeader(req: IncomingMessage): boolean {
+  let count = 0;
+  for (let i = 0; i < req.rawHeaders.length; i += 2) {
+    if (req.rawHeaders[i].toLowerCase() === "origin") {
+      count += 1;
+    }
+  }
+  return count === 1;
 }
 
 function isActiveViteDevOrigin(
@@ -45,19 +56,53 @@ function isActiveViteDevOrigin(
   );
 }
 
+function rejectForeignOrigin(
+  req: IncomingMessage,
+  res: ServerResponse | undefined,
+): boolean {
+  const incomingOrigin = req.headers.origin;
+  if (incomingOrigin === undefined) {
+    return false;
+  }
+  if (
+    typeof incomingOrigin === "string" &&
+    hasSingleOriginHeader(req) &&
+    isActiveViteDevOrigin(
+      incomingOrigin,
+      req.headers.host,
+      req.socket.localPort,
+    )
+  ) {
+    return false;
+  }
+  if (res) {
+    res.statusCode = 403;
+    res.setHeader("Content-Security-Policy", "default-src 'self'");
+    res.setHeader("Referrer-Policy", "no-referrer");
+    res.setHeader("Cache-Control", "no-store");
+    res.end();
+  }
+  return true;
+}
+
 function createBackendProxy(targetUrl: URL): ProxyOptions {
   return {
     target: targetUrl.origin,
     changeOrigin: true,
+    bypass(req, res) {
+      // Reject foreign Origin headers (including the backend's own origin) before
+      // changeOrigin rewrites Host; leave missing Origin untouched for Rust's check.
+      if (rejectForeignOrigin(req, res)) {
+        return false;
+      }
+      return undefined;
+    },
     configure(proxy) {
       proxy.on("proxyReq", (proxyReq, req) => {
-        // Rewrite Origin only when it strictly matches this Vite dev origin so
-        // foreign origins and missing-Origin mutations still hit Rust's 403 gate.
         const incomingOrigin = req.headers.origin;
-        if (typeof incomingOrigin !== "string") {
-          return;
-        }
         if (
+          typeof incomingOrigin === "string" &&
+          hasSingleOriginHeader(req) &&
           isActiveViteDevOrigin(
             incomingOrigin,
             req.headers.host,

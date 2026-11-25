@@ -91,9 +91,11 @@ const CSS_NAMED_COLORS = new Set(
 );
 
 const PROSE_RE = /\p{L}/u;
-const HEX_COLOR_RE = /#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})(?![0-9a-fA-F_-])/;
+const HEX_COLOR_RE =
+  /#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})(?![0-9a-fA-F_-])/;
 
 /** @typedef {{ file: string, line: number, rule: string, message: string }} Finding */
+/** @typedef {{ parent: Scope | null, constInits: Map<string, ts.Expression>, finiteTables: Map<string, string[]> }} Scope */
 
 /** @type {Finding[]} */
 const findings = [];
@@ -223,7 +225,9 @@ function checkMarkup(absPath) {
     const nameMatch = /^([a-zA-Z0-9:-]+)/.exec(trimmedTag);
     const tagName = nameMatch ? nameMatch[1].toLowerCase() : "";
     inTitle = tagName === "title";
-    const attrsSource = tagText.slice(tagText.indexOf(nameMatch ? nameMatch[1] : "") + tagName.length);
+    const attrsSource = tagText.slice(
+      tagText.indexOf(nameMatch ? nameMatch[1] : "") + tagName.length,
+    );
 
     let scriptSrc = null;
     let inputType = "";
@@ -413,64 +417,86 @@ function getStaticString(expr) {
   return null;
 }
 
-function collectConstBindings(sourceFile) {
-  /** @type {Map<string, ts.Expression>} */
-  const constInits = new Map();
-  /** @type {Map<string, string[]>} */
-  const finiteTables = new Map();
+/**
+ * @param {Scope | null} parent
+ * @returns {Scope}
+ */
+function createScope(parent) {
+  return { parent, constInits: new Map(), finiteTables: new Map() };
+}
 
-  function visit(node) {
-    if (ts.isVariableStatement(node) || ts.isVariableDeclarationList(node)) {
-      const list = ts.isVariableStatement(node) ? node.declarationList : node;
-      if ((list.flags & ts.NodeFlags.Const) !== 0) {
-        for (const decl of list.declarations) {
-          if (ts.isIdentifier(decl.name) && decl.initializer) {
-            const init = unwrapExpression(decl.initializer);
-            constInits.set(decl.name.text, init);
-            if (ts.isObjectLiteralExpression(init)) {
-              /** @type {string[]} */
-              const values = [];
-              let allStrings = init.properties.length > 0;
-              for (const prop of init.properties) {
-                if (!ts.isPropertyAssignment(prop)) {
-                  allStrings = false;
-                  break;
-                }
-                const str = getStaticString(prop.initializer);
-                if (str === null) {
-                  allStrings = false;
-                  break;
-                }
-                values.push(str);
-              }
-              if (allStrings) {
-                finiteTables.set(decl.name.text, values);
-              }
-            } else if (ts.isArrayLiteralExpression(init)) {
-              /** @type {string[]} */
-              const values = [];
-              let allStrings = init.elements.length > 0;
-              for (const elem of init.elements) {
-                const str = getStaticString(elem);
-                if (str === null) {
-                  allStrings = false;
-                  break;
-                }
-                values.push(str);
-              }
-              if (allStrings) {
-                finiteTables.set(decl.name.text, values);
-              }
-            }
-          }
+function recordConstDeclList(scope, list) {
+  if ((list.flags & ts.NodeFlags.Const) === 0) {
+    return;
+  }
+  for (const decl of list.declarations) {
+    if (!ts.isIdentifier(decl.name) || !decl.initializer) {
+      continue;
+    }
+    const init = unwrapExpression(decl.initializer);
+    scope.constInits.set(decl.name.text, init);
+    if (ts.isObjectLiteralExpression(init)) {
+      /** @type {string[]} */
+      const values = [];
+      let allStrings = init.properties.length > 0;
+      for (const prop of init.properties) {
+        if (!ts.isPropertyAssignment(prop)) {
+          allStrings = false;
+          break;
         }
+        const str = getStaticString(prop.initializer);
+        if (str === null) {
+          allStrings = false;
+          break;
+        }
+        values.push(str);
+      }
+      if (allStrings) {
+        scope.finiteTables.set(decl.name.text, values);
+      }
+    } else if (ts.isArrayLiteralExpression(init)) {
+      /** @type {string[]} */
+      const values = [];
+      let allStrings = init.elements.length > 0;
+      for (const elem of init.elements) {
+        const str = getStaticString(elem);
+        if (str === null) {
+          allStrings = false;
+          break;
+        }
+        values.push(str);
+      }
+      if (allStrings) {
+        scope.finiteTables.set(decl.name.text, values);
       }
     }
-    ts.forEachChild(node, visit);
   }
+}
 
-  visit(sourceFile);
-  return { constInits, finiteTables };
+function populateStatementScope(scope, statements) {
+  for (const stmt of statements) {
+    if (ts.isVariableStatement(stmt)) {
+      recordConstDeclList(scope, stmt.declarationList);
+    }
+  }
+}
+
+function lookupConstInit(scope, name) {
+  for (let cur = scope; cur; cur = cur.parent) {
+    if (cur.constInits.has(name)) {
+      return cur.constInits.get(name);
+    }
+  }
+  return undefined;
+}
+
+function lookupFiniteTable(scope, name) {
+  for (let cur = scope; cur; cur = cur.parent) {
+    if (cur.finiteTables.has(name)) {
+      return cur.finiteTables.get(name);
+    }
+  }
+  return undefined;
 }
 
 function checkRenderedStrings(sourceFile, expr, onLiteral) {
@@ -516,7 +542,12 @@ function checkRenderedStrings(sourceFile, expr, onLiteral) {
 function checkNoProseInExpr(sourceFile, expr, context) {
   checkRenderedStrings(sourceFile, expr, (literalNode, text) => {
     if (isProse(text)) {
-      reportNode(sourceFile, literalNode, "copy-text", `hardcoded visible copy in ${context}: "${text}"`);
+      reportNode(
+        sourceFile,
+        literalNode,
+        "copy-text",
+        `hardcoded visible copy in ${context}: "${text}"`,
+      );
     }
   });
 }
@@ -524,22 +555,63 @@ function checkNoProseInExpr(sourceFile, expr, context) {
 function checkNoJavascriptUrlInExpr(sourceFile, expr, context) {
   checkRenderedStrings(sourceFile, expr, (literalNode, text) => {
     if (isJavascriptUrl(text)) {
-      reportNode(sourceFile, literalNode, "javascript-url", `forbidden javascript: URL in ${context}`);
+      reportNode(
+        sourceFile,
+        literalNode,
+        "javascript-url",
+        `forbidden javascript: URL in ${context}`,
+      );
     }
   });
 }
 
-function checkNoColorInExpr(sourceFile, expr, context) {
+function checkNoColorInExpr(sourceFile, expr, context, scope, seen = new Set()) {
   const node = unwrapExpression(expr);
   if (ts.isObjectLiteralExpression(node)) {
     for (const prop of node.properties) {
       if (ts.isPropertyAssignment(prop)) {
-        checkNoColorInExpr(sourceFile, prop.initializer, context);
+        checkNoColorInExpr(sourceFile, prop.initializer, context, scope, seen);
       } else if (ts.isSpreadAssignment(prop)) {
-        checkNoColorInExpr(sourceFile, prop.expression, context);
+        checkNoColorInExpr(sourceFile, prop.expression, context, scope, seen);
+      } else if (ts.isShorthandPropertyAssignment(prop)) {
+        checkNoColorInExpr(sourceFile, prop.name, context, scope, seen);
       }
     }
     return;
+  }
+  if (ts.isConditionalExpression(node)) {
+    checkNoColorInExpr(sourceFile, node.whenTrue, context, scope, seen);
+    checkNoColorInExpr(sourceFile, node.whenFalse, context, scope, seen);
+    return;
+  }
+  if (ts.isBinaryExpression(node)) {
+    const op = node.operatorToken.kind;
+    if (
+      op === ts.SyntaxKind.PlusToken ||
+      op === ts.SyntaxKind.BarBarToken ||
+      op === ts.SyntaxKind.QuestionQuestionToken
+    ) {
+      checkNoColorInExpr(sourceFile, node.left, context, scope, seen);
+      checkNoColorInExpr(sourceFile, node.right, context, scope, seen);
+    } else if (op === ts.SyntaxKind.AmpersandAmpersandToken) {
+      checkNoColorInExpr(sourceFile, node.right, context, scope, seen);
+    }
+    return;
+  }
+  if (ts.isArrayLiteralExpression(node)) {
+    for (const elem of node.elements) {
+      checkNoColorInExpr(sourceFile, elem, context, scope, seen);
+    }
+    return;
+  }
+  if (ts.isIdentifier(node) && !seen.has(node.text)) {
+    const init = lookupConstInit(scope, node.text);
+    if (init) {
+      const nextSeen = new Set(seen);
+      nextSeen.add(node.text);
+      checkNoColorInExpr(sourceFile, init, context, scope, nextSeen);
+      return;
+    }
   }
   checkRenderedStrings(sourceFile, node, (literalNode, text) => {
     if (hasHardcodedColor(text)) {
@@ -561,7 +633,7 @@ function isServerProvidedKeyExpr(expr) {
   return false;
 }
 
-function extractI18nKeysFromExpr(sourceFile, expr, bindings, seen = new Set()) {
+function extractI18nKeysFromExpr(sourceFile, expr, scope, seen = new Set()) {
   const node = unwrapExpression(expr);
   const literal = getStaticString(node);
   if (literal !== null) {
@@ -569,8 +641,8 @@ function extractI18nKeysFromExpr(sourceFile, expr, bindings, seen = new Set()) {
     return true;
   }
   if (ts.isConditionalExpression(node)) {
-    const a = extractI18nKeysFromExpr(sourceFile, node.whenTrue, bindings, seen);
-    const b = extractI18nKeysFromExpr(sourceFile, node.whenFalse, bindings, seen);
+    const a = extractI18nKeysFromExpr(sourceFile, node.whenTrue, scope, seen);
+    const b = extractI18nKeysFromExpr(sourceFile, node.whenFalse, scope, seen);
     return a && b;
   }
   if (
@@ -578,23 +650,29 @@ function extractI18nKeysFromExpr(sourceFile, expr, bindings, seen = new Set()) {
     (node.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken ||
       node.operatorToken.kind === ts.SyntaxKind.BarBarToken)
   ) {
-    const a = extractI18nKeysFromExpr(sourceFile, node.left, bindings, seen);
-    const b = extractI18nKeysFromExpr(sourceFile, node.right, bindings, seen);
+    const a = extractI18nKeysFromExpr(sourceFile, node.left, scope, seen);
+    const b = extractI18nKeysFromExpr(sourceFile, node.right, scope, seen);
     return a && b;
   }
   if (ts.isElementAccessExpression(node)) {
     const target = unwrapExpression(node.expression);
-    if (ts.isIdentifier(target) && bindings.finiteTables.has(target.text)) {
-      for (const key of bindings.finiteTables.get(target.text)) {
-        i18nKeys.add(key);
+    if (ts.isIdentifier(target)) {
+      const table = lookupFiniteTable(scope, target.text);
+      if (table) {
+        for (const key of table) {
+          i18nKeys.add(key);
+        }
+        return true;
       }
-      return true;
     }
   }
-  if (ts.isIdentifier(node) && bindings.constInits.has(node.text) && !seen.has(node.text)) {
-    const nextSeen = new Set(seen);
-    nextSeen.add(node.text);
-    return extractI18nKeysFromExpr(sourceFile, bindings.constInits.get(node.text), bindings, nextSeen);
+  if (ts.isIdentifier(node) && !seen.has(node.text)) {
+    const init = lookupConstInit(scope, node.text);
+    if (init) {
+      const nextSeen = new Set(seen);
+      nextSeen.add(node.text);
+      return extractI18nKeysFromExpr(sourceFile, init, scope, nextSeen);
+    }
   }
   if (isServerProvidedKeyExpr(node)) {
     return true;
@@ -610,7 +688,10 @@ function extractI18nKeysFromExpr(sourceFile, expr, bindings, seen = new Set()) {
 
 function isWindowGlobal(expr) {
   const node = unwrapExpression(expr);
-  return ts.isIdentifier(node) && (node.text === "window" || node.text === "globalThis" || node.text === "self");
+  return (
+    ts.isIdentifier(node) &&
+    (node.text === "window" || node.text === "globalThis" || node.text === "self")
+  );
 }
 
 function getPropertyName(node) {
@@ -634,10 +715,37 @@ function checkScript(absPath) {
         : ext === ".jsx"
           ? ts.ScriptKind.JSX
           : ts.ScriptKind.JS;
-  const sourceFile = ts.createSourceFile(absPath, source, ts.ScriptTarget.Latest, true, scriptKind);
-  const bindings = collectConstBindings(sourceFile);
+  const sourceFile = ts.createSourceFile(
+    absPath,
+    source,
+    ts.ScriptTarget.Latest,
+    true,
+    scriptKind,
+  );
 
-  function visit(node) {
+  /**
+   * @param {ts.Node} node
+   * @param {Scope} scope
+   */
+  function visit(node, scope) {
+    let activeScope = scope;
+    if (ts.isSourceFile(node) || ts.isBlock(node) || ts.isModuleBlock(node)) {
+      activeScope = createScope(scope);
+      populateStatementScope(activeScope, node.statements);
+    } else if (ts.isCaseClause(node) || ts.isDefaultClause(node)) {
+      activeScope = createScope(scope);
+      populateStatementScope(activeScope, node.statements);
+    } else if (
+      ts.isForStatement(node) ||
+      ts.isForOfStatement(node) ||
+      ts.isForInStatement(node)
+    ) {
+      activeScope = createScope(scope);
+      if (node.initializer && ts.isVariableDeclarationList(node.initializer)) {
+        recordConstDeclList(activeScope, node.initializer);
+      }
+    }
+
     // Dangerous property/element accesses: innerHTML, outerHTML, insertAdjacentHTML, srcdoc, cookie, window.open
     if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
       const prop = getPropertyName(node);
@@ -648,9 +756,18 @@ function checkScript(absPath) {
         reportNode(sourceFile, node, "unsafe-dom", "document.cookie access is forbidden");
       }
       if (prop === "open" && isWindowGlobal(node.expression)) {
-        reportNode(sourceFile, node, "window-open", "window.open is forbidden; render a clickable <a target=\"_blank\" rel=\"noopener noreferrer\">");
+        reportNode(
+          sourceFile,
+          node,
+          "window-open",
+          'window.open is forbidden; render a clickable <a target="_blank" rel="noopener noreferrer">',
+        );
       }
-      if ((prop === "write" || prop === "writeln") && ts.isIdentifier(node.expression) && node.expression.text === "document") {
+      if (
+        (prop === "write" || prop === "writeln") &&
+        ts.isIdentifier(node.expression) &&
+        node.expression.text === "document"
+      ) {
         reportNode(sourceFile, node, "unsafe-dom", `document.${prop} is forbidden`);
       }
       if (prop === "eval" && isWindowGlobal(node.expression)) {
@@ -669,19 +786,35 @@ function checkScript(absPath) {
         } else if (callee.text === "Function") {
           reportNode(sourceFile, node, "eval", "Function(...) constructor is forbidden");
         } else if (callee.text === "EventSource") {
-          reportNode(sourceFile, node, "unsafe-dom", "EventSource is forbidden; use fetch with Bearer header");
+          reportNode(
+            sourceFile,
+            node,
+            "unsafe-dom",
+            "EventSource is forbidden; use fetch with Bearer header",
+          );
         } else if (callee.text === "t" && ts.isCallExpression(node) && args.length >= 1) {
-          extractI18nKeysFromExpr(sourceFile, args[0], bindings);
+          extractI18nKeysFromExpr(sourceFile, args[0], activeScope);
         }
       } else if (ts.isPropertyAccessExpression(callee) || ts.isElementAccessExpression(callee)) {
         const method = getPropertyName(callee);
-        if (method === "t" && ts.isCallExpression(node) && args.length >= 1 && ts.isIdentifier(callee.expression) && callee.expression.text === "i18n") {
-          extractI18nKeysFromExpr(sourceFile, args[0], bindings);
+        if (
+          method === "t" &&
+          ts.isCallExpression(node) &&
+          args.length >= 1 &&
+          ts.isIdentifier(callee.expression) &&
+          (callee.expression.text === "i18n" || callee.expression.text === "props")
+        ) {
+          extractI18nKeysFromExpr(sourceFile, args[0], activeScope);
         } else if (method === "createElement" || method === "createElementNS") {
           const tagArg = args[method === "createElementNS" ? 1 : 0];
           const tag = tagArg ? getStaticString(tagArg)?.toLowerCase() : null;
           if (tag === "script" || tag === "style") {
-            reportNode(sourceFile, node, "inline-html", `creating <${tag}> dynamically is forbidden`);
+            reportNode(
+              sourceFile,
+              node,
+              "inline-html",
+              `creating <${tag}> dynamically is forbidden`,
+            );
           }
         } else if (method === "setAttribute" || method === "setAttributeNS") {
           const offset = method === "setAttributeNS" ? 1 : 0;
@@ -690,7 +823,12 @@ function checkScript(absPath) {
           const attrName = nameArg ? getStaticString(nameArg)?.toLowerCase() : null;
           if (attrName) {
             if (attrName === "style" || attrName === "srcdoc" || attrName.startsWith("on")) {
-              reportNode(sourceFile, node, "inline-html", `setAttribute("${attrName}", ...) is forbidden`);
+              reportNode(
+                sourceFile,
+                node,
+                "inline-html",
+                `setAttribute("${attrName}", ...) is forbidden`,
+              );
             }
             if (valArg) {
               checkNoJavascriptUrlInExpr(sourceFile, valArg, `setAttribute("${attrName}")`);
@@ -698,7 +836,7 @@ function checkScript(absPath) {
                 checkNoProseInExpr(sourceFile, valArg, `setAttribute("${attrName}")`);
               }
               if (COLOR_ATTRS.has(attrName)) {
-                checkNoColorInExpr(sourceFile, valArg, `setAttribute("${attrName}")`);
+                checkNoColorInExpr(sourceFile, valArg, `setAttribute("${attrName}")`, activeScope);
               }
             }
           }
@@ -717,17 +855,22 @@ function checkScript(absPath) {
         const prop = getPropertyName(lhs);
         if (prop === "textContent" || prop === "innerText") {
           checkNoProseInExpr(sourceFile, node.right, prop);
-        } else if (prop === "title" && ts.isIdentifier(lhs.expression) && lhs.expression.text === "document") {
+        } else if (
+          prop === "title" &&
+          ts.isIdentifier(lhs.expression) &&
+          lhs.expression.text === "document"
+        ) {
           checkNoProseInExpr(sourceFile, node.right, "document.title");
         } else if (prop === "href" || prop === "src" || prop === "action") {
           checkNoJavascriptUrlInExpr(sourceFile, node.right, prop);
         } else if (prop === "style") {
           reportNode(sourceFile, node, "inline-html", "direct .style assignment violates CSP");
         } else if (
-          (ts.isPropertyAccessExpression(lhs.expression) || ts.isElementAccessExpression(lhs.expression)) &&
+          (ts.isPropertyAccessExpression(lhs.expression) ||
+            ts.isElementAccessExpression(lhs.expression)) &&
           getPropertyName(lhs.expression) === "style"
         ) {
-          checkNoColorInExpr(sourceFile, node.right, "inline style");
+          checkNoColorInExpr(sourceFile, node.right, "inline style", activeScope);
         }
       }
     }
@@ -741,8 +884,8 @@ function checkScript(absPath) {
       }
 
       let inputType = "";
-      /** @type {ts.JsxAttribute | null} */
-      let valueAttr = null;
+      /** @type {ts.JsxAttribute[]} */
+      const visibleValueAttrs = [];
 
       for (const attr of node.attributes.properties) {
         if (!ts.isJsxAttribute(attr)) {
@@ -767,25 +910,35 @@ function checkScript(absPath) {
             inputType = (getStaticString(init.expression) ?? "").toLowerCase();
           }
         }
-        if (lowerAttr === "value") {
-          valueAttr = attr;
+        if (lowerAttr === "value" || lowerAttr === "defaultvalue") {
+          visibleValueAttrs.push(attr);
         }
 
         if (lowerAttr.startsWith("on") && ts.isStringLiteral(init)) {
-          reportNode(sourceFile, attr, "inline-html", `string event handler "${attrName}" is forbidden`);
+          reportNode(
+            sourceFile,
+            attr,
+            "inline-html",
+            `string event handler "${attrName}" is forbidden`,
+          );
         }
 
         if (lowerAttr === "style") {
           if (ts.isStringLiteral(init)) {
             reportNode(sourceFile, attr, "inline-html", "string style attribute is forbidden");
           } else if (ts.isJsxExpression(init) && init.expression) {
-            checkNoColorInExpr(sourceFile, init.expression, "JSX style");
+            checkNoColorInExpr(sourceFile, init.expression, "JSX style", activeScope);
           }
         }
 
         if (ts.isStringLiteral(init)) {
           if (isJavascriptUrl(init.text)) {
-            reportNode(sourceFile, init, "javascript-url", `forbidden javascript: URL in "${attrName}"`);
+            reportNode(
+              sourceFile,
+              init,
+              "javascript-url",
+              `forbidden javascript: URL in "${attrName}"`,
+            );
           }
           if (TEXT_ATTRS.has(lowerAttr) && isProse(init.text)) {
             reportNode(sourceFile, init, "copy-text", `hardcoded text attribute "${attrName}"`);
@@ -799,21 +952,36 @@ function checkScript(absPath) {
             checkNoProseInExpr(sourceFile, init.expression, `JSX attribute "${attrName}"`);
           }
           if (COLOR_ATTRS.has(lowerAttr)) {
-            checkNoColorInExpr(sourceFile, init.expression, `JSX attribute "${attrName}"`);
+            checkNoColorInExpr(
+              sourceFile,
+              init.expression,
+              `JSX attribute "${attrName}"`,
+              activeScope,
+            );
           }
         }
       }
 
       if (
-        valueAttr &&
-        valueAttr.initializer &&
+        visibleValueAttrs.length > 0 &&
         (lowerTag === "textarea" || (lowerTag === "input" && !HIDDEN_INPUT_TYPES.has(inputType)))
       ) {
-        const init = valueAttr.initializer;
-        if (ts.isStringLiteral(init) && isProse(init.text)) {
-          reportNode(sourceFile, init, "copy-text", `hardcoded visible value on <${tagName}>`);
-        } else if (ts.isJsxExpression(init) && init.expression) {
-          checkNoProseInExpr(sourceFile, init.expression, `<${tagName} value>`);
+        for (const valueAttr of visibleValueAttrs) {
+          const init = valueAttr.initializer;
+          if (!init) {
+            continue;
+          }
+          const attrName = valueAttr.name.getText(sourceFile);
+          if (ts.isStringLiteral(init) && isProse(init.text)) {
+            reportNode(
+              sourceFile,
+              init,
+              "copy-text",
+              `hardcoded visible ${attrName} on <${tagName}>`,
+            );
+          } else if (ts.isJsxExpression(init) && init.expression) {
+            checkNoProseInExpr(sourceFile, init.expression, `<${tagName} ${attrName}>`);
+          }
         }
       }
     }
@@ -835,10 +1003,10 @@ function checkScript(absPath) {
       checkNoProseInExpr(sourceFile, node.expression, "JSX child");
     }
 
-    ts.forEachChild(node, visit);
+    ts.forEachChild(node, (child) => visit(child, activeScope));
   }
 
-  visit(sourceFile);
+  visit(sourceFile, createScope(null));
 }
 
 // 1. Check HTML & SVG markup
@@ -870,11 +1038,7 @@ if (findings.length > 0) {
 
 fs.mkdirSync(GENERATED_DIR, { recursive: true });
 const sortedKeys = [...i18nKeys].sort();
-fs.writeFileSync(
-  I18N_MANIFEST,
-  `${JSON.stringify({ keys: sortedKeys }, null, 2)}\n`,
-  "utf8",
-);
+fs.writeFileSync(I18N_MANIFEST, `${JSON.stringify({ keys: sortedKeys }, null, 2)}\n`, "utf8");
 console.log(
   `Frontend static check passed (${scriptFiles.length} script(s), ${sortedKeys.length} i18n key(s) written to ${relPath(I18N_MANIFEST)}).`,
 );
