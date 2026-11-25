@@ -623,17 +623,22 @@ export function getRemoveBlock(accountId) {
   if (view?.active === accountId) {
     return "active";
   }
-  const runtimes = state.snapshot?.runtimes?.runtimes;
-  if (Array.isArray(runtimes)) {
-    if (runtimes.some((rt) => rt?.id?.account === accountId)) {
+  const runtimesView = state.snapshot?.runtimes;
+  const runtimes = runtimesView?.runtimes;
+  if (Array.isArray(runtimes) && runtimes.some((rt) => rt?.id?.account === accountId)) {
+    return "running";
+  }
+  const runtimesErrors = Array.isArray(runtimesView?.errors) ? runtimesView.errors : [];
+  const runtimeListIncomplete =
+    !Array.isArray(runtimes) ||
+    Boolean(state.snapshot?.runtimes_error) ||
+    runtimesErrors.some((err) => err?.account === accountId);
+  if (runtimeListIncomplete) {
+    const account = (view?.accounts || []).find((a) => a.id === accountId) || null;
+    const usage = getUsageForAccount(accountId, account);
+    if ((usage?.snapshot?.assignments || 0) > 0 || (usage?.unmanaged_runtimes || 0) > 0) {
       return "running";
     }
-    return null;
-  }
-  const account = (view?.accounts || []).find((a) => a.id === accountId) || null;
-  const usage = getUsageForAccount(accountId, account);
-  if ((usage?.snapshot?.assignments || 0) > 0) {
-    return "running";
   }
   return null;
 }

@@ -327,6 +327,9 @@
   width: 100%;
   max-width: var(--content-max-width);
   margin-inline: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
 }
 
 /* Ely Page frame: 32px title-strip top offset + max-w 1200px, px-10 (40px), py-8 (32px), gap-8 (32px) */

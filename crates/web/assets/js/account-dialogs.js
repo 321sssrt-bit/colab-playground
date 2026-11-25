@@ -48,6 +48,7 @@ function isBusy(dialog) {
       dialog.phase === "starting" ||
       dialog.phase === "submitting" ||
       dialog.phase === "cancelling" ||
+      dialog.phase === "rolling_back" ||
       dialog.cancellingExisting
     );
   }
@@ -58,6 +59,21 @@ function isBusy(dialog) {
     return dialog.submitting;
   }
   return false;
+}
+
+function hasLoginRollbackOp(snapshot, loginId) {
+  const ops = snapshot?.operations;
+  if (!Array.isArray(ops)) return false;
+  return ops.some(
+    (entry) =>
+      entry?.operation?.kind === "login" &&
+      (entry.operation.login_id === loginId || entry.id === loginId)
+  );
+}
+
+function hasAnyLoginOp(snapshot) {
+  const ops = snapshot?.operations;
+  return Array.isArray(ops) && ops.some((entry) => entry?.operation?.kind === "login");
 }
 
 function closeDialogNow() {
@@ -137,7 +153,11 @@ function renderImpactList(impact) {
           sessions.map((session) => {
             const hardware = acceleratorLabel(session.accelerator);
             const deadline =
-              session?.watchdog && !session.watchdog.cancelled ? session.watchdog.deadline : null;
+              session?.watchdog &&
+              session.watchdog.armed === true &&
+              !session.watchdog.cancelled
+                ? session.watchdog.deadline
+                : null;
             const remaining =
               typeof deadline === "number" && Number.isFinite(deadline) && deadline > nowSecs
                 ? deadline - nowSecs
@@ -292,10 +312,16 @@ async function submitAddCode() {
     }
     if (gen !== dialogGeneration || !activeDialog || activeDialog.kind !== "add") return;
     activeDialog.codeDraft = "";
-    activeDialog.loginId = null;
     if (err?.payload?.error?.kind === "login_cancelled") {
-      activeDialog.phase = "expired";
+      if (hasLoginRollbackOp(state.snapshot, loginId)) {
+        activeDialog.phase = "rolling_back";
+        activeDialog.loginId = loginId;
+      } else {
+        activeDialog.phase = "expired";
+        activeDialog.loginId = null;
+      }
     } else {
+      activeDialog.loginId = null;
       activeDialog.phase = "failed";
       activeDialog.error = err?.payload || { error: {} };
     }
@@ -363,7 +389,11 @@ async function executeSwitchAccount() {
     if (gen !== dialogGeneration || !activeDialog || activeDialog.kind !== "switch") return;
     activeDialog.submitting = false;
     activeDialog.confirmError = err?.payload || { error: {} };
-    if (err?.payload?.error?.message_key === "web.accounts.switch_impact_changed") {
+    const errInfo = err?.payload?.error;
+    if (
+      errInfo?.message_key === "web.accounts.switch_impact_changed" ||
+      errInfo?.kind === "account_not_active"
+    ) {
       activeDialog.impactChanged = true;
     }
     renderActiveDialog();
@@ -405,6 +435,7 @@ function renderAddDialog(dialog, model) {
   if (model.phase === "intro") {
     const existingLoginId = state.snapshot?.login_id;
     const hasExisting = existingLoginId !== null && existingLoginId !== undefined;
+    const loginOpRunning = hasAnyLoginOp(state.snapshot);
     const bodyChildren = [
       el("p", { className: "dialog-paragraph" }, t("app.add.intro")),
       inlineMessage({ tone: "info", text: t("app.add.impact") }),
@@ -439,6 +470,8 @@ function renderAddDialog(dialog, model) {
           ),
         })
       );
+    } else if (loginOpRunning) {
+      bodyChildren.push(busyLine(t("web.add.cancelling")));
     }
     dialog.append(
       title,
@@ -461,8 +494,8 @@ function renderAddDialog(dialog, model) {
             type: "button",
             className: "btn btn-primary",
             dataset: { addContinue: "true" },
-            disabled: hasExisting || model.cancellingExisting,
-            autofocus: !hasExisting,
+            disabled: hasExisting || loginOpRunning || model.cancellingExisting,
+            autofocus: !hasExisting && !loginOpRunning,
             onClick: () => {
               void startAddFlow();
             },
@@ -638,6 +671,27 @@ function renderAddDialog(dialog, model) {
         el("p", { className: "dialog-paragraph" }, t("web.add.open_hint")),
         oauthBox,
         form
+      )
+    );
+    return;
+  }
+
+  if (model.phase === "rolling_back") {
+    dialog.append(
+      title,
+      el("div", { className: "dialog-body" }, busyLine(t("web.add.cancelling"))),
+      el(
+        "div",
+        { className: "modal-actions" },
+        el(
+          "button",
+          {
+            type: "button",
+            className: "btn btn-ghost",
+            disabled: true,
+          },
+          t("app.action.close")
+        )
       )
     );
     return;
@@ -941,10 +995,22 @@ export function initAccountDialogs() {
         if (state.snapshot?.login_id === activeDialog.loginId) {
           activeDialog.seenInSnapshot = true;
         } else if (activeDialog.seenInSnapshot && state.snapshot?.login_id !== activeDialog.loginId) {
-          // Server inactivity timeout or external cancel released this login flow.
+          // Server inactivity timeout or external cancel released login_id; wait for rollback job to finish.
+          activeDialog.codeDraft = "";
+          if (hasLoginRollbackOp(state.snapshot, activeDialog.loginId)) {
+            activeDialog.phase = "rolling_back";
+          } else {
+            activeDialog.phase = "expired";
+            activeDialog.loginId = null;
+          }
+          renderActiveDialog();
+        }
+        return;
+      }
+      if (activeDialog.phase === "rolling_back" && activeDialog.loginId !== null) {
+        if (!hasLoginRollbackOp(state.snapshot, activeDialog.loginId)) {
           activeDialog.phase = "expired";
           activeDialog.loginId = null;
-          activeDialog.codeDraft = "";
           renderActiveDialog();
         }
       }

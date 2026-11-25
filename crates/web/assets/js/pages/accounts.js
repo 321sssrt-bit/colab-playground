@@ -25,7 +25,6 @@ import { t } from "../i18n.js";
 import { icon } from "../icons.js";
 import {
   adoptAccount,
-  clearAccountNotice,
   dismissRecoveredNotice,
   getAccountTotals,
   getAccountsView,
@@ -383,17 +382,6 @@ export function createAccountsPage({ navigate }) {
 
     const view = status.view;
 
-    if (state.accountNotice) {
-      bodyEl.appendChild(
-        alertBox({
-          tone: state.accountNotice.tone || "info",
-          body: state.accountNotice.message,
-          onDismiss: () => clearAccountNotice(),
-          live: true,
-        })
-      );
-    }
-
     if (view.recovered_pending_add && !state.dismissedRecovered) {
       bodyEl.appendChild(
         alertBox({
@@ -459,7 +447,10 @@ export function createAccountsPage({ navigate }) {
     }
 
     const busy = state.accountsBusy.switch || state.accountsBusy.remove;
-    for (const account of rows) {
+    const ordered = [...rows].sort(
+      (a, b) => Number(b.id === view.active) - Number(a.id === view.active)
+    );
+    for (const account of ordered) {
       bodyEl.appendChild(renderAccountCard(account, view.active === account.id, busy));
     }
   }

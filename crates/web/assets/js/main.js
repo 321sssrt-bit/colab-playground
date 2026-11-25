@@ -13,6 +13,7 @@ import { createOverviewPage } from "./pages/overview.js";
 import { createPlaceholderPage } from "./pages/placeholder.js";
 import { createSettingsPage } from "./pages/settings.js";
 import {
+  clearAccountNotice,
   getAccountsView,
   getActiveEmail,
   getActiveUsage,
@@ -728,21 +729,28 @@ class AppShellController {
       )
     );
 
-    // Connection / shutdown banner
+    // Connection / shutdown / account-action feedback banner
     clear(this.bannerEl);
     if (state.snapshot?.shutting_down) {
-      this.bannerEl.hidden = false;
       this.bannerEl.appendChild(
         alertBox({ tone: "warning", body: t("web.shell.shutting_down"), live: true })
       );
     } else if (state.connection === "reconnecting") {
-      this.bannerEl.hidden = false;
       this.bannerEl.appendChild(
         alertBox({ tone: "warning", body: t("web.shell.reconnecting"), live: true })
       );
-    } else {
-      this.bannerEl.hidden = true;
     }
+    if (state.accountNotice) {
+      this.bannerEl.appendChild(
+        alertBox({
+          tone: state.accountNotice.tone || "info",
+          body: state.accountNotice.message,
+          onDismiss: () => clearAccountNotice(),
+          live: true,
+        })
+      );
+    }
+    this.bannerEl.hidden = this.bannerEl.childElementCount === 0;
 
     this.updateTitle();
   }
