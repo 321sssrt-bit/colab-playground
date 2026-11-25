@@ -76,19 +76,28 @@ export function HfTokenDialog({
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [tokenInvalid, setTokenInvalid] = useState(false);
 
+  const loadStateRef = useRef(loadState);
+  loadStateRef.current = loadState;
+  const mutationRef = useRef(mutation);
+  mutationRef.current = mutation;
+  const prevOpenRef = useRef(open);
+  const prevDisabledRef = useRef(disabled);
+
   const clearTokenInput = useCallback(() => {
     if (tokenInputRef.current) {
       tokenInputRef.current.value = "";
     }
   }, []);
 
-  const fetchTokenStatus = useCallback(async () => {
+  const fetchTokenStatus = useCallback(async (options?: { readonly silent?: boolean }) => {
     loadAbortRef.current?.abort();
     const controller = new AbortController();
     loadAbortRef.current = controller;
     const seq = ++statusSeqRef.current;
 
-    setLoadState({ kind: "loading" });
+    if (!options?.silent) {
+      setLoadState({ kind: "loading" });
+    }
 
     try {
       const result = await getHfTokenStatus(controller.signal);
@@ -119,6 +128,17 @@ export function HfTokenDialog({
       }
     }
   }, []);
+
+  useEffect(() => {
+    const wasOpen = prevOpenRef.current;
+    const wasDisabled = prevDisabledRef.current;
+    prevOpenRef.current = open;
+    prevDisabledRef.current = disabled;
+    if (open && wasOpen && wasDisabled && !disabled && mutationRef.current === "idle") {
+      // Refresh token state after an external hf_token operation (e.g. another tab) finishes.
+      void fetchTokenStatus({ silent: true });
+    }
+  }, [open, disabled, fetchTokenStatus]);
 
   useEffect(() => {
     const dialog = dialogRef.current;
@@ -255,6 +275,10 @@ export function HfTokenDialog({
       }
       setMutation("idle");
       setErrorMessage(formatPluginApiError(error, tRef.current));
+      if (loadStateRef.current.kind === "loading") {
+        // Recover token status if saving aborted the initial status check and then failed.
+        void fetchTokenStatus();
+      }
       queueMicrotask(() => {
         tokenInputRef.current?.focus();
       });
