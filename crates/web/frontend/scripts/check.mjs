@@ -481,10 +481,16 @@ function populateStatementScope(scope, statements) {
   }
 }
 
+/**
+ * @param {Scope | null} scope
+ * @param {string} name
+ * @returns {{ expr: ts.Expression, scope: Scope } | undefined}
+ */
 function lookupConstInit(scope, name) {
   for (let cur = scope; cur; cur = cur.parent) {
-    if (cur.constInits.has(name)) {
-      return cur.constInits.get(name);
+    const expr = cur.constInits.get(name);
+    if (expr) {
+      return { expr, scope: cur };
     }
   }
   return undefined;
@@ -604,12 +610,12 @@ function checkNoColorInExpr(sourceFile, expr, context, scope, seen = new Set()) 
     }
     return;
   }
-  if (ts.isIdentifier(node) && !seen.has(node.text)) {
-    const init = lookupConstInit(scope, node.text);
-    if (init) {
+  if (ts.isIdentifier(node)) {
+    const binding = lookupConstInit(scope, node.text);
+    if (binding && !seen.has(binding.expr)) {
       const nextSeen = new Set(seen);
-      nextSeen.add(node.text);
-      checkNoColorInExpr(sourceFile, init, context, scope, nextSeen);
+      nextSeen.add(binding.expr);
+      checkNoColorInExpr(sourceFile, binding.expr, context, binding.scope, nextSeen);
       return;
     }
   }
@@ -666,12 +672,12 @@ function extractI18nKeysFromExpr(sourceFile, expr, scope, seen = new Set()) {
       }
     }
   }
-  if (ts.isIdentifier(node) && !seen.has(node.text)) {
-    const init = lookupConstInit(scope, node.text);
-    if (init) {
+  if (ts.isIdentifier(node)) {
+    const binding = lookupConstInit(scope, node.text);
+    if (binding && !seen.has(binding.expr)) {
       const nextSeen = new Set(seen);
-      nextSeen.add(node.text);
-      return extractI18nKeysFromExpr(sourceFile, init, scope, nextSeen);
+      nextSeen.add(binding.expr);
+      return extractI18nKeysFromExpr(sourceFile, binding.expr, binding.scope, nextSeen);
     }
   }
   if (isServerProvidedKeyExpr(node)) {
