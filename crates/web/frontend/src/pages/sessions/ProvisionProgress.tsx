@@ -1,20 +1,15 @@
 /**
- * Reusable live provisioning progress stream hook and step list renderer,
+ * Reusable provisioning progress parser, formatter, and step list renderer,
  * shared by `NewSessionDialog`, `ProvisioningCard`, and future plugin new-session runs.
  */
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 
 import { CheckCircleIcon } from "../../components/Icons.tsx";
-import { ApiError } from "../../lib/api.ts";
 import { formatDuration } from "../../lib/format.ts";
 import type { TranslateFn } from "../../lib/i18n.ts";
 import type { Locale } from "../../lib/types.ts";
-import {
-  openProvisionEventStream,
-  type ProvisionFinishedEvent,
-  type ProvisionProgressEvent,
-} from "./api.ts";
+import type { ProvisionFinishedEvent, ProvisionProgressEvent } from "./api.ts";
 import { formatErrorMessage, formatHardware, formatShortWait, formatVram } from "./format.ts";
 import { AlertTriangleIcon, CircleXIcon, DotIcon, SmallInfoIcon } from "./Icons.tsx";
 
@@ -154,109 +149,6 @@ export function hasProvisionLines(
   t: TranslateFn,
 ): boolean {
   return events.some((ev) => formatProvisionSentence(ev, true, locale, t) !== null);
-}
-
-export interface UseProvisionStreamOptions {
-  readonly operationId: number | null;
-  readonly onFinished?: (event: ProvisionFinishedEvent) => void;
-  readonly onStreamError?: (error: unknown) => void;
-}
-
-export interface ProvisionStreamState {
-  readonly events: readonly ProvisionProgressEvent[];
-  readonly waitingSinceMs: number | null;
-}
-
-/**
- * Subscribes to `POST /api/sessions/{id}/events` for `operationId`, accumulating
- * replayed and live progress frames and tracking when an unanswered `allocating`
- * step began so slow-answer notices can be displayed.
- */
-export function useProvisionStream({
-  operationId,
-  onFinished,
-  onStreamError,
-}: UseProvisionStreamOptions): ProvisionStreamState {
-  const [events, setEvents] = useState<readonly ProvisionProgressEvent[]>([]);
-  const [waitingSinceMs, setWaitingSinceMs] = useState<number | null>(null);
-
-  const onFinishedRef = useRef(onFinished);
-  onFinishedRef.current = onFinished;
-  const onStreamErrorRef = useRef(onStreamError);
-  onStreamErrorRef.current = onStreamError;
-
-  useEffect(() => {
-    if (operationId === null) {
-      setEvents([]);
-      setWaitingSinceMs(null);
-      return;
-    }
-
-    setEvents([]);
-    setWaitingSinceMs(null);
-
-    const controller = new AbortController();
-    let sawFinished = false;
-
-    void openProvisionEventStream(operationId, {
-      signal: controller.signal,
-      onFrame: (frame) => {
-        if (frame.event === "progress") {
-          const parsed = parseProvisionEvent(frame.data);
-          if (parsed) {
-            setEvents((prev) => [...prev, parsed]);
-            setWaitingSinceMs(parsed.event === "allocating" ? Date.now() : null);
-          }
-        } else if (frame.event === "finished") {
-          const finished = parseFinishedEvent(frame.data);
-          if (finished) {
-            sawFinished = true;
-            setWaitingSinceMs(null);
-            if (finished.phase === "ready" && finished.outcome) {
-              const readyEvent: ProvisionProgressEvent = {
-                event: "ready",
-                name: finished.outcome.name,
-                gpu: finished.outcome.hardware?.gpu ?? null,
-                vram_mib: finished.outcome.hardware?.vram_mib ?? null,
-                below_spec: Boolean(finished.outcome.below_spec),
-              };
-              setEvents((prev) =>
-                prev.some((item) => item.event === "ready") ? prev : [...prev, readyEvent],
-              );
-            }
-            onFinishedRef.current?.(finished);
-          }
-        }
-      },
-    })
-      .then(() => {
-        if (controller.signal.aborted || sawFinished) {
-          return;
-        }
-        onStreamErrorRef.current?.(
-          new ApiError({
-            status: 0,
-            kind: "connection_lost",
-            message: "provision stream ended before completion",
-          }),
-        );
-      })
-      .catch((error: unknown) => {
-        if (controller.signal.aborted || sawFinished) {
-          return;
-        }
-        if (error instanceof ApiError && error.isAbort) {
-          return;
-        }
-        onStreamErrorRef.current?.(error);
-      });
-
-    return () => {
-      controller.abort();
-    };
-  }, [operationId]);
-
-  return { events, waitingSinceMs };
 }
 
 export interface ProvisionProgressProps {

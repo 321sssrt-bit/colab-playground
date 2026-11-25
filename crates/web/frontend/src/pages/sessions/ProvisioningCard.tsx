@@ -1,5 +1,7 @@
 /**
- * In-flight session provisioning summary card attached to `POST /api/sessions/{id}/events`.
+ * In-flight session provisioning summary card backed by the store-owned
+ * `POST /api/sessions/{id}/events` tracker so hiding/reopening never resets
+ * progress or slow-answer timing.
  */
 
 import { useEffect, useState } from "react";
@@ -8,47 +10,56 @@ import { ApiError } from "../../lib/api.ts";
 import type { TranslateFn } from "../../lib/i18n.ts";
 import type { ToastInput } from "../../lib/toast.ts";
 import type { Locale, PendingOperation } from "../../lib/types.ts";
-import { cancelProvision, type ProvisionFinishedEvent } from "./api.ts";
+import { cancelProvision } from "./api.ts";
 import { formatErrorMessage } from "./format.ts";
-import {
-  formatProvisionHeadline,
-  ProvisionProgress,
-  useProvisionStream,
-} from "./ProvisionProgress.tsx";
+import { SmallInfoIcon } from "./Icons.tsx";
+import { formatProvisionHeadline, ProvisionProgress } from "./ProvisionProgress.tsx";
+import { trackProvision, type TrackedProvision } from "./store.ts";
 
 export interface ProvisioningCardProps {
-  readonly operation: PendingOperation;
+  readonly operation: PendingOperation | null;
+  readonly trackedProvision: TrackedProvision | null;
   readonly sessionName: string;
   readonly locale: Locale;
   readonly t: TranslateFn;
   readonly pushToast: (toast: ToastInput) => number;
   readonly onShowDialog?: () => void;
-  readonly onFinished?: (event: ProvisionFinishedEvent, sessionName: string) => void;
 }
 
 export function ProvisioningCard({
   operation,
+  trackedProvision,
   sessionName,
   locale,
   t,
   pushToast,
   onShowDialog,
-  onFinished,
 }: ProvisioningCardProps) {
+  const operationId = operation?.id ?? trackedProvision?.operationId ?? null;
   const [cancelRequested, setCancelRequested] = useState(false);
 
   useEffect(() => {
     setCancelRequested(false);
-  }, [operation.id]);
+    if (operationId !== null) {
+      trackProvision(operationId, sessionName);
+    }
+  }, [operationId, sessionName]);
 
-  const { events, waitingSinceMs } = useProvisionStream({
-    operationId: operation.id,
-    onFinished: (finished) => {
-      onFinished?.(finished, sessionName);
-    },
-  });
+  if (operationId === null) {
+    return null;
+  }
 
-  const cancelling = operation.cancelling || cancelRequested;
+  const events =
+    trackedProvision && trackedProvision.operationId === operationId ? trackedProvision.events : [];
+  const waitingSinceMs =
+    trackedProvision && trackedProvision.operationId === operationId
+      ? trackedProvision.waitingSinceMs
+      : null;
+  const reconnecting =
+    trackedProvision !== null &&
+    trackedProvision.operationId === operationId &&
+    trackedProvision.reconnecting;
+  const cancelling = Boolean(operation?.cancelling) || cancelRequested;
 
   const handleCancel = async () => {
     if (cancelling) {
@@ -56,15 +67,15 @@ export function ProvisioningCard({
     }
     setCancelRequested(true);
     try {
-      await cancelProvision(operation.id);
+      await cancelProvision(operationId);
     } catch (error) {
-      if (!(error instanceof ApiError && error.isUnauthorized)) {
+      if (!(error instanceof ApiError && (error.isUnauthorized || error.kind === "provision_not_found"))) {
         pushToast({
           tone: "danger",
           body: formatErrorMessage(error, t).message,
         });
+        setCancelRequested(false);
       }
-      setCancelRequested(false);
     }
   };
 
@@ -84,6 +95,13 @@ export function ProvisioningCard({
         locale={locale}
         t={t}
       />
+
+      {reconnecting && (
+        <div className="inline-msg inline-msg-info" role="status">
+          <SmallInfoIcon className="icon-xs icon-info" />
+          <span className="inline-msg-text">{t("web.shell.reconnecting")}</span>
+        </div>
+      )}
 
       <div className="session-actions">
         {onShowDialog && (

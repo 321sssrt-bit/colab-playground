@@ -14,13 +14,19 @@ import { resolveActiveAccount } from "../../lib/format.ts";
 import type { TranslateFn } from "../../lib/i18n.ts";
 import type { RouteId } from "../../lib/router.ts";
 import type { ToastInput } from "../../lib/toast.ts";
-import type { AccountContext, Locale, PendingOperation, Snapshot } from "../../lib/types.ts";
+import type {
+  AccountContext,
+  AccountId,
+  Locale,
+  PendingOperation,
+  Snapshot,
+} from "../../lib/types.ts";
 import {
   cancelProvision,
   fetchSessionTemplate,
   startProvision,
-  type ProvisionFinishedEvent,
   type ProvisionOutcome,
+  type ProvisionSpec,
 } from "./api.ts";
 import { formatEmail, formatErrorMessage, type FormattedError } from "./format.ts";
 import { AlertTriangleIcon, PlayIcon, SmallAlertIcon, SmallInfoIcon } from "./Icons.tsx";
@@ -39,9 +45,12 @@ import {
   formatProvisionHeadline,
   hasProvisionLines,
   ProvisionProgress,
-  useProvisionStream,
 } from "./ProvisionProgress.tsx";
-import { refreshRearmDuration } from "./store.ts";
+import {
+  refreshRearmDuration,
+  trackProvision,
+  type TrackedProvision,
+} from "./store.ts";
 
 export type NewSessionDialogRequest =
   | {
@@ -61,29 +70,53 @@ export interface NewSessionDialogProps {
   readonly snapshot: Snapshot | null;
   readonly maxConcurrentSessions: number;
   readonly activeProvisionOp: { readonly op: PendingOperation; readonly sessionName: string } | null;
+  readonly trackedProvision: TrackedProvision | null;
   readonly locale: Locale;
   readonly t: TranslateFn;
   readonly navigate: (route: RouteId) => void;
   readonly pushToast: (toast: ToastInput) => number;
   readonly onClose: () => void;
-  readonly onProvisionFinished: () => void;
+  readonly onTrackingOperation: (operationId: number | null) => void;
 }
 
 type DialogPhase =
   | { readonly kind: "loading" }
   | { readonly kind: "load_error"; readonly error: FormattedError }
-  | { readonly kind: "limit"; readonly limit: number; readonly counted: readonly string[] }
+  | {
+      readonly kind: "limit";
+      readonly limit: number;
+      readonly email: string;
+      readonly counted: readonly string[];
+    }
   | { readonly kind: "form" }
   | { readonly kind: "running"; readonly operationId: number; readonly sessionName: string }
   | { readonly kind: "ready"; readonly outcome: ProvisionOutcome }
   | { readonly kind: "failed"; readonly error: FormattedError }
   | { readonly kind: "cancelled" };
 
-function countNamedRuntimesOnActiveAccount(snapshot: Snapshot | null): string[] {
+function resolveAccountEmail(
+  snapshot: Snapshot | null,
+  accountId: AccountId | null,
+  t: TranslateFn,
+): string {
+  if (accountId !== null) {
+    const matched = snapshot?.accounts?.accounts.find((item) => item.id === accountId) ?? null;
+    if (matched) {
+      return formatEmail(matched.email, t);
+    }
+  }
+  return formatEmail(resolveActiveAccount(snapshot, t).email, t);
+}
+
+function countNamedRuntimesOnAccount(
+  snapshot: Snapshot | null,
+  accountId: AccountId | null,
+): string[] {
   const runtimes = snapshot?.runtimes?.runtimes ?? [];
   const names: string[] = [];
   for (const rt of runtimes) {
-    if (rt.on_active_account && rt.id.name) {
+    const onTarget = accountId !== null ? rt.id.account === accountId : rt.on_active_account;
+    if (onTarget && rt.id.name) {
       names.push(rt.id.name);
     }
   }
@@ -95,12 +128,13 @@ export function NewSessionDialog({
   snapshot,
   maxConcurrentSessions,
   activeProvisionOp,
+  trackedProvision,
   locale,
   t,
   navigate,
   pushToast,
   onClose,
-  onProvisionFinished,
+  onTrackingOperation,
 }: NewSessionDialogProps) {
   const titleId = useId();
   const nameInputId = useId();
@@ -115,9 +149,12 @@ export function NewSessionDialog({
   maxConcurrentRef.current = maxConcurrentSessions;
   const tRef = useRef(t);
   tRef.current = t;
+  const onTrackingOperationRef = useRef(onTrackingOperation);
+  onTrackingOperationRef.current = onTrackingOperation;
 
   const [phase, setPhase] = useState<DialogPhase>({ kind: "loading" });
   const [nameDraft, setNameDraft] = useState("");
+  const [baseTemplate, setBaseTemplate] = useState<ProvisionSpec | null>(null);
   const [provisionDraft, setProvisionDraft] = useState<ProvisionDraft | null>(null);
   const [retryDelaySecs, setRetryDelaySecs] = useState<number>(CORE_DEFAULTS.retry_delay);
   const [submitting, setSubmitting] = useState(false);
@@ -126,17 +163,22 @@ export function NewSessionDialog({
     () => new Set<ProvisionFieldErrorId>(),
   );
   const [submitError, setSubmitError] = useState<FormattedError | null>(null);
-  const [streamOperationId, setStreamOperationId] = useState<number | null>(null);
+  const [attachedOperationId, setAttachedOperationId] = useState<number | null>(null);
   const [reloadSeq, setReloadSeq] = useState(0);
 
-  const loadTemplateAndLimit = (requestId: number, signal: AbortSignal) => {
+  const loadTemplateAndLimit = (
+    requestId: number,
+    targetAccount: AccountId | null,
+    signal: AbortSignal,
+  ) => {
     const gen = apiClient.getSessionGeneration();
     setPhase({ kind: "loading" });
     setSubmitting(false);
     setCancelRequested(false);
     setInvalidFields(new Set<ProvisionFieldErrorId>());
     setSubmitError(null);
-    setStreamOperationId(null);
+    setAttachedOperationId(null);
+    onTrackingOperationRef.current(null);
 
     const templatePromise = fetchSessionTemplate(signal);
     const settingsPromise = refreshRearmDuration(signal)
@@ -152,14 +194,20 @@ export function NewSessionDialog({
         ) {
           return;
         }
-        const counted = countNamedRuntimesOnActiveAccount(snapshotRef.current);
+        const counted = countNamedRuntimesOnAccount(snapshotRef.current, targetAccount);
         const cap = Math.max(1, resolvedMaxConcurrent);
         setNameDraft(template.name);
         autoNameRef.current = template.name;
+        setBaseTemplate(template);
         setProvisionDraft(specToProvisionDraft(template));
         setRetryDelaySecs(template.retry_delay);
         if (counted.length >= cap) {
-          setPhase({ kind: "limit", limit: cap, counted });
+          setPhase({
+            kind: "limit",
+            limit: cap,
+            email: resolveAccountEmail(snapshotRef.current, targetAccount, tRef.current),
+            counted,
+          });
         } else {
           setPhase({ kind: "form" });
         }
@@ -188,7 +236,8 @@ export function NewSessionDialog({
     const dialog = dialogRef.current;
     if (!request) {
       activeRequestIdRef.current = 0;
-      setStreamOperationId(null);
+      setAttachedOperationId(null);
+      onTrackingOperationRef.current(null);
       if (dialog?.open) {
         dialog.close();
       }
@@ -206,68 +255,65 @@ export function NewSessionDialog({
       setCancelRequested(false);
       setSubmitError(null);
       setInvalidFields(new Set<ProvisionFieldErrorId>());
+      setBaseTemplate(null);
       setProvisionDraft(null);
+      setAttachedOperationId(request.operationId);
+      onTrackingOperationRef.current(request.operationId);
+      trackProvision(request.operationId, request.sessionName);
       setPhase({
         kind: "running",
         operationId: request.operationId,
         sessionName: request.sessionName,
       });
-      setStreamOperationId(request.operationId);
       return;
     }
 
     const controller = new AbortController();
-    loadTemplateAndLimit(request.id, controller.signal);
+    loadTemplateAndLimit(request.id, request.accountContext.active, controller.signal);
     return () => {
       controller.abort();
     };
   }, [request?.id, reloadSeq]);
 
-  const handleStreamFinished = (finished: ProvisionFinishedEvent) => {
-    setCancelRequested(false);
-    onProvisionFinished();
-    if (finished.phase === "ready" && finished.outcome) {
-      setPhase({ kind: "ready", outcome: finished.outcome });
+  const attachedTracked =
+    attachedOperationId !== null && trackedProvision?.operationId === attachedOperationId
+      ? trackedProvision
+      : null;
+
+  // Converge dialog phase when the store-owned provision stream reaches a terminal state.
+  useEffect(() => {
+    if (phase.kind !== "running" || !attachedTracked || attachedTracked.phase === "running") {
       return;
     }
-    if (finished.phase === "cancelled") {
+    setCancelRequested(false);
+    if (attachedTracked.phase === "ready" && attachedTracked.outcome) {
+      setPhase({ kind: "ready", outcome: attachedTracked.outcome });
+      return;
+    }
+    if (attachedTracked.phase === "cancelled") {
       setPhase({ kind: "cancelled" });
       return;
     }
-    if (finished.error?.kind === "session_limit_reached") {
-      const parsedLimit = Number(finished.error.args?.limit);
+    if (attachedTracked.finishedError?.kind === "session_limit_reached") {
+      const parsedLimit = Number(attachedTracked.finishedError.args?.limit);
       const cap =
         Number.isFinite(parsedLimit) && parsedLimit >= 1
           ? Math.floor(parsedLimit)
           : Math.max(1, maxConcurrentRef.current);
+      const targetAccount = request?.mode === "create" ? request.accountContext.active : null;
       setPhase({
         kind: "limit",
         limit: cap,
-        counted: countNamedRuntimesOnActiveAccount(snapshotRef.current),
+        email: resolveAccountEmail(snapshotRef.current, targetAccount, tRef.current),
+        counted: countNamedRuntimesOnAccount(snapshotRef.current, targetAccount),
       });
       return;
     }
-    setPhase({ kind: "failed", error: formatErrorMessage(finished.error, tRef.current) });
-  };
-
-  const handleStreamError = (error: unknown) => {
-    if (error instanceof ApiError && error.isUnauthorized) {
-      onClose();
-      return;
-    }
-    setCancelRequested(false);
-    setPhase((prev) =>
-      prev.kind === "running"
-        ? { kind: "failed", error: formatErrorMessage(error, tRef.current) }
-        : prev,
-    );
-  };
-
-  const { events, waitingSinceMs } = useProvisionStream({
-    operationId: streamOperationId,
-    onFinished: handleStreamFinished,
-    onStreamError: handleStreamError,
-  });
+    setPhase({
+      kind: "failed",
+      error: formatErrorMessage(attachedTracked.finishedError, tRef.current),
+    });
+  }, [phase.kind, attachedTracked, request]);
 
   const handleDialogCancel = (event: SyntheticEvent<HTMLDialogElement>) => {
     event.preventDefault();
@@ -294,10 +340,9 @@ export function NewSessionDialog({
     (currentAccountContext.revision !== request.accountContext.revision ||
       currentAccountContext.active !== request.accountContext.active);
 
-  const activeAccount = resolveActiveAccount(snapshot, t);
-  const activeEmail = formatEmail(activeAccount.email, t);
   const shuttingDown = Boolean(snapshot?.shutting_down);
-  const blockedByActiveProvision = activeProvisionOp !== null && phase.kind === "form";
+  const blockedByActiveProvision =
+    (activeProvisionOp !== null || trackedProvision?.phase === "running") && phase.kind === "form";
 
   const measuredRate = provisionDraft
     ? findMeasuredRate(
@@ -360,7 +405,12 @@ export function NewSessionDialog({
       return;
     }
 
-    const built = buildProvisionSpecFromDraft(nameDraft, provisionDraft, retryDelaySecs);
+    const built = buildProvisionSpecFromDraft(
+      nameDraft,
+      provisionDraft,
+      retryDelaySecs,
+      baseTemplate,
+    );
     if (!built.ok) {
       setInvalidFields(built.invalidFields);
       focusFirstInvalidControl(built.invalidFields);
@@ -383,12 +433,14 @@ export function NewSessionDialog({
       }
       setSubmitting(false);
       setCancelRequested(false);
+      setAttachedOperationId(accepted.id);
+      onTrackingOperationRef.current(accepted.id);
+      trackProvision(accepted.id, built.spec.name);
       setPhase({
         kind: "running",
         operationId: accepted.id,
         sessionName: built.spec.name,
       });
-      setStreamOperationId(accepted.id);
     } catch (error) {
       if (error instanceof ApiError && error.isUnauthorized) {
         setSubmitting(false);
@@ -411,7 +463,12 @@ export function NewSessionDialog({
         setPhase({
           kind: "limit",
           limit: cap,
-          counted: countNamedRuntimesOnActiveAccount(snapshotRef.current),
+          email: resolveAccountEmail(
+            snapshotRef.current,
+            request.accountContext.active,
+            tRef.current,
+          ),
+          counted: countNamedRuntimesOnAccount(snapshotRef.current, request.accountContext.active),
         });
         return;
       }
@@ -450,7 +507,8 @@ export function NewSessionDialog({
   const handleEditAgain = () => {
     setSubmitError(null);
     setInvalidFields(new Set<ProvisionFieldErrorId>());
-    setStreamOperationId(null);
+    setAttachedOperationId(null);
+    onTrackingOperationRef.current(null);
     if (provisionDraft && request?.mode === "create") {
       setPhase({ kind: "form" });
     } else if (request?.mode === "create") {
@@ -459,6 +517,10 @@ export function NewSessionDialog({
       onClose();
     }
   };
+
+  const events = attachedTracked?.events ?? [];
+  const waitingSinceMs = attachedTracked?.waitingSinceMs ?? null;
+  const reconnecting = Boolean(attachedTracked?.reconnecting);
 
   const closedByAttr = {
     closedby: submitting ? "none" : "closerequest",
@@ -528,12 +590,22 @@ export function NewSessionDialog({
           {phase.kind === "limit" && (
             <>
               <div className="dialog-body" data-new-session-limit="true">
+                {accountChanged && (
+                  <div
+                    className="inline-msg inline-msg-warning"
+                    role="alert"
+                    data-new-session-account-changed="true"
+                  >
+                    <AlertTriangleIcon className="icon-xs icon-warning" />
+                    <span className="inline-msg-text">{t("web.sessions.account_changed")}</span>
+                  </div>
+                )}
                 <div className="inline-msg inline-msg-warning" role="status">
                   <AlertTriangleIcon className="icon-xs icon-warning" />
                   <span className="inline-msg-text">
                     {t("app.b3.new_limit_body", {
                       limit: phase.limit,
-                      email: activeEmail,
+                      email: phase.email,
                     })}
                   </span>
                 </div>
@@ -703,6 +775,13 @@ export function NewSessionDialog({
                   locale={locale}
                   t={t}
                 />
+
+                {reconnecting && (
+                  <div className="inline-msg inline-msg-info" role="status">
+                    <SmallInfoIcon className="icon-xs icon-info" />
+                    <span className="inline-msg-text">{t("web.shell.reconnecting")}</span>
+                  </div>
+                )}
 
                 <div className="inline-msg inline-msg-info">
                   <SmallInfoIcon className="icon-xs icon-info" />

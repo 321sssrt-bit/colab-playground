@@ -261,15 +261,26 @@ export function specToProvisionDraft(spec: ProvisionSpec): ProvisionDraft {
   };
 }
 
+function durationDraftEqual(a: ProvisionDurationDraft, b: ProvisionDurationDraft): boolean {
+  return a.hours.trim() === b.hours.trim() && a.minutes.trim() === b.minutes.trim();
+}
+
 export type BuildProvisionSpecResult =
   | { readonly ok: true; readonly spec: ProvisionSpec }
   | { readonly ok: false; readonly invalidFields: ReadonlySet<ProvisionFieldErrorId> };
 
+/**
+ * Validates `draft` and builds a `ProvisionSpec`. When `baseSpec` is supplied,
+ * untouched fields preserve exact backend values (such as sub-minute durations
+ * or non-GiB-aligned `min_vram_mib`) instead of rounding them through UI inputs.
+ */
 export function buildProvisionSpecFromDraft(
   name: string,
   draft: ProvisionDraft,
   retryDelaySecs: number,
+  baseSpec?: ProvisionSpec | null,
 ): BuildProvisionSpecResult {
+  const initialDraft = baseSpec ? specToProvisionDraft(baseSpec) : null;
   const invalidFields = new Set<ProvisionFieldErrorId>();
   const trimmedName = name.trim();
   if (!validateSessionName(trimmedName)) {
@@ -279,48 +290,111 @@ export function buildProvisionSpecFromDraft(
   const isGpu = acceleratorIsGpu(draft.accelerator);
   let minVramMib: number | null = null;
   if (isGpu && draft.min_vram_enabled) {
-    const parsedGib = parseIntInRange(draft.min_vram_gib, MIN_VRAM_GIB, MAX_VRAM_GIB);
-    if (parsedGib === null) {
-      invalidFields.add("min_vram_mib");
+    if (
+      baseSpec &&
+      initialDraft &&
+      initialDraft.min_vram_enabled &&
+      baseSpec.min_vram_mib !== null &&
+      baseSpec.min_vram_mib > 0 &&
+      draft.min_vram_gib.trim() === initialDraft.min_vram_gib.trim()
+    ) {
+      minVramMib = baseSpec.min_vram_mib;
     } else {
-      minVramMib = parsedGib * MIB_PER_GIB;
+      const parsedGib = parseIntInRange(draft.min_vram_gib, MIN_VRAM_GIB, MAX_VRAM_GIB);
+      if (parsedGib === null) {
+        invalidFields.add("min_vram_mib");
+      } else {
+        minVramMib = parsedGib * MIB_PER_GIB;
+      }
     }
   }
 
-  const maxAttempts = parseIntInRange(draft.max_attempts, MIN_ATTEMPTS, MAX_ATTEMPTS_CAP);
-  if (maxAttempts === null) {
-    invalidFields.add("max_attempts");
+  let maxAttempts: number | null;
+  if (
+    baseSpec &&
+    initialDraft &&
+    draft.max_attempts.trim() === initialDraft.max_attempts.trim()
+  ) {
+    maxAttempts = Math.min(
+      MAX_ATTEMPTS_CAP,
+      Math.max(MIN_ATTEMPTS, Math.round(baseSpec.max_attempts)),
+    );
+  } else {
+    maxAttempts = parseIntInRange(draft.max_attempts, MIN_ATTEMPTS, MAX_ATTEMPTS_CAP);
+    if (maxAttempts === null) {
+      invalidFields.add("max_attempts");
+    }
   }
 
   let maxRuntime: number | null = null;
   if (draft.max_runtime_enabled) {
-    maxRuntime = parseDurationSecs(draft.max_runtime);
-    if (maxRuntime === null) {
-      invalidFields.add("max_runtime");
+    if (
+      baseSpec &&
+      initialDraft &&
+      initialDraft.max_runtime_enabled &&
+      baseSpec.guard.max_runtime !== null &&
+      durationDraftEqual(draft.max_runtime, initialDraft.max_runtime)
+    ) {
+      maxRuntime = baseSpec.guard.max_runtime;
+    } else {
+      maxRuntime = parseDurationSecs(draft.max_runtime);
+      if (maxRuntime === null) {
+        invalidFields.add("max_runtime");
+      }
     }
   }
 
   let maxSpendCu: number | null = null;
   if (draft.max_spend_enabled) {
-    maxSpendCu = parseFloatInRange(draft.max_spend_cu, MIN_CU_FIELD, MAX_CU_FIELD);
-    if (maxSpendCu === null) {
-      invalidFields.add("max_spend_cu");
+    if (
+      baseSpec &&
+      initialDraft &&
+      initialDraft.max_spend_enabled &&
+      baseSpec.guard.max_spend_cu !== null &&
+      draft.max_spend_cu.trim() === initialDraft.max_spend_cu.trim()
+    ) {
+      maxSpendCu = baseSpec.guard.max_spend_cu;
+    } else {
+      maxSpendCu = parseFloatInRange(draft.max_spend_cu, MIN_CU_FIELD, MAX_CU_FIELD);
+      if (maxSpendCu === null) {
+        invalidFields.add("max_spend_cu");
+      }
     }
   }
 
   let minBalanceCu: number | null = null;
   if (draft.min_balance_enabled) {
-    minBalanceCu = parseFloatInRange(draft.min_balance_cu, MIN_CU_FIELD, MAX_CU_FIELD);
-    if (minBalanceCu === null) {
-      invalidFields.add("min_balance_cu");
+    if (
+      baseSpec &&
+      initialDraft &&
+      initialDraft.min_balance_enabled &&
+      baseSpec.guard.min_balance_cu !== null &&
+      draft.min_balance_cu.trim() === initialDraft.min_balance_cu.trim()
+    ) {
+      minBalanceCu = baseSpec.guard.min_balance_cu;
+    } else {
+      minBalanceCu = parseFloatInRange(draft.min_balance_cu, MIN_CU_FIELD, MAX_CU_FIELD);
+      if (minBalanceCu === null) {
+        invalidFields.add("min_balance_cu");
+      }
     }
   }
 
   let idleTimeout: number | null = null;
   if (draft.idle_timeout_enabled) {
-    idleTimeout = parseDurationSecs(draft.idle_timeout);
-    if (idleTimeout === null) {
-      invalidFields.add("idle_timeout");
+    if (
+      baseSpec &&
+      initialDraft &&
+      initialDraft.idle_timeout_enabled &&
+      baseSpec.guard.idle_timeout !== null &&
+      durationDraftEqual(draft.idle_timeout, initialDraft.idle_timeout)
+    ) {
+      idleTimeout = baseSpec.guard.idle_timeout;
+    } else {
+      idleTimeout = parseDurationSecs(draft.idle_timeout);
+      if (idleTimeout === null) {
+        invalidFields.add("idle_timeout");
+      }
     }
   }
 
