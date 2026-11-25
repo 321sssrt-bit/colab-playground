@@ -23,8 +23,8 @@ const MAX_AUTO_STOP_SECS = 0xffffffff;
 export const MAX_HOURS_INPUT = 999;
 export const MAX_MINUTES_INPUT = 59;
 export const FORWARD_DEFAULT_PORT = 8000;
-export const MIN_PORT = 1;
-export const MAX_PORT = 65535;
+const MIN_PORT = 1;
+const MAX_PORT = 65535;
 export const RESERVED_VM_PORT = 8080;
 
 const LIMIT_KEYS: Readonly<Record<Limit, string>> = {

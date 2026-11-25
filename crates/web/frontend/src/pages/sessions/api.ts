@@ -50,7 +50,7 @@ export interface ForwardView extends TunnelInfo {
   readonly addresses?: ForwardAddresses | null;
 }
 
-export interface OpenForwardPayload {
+interface OpenForwardPayload {
   readonly account_context: AccountContext;
   readonly account: AccountId;
   readonly session: string;
