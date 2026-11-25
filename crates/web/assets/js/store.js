@@ -55,7 +55,6 @@ function emptyPluginRunState() {
     launched: false,
     cleanupResult: null, // null | checking | still_billing | stopped | unknown
     cleanupRuntime: null,
-    runId: null,
     phase: "idle", // idle | running | ready | failed | cancelled
     cancelling: false,
     provision: { events: [], latestAtMs: null },
@@ -73,8 +72,6 @@ function emptyHfTokenState() {
   return {
     status: "idle", // idle | loading | ready | error
     saved: false,
-    error: null,
-    busy: false,
   };
 }
 
@@ -411,7 +408,6 @@ function syncPluginRunWithOperations(snapshot) {
         session: activeOp.operation.session || "",
         account: snapshot?.account?.active || null,
         provisions: null,
-        finished: false,
       });
       void loadPluginRuns();
     }
@@ -628,7 +624,7 @@ export async function loadHfToken({ silent = false } = {}) {
   }
   const gen = authGeneration;
   if (!silent && state.hfToken.status === "idle") {
-    state.hfToken = { ...state.hfToken, status: "loading", error: null };
+    state.hfToken = { ...state.hfToken, status: "loading" };
     emit("hf_token");
   }
   hfTokenPromise = (async () => {
@@ -638,8 +634,6 @@ export async function loadHfToken({ silent = false } = {}) {
       state.hfToken = {
         status: "ready",
         saved: Boolean(data?.saved),
-        error: null,
-        busy: false,
       };
       return state.hfToken;
     } catch (err) {
@@ -647,8 +641,6 @@ export async function loadHfToken({ silent = false } = {}) {
       state.hfToken = {
         status: "error",
         saved: false,
-        error: err?.payload || { error: {} },
-        busy: false,
       };
       return null;
     } finally {
@@ -663,58 +655,34 @@ export async function loadHfToken({ silent = false } = {}) {
 
 export async function saveHfToken(token) {
   const gen = authGeneration;
-  state.hfToken = { ...state.hfToken, busy: true };
-  emit("hf_token");
-  try {
-    const data = await apiRequest("/api/plugins/hf/token", {
-      method: "PUT",
-      body: { token },
-    });
-    if (gen === authGeneration && state.authenticated) {
-      state.hfToken = {
-        status: "ready",
-        saved: Boolean(data?.saved ?? true),
-        error: null,
-        busy: false,
-      };
-      emit("hf_token");
-    }
-    return data;
-  } catch (err) {
-    if (gen === authGeneration && state.authenticated) {
-      state.hfToken = { ...state.hfToken, busy: false };
-      emit("hf_token");
-    }
-    throw err;
+  const data = await apiRequest("/api/plugins/hf/token", {
+    method: "PUT",
+    body: { token },
+  });
+  if (gen === authGeneration && state.authenticated) {
+    state.hfToken = {
+      status: "ready",
+      saved: Boolean(data?.saved ?? true),
+    };
+    emit("hf_token");
   }
+  return data;
 }
 
 export async function deleteHfToken() {
   const gen = authGeneration;
-  state.hfToken = { ...state.hfToken, busy: true };
-  emit("hf_token");
-  try {
-    const data = await apiRequest("/api/plugins/hf/token", {
-      method: "DELETE",
-      body: {},
-    });
-    if (gen === authGeneration && state.authenticated) {
-      state.hfToken = {
-        status: "ready",
-        saved: Boolean(data?.saved ?? false),
-        error: null,
-        busy: false,
-      };
-      emit("hf_token");
-    }
-    return data;
-  } catch (err) {
-    if (gen === authGeneration && state.authenticated) {
-      state.hfToken = { ...state.hfToken, busy: false };
-      emit("hf_token");
-    }
-    throw err;
+  const data = await apiRequest("/api/plugins/hf/token", {
+    method: "DELETE",
+    body: {},
+  });
+  if (gen === authGeneration && state.authenticated) {
+    state.hfToken = {
+      status: "ready",
+      saved: Boolean(data?.saved ?? false),
+    };
+    emit("hf_token");
   }
+  return data;
 }
 
 export async function previewPlugin(origin) {
@@ -962,7 +930,6 @@ async function consumePluginRunStream(id, gen) {
         if (event === "launched" && data) {
           state.pluginRun.launched = true;
           if (data.session) state.pluginRun.session = data.session;
-          if (data.run_id) state.pluginRun.runId = data.run_id;
           emit("plugin_run");
           return;
         }
@@ -1102,7 +1069,7 @@ async function consumePluginRunStream(id, gen) {
   }, delay);
 }
 
-export async function attachPluginRun(summary) {
+async function attachPluginRun(summary) {
   if (!state.authenticated || !summary || summary.id === null || summary.id === undefined) {
     return;
   }
@@ -1128,7 +1095,6 @@ export async function attachPluginRun(summary) {
     launched: provisions === false && Boolean(summary.session),
     cleanupResult: null,
     cleanupRuntime: null,
-    runId: null,
     phase: "running",
     cancelling: false,
     provision: { events: [], latestAtMs: Date.now() },
@@ -1227,7 +1193,6 @@ export async function startPluginRun({ spec, existing = null, accountContext = n
     launched: !provisions,
     cleanupResult: null,
     cleanupRuntime: null,
-    runId: null,
     phase: "running",
     cancelling: false,
     provision: { events: [], latestAtMs: Date.now() },

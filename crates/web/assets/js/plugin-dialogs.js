@@ -26,7 +26,7 @@ function getDialogEl() {
   return document.getElementById(DIALOG_ID);
 }
 
-export function isGitSource(text) {
+function isGitSource(text) {
   const trimmed = String(text || "").trim();
   return trimmed.includes("://") || trimmed.startsWith("git@");
 }

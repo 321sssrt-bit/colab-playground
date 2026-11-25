@@ -813,7 +813,6 @@ export function createPluginsPage({ navigate }) {
     const info = findPlugin(formModel.pluginId);
     if (!info) return;
 
-    // 1. Update HF token notice banner
     if (formDom.hfTokenBannerHost?.isConnected) {
       clear(formDom.hfTokenBannerHost);
       if (Array.isArray(info.manifest.needs) && info.manifest.needs.includes("hf_token")) {
@@ -827,7 +826,7 @@ export function createPluginsPage({ navigate }) {
       }
     }
 
-    // 2. Drop gone run target if session ended or active account changed (1:1 runs.rs::drop_gone_run_target)
+    // 1:1 runs.rs::drop_gone_run_target
     const managed = activeManagedRuntimes();
     const activeAccount = state.snapshot?.account?.active ?? null;
     if (formModel.existing) {
@@ -852,7 +851,6 @@ export function createPluginsPage({ navigate }) {
       renderTargetOptionsSlot();
     }
 
-    // 3. Target-lost notice
     if (formDom.targetLostHost?.isConnected) {
       clear(formDom.targetLostHost);
       if (formModel.targetLost) {
@@ -866,7 +864,6 @@ export function createPluginsPage({ navigate }) {
       }
     }
 
-    // 4. Session limit notice
     const limit = !formModel.existing ? getSessionLimitReached() : null;
     if (formDom.limitHost?.isConnected) {
       clear(formDom.limitHost);
@@ -901,12 +898,10 @@ export function createPluginsPage({ navigate }) {
       }
     }
 
-    // 5. Submit button availability
     if (formDom.submitBtn?.isConnected) {
       formDom.submitBtn.disabled = Boolean(formModel.submitting || isPluginRunning() || limit);
     }
 
-    // 6. Account context changed notice
     if (formDom.accountWarningHost?.isConnected) {
       clear(formDom.accountWarningHost);
       const current = state.snapshot?.account;
