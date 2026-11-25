@@ -1,17 +1,3 @@
-/**
- * Dynamic plugin deploy form generated from a plugin's manifest:
- * - Renders all 6 input kinds (`text`, `number` with min/max bounds, `bool`,
- *   `select`, `secret`, and `hf-model` with search + server-computed GGUF fit).
- * - Enforces the secret security invariant: `secret` inputs remain uncontrolled
- *   DOM `<input type="password">` nodes read only at submit time and cleared
- *   immediately before dispatching the request, never entering React state,
- *   stores, snapshots, storage, or logs.
- * - Switches between provisioning a new session (reusing `ProvisionFields`,
- *   concurrent session limit guard, and `stop_on_failure` switch) and running
- *   on an existing active managed runtime, monitoring target loss and active
- *   account switches.
- */
-
 import {
   useCallback,
   useEffect,
@@ -97,7 +83,7 @@ type TargetLost =
   | { readonly kind: "ended"; readonly name: string }
   | { readonly kind: "other_account"; readonly name: string };
 
-export interface PluginDeployFormProps {
+interface PluginDeployFormProps {
   readonly plugin: PluginInfo;
   readonly snapshot: Snapshot | null;
   readonly maxConcurrentSessions: number;
@@ -395,7 +381,6 @@ export function PluginDeployForm({
 
   const wantsHfToken = plugin.manifest.needs.includes("hf_token");
 
-  // Load the plugin template, concurrent session limit, and optional HF token presence once per open/retry.
   useEffect(() => {
     const seq = ++loadSeqRef.current;
     const controller = new AbortController();
@@ -510,7 +495,6 @@ export function PluginDeployForm({
     };
   }, [plugin.manifest.id, reloadSeq, wantsHfToken, clearSecretInputs]);
 
-  // Monitor the picked existing runtime against live snapshots: unpick cleanly if stopped or account switched.
   useEffect(() => {
     if (!selectedExisting || !snapshot) {
       return;

@@ -97,7 +97,7 @@ export interface HfTokenStatus {
   readonly saved: boolean;
 }
 
-export type PluginRunTarget =
+type PluginRunTarget =
   | { readonly kind: "existing"; readonly name: string }
   | ({ readonly kind: "provision" } & ProvisionSpec);
 
@@ -127,18 +127,18 @@ export interface HfModel {
 
 export type KvType = "f16" | "q8_0" | "q4_0";
 
-export interface GgufFile {
+interface GgufFile {
   readonly path: string;
   readonly size: number;
 }
 
-export interface GgufVariant {
+interface GgufVariant {
   readonly quant: string;
   readonly files: readonly string[];
   readonly size: number;
 }
 
-export interface GgufListing {
+interface GgufListing {
   readonly variants: readonly GgufVariant[];
   readonly mmproj: readonly GgufFile[];
 }
@@ -159,7 +159,7 @@ export interface GgufEstimateRequest {
   readonly quant?: string | null;
 }
 
-export interface GgufFitChoice {
+interface GgufFitChoice {
   readonly quant: string;
   readonly kv: KvType;
   readonly ctx: number;
@@ -169,7 +169,7 @@ export interface GgufFitChoice {
   readonly kv_reduced: boolean;
 }
 
-export interface GgufFitEntry {
+interface GgufFitEntry {
   readonly vram_mib: number;
   readonly fit: GgufFitChoice | null;
   readonly fit_error: ApiErrorPayload | null;

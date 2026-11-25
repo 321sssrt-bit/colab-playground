@@ -1,9 +1,3 @@
-/**
- * Dynamic `hf-model` input field: repository ID entry (`owner/name`), debounced
- * IME-safe Hugging Face model search, and real-time server-computed GGUF
- * quantisation fit preview via `POST /api/plugins/hf/search` and `/api/plugins/hf/gguf`.
- */
-
 import { useCallback, useEffect, useId, useRef, useState, type KeyboardEvent } from "react";
 
 import { ApiError } from "../../lib/api.ts";
@@ -42,7 +36,7 @@ export interface HfGgufFitParams {
   readonly kv: KvType | null;
 }
 
-export interface HfModelFieldProps {
+interface HfModelFieldProps {
   readonly input: PluginInputSpec;
   readonly value: string;
   readonly error: string | null;
@@ -195,7 +189,6 @@ export function HfModelField({
     }
   }, []);
 
-  // Debounce model search while typing; clearing the query resets results immediately.
   useEffect(() => {
     if (searchTimerRef.current !== null) {
       window.clearTimeout(searchTimerRef.current);
@@ -221,7 +214,6 @@ export function HfModelField({
     };
   }, [searchQuery, executeSearch]);
 
-  // Synchronize typed `owner/name` repo IDs into `activeRepo` with debounce.
   useEffect(() => {
     if (repoTimerRef.current !== null) {
       window.clearTimeout(repoTimerRef.current);
@@ -250,7 +242,6 @@ export function HfModelField({
     };
   }, [value, activeRepo]);
 
-  // Recompute server-side GGUF fit whenever the selected repo or GPU/ctx/quant/kv parameters change.
   const { accelerator, vramMib, ctx, quant, kv } = fitParams;
   useEffect(() => {
     if (ggufTimerRef.current !== null) {
