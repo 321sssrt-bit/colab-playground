@@ -92,6 +92,7 @@
   font: inherit;
   font-size: var(--text-sm);
   text-align: start;
+  text-decoration: none;
   cursor: pointer;
 }
 
@@ -99,6 +100,7 @@
 .sidebar-account[aria-expanded="true"] {
   background-color: var(--color-hover);
   color: var(--color-fg);
+  text-decoration: none;
 }
 
 .sidebar-account-text {
@@ -490,14 +492,21 @@
     top: var(--space-0);
     z-index: var(--z-topbar);
     display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: var(--space-1p5);
+    min-height: var(--mobile-topbar-height);
+    padding: var(--space-1p5) var(--space-3);
+    border-bottom: var(--border-width) solid var(--color-border);
+    background-color: var(--color-bg);
+  }
+
+  .topbar-row {
+    display: flex;
     align-items: center;
     justify-content: space-between;
     flex-wrap: nowrap;
     gap: var(--space-2);
-    height: var(--mobile-topbar-height);
-    padding: var(--space-0) var(--space-3);
-    border-bottom: var(--border-width) solid var(--color-border);
-    background-color: var(--color-bg);
   }
 
   .topbar-left {
@@ -512,7 +521,8 @@
     padding-inline: var(--space-0);
     border: none;
     font-size: var(--text-md);
-    flex-shrink: 0;
+    min-width: 0;
+    flex-shrink: 1;
   }
 
   .topbar-right {
@@ -525,6 +535,46 @@
   .topbar-signout {
     color: var(--color-fg-muted);
     padding-inline: var(--space-2);
+  }
+
+  .topbar-meta {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
+    min-width: 0;
+  }
+
+  .topbar-account-wrap {
+    position: relative;
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  .topbar-account {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1p5);
+    max-width: 100%;
+    min-height: var(--control-height-sm);
+    padding-inline: var(--space-1p5);
+    border-radius: var(--radius-md);
+    color: var(--color-fg-muted);
+    font-size: var(--text-sm);
+    text-decoration: none;
+  }
+
+  .topbar-account:hover,
+  .topbar-account[aria-expanded="true"] {
+    background-color: var(--color-hover);
+    color: var(--color-fg);
+    text-decoration: none;
+  }
+
+  .topbar-account-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .page-host {
