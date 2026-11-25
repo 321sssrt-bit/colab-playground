@@ -198,6 +198,7 @@
 
 /* Main area: independent vertical scroll pane (mirrors desktop ScrollArea in root.rs) */
 .shell-main {
+  position: relative;
   flex: 1;
   min-width: 0;
   min-height: 0;

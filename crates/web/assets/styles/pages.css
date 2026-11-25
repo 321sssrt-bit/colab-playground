@@ -365,6 +365,7 @@
 }
 
 .settings-fieldset {
+  position: relative;
   border: none;
   padding: var(--space-0);
   min-width: 0;

@@ -62,12 +62,17 @@ class AppShellController {
 
   start() {
     window.addEventListener("hashchange", () => {
+      const raw = window.location.hash.replace(/^#\/?/, "").split("?")[0];
+      if (raw === "main-content") {
+        if (this.pageHostEl) this.pageHostEl.focus({ preventScroll: true });
+        return;
+      }
       const next = parseHashRoute();
       if (next !== this.route) {
         this.route = next;
         this.closeDrawer();
         if (state.authenticated) {
-          this.mountCurrentRoute();
+          this.mountCurrentRoute({ focusMain: true });
           this.renderChrome();
         }
       }
@@ -126,7 +131,7 @@ class AppShellController {
       window.location.hash = `#/${routeId}`;
     } else if (this.route !== routeId) {
       this.route = routeId;
-      this.mountCurrentRoute();
+      this.mountCurrentRoute({ focusMain: true });
       this.renderChrome();
     }
   }
@@ -160,21 +165,29 @@ class AppShellController {
     this.loginPage.unmount();
     this.buildShell();
     this.renderChrome();
-    this.mountCurrentRoute();
+    this.mountCurrentRoute({ focusMain: true });
   }
 
   buildShell() {
     this.sidebarEl = el("aside", { className: "sidebar" });
     this.topbarEl = el("header", { className: "topbar" });
     this.bannerEl = el("div", { className: "status-banner", hidden: true });
-    this.pageHostEl = el("main", { id: "main-content", className: "page-host" });
+    this.pageHostEl = el("main", { id: "main-content", className: "page-host", tabindex: "-1" });
     const backdrop = el("div", {
       className: "drawer-backdrop",
       onClick: () => this.closeDrawer({ restoreFocus: true }),
     });
     this.skipLinkEl = el(
       "a",
-      { href: "#main-content", className: "skip-link visually-hidden" },
+      {
+        href: "#main-content",
+        className: "skip-link visually-hidden",
+        onClick: (event) => {
+          event.preventDefault();
+          const target = this.pageHostEl?.querySelector("#page-heading") || this.pageHostEl;
+          if (target) target.focus({ preventScroll: true });
+        },
+      },
       t("web.shell.skip_to_content")
     );
 
@@ -218,7 +231,7 @@ class AppShellController {
     }
   }
 
-  mountCurrentRoute() {
+  mountCurrentRoute({ focusMain = false } = {}) {
     if (!this.pageHostEl) return;
     if (this.activeRouteId === this.route && this.activePage) {
       return;
@@ -235,6 +248,10 @@ class AppShellController {
     }
     if (window.scrollY > 0) {
       window.scrollTo(0, 0);
+    }
+    if (focusMain) {
+      const heading = this.pageHostEl.querySelector("#page-heading") || this.pageHostEl;
+      heading.focus({ preventScroll: true });
     }
     this.updateTitle();
   }
