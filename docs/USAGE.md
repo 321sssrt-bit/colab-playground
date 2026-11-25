@@ -85,8 +85,10 @@ The app checks GitHub for a newer release, and installs it when you ask.
 - Rust: the version in `rust-version` under `[workspace.package]` in
   [`Cargo.toml`](../Cargo.toml), or newer.
 - Linux desktop build: `libxkbcommon-x11-dev` and `libfontconfig-dev` (Ubuntu package names).
-  The [Web Server](#headless-web-server) builds with Cargo on Linux without desktop libraries.
-  Windows and macOS need nothing beyond the Rust toolchain.
+  The [Web Server](#headless-web-server) builds without Linux desktop libraries, and its compiled
+  binary needs no Node.js at runtime; building it from source needs Node.js 24 and `pnpm` to build
+  the embedded frontend bundle first. Windows and macOS desktop builds need nothing beyond the Rust
+  toolchain.
 - Real mode only: on Windows, WSL with a Linux distribution; inside it (or locally on macOS and
   Linux) `bash`, `ssh` for port forwarding, a keyring the CLI can use, and either the Colab CLI
   (`colab`, package `google-colab-cli`) or `uv` / `python3` to install it. Installing plugins from
@@ -141,10 +143,21 @@ another folder to keep experiments apart.
 
 ## Headless Web Server
 
-Start with demo data from a checkout. Run the command in an interactive terminal on the server.
+Build the embedded frontend bundle once from a clean checkout, then start the Web Server with demo
+data. Cargo embeds `crates/web/frontend/dist/` directly and never invokes `pnpm` during build. Run
+the server command in an interactive terminal.
 
 ```sh
+pnpm --dir crates/web/frontend install --frozen-lockfile
+pnpm --dir crates/web/frontend run build
 cargo run -p colab-playground-web --locked -- --mock --no-open
+```
+
+For local frontend hot-reload development, keep the `--mock` Web Server running and start Vite's
+dev server alongside it (`CPG_WEB_PROXY_TARGET` defaults to `http://127.0.0.1:3000`):
+
+```sh
+pnpm --dir crates/web/frontend dev
 ```
 
 Sign in at `http://127.0.0.1:3000` with the Web access key printed on first launch. Save the key

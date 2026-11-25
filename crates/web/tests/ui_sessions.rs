@@ -5,7 +5,6 @@ use std::{
     time::Duration,
 };
 
-use colab_playground_web::assets::{INDEX, lookup};
 use sha2::{Digest as _, Sha256};
 use ureq::{
     Agent,
@@ -102,70 +101,6 @@ fn login(agent: &Agent, origin: &str, key: &str) -> String {
     );
     assert_eq!(status, StatusCode::OK);
     format!("Bearer {}", cred["token"].as_str().unwrap())
-}
-
-#[test]
-fn sessions_ui_assets_mount_dialogs_outside_app_and_wire_sessions_route() {
-    assert!(
-        INDEX
-            .body
-            .contains("<dialog id=\"session-dialog\" class=\"modal-dialog\"></dialog>"),
-        "index.html must mount top-level session <dialog> outside #app"
-    );
-
-    let main_js = lookup("js/main.js").expect("main.js").body;
-    assert!(
-        main_js.contains("createSessionsPage"),
-        "main.js must wire sessions route to createSessionsPage"
-    );
-    assert!(
-        main_js.contains("initSessionDialogs"),
-        "main.js must initialize session dialogs"
-    );
-
-    let sessions_js = lookup("js/pages/sessions.js")
-        .expect("pages/sessions.js")
-        .body;
-    for marker in [
-        "app.b2.runtime_unmanaged",
-        "app.b5.runtime_auto_stop_app_only",
-        "web.sessions.watchdog_armed",
-        "web.sessions.stop_all",
-        "app.b2.stop_action",
-        "app.b2.forward_title",
-        "app.b3.sessions_estimate_note",
-    ] {
-        assert!(
-            sessions_js.contains(marker),
-            "pages/sessions.js missing expected key {marker}"
-        );
-    }
-
-    let dialogs_js = lookup("js/session-dialogs.js")
-        .expect("session-dialogs.js")
-        .body;
-    for marker in [
-        "web.forward.server_local",
-        "web.forward.downstream_auth",
-        "web.forward.bind_windows_or_wsl",
-        "web.forward.bind_loopback_listener",
-        "web.sessions.account_changed",
-        "app.b2.stop_wiped",
-        "app.b3.quit_stop_wiped",
-        "app.b2.forward_billing_note",
-        "app.b2.new_cancel_note",
-        "app.b2.prov_ready_below",
-        "clipboard-proxy",
-    ] {
-        assert!(
-            dialogs_js.contains(marker),
-            "session-dialogs.js missing expected key {marker}"
-        );
-    }
-    assert!(
-        sessions_js.contains("updateCountdowns"),
-        "pages/sessions.js must update countdowns in place without dropping focus"
-    );
 }
 
 #[test]

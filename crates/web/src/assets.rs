@@ -1,4 +1,4 @@
-//! Embedded zero-build frontend assets and 5-locale Web shell supplement dictionary.
+//! Embedded pre-built frontend assets and 5-locale Web shell supplement dictionary.
 
 use colab_playground_shared::i18n::Messages;
 
@@ -7,147 +7,10 @@ use colab_playground_shared::i18n::Messages;
 pub struct Asset {
     pub path: &'static str,
     pub content_type: &'static str,
-    pub body: &'static str,
+    pub body: &'static [u8],
 }
 
-const HTML: &str = "text/html; charset=utf-8";
-const CSS: &str = "text/css; charset=utf-8";
-const JS: &str = "text/javascript; charset=utf-8";
-const SVG: &str = "image/svg+xml";
-
-/// The HTML document served at `/`.
-pub const INDEX: Asset = Asset {
-    path: "index.html",
-    content_type: HTML,
-    body: include_str!("../assets/index.html"),
-};
-
-/// The SVG icon served at `/assets/favicon.svg` and `/favicon.ico`.
-pub const FAVICON: Asset = Asset {
-    path: "favicon.svg",
-    content_type: SVG,
-    body: include_str!("../assets/favicon.svg"),
-};
-
-/// Every static file served under `/assets/{path}`.
-pub const STATIC_ASSETS: &[Asset] = &[
-    FAVICON,
-    Asset {
-        path: "styles/tokens.css",
-        content_type: CSS,
-        body: include_str!("../assets/styles/tokens.css"),
-    },
-    Asset {
-        path: "styles/base.css",
-        content_type: CSS,
-        body: include_str!("../assets/styles/base.css"),
-    },
-    Asset {
-        path: "styles/shell.css",
-        content_type: CSS,
-        body: include_str!("../assets/styles/shell.css"),
-    },
-    Asset {
-        path: "styles/pages.css",
-        content_type: CSS,
-        body: include_str!("../assets/styles/pages.css"),
-    },
-    Asset {
-        path: "js/theme-init.js",
-        content_type: JS,
-        body: include_str!("../assets/js/theme-init.js"),
-    },
-    Asset {
-        path: "js/icons.js",
-        content_type: JS,
-        body: include_str!("../assets/js/icons.js"),
-    },
-    Asset {
-        path: "js/i18n.js",
-        content_type: JS,
-        body: include_str!("../assets/js/i18n.js"),
-    },
-    Asset {
-        path: "js/theme.js",
-        content_type: JS,
-        body: include_str!("../assets/js/theme.js"),
-    },
-    Asset {
-        path: "js/format.js",
-        content_type: JS,
-        body: include_str!("../assets/js/format.js"),
-    },
-    Asset {
-        path: "js/api.js",
-        content_type: JS,
-        body: include_str!("../assets/js/api.js"),
-    },
-    Asset {
-        path: "js/store.js",
-        content_type: JS,
-        body: include_str!("../assets/js/store.js"),
-    },
-    Asset {
-        path: "js/components.js",
-        content_type: JS,
-        body: include_str!("../assets/js/components.js"),
-    },
-    Asset {
-        path: "js/account-dialogs.js",
-        content_type: JS,
-        body: include_str!("../assets/js/account-dialogs.js"),
-    },
-    Asset {
-        path: "js/session-dialogs.js",
-        content_type: JS,
-        body: include_str!("../assets/js/session-dialogs.js"),
-    },
-    Asset {
-        path: "js/plugin-dialogs.js",
-        content_type: JS,
-        body: include_str!("../assets/js/plugin-dialogs.js"),
-    },
-    Asset {
-        path: "js/pages/login.js",
-        content_type: JS,
-        body: include_str!("../assets/js/pages/login.js"),
-    },
-    Asset {
-        path: "js/pages/overview.js",
-        content_type: JS,
-        body: include_str!("../assets/js/pages/overview.js"),
-    },
-    Asset {
-        path: "js/pages/sessions.js",
-        content_type: JS,
-        body: include_str!("../assets/js/pages/sessions.js"),
-    },
-    Asset {
-        path: "js/pages/plugins.js",
-        content_type: JS,
-        body: include_str!("../assets/js/pages/plugins.js"),
-    },
-    Asset {
-        path: "js/pages/accounts.js",
-        content_type: JS,
-        body: include_str!("../assets/js/pages/accounts.js"),
-    },
-    Asset {
-        path: "js/pages/settings.js",
-        content_type: JS,
-        body: include_str!("../assets/js/pages/settings.js"),
-    },
-    Asset {
-        path: "js/pages/placeholder.js",
-        content_type: JS,
-        body: include_str!("../assets/js/pages/placeholder.js"),
-    },
-    Asset {
-        path: "js/main.js",
-        content_type: JS,
-        body: include_str!("../assets/js/main.js"),
-    },
-];
+include!(concat!(env!("OUT_DIR"), "/embedded_assets.rs"));
 
 /// Looks up an embedded static asset by its exact relative path under `/assets/`.
 pub fn lookup(path: &str) -> Option<Asset> {
@@ -218,14 +81,6 @@ const SHELL_EN_US: Messages = &[
     (
         "web.shell.copy_failed",
         "Could not copy automatically. Select the path and copy it manually.",
-    ),
-    (
-        "web.shell.page_upcoming_title",
-        "Coming in a follow-up update",
-    ),
-    (
-        "web.shell.page_upcoming_body",
-        "This section is reserved in the web shell and will be enabled in upcoming releases.",
     ),
     ("web.overview.keyring_title", "OS keyring"),
     ("web.overview.keyring_ready", "Available and unlocked."),
@@ -420,11 +275,6 @@ const SHELL_ZH_CN: Messages = &[
         "web.shell.copy_failed",
         "无法自动复制，请选中路径后手动复制。",
     ),
-    ("web.shell.page_upcoming_title", "后续更新中提供"),
-    (
-        "web.shell.page_upcoming_body",
-        "该页面入口已在网页外壳中预留，将在后续迭代中启用。",
-    ),
     ("web.overview.keyring_title", "系统密钥环"),
     ("web.overview.keyring_ready", "可用且已解锁。"),
     ("web.overview.keyring_unknown", "等待 Colab CLI 检查完成。"),
@@ -599,11 +449,6 @@ const SHELL_ZH_TW: Messages = &[
     (
         "web.shell.copy_failed",
         "無法自動複製，請選取路徑後手動複製。",
-    ),
-    ("web.shell.page_upcoming_title", "後續更新中提供"),
-    (
-        "web.shell.page_upcoming_body",
-        "此頁面入口已在網頁外殼中預留，將於後續版本啟用。",
     ),
     ("web.overview.keyring_title", "系統鑰匙圈"),
     ("web.overview.keyring_ready", "可用且已解鎖。"),
@@ -782,14 +627,6 @@ const SHELL_JA_JP: Messages = &[
     (
         "web.shell.copy_failed",
         "自動コピーできませんでした。パスを選択して手動でコピーしてください。",
-    ),
-    (
-        "web.shell.page_upcoming_title",
-        "今後のアップデートで追加予定",
-    ),
-    (
-        "web.shell.page_upcoming_body",
-        "このセクションは Web シェルに予約されており、今後のリリースで有効になります。",
     ),
     ("web.overview.keyring_title", "OS キーリング"),
     (
@@ -1004,14 +841,6 @@ const SHELL_KO_KR: Messages = &[
     (
         "web.shell.copy_failed",
         "자동으로 복사할 수 없습니다. 경로를 선택해 직접 복사하세요.",
-    ),
-    (
-        "web.shell.page_upcoming_title",
-        "후속 업데이트에서 제공 예정",
-    ),
-    (
-        "web.shell.page_upcoming_body",
-        "이 섹션은 웹 셸에 예약되어 있으며 다음 릴리스에서 활성화됩니다.",
     ),
     ("web.overview.keyring_title", "OS 키링"),
     (

@@ -45,16 +45,65 @@ jobs:
           other=$(printf '%s\n' "$files" | grep -cvE '(\.md$|^docs/)' || true)
           if [ "$other" = 0 ]; then echo "code=false" >> "$GITHUB_OUTPUT"; fi
 
+  web-frontend:
+    name: Web Frontend (check, build)
+    needs: changes
+    # Runs on code PRs, pushes to `main`, or if `changes` failed.
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+          cache-dependency-path: crates/web/frontend/pnpm-lock.yaml
+      - run: pnpm --dir crates/web/frontend install --frozen-lockfile
+      - run: pnpm --dir crates/web/frontend run check
+      - run: pnpm --dir crates/web/frontend run build
+      - name: Verify frontend build outputs
+        run: |
+          test -f crates/web/frontend/dist/index.html
+          test -f crates/web/frontend/.generated/i18n-keys.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-frontend-dist
+          path: |
+            crates/web/frontend/dist/
+            crates/web/frontend/.generated/i18n-keys.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+
   linux:
     name: Linux (fmt, clippy, test)
-    needs: changes
-    # Runs even when `changes` failed, so a lookup that broke never passes for a build.
+    needs: [changes, web-frontend]
+    # Runs even when `changes` or `web-frontend` failed so the required check never skips green.
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
+      - name: Require web-frontend build
+        if: needs.changes.outputs.code != 'false' && needs.web-frontend.result != 'success'
+        run: |
+          echo "web-frontend job did not succeed (result: ${{ needs.web-frontend.result }})" >&2
+          exit 1
       - uses: actions/checkout@v7
         if: needs.changes.outputs.code != 'false'
+      - uses: actions/download-artifact@v4
+        if: needs.changes.outputs.code != 'false'
+        with:
+          name: web-frontend-dist
+          path: crates/web/frontend
+      - name: Verify restored frontend artifacts
+        if: needs.changes.outputs.code != 'false'
+        run: |
+          test -f crates/web/frontend/dist/index.html
+          test -f crates/web/frontend/.generated/i18n-keys.json
       - uses: dtolnay/rust-toolchain@v1
         if: needs.changes.outputs.code != 'false'
         with:
@@ -78,14 +127,29 @@ jobs:
 
   web:
     name: Headless Linux (Web fmt, clippy, test)
-    needs: changes
+    needs: [changes, web-frontend]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     container: rust:1.98-slim-bookworm
     timeout-minutes: 45
     steps:
+      - name: Require web-frontend build
+        if: needs.changes.outputs.code != 'false' && needs.web-frontend.result != 'success'
+        run: |
+          echo "web-frontend job did not succeed (result: ${{ needs.web-frontend.result }})" >&2
+          exit 1
       - uses: actions/checkout@v7
         if: needs.changes.outputs.code != 'false'
+      - uses: actions/download-artifact@v4
+        if: needs.changes.outputs.code != 'false'
+        with:
+          name: web-frontend-dist
+          path: crates/web/frontend
+      - name: Verify restored frontend artifacts
+        if: needs.changes.outputs.code != 'false'
+        run: |
+          test -f crates/web/frontend/dist/index.html
+          test -f crates/web/frontend/.generated/i18n-keys.json
       - run: rustup component add rustfmt clippy
         if: needs.changes.outputs.code != 'false'
       - run: cargo fmt -p colab-playground-web -- --check

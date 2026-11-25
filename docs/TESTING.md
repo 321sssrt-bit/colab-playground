@@ -25,9 +25,15 @@ The commands CI runs on each platform are in
 
 - UI tests (`crates/app/tests/ui/`) render the real views headless under GPUI's `TestAppContext`,
   with the mock backend only.
-- Headless Linux CI formats, lints, and tests `colab-playground-web` in a Rust container.
-  Its tests use the mock backend and check the embedded assets. To run the Web tests on their
-  own, use `cargo test -p colab-playground-web --locked`.
+- The Web frontend (`crates/web/frontend/`) is checked and built once per CI run in the
+  `Web Frontend (check, build)` job (`pnpm --dir crates/web/frontend install --frozen-lockfile`,
+  `pnpm --dir crates/web/frontend run check`, and `pnpm --dir crates/web/frontend run build`),
+  which runs TypeScript type checking, the AST static checker, and the Vite production build before
+  passing `dist/` and the generated i18n key manifest downstream.
+- Headless Linux CI formats, lints, and tests `colab-playground-web` in a Rust container using the
+  pre-built frontend bundle. Its tests use the mock backend and verify the embedded assets, headers,
+  and i18n key coverage. Locally, run the frontend `check` and `build` commands above before
+  `cargo test -p colab-playground-web --locked`.
 - `RealBackend` is tested against a fake `colab`, keyring and `ssh` (`crates/core/tests/fake/`).
   Those tests are unix-only: they run on Linux and macOS, not on Windows.
 - No test runs the real `colab` ([hard safety rules](DESIGN.md#hard-safety-rules)). The ignored,

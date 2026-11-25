@@ -5,7 +5,6 @@ use std::{
     time::Duration,
 };
 
-use colab_playground_web::assets::{INDEX, lookup};
 use sha2::{Digest as _, Sha256};
 
 struct Server(Child);
@@ -41,43 +40,6 @@ fn spawn_mock_server(dir: &Path, access_key: &str) -> (Server, String) {
         .unwrap_or_else(|| panic!("unexpected startup line: {line:?}"))
         .to_owned();
     (server, format!("http://{addr}"))
-}
-
-#[test]
-fn accounts_assets_use_native_dialog_and_user_clickable_oauth_link() {
-    assert!(
-        INDEX.body.contains("<dialog id=\"account-dialog\""),
-        "index.html must mount the top-level native account dialog outside #app"
-    );
-    let page = lookup("js/pages/accounts.js").expect("accounts page asset");
-    let dialogs = lookup("js/account-dialogs.js").expect("account dialogs asset");
-    let main = lookup("js/main.js").expect("main shell asset");
-
-    assert!(
-        main.body.contains("createAccountsPage"),
-        "main.js must wire the real Accounts page instead of placeholder"
-    );
-    assert!(
-        dialogs.body.contains("target: \"_blank\"")
-            && dialogs.body.contains("rel: \"noopener noreferrer\""),
-        "OAuth sign-in must render an explicit user-clickable new-tab link"
-    );
-    assert!(
-        !dialogs.body.contains("window.open("),
-        "OAuth sign-in must not trigger browser-blocked async window.open popups"
-    );
-    assert!(
-        page.body.contains("app.accounts.remove_active")
-            && page.body.contains("app.accounts.remove_running"),
-        "Accounts page must explain why active or busy accounts cannot be removed"
-    );
-    assert!(
-        dialogs.body.contains("app.switch.tunnels")
-            && dialogs.body.contains("app.switch.sessions")
-            && dialogs.body.contains("app.b3.switch_unmanaged")
-            && dialogs.body.contains("app.b10.switch_unmanaged_unknown"),
-        "Switch impact confirmation dialog must render full tunnel, managed, and unmanaged impacts"
-    );
 }
 
 #[test]
