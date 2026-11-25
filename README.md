@@ -93,6 +93,8 @@ Requirements, backend flags, demo scenarios and where settings are stored:
 
 - [docs/USAGE.md](docs/USAGE.md): install a release, build and run, demo data, where things are
   stored.
+- [Headless Web Server](docs/USAGE.md#headless-web-server) for demo startup, remote access, and
+  Linux keyring setup.
 - [docs/PLUGINS.md](docs/PLUGINS.md): writing a plugin (manifest, environment, status, security).
 - [docs/DESIGN.md](docs/DESIGN.md): the product principle, the scope and the rules every change
   follows.

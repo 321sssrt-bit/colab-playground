@@ -76,6 +76,25 @@ jobs:
       - run: cargo test --workspace --locked
         if: needs.changes.outputs.code != 'false'
 
+  web:
+    name: Headless Linux (Web fmt, clippy, test)
+    needs: changes
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    container: rust:1.98-slim-bookworm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        if: needs.changes.outputs.code != 'false'
+      - run: rustup component add rustfmt clippy
+        if: needs.changes.outputs.code != 'false'
+      - run: cargo fmt -p colab-playground-web -- --check
+        if: needs.changes.outputs.code != 'false'
+      - run: cargo clippy -p colab-playground-web --all-targets --locked -- -D warnings
+        if: needs.changes.outputs.code != 'false'
+      - run: cargo test -p colab-playground-web --locked
+        if: needs.changes.outputs.code != 'false'
+
   check:
     name: ${{ matrix.os }} (check, tests)
     needs: changes

@@ -231,9 +231,9 @@ Does not match (release-please's fixed format):
 
    Only those two CI jobs are required. The macOS CI job often waits for a runner that is never
    assigned, and Release and Package do not run on every pull request, so requiring any of them
-   would block every merge. The macOS job still runs when a runner is assigned. The required
-   names are the job names in [`ci.yml`](../.github/workflows/ci.yml): change one and the ruleset
-   must follow.
+   would block every merge. The macOS job still runs when a runner is assigned. Headless Linux
+   checks the Web Server in a container on code pull requests. The required names are the job
+   names in [`ci.yml`](../.github/workflows/ci.yml): change one and the ruleset must follow.
 
 3. **Merge by squashing only.** Settings → General → Pull Requests: tick only **Allow squash
    merging**, with the default commit message set to "Default to pull request title and commit
