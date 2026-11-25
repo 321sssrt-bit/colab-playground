@@ -238,7 +238,7 @@ class AppShellController {
 
     const signOut = () => handleSessionLost({ expired: false });
 
-    // Sidebar
+    // Sidebar (1:1 mirror of titlebar.rs + sidebar.rs)
     clear(this.sidebarEl);
     this.sidebarEl.append(
       el(
@@ -247,7 +247,7 @@ class AppShellController {
         el(
           "div",
           { className: "brand-mark" },
-          icon("zap", "icon-md icon-accent"),
+          icon("zap", "icon-accent"),
           el("span", { className: "brand-name" }, t("app.name"))
         ),
         el(
@@ -263,66 +263,79 @@ class AppShellController {
         )
       ),
       el(
-        "button",
-        {
-          type: "button",
-          className: "sidebar-account",
-          title: accountLabel,
-          onClick: () => this.navigate("accounts"),
-        },
-        icon("user", "icon-muted"),
-        el("span", { className: "sidebar-account-text" }, accountLabel)
-      ),
-      el(
-        "nav",
-        { "aria-label": t("web.shell.primary_nav") },
-        el(
-          "ul",
-          { className: "nav-list" },
-          ROUTES.map((item) =>
-            el(
-              "li",
-              null,
-              el(
-                "a",
-                {
-                  href: `#/${item.id}`,
-                  className: "nav-link",
-                  "aria-current": item.id === this.route ? "page" : null,
-                  onClick: () => this.closeDrawer(),
-                },
-                icon(item.iconName),
-                el("span", { className: "nav-label" }, t(item.titleKey)),
-                hasUpdate && item.id === "settings" ? badge(t("app.b7.update_badge"), "info") : null
-              )
-            )
-          )
-        )
-      ),
-      el("div", { className: "sidebar-spacer" }),
-      el(
         "div",
-        { className: "sidebar-footer" },
-        el(
-          "div",
-          { className: "sidebar-badges" },
-          badge(usageInfo.text, usageInfo.stale ? "warning" : "neutral"),
-          isMock ? badge(t("app.shell.backend.mock"), "warning") : null
-        ),
+        { className: "sidebar-body" },
         el(
           "button",
           {
             type: "button",
-            className: "btn btn-sm btn-ghost",
-            onClick: signOut,
+            className: "sidebar-account",
+            title: accountLabel,
+            onClick: () => this.navigate("accounts"),
           },
-          icon("logOut"),
-          t("web.shell.sign_out")
+          icon("user", "icon-muted"),
+          el("span", { className: "sidebar-account-text" }, accountLabel),
+          icon("chevronDown", "icon-subtle")
+        ),
+        el(
+          "nav",
+          { "aria-label": t("web.shell.primary_nav") },
+          el(
+            "ul",
+            { className: "nav-list" },
+            ROUTES.map((item) =>
+              el(
+                "li",
+                null,
+                el(
+                  "a",
+                  {
+                    href: `#/${item.id}`,
+                    className: "nav-link",
+                    "aria-current": item.id === this.route ? "page" : null,
+                    onClick: () => this.closeDrawer(),
+                  },
+                  icon(item.iconName),
+                  el("span", { className: "nav-label" }, t(item.titleKey)),
+                  hasUpdate && item.id === "settings"
+                    ? el("span", { className: "nav-count" }, t("app.b7.update_badge"))
+                    : null
+                )
+              )
+            )
+          )
+        ),
+        el("div", { className: "sidebar-spacer" }),
+        el(
+          "div",
+          { className: "sidebar-footer" },
+          el(
+            "div",
+            { className: "sidebar-badges" },
+            badge(usageInfo.text, usageInfo.stale ? "warning" : "neutral"),
+            isMock
+              ? el(
+                  "span",
+                  { title: t("app.shell.backend.mock.hint") },
+                  badge(t("app.shell.backend.mock"), "warning")
+                )
+              : null
+          ),
+          el(
+            "button",
+            {
+              type: "button",
+              className: "btn btn-ghost sidebar-signout",
+              onClick: signOut,
+            },
+            icon("logOut"),
+            t("web.shell.sign_out")
+          )
         )
       )
     );
 
-    // Top bar
+    // Mobile-only compact single-line top bar (hidden on desktop)
     clear(this.topbarEl);
     this.topbarEl.append(
       el(
@@ -332,7 +345,7 @@ class AppShellController {
           "button",
           {
             type: "button",
-            className: "btn btn-sm btn-ghost btn-icon topbar-menu-btn",
+            className: "btn btn-sm btn-ghost btn-icon",
             dataset: { drawerOpen: "true" },
             "aria-label": t("web.shell.menu_open"),
             "aria-expanded": String(this.drawerOpen),
@@ -350,20 +363,11 @@ class AppShellController {
       el(
         "div",
         { className: "topbar-right" },
-        isMock
-          ? el(
-              "span",
-              { title: t("app.shell.backend.mock.hint") },
-              badge(t("app.shell.backend.mock"), "warning")
-            )
-          : null,
-        badge(accountLabel, "neutral", "topbar-account"),
-        badge(usageInfo.text, usageInfo.stale ? "warning" : "neutral", "topbar-usage"),
         el(
           "button",
           {
             type: "button",
-            className: "btn btn-sm btn-ghost",
+            className: "btn btn-sm btn-ghost topbar-signout",
             onClick: signOut,
           },
           icon("logOut"),

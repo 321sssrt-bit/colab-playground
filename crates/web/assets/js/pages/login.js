@@ -29,7 +29,7 @@ export function createLoginPage() {
       id: keyInputId,
       name: "access_key",
       type: showKey ? "text" : "password",
-      className: "input mono",
+      className: "input input-lg mono",
       autocomplete: "current-password",
       autocorrect: "off",
       autocapitalize: "none",
@@ -56,7 +56,7 @@ export function createLoginPage() {
       "button",
       {
         type: "button",
-        className: "btn btn-icon",
+        className: "btn btn-lg btn-icon",
         "aria-pressed": String(showKey),
         "aria-label": t(showKey ? "input.hide_password" : "input.show_password"),
         disabled: submitting,
@@ -74,7 +74,7 @@ export function createLoginPage() {
       "button",
       {
         type: "submit",
-        className: "btn btn-primary login-submit",
+        className: "btn btn-lg btn-primary login-submit",
         disabled: submitting,
       },
       submitting ? el("span", { className: "spinner", "aria-hidden": "true" }) : null,
@@ -145,39 +145,35 @@ export function createLoginPage() {
     const prefsBar = el(
       "div",
       { className: "login-topbar" },
-      el(
-        "div",
-        { className: "brand-mark" },
-        icon("zap", "icon-md icon-accent"),
-        el("span", { className: "brand-name" }, t("app.name"))
-      ),
-      el(
-        "div",
-        { className: "login-prefs" },
-        languageSelect({
-          id: "login-language",
-          value: getLanguagePreference(),
-          ariaLabel: t("app.settings.language.title"),
-          compact: true,
-          onChange: (next) => {
-            recordLoginLanguageChoice(next);
-            void setLanguagePreference(next, { persist: true });
-          },
-        }),
-        appearanceSegmented({
-          name: "login-appearance",
-          value: getAppearancePreference(),
-          onChange: (next) => {
-            recordLoginAppearanceChoice(next);
-            setAppearancePreference(next, { persist: true });
-          },
-        })
-      )
+      languageSelect({
+        id: "login-language",
+        value: getLanguagePreference(),
+        ariaLabel: t("app.settings.language.title"),
+        compact: true,
+        onChange: (next) => {
+          recordLoginLanguageChoice(next);
+          void setLanguagePreference(next, { persist: true });
+        },
+      }),
+      appearanceSegmented({
+        name: "login-appearance",
+        value: getAppearancePreference(),
+        onChange: (next) => {
+          recordLoginAppearanceChoice(next);
+          setAppearancePreference(next, { persist: true });
+        },
+      })
     );
 
     const card = el(
       "section",
       { className: "card login-card" },
+      el(
+        "div",
+        { className: "brand-mark login-brand" },
+        icon("zap", "icon-accent"),
+        el("span", { className: "brand-name" }, t("app.name"))
+      ),
       el(
         "div",
         { className: "login-header" },

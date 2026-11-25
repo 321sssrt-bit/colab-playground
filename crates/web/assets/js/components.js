@@ -69,10 +69,10 @@ export function alertBox({ tone = "info", title = null, body = null, actions = n
     info: "info",
   };
   const iconToneMap = {
-    warning: "icon-warning",
-    danger: "icon-danger",
-    success: "icon-success",
-    info: "icon-accent",
+    warning: "icon-md icon-warning",
+    danger: "icon-md icon-danger",
+    success: "icon-md icon-success",
+    info: "icon-md icon-info",
   };
   const textChildren = [];
   if (title) {
@@ -81,6 +81,9 @@ export function alertBox({ tone = "info", title = null, body = null, actions = n
   if (body) {
     textChildren.push(el("div", { className: "alert-body" }, body));
   }
+  if (actions) {
+    textChildren.push(el("div", { className: "alert-actions" }, actions));
+  }
   const attrs = {
     className: `alert alert-${tone}`,
     role: live ? (tone === "danger" ? "alert" : "status") : null,
@@ -88,13 +91,8 @@ export function alertBox({ tone = "info", title = null, body = null, actions = n
   return el(
     "div",
     attrs,
-    el(
-      "div",
-      { className: "alert-content" },
-      icon(iconMap[tone] || "info", iconToneMap[tone] || "icon-accent"),
-      el("div", { className: "alert-text" }, textChildren)
-    ),
-    actions ? el("div", { className: "card-actions" }, actions) : null
+    el("span", { className: "alert-icon" }, icon(iconMap[tone] || "info", iconToneMap[tone] || "icon-md icon-info")),
+    el("div", { className: "alert-text" }, textChildren)
   );
 }
 
@@ -103,7 +101,7 @@ export function languageSelect({ id, value, onChange, ariaLabel, compact = false
     "select",
     {
       id,
-      className: compact ? "select select-sm select-inline" : "select select-inline",
+      className: compact ? "select select-sm select-compact" : "select select-inline",
       "aria-label": ariaLabel || null,
       onChange: (event) => onChange(event.target.value),
     },

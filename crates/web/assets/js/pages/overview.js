@@ -77,7 +77,9 @@ export function createOverviewPage({ navigate }) {
       "button",
       {
         type: "button",
-        className: "btn btn-sm btn-ghost",
+        className: "btn btn-ghost btn-icon",
+        "aria-label": t("app.usage.refresh"),
+        title: t("app.usage.refresh"),
         disabled: refreshingUsage,
         onClick: async () => {
           refreshingUsage = true;
@@ -90,8 +92,7 @@ export function createOverviewPage({ navigate }) {
           }
         },
       },
-      icon("refresh"),
-      t("app.usage.refresh")
+      icon("refresh")
     );
 
     const tile = (label, value, extraBadge = null, note = null) =>
@@ -149,7 +150,28 @@ export function createOverviewPage({ navigate }) {
     if (!unmanaged || !unmanaged.warning_key) {
       return null;
     }
-    const body = t(unmanaged.warning_key, { count: unmanaged.count ?? 0 });
+    let body = t(unmanaged.warning_key, { count: unmanaged.count ?? 0 });
+    if (!unmanaged.incomplete && Array.isArray(state.snapshot?.runtimes?.runtimes)) {
+      const counts = new Map();
+      for (const runtime of state.snapshot.runtimes.runtimes) {
+        if (runtime && runtime.managed === false) {
+          const key = runtime.id?.account || runtime.account_email || "";
+          const entry = counts.get(key) || { email: runtime.account_email, count: 0 };
+          entry.count += 1;
+          counts.set(key, entry);
+        }
+      }
+      if (counts.size > 0) {
+        body = Array.from(counts.values())
+          .map(({ email, count }) => {
+            const label = formatEmail(email);
+            return count === 1
+              ? t("app.unmanaged.one", { email: label })
+              : t("app.unmanaged.many", { count, email: label });
+          })
+          .join("\n");
+      }
+    }
     const title = unmanaged.incomplete
       ? t("app.unmanaged.unknown_title")
       : t("app.unmanaged.title");
@@ -509,23 +531,18 @@ export function createOverviewPage({ navigate }) {
       ),
       el(
         "div",
-        { className: "deploy-grid" },
+        { className: "deploy-list" },
         enabled.map((info) => {
           const name = localized(info.manifest.name) || info.manifest.id;
           const desc = localized(info.manifest.description);
           return el(
             "article",
-            { className: "card" },
+            { className: "card card-compact" },
             el(
               "div",
-              { className: "deploy-card-head" },
-              el(
-                "div",
-                { className: "deploy-card-title" },
-                icon("rocket", "icon-accent"),
-                el("span", null, name)
-              ),
-              badge(t("app.b2.plugin_version_short", { version: info.manifest.version }), "neutral")
+              { className: "deploy-card-title" },
+              icon("rocket", "icon-accent"),
+              el("span", null, name)
             ),
             desc ? el("p", { className: "card-desc" }, desc) : null,
             el(
@@ -535,7 +552,7 @@ export function createOverviewPage({ navigate }) {
                 "button",
                 {
                   type: "button",
-                  className: "btn btn-sm btn-primary",
+                  className: "btn btn-primary",
                   onClick: () => navigate("plugins"),
                 },
                 icon("rocket"),
@@ -585,19 +602,16 @@ export function createOverviewPage({ navigate }) {
 
     const overview = state.overview;
     const ready = isChecklistComplete(overview);
-    const checklistCard = renderChecklistCard(overview);
     const unmanagedAlert = renderUnmanagedAlert(overview);
-    const quickDeploy = renderQuickDeploySection();
 
     if (ready) {
       bodyEl.appendChild(renderSummaryCard());
       if (unmanagedAlert) bodyEl.appendChild(unmanagedAlert);
+      const quickDeploy = renderQuickDeploySection();
       if (quickDeploy) bodyEl.appendChild(quickDeploy);
-      bodyEl.appendChild(checklistCard);
     } else {
-      bodyEl.appendChild(checklistCard);
+      bodyEl.appendChild(renderChecklistCard(overview));
       if (unmanagedAlert) bodyEl.appendChild(unmanagedAlert);
-      if (quickDeploy) bodyEl.appendChild(quickDeploy);
     }
   }
 
@@ -606,7 +620,7 @@ export function createOverviewPage({ navigate }) {
       root = container;
       clear(root);
       headerEl = el("header", { className: "page-header" });
-      bodyEl = el("div", { className: "section-stack" });
+      bodyEl = el("div", { className: "page-sections" });
       root.append(headerEl, bodyEl);
       renderHeader();
       renderBody();

@@ -65,7 +65,10 @@ export function createSettingsPage() {
     if (!noticesEl) return;
     clear(noticesEl);
     const settings = state.settings;
-    if (!settings) return;
+    if (!settings) {
+      noticesEl.hidden = true;
+      return;
+    }
     if (settings.load_status === "corrupt") {
       const body = settings.corrupt_backup
         ? t("app.toast.settings_reset.body", { file: settings.corrupt_backup })
@@ -89,6 +92,7 @@ export function createSettingsPage() {
         })
       );
     }
+    noticesEl.hidden = noticesEl.childElementCount === 0;
   }
 
   function settingsRow(title, desc, control) {
@@ -142,7 +146,7 @@ export function createSettingsPage() {
     generalEl.appendChild(
       el(
         "section",
-        { className: "card" },
+        { className: "card settings-section" },
         el(
           "div",
           { className: "card-heading" },
@@ -521,7 +525,7 @@ export function createSettingsPage() {
     const form = el(
       "form",
       {
-        className: "card",
+        className: "card settings-section",
         "aria-labelledby": formTitleId,
         onSubmit: async (event) => {
           event.preventDefault();
@@ -717,7 +721,7 @@ export function createSettingsPage() {
     aboutEl.appendChild(
       el(
         "section",
-        { className: "card" },
+        { className: "card settings-section" },
         el(
           "div",
           { className: "card-heading" },
@@ -757,11 +761,14 @@ export function createSettingsPage() {
       saving = false;
       clear(root);
       headerEl = el("header", { className: "page-header" });
-      noticesEl = el("div", { className: "section-stack" });
+      noticesEl = el("div", { className: "section-stack", hidden: true });
       generalEl = el("div");
       defaultsEl = el("div");
       aboutEl = el("div");
-      root.append(headerEl, noticesEl, generalEl, defaultsEl, aboutEl);
+      root.append(
+        headerEl,
+        el("div", { className: "page-sections" }, noticesEl, generalEl, defaultsEl, aboutEl)
+      );
 
       renderHeader();
       renderNotices();
