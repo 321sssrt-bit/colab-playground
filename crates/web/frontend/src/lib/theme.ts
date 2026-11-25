@@ -7,8 +7,6 @@ import { useSyncExternalStore } from "react";
 
 import type { AppearancePref } from "./types.ts";
 
-export type { AppearancePref } from "./types.ts";
-
 export const APPEARANCE_STORAGE_KEY = "cpg_appearance";
 
 export const APPEARANCE_OPTIONS: readonly AppearancePref[] = ["light", "dark", "system"];
@@ -18,7 +16,7 @@ export interface ThemeState {
 }
 
 export interface ThemeStoreOptions {
-  readonly storage?: Pick<Storage, "getItem" | "setItem" | "removeItem"> | null;
+  readonly storage?: Pick<Storage, "getItem" | "setItem"> | null;
   readonly doc?: Pick<Document, "documentElement" | "querySelector"> | null;
   readonly win?: Pick<Window, "addEventListener" | "removeEventListener"> | null;
 }
@@ -52,7 +50,7 @@ function applyAppearanceToDocument(
   doc.documentElement.dataset.theme = pref;
 }
 
-function resolveDefaultStorage(): Pick<Storage, "getItem" | "setItem" | "removeItem"> | null {
+function resolveDefaultStorage(): Pick<Storage, "getItem" | "setItem"> | null {
   try {
     return typeof window !== "undefined" ? window.localStorage : null;
   } catch {
@@ -80,7 +78,7 @@ function readStoredAppearance(
 }
 
 function writeStoredAppearance(
-  storage: Pick<Storage, "setItem" | "removeItem"> | null,
+  storage: Pick<Storage, "setItem"> | null,
   pref: AppearancePref,
 ): void {
   if (!storage) {

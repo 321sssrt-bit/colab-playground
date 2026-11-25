@@ -89,7 +89,6 @@ export function LoginPage({
       return;
     }
 
-    submitAbortRef.current?.abort();
     const controller = new AbortController();
     submitAbortRef.current = controller;
 

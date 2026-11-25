@@ -7,8 +7,6 @@ import { useSyncExternalStore } from "react";
 
 import type { LanguagePref, Locale } from "./types.ts";
 
-export type { LanguagePref, Locale } from "./types.ts";
-
 export type Dictionary = Readonly<Record<string, string>>;
 
 export type I18nParams = Readonly<Record<string, string | number>>;
@@ -41,7 +39,7 @@ export interface I18nState {
 
 export interface I18nStoreOptions {
   readonly fetchImpl?: typeof fetch;
-  readonly storage?: Pick<Storage, "getItem" | "setItem" | "removeItem"> | null;
+  readonly storage?: Pick<Storage, "getItem" | "setItem"> | null;
   readonly getBrowserLanguages?: () => readonly string[];
   readonly doc?: Pick<Document, "documentElement" | "title" | "visibilityState" | "addEventListener" | "removeEventListener"> | null;
   readonly win?: Pick<Window, "addEventListener" | "removeEventListener"> | null;
@@ -170,7 +168,7 @@ export async function loadDictionary(
   return raw as Dictionary;
 }
 
-function resolveDefaultStorage(): Pick<Storage, "getItem" | "setItem" | "removeItem"> | null {
+function resolveDefaultStorage(): Pick<Storage, "getItem" | "setItem"> | null {
   try {
     return typeof window !== "undefined" ? window.localStorage : null;
   } catch {
@@ -198,7 +196,7 @@ function readStoredLanguage(
 }
 
 function writeStoredLanguage(
-  storage: Pick<Storage, "setItem" | "removeItem"> | null,
+  storage: Pick<Storage, "setItem"> | null,
   pref: LanguagePref,
 ): void {
   if (!storage) {
