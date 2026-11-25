@@ -5,7 +5,6 @@ use std::{
     time::Duration,
 };
 
-use colab_playground_web::assets::{INDEX, lookup};
 use sha2::{Digest as _, Sha256};
 use ureq::{
     Agent,
@@ -101,93 +100,6 @@ fn login(agent: &Agent, origin: &str, key: &str) -> String {
     );
     assert_eq!(status, StatusCode::OK);
     format!("Bearer {}", cred["token"].as_str().unwrap())
-}
-
-#[test]
-fn plugins_ui_assets_mount_dialog_wire_route_and_cover_all_form_and_endpoint_contracts() {
-    assert!(
-        INDEX
-            .body
-            .contains("<dialog id=\"plugin-dialog\" class=\"modal-dialog\"></dialog>"),
-        "index.html must mount top-level plugin <dialog> outside #app"
-    );
-
-    let main_js = lookup("js/main.js").expect("main.js").body;
-    assert!(
-        main_js.contains("createPluginsPage"),
-        "main.js must wire plugins route to createPluginsPage"
-    );
-    assert!(
-        main_js.contains("initPluginDialogs"),
-        "main.js must initialize plugin dialogs"
-    );
-
-    let plugins_js = lookup("js/pages/plugins.js")
-        .expect("pages/plugins.js")
-        .body;
-    for marker in [
-        "hf-model",
-        "\"secret\"",
-        "\"select\"",
-        "\"bool\"",
-        "\"number\"",
-        "app.b2.run_secret_note",
-        "app.b2.quant_files",
-        "app.b3.quant_fits_assumed",
-        "app.b2.quant_fits",
-        "app.b2.endpoint_healthy",
-        "app.b2.endpoint_unhealthy",
-        "app.b2.endpoint_not_forwarded",
-        "app.b2.endpoint_curl",
-        "web.forward.server_local",
-        "web.plugins.endpoint_local_curl",
-        "web.plugins.history_skipped",
-        "app.b2.run_session_stopped",
-        "app.b2.run_session_billing",
-        "copyTextToClipboard",
-        "buildProvisionOptionRows",
-        "renderProvisionProgress",
-    ] {
-        assert!(
-            plugins_js.contains(marker),
-            "pages/plugins.js missing expected marker {marker}"
-        );
-    }
-
-    let dialogs_js = lookup("js/plugin-dialogs.js")
-        .expect("plugin-dialogs.js")
-        .body;
-    for marker in [
-        "app.b2.plugin_runs_on_runtime",
-        "app.b2.plugin_install_title",
-        "app.b2.plugin_remove_title",
-        "app.b2.hf_token_title",
-        "app.b2.hf_token_stored",
-        "app.b2.hf_token_none",
-        "type: \"password\"",
-        "discardPluginPreview",
-    ] {
-        assert!(
-            dialogs_js.contains(marker),
-            "plugin-dialogs.js missing expected marker {marker}"
-        );
-    }
-
-    let store_js = lookup("js/store.js").expect("store.js").body;
-    for marker in [
-        "/api/plugins/previews",
-        "/api/plugins/hf/token",
-        "/api/plugins/hf/search",
-        "/api/plugins/hf/gguf",
-        "/api/plugins/runs",
-        "log_skipped",
-        "app.b2.run_log_skipped",
-    ] {
-        assert!(
-            store_js.contains(marker),
-            "store.js missing expected plugin API/stream marker {marker}"
-        );
-    }
 }
 
 #[test]

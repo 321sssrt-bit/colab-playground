@@ -7,7 +7,8 @@ use std::{
 };
 
 use colab_playground_shared::i18n::CATALOGS;
-use colab_playground_web::assets::{SHELL_CATALOGS, STATIC_ASSETS};
+use colab_playground_web::assets::{FAVICON, SHELL_CATALOGS, STATIC_ASSETS, lookup};
+use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
 fn placeholders(text: &str) -> BTreeSet<String> {
@@ -30,6 +31,124 @@ fn placeholders(text: &str) -> BTreeSet<String> {
     found
 }
 
+#[derive(Debug, Default)]
+struct HtmlRefs {
+    scripts: Vec<(usize, String)>,
+    stylesheets: Vec<(usize, String)>,
+    icons: Vec<(usize, String)>,
+}
+
+fn parse_html_attrs(tag_body: &str) -> BTreeMap<String, String> {
+    let mut attrs = BTreeMap::new();
+    let mut rest = tag_body;
+    while !rest.is_empty() {
+        rest = rest.trim_start_matches(|ch: char| ch.is_ascii_whitespace() || ch == '/');
+        if rest.is_empty() {
+            break;
+        }
+        let name_end = rest
+            .find(|ch: char| ch.is_ascii_whitespace() || matches!(ch, '=' | '/'))
+            .unwrap_or(rest.len());
+        if name_end == 0 {
+            rest = &rest[1..];
+            continue;
+        }
+        let name = rest[..name_end].to_ascii_lowercase();
+        rest = rest[name_end..].trim_start();
+        let value = if let Some(after_eq) = rest.strip_prefix('=') {
+            let rhs = after_eq.trim_start();
+            match rhs.as_bytes().first() {
+                Some(&quote @ (b'"' | b'\'')) => {
+                    let tail = &rhs[1..];
+                    let end = tail.find(char::from(quote)).unwrap_or(tail.len());
+                    let val = &tail[..end];
+                    rest = if end < tail.len() {
+                        &tail[end + 1..]
+                    } else {
+                        ""
+                    };
+                    val.to_owned()
+                }
+                _ => {
+                    let end = rhs
+                        .find(|ch: char| ch.is_ascii_whitespace() || ch == '/')
+                        .unwrap_or(rhs.len());
+                    let val = &rhs[..end];
+                    rest = &rhs[end..];
+                    val.to_owned()
+                }
+            }
+        } else {
+            String::new()
+        };
+        attrs.insert(name, value);
+    }
+    attrs
+}
+
+fn extract_html_refs(html: &str) -> HtmlRefs {
+    let mut refs = HtmlRefs::default();
+    let mut cursor = 0;
+    while let Some(rel_lt) = html[cursor..].find('<') {
+        let lt = cursor + rel_lt;
+        if html[lt..].starts_with("<!--") {
+            let Some(rel_end) = html[lt + 4..].find("-->") else {
+                break;
+            };
+            cursor = lt + 4 + rel_end + 3;
+            continue;
+        }
+        let Some(rel_gt) = html[lt + 1..].find('>') else {
+            break;
+        };
+        let gt = lt + 1 + rel_gt;
+        let inner = html[lt + 1..gt].trim();
+        cursor = gt + 1;
+        if inner.is_empty() || inner.starts_with('/') || inner.starts_with('!') {
+            continue;
+        }
+        let name_end = inner
+            .find(|ch: char| ch.is_ascii_whitespace() || ch == '/')
+            .unwrap_or(inner.len());
+        let tag = inner[..name_end].to_ascii_lowercase();
+        let attrs = parse_html_attrs(&inner[name_end..]);
+        match tag.as_str() {
+            "script" => {
+                if let Some(src) = attrs.get("src") {
+                    refs.scripts.push((lt, src.clone()));
+                }
+            }
+            "link" => {
+                let rel_tokens: Vec<&str> = attrs
+                    .get("rel")
+                    .map(|rel| rel.split_ascii_whitespace().collect())
+                    .unwrap_or_default();
+                if let Some(href) = attrs.get("href") {
+                    if rel_tokens
+                        .iter()
+                        .any(|tok| tok.eq_ignore_ascii_case("stylesheet"))
+                    {
+                        refs.stylesheets.push((lt, href.clone()));
+                    }
+                    if rel_tokens
+                        .iter()
+                        .any(|tok| tok.eq_ignore_ascii_case("icon"))
+                    {
+                        refs.icons.push((lt, href.clone()));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    refs
+}
+
+#[derive(Deserialize)]
+struct FrontendI18nManifest {
+    keys: Vec<String>,
+}
+
 #[test]
 fn shell_catalog_has_five_locale_parity_and_no_shared_key_collisions() {
     assert_eq!(
@@ -42,6 +161,11 @@ fn shell_catalog_has_five_locale_parity_and_no_shared_key_collisions() {
         base.len(),
         SHELL_CATALOGS[0].1.len(),
         "duplicate keys in en-US"
+    );
+    assert!(
+        !base.contains_key("web.shell.page_upcoming_title")
+            && !base.contains_key("web.shell.page_upcoming_body"),
+        "retired placeholder keys must be removed from SHELL_CATALOGS"
     );
     let base_keys: BTreeSet<&str> = base.keys().copied().collect();
     assert!(
@@ -142,13 +266,75 @@ fn static_routes_csp_headers_and_public_i18n_work_without_cookies() {
         root.headers()[header::CONTENT_TYPE],
         "text/html; charset=utf-8"
     );
+    assert_eq!(root.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
     let root_body = root.body_mut().read_to_string().unwrap();
-    assert!(root_body.contains("/assets/js/main.js"));
-    assert!(root_body.contains("/assets/styles/tokens.css"));
 
-    // Every embedded static asset resolves with the expected content type.
+    // Parse built / HTML and verify every referenced script, stylesheet, and icon URL.
+    let refs = extract_html_refs(&root_body);
+    assert!(
+        !refs.scripts.is_empty(),
+        "built index.html must reference scripts"
+    );
+    assert!(
+        !refs.stylesheets.is_empty(),
+        "built index.html must reference stylesheets"
+    );
+    assert!(
+        !refs.icons.is_empty(),
+        "built index.html must reference favicon"
+    );
+
+    let theme_init_pos = refs
+        .scripts
+        .iter()
+        .find(|(_, src)| src == "/assets/theme-init.js")
+        .map(|(pos, _)| *pos)
+        .expect("built index.html must load /assets/theme-init.js");
+    let first_css_pos = refs.stylesheets[0].0;
+    assert!(
+        theme_init_pos < first_css_pos,
+        "theme-init.js must execute before stylesheets to avoid theme flash"
+    );
+
+    for (url, expected_mime) in refs
+        .scripts
+        .iter()
+        .map(|(_, url)| (url.as_str(), "text/javascript; charset=utf-8"))
+        .chain(
+            refs.stylesheets
+                .iter()
+                .map(|(_, url)| (url.as_str(), "text/css; charset=utf-8")),
+        )
+        .chain(
+            refs.icons
+                .iter()
+                .map(|(_, url)| (url.as_str(), "image/svg+xml")),
+        )
+    {
+        let rel = url
+            .strip_prefix("/assets/")
+            .unwrap_or_else(|| panic!("index.html asset URL must live under /assets/: {url}"));
+        let embedded = lookup(rel)
+            .unwrap_or_else(|| panic!("index.html references missing embedded asset {url}"));
+        assert_eq!(embedded.content_type, expected_mime, "{url}");
+
+        let mut resp = send("GET", url, &[], "");
+        assert_eq!(resp.status(), StatusCode::OK, "{url}");
+        assert_eq!(resp.headers()[header::CONTENT_TYPE], expected_mime, "{url}");
+        assert_eq!(resp.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+        assert_eq!(resp.body_mut().read_to_vec().unwrap(), embedded.body);
+    }
+
+    // /favicon.ico serves the embedded favicon with identical security headers.
+    let mut fav = send("GET", "/favicon.ico", &[], "");
+    assert_eq!(fav.status(), StatusCode::OK);
+    assert_eq!(fav.headers()[header::CONTENT_TYPE], FAVICON.content_type);
+    assert_eq!(fav.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+    assert_eq!(fav.body_mut().read_to_vec().unwrap(), FAVICON.body);
+
+    // Every embedded static asset resolves with the expected content type and exact bytes.
     for asset in STATIC_ASSETS {
-        let resp = send("GET", &format!("/assets/{}", asset.path), &[], "");
+        let mut resp = send("GET", &format!("/assets/{}", asset.path), &[], "");
         assert_eq!(resp.status(), StatusCode::OK, "{}", asset.path);
         assert_eq!(
             resp.headers()[header::CONTENT_TYPE],
@@ -157,6 +343,7 @@ fn static_routes_csp_headers_and_public_i18n_work_without_cookies() {
             asset.path
         );
         assert_eq!(resp.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+        assert_eq!(resp.body_mut().read_to_vec().unwrap(), asset.body);
     }
 
     // Missing assets and bad host are rejected cleanly.
@@ -231,31 +418,26 @@ fn static_routes_csp_headers_and_public_i18n_work_without_cookies() {
         }
     }
 
-    // Every literal t("...") call referenced in embedded JS exists in the merged 5-locale catalog.
+    // Every i18n key extracted by the frontend AST checker exists in the merged 5-locale catalog.
     let all_keys = expected_keys.expect("merged dictionary keys");
-    for asset in STATIC_ASSETS.iter().filter(|a| a.path.ends_with(".js")) {
-        let bytes = asset.body.as_bytes();
-        let mut cursor = 0;
-        while let Some(offset) = asset.body[cursor..].find("t(\"") {
-            let start = cursor + offset;
-            let boundary_ok = start == 0
-                || !(bytes[start - 1].is_ascii_alphanumeric()
-                    || matches!(bytes[start - 1], b'_' | b'$' | b'.'));
-            cursor = start + 3;
-            if !boundary_ok {
-                continue;
-            }
-            if let Some(end) = asset.body[cursor..].find('"') {
-                let key = &asset.body[cursor..cursor + end];
-                assert!(
-                    all_keys.contains(key),
-                    "unknown i18n key {key:?} referenced in {}",
-                    asset.path
-                );
-                cursor += end + 1;
-            } else {
-                break;
-            }
-        }
+    let manifest_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("frontend/.generated/i18n-keys.json");
+    let manifest_raw = std::fs::read_to_string(&manifest_path).unwrap_or_else(|err| {
+        panic!(
+            "missing frontend i18n key manifest at {} ({err}); run `pnpm --dir crates/web/frontend run check`",
+            manifest_path.display()
+        )
+    });
+    let manifest: FrontendI18nManifest =
+        serde_json::from_str(&manifest_raw).expect("valid i18n-keys.json");
+    assert!(
+        !manifest.keys.is_empty(),
+        "frontend i18n key manifest must not be empty"
+    );
+    for key in &manifest.keys {
+        assert!(
+            all_keys.contains(key),
+            "unknown i18n key {key:?} referenced in frontend/.generated/i18n-keys.json"
+        );
     }
 }
