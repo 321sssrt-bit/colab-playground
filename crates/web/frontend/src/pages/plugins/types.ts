@@ -149,6 +149,7 @@ export interface PluginRunDetail {
   readonly latestProvisionAtMs: number;
   readonly status: PluginRunStatus | null;
   readonly logEntries: readonly PluginRunLogEntry[];
+  readonly logSkipped: { readonly path: string; readonly message_key: string } | null;
   readonly outcome: PluginRunOutcome | null;
   readonly endpoints: readonly PluginRunEndpointResult[];
   readonly error: ApiErrorPayload | null;

@@ -47,6 +47,7 @@ export interface PluginRunsStoreState {
   readonly selectedRunId: number | null;
   readonly activeRun: PluginRunDetail | null;
   readonly knownPhasesById: Readonly<Record<number, PluginRunPhase>>;
+  readonly endpointForwardIdsByKey: Readonly<Record<string, number | null>>;
   readonly forwardAddressesById: Readonly<Record<number, ForwardAddresses>>;
   readonly forwardOverlaysById: Readonly<Record<number, ForwardLiveOverlay>>;
   readonly latestSnapshotVersion: number;
@@ -59,6 +60,7 @@ const INITIAL_STATE: PluginRunsStoreState = {
   selectedRunId: null,
   activeRun: null,
   knownPhasesById: {},
+  endpointForwardIdsByKey: {},
   forwardAddressesById: {},
   forwardOverlaysById: {},
   latestSnapshotVersion: 0,
@@ -66,6 +68,7 @@ const INITIAL_STATE: PluginRunsStoreState = {
 
 let state: PluginRunsStoreState = INITIAL_STATE;
 let dismissedAutoRunId = 0;
+let highestSeenRunId = 0;
 let runsListInFlight: Promise<PluginRunSummary[]> | null = null;
 let forwardsInFlight: Promise<ForwardView[]> | null = null;
 let forwardsSeq = 0;
@@ -107,6 +110,7 @@ function stopStream(): void {
 function resetStore(): void {
   stopStream();
   dismissedAutoRunId = 0;
+  highestSeenRunId = 0;
   runsListInFlight = null;
   forwardsInFlight = null;
   forwardsSeq += 1;
@@ -199,11 +203,30 @@ function appendLogEntries(
   if (combined.length <= MAX_LOG_ENTRIES) {
     return combined;
   }
-  const tail = combined.slice(combined.length - (MAX_LOG_ENTRIES - 1));
-  if (tail[0]?.kind === "history_skipped") {
-    return tail;
+  const dropCount = combined.length - (MAX_LOG_ENTRIES - 1);
+  let droppedLogSkipped: Extract<PluginRunLogEntry, { readonly kind: "log_skipped" }> | null = null;
+  for (let i = 0; i < dropCount; i += 1) {
+    const entry = combined[i];
+    if (entry?.kind === "log_skipped") {
+      droppedLogSkipped = entry;
+    }
   }
-  return [{ kind: "history_skipped" }, ...tail];
+  const tail = combined.slice(dropCount);
+  const tailHasLogSkipped = tail.some((entry) => entry.kind === "log_skipped");
+  const pinned: PluginRunLogEntry[] = [];
+  if (tail[0]?.kind !== "history_skipped") {
+    pinned.push({ kind: "history_skipped" });
+  }
+  if (droppedLogSkipped && !tailHasLogSkipped) {
+    pinned.push(droppedLogSkipped);
+  }
+  const maxTailLen = Math.max(0, MAX_LOG_ENTRIES - pinned.length);
+  const trimmedTail = tail.length > maxTailLen ? tail.slice(tail.length - maxTailLen) : tail;
+  return [...pinned, ...trimmedTail];
+}
+
+function endpointForwardKey(runId: number, endpointId: string): string {
+  return `${runId}:${endpointId}`;
 }
 
 function createInitialDetail(summary: PluginRunSummary): PluginRunDetail {
@@ -221,6 +244,7 @@ function createInitialDetail(summary: PluginRunSummary): PluginRunDetail {
     latestProvisionAtMs: Date.now(),
     status: null,
     logEntries: [],
+    logSkipped: null,
     outcome: null,
     endpoints: [],
     error: null,
@@ -248,18 +272,29 @@ function updateActiveRun(id: number, updater: (prev: PluginRunDetail) => PluginR
   });
 }
 
-function mergeEndpointForwardAddresses(endpoints: readonly PluginRunEndpointResult[]): void {
-  let changed = false;
-  const next = { ...state.forwardAddressesById };
+function mergeEndpointResults(runId: number, endpoints: readonly PluginRunEndpointResult[]): void {
+  let addrChanged = false;
+  let idChanged = false;
+  const nextAddrs = { ...state.forwardAddressesById };
+  const nextIds = { ...state.endpointForwardIdsByKey };
   for (const item of endpoints) {
+    const key = endpointForwardKey(runId, item.endpoint.id);
+    const serverForwardId = item.forward?.id ?? null;
+    if ((!Object.hasOwn(nextIds, key) || serverForwardId !== null) && nextIds[key] !== serverForwardId) {
+      nextIds[key] = serverForwardId;
+      idChanged = true;
+    }
     if (item.forward?.addresses) {
-      next[item.forward.id] = item.forward.addresses;
+      nextAddrs[item.forward.id] = item.forward.addresses;
       recordForwardAddresses(item.forward);
-      changed = true;
+      addrChanged = true;
     }
   }
-  if (changed) {
-    setState({ forwardAddressesById: next });
+  if (addrChanged || idChanged) {
+    setState({
+      ...(addrChanged ? { forwardAddressesById: nextAddrs } : {}),
+      ...(idChanged ? { endpointForwardIdsByKey: nextIds } : {}),
+    });
   }
 }
 
@@ -349,13 +384,23 @@ function applyRunFrame(runId: number, frame: SseFrame, wasAlreadyFinished: boole
       typeof parsed.message_key === "string" && parsed.message_key.length > 0
         ? parsed.message_key
         : "app.b2.run_log_skipped";
-    updateActiveRun(runId, (prev) => ({
-      ...prev,
-      logEntries: appendLogEntries(prev.logEntries, [
-        { kind: "log_skipped", path: parsed.path as string, message_key },
-      ]),
-      streamError: null,
-    }));
+    const path = parsed.path as string;
+    updateActiveRun(runId, (prev) => {
+      const alreadyPresent = prev.logEntries.some(
+        (entry) =>
+          entry.kind === "log_skipped" &&
+          entry.path === path &&
+          entry.message_key === message_key,
+      );
+      return {
+        ...prev,
+        logSkipped: { path, message_key },
+        logEntries: alreadyPresent
+          ? prev.logEntries
+          : appendLogEntries(prev.logEntries, [{ kind: "log_skipped", path, message_key }]),
+        streamError: null,
+      };
+    });
     return false;
   }
 
@@ -364,7 +409,7 @@ function applyRunFrame(runId: number, frame: SseFrame, wasAlreadyFinished: boole
     if (!finished) {
       return false;
     }
-    mergeEndpointForwardAddresses(finished.endpoints);
+    mergeEndpointResults(runId, finished.endpoints);
     updateActiveRun(runId, (prev) => ({
       ...prev,
       plugin: finished.run.plugin,
@@ -410,31 +455,38 @@ function connectRunStream(
   streamAbort = controller;
   let receivedFinished = false;
 
+  let resetPendingForReconnect = isReconnect;
+
   void openPluginRunEventStream(runId, {
     signal: controller.signal,
     onOpen: () => {
       if (seq !== streamSeq || apiClient.getSessionGeneration() !== gen) {
         return;
       }
-      if (isReconnect) {
-        // The server journal replays from offset 0 on each subscription, so reset buffered replay
-        // state on reconnect to prevent duplicate progress rows or log lines.
-        updateActiveRun(runId, (prev) => ({
-          ...prev,
-          provisionEvents: [],
-          logEntries: [],
-          streamError: null,
-        }));
-      } else {
-        updateActiveRun(runId, (prev) => ({
-          ...prev,
-          streamError: null,
-        }));
-      }
+      updateActiveRun(runId, (prev) => ({
+        ...prev,
+        streamError: null,
+      }));
     },
     onFrame: (frame) => {
       if (seq !== streamSeq || apiClient.getSessionGeneration() !== gen) {
         return;
+      }
+      if (resetPendingForReconnect) {
+        resetPendingForReconnect = false;
+        // Wait until the first replayed frame arrives before replacing buffered logs so a
+        // transient drop never leaves the log pane empty; preserve completed provisioning
+        // history and any previously seen `log_skipped` path notice across journal rollovers.
+        updateActiveRun(runId, (prev) => ({
+          ...prev,
+          provisionEvents: prev.launched ? prev.provisionEvents : [],
+          logEntries:
+            frame.event === "history_skipped"
+              ? prev.logEntries
+              : prev.logSkipped
+                ? [{ kind: "log_skipped", ...prev.logSkipped }]
+                : [],
+        }));
       }
       if (applyRunFrame(runId, frame, wasAlreadyFinished)) {
         receivedFinished = true;
@@ -547,7 +599,15 @@ export function refreshPluginRuns(options?: {
 
       const newest = runs[0] ?? null;
       if (autoAttach && newest) {
-        if (state.selectedRunId === null && newest.id > dismissedAutoRunId) {
+        const isBrandNewRun = newest.id > highestSeenRunId;
+        const shouldAutoAttach =
+          newest.id > dismissedAutoRunId &&
+          (state.selectedRunId === null ||
+            (isBrandNewRun &&
+              newest.id > state.selectedRunId &&
+              (!newest.finished || state.activeRun?.phase !== "running")));
+        highestSeenRunId = Math.max(highestSeenRunId, newest.id);
+        if (shouldAutoAttach) {
           attachRun(newest);
         } else if (
           state.selectedRunId !== null &&
@@ -559,6 +619,8 @@ export function refreshPluginRuns(options?: {
             setState({ selectedRunId: null, activeRun: null });
           }
         }
+      } else if (newest) {
+        highestSeenRunId = Math.max(highestSeenRunId, newest.id);
       }
       return runs;
     })
@@ -627,6 +689,26 @@ export async function requestCancelPluginRun(id: number): Promise<void> {
     }
     throw error;
   }
+}
+
+/**
+ * Records the exact tunnel ID currently bound to one endpoint card (`null` when closed).
+ */
+export function setEndpointForwardId(
+  runId: number,
+  endpointId: string,
+  forwardId: number | null,
+): void {
+  const key = endpointForwardKey(runId, endpointId);
+  if (state.endpointForwardIdsByKey[key] === forwardId) {
+    return;
+  }
+  setState({
+    endpointForwardIdsByKey: {
+      ...state.endpointForwardIdsByKey,
+      [key]: forwardId,
+    },
+  });
 }
 
 /**

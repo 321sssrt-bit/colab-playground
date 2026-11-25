@@ -7,7 +7,7 @@
  * never falls back to `/` or a hardcoded `/v1`.
  */
 
-import type { AccountId, TunnelInfo, TunnelState } from "../../lib/types.ts";
+import type { TunnelInfo, TunnelState } from "../../lib/types.ts";
 import type { ForwardAddresses } from "../sessions/api.ts";
 import { safeHttpUrl } from "../sessions/format.ts";
 import type { ResolvedEndpoint } from "./types.ts";
@@ -142,8 +142,13 @@ export function formatEndpointBindFallback(
   return `${host}:${tunnel.spec.local_port}${cleanPath}`;
 }
 
+function shellSingleQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
 /**
  * Builds an OpenAI-compatible `curl` example using the resolved base URL and model output.
+ * Both URL and JSON payload are single-quoted to prevent shell metacharacter expansion.
  */
 export function buildOpenAiCurl(
   baseUrl: string,
@@ -151,46 +156,44 @@ export function buildOpenAiCurl(
   hasSecretInput: boolean,
 ): string {
   const safeBase = baseUrl.replace(/\/+$/, "");
-  const payload = JSON.stringify({
-    model: modelId,
-    messages: [{ role: "user", content: "Hello" }],
-  }).replace(/'/g, "'\\''");
+  const requestUrl = shellSingleQuote(`${safeBase}/chat/completions`);
+  const payload = shellSingleQuote(
+    JSON.stringify({
+      model: modelId,
+      messages: [{ role: "user", content: "Hello" }],
+    }),
+  );
   const auth = hasSecretInput ? ' \\\n  -H "Authorization: Bearer $API_KEY"' : "";
-  return `curl ${safeBase}/chat/completions \\\n  -H "Content-Type: application/json"${auth} \\\n  -d '${payload}'`;
+  return `curl ${requestUrl} \\\n  -H "Content-Type: application/json"${auth} \\\n  -d ${payload}`;
 }
 
 /**
- * Picks the active live tunnel matching a plugin endpoint from `snapshot.tunnels`
+ * Looks up the specific live tunnel bound to a plugin endpoint by its exact tunnel ID
  * and applies any same-version SSE `forward` transition overlays.
  */
-export function selectEndpointTunnel(
+export function selectEndpointTunnelById(
   tunnels: readonly TunnelInfo[],
-  account: AccountId,
-  session: string,
-  remotePort: number,
+  tunnelId: number | null,
   overlaysById: Readonly<Record<number, ForwardLiveOverlay>>,
   snapshotVersion: number,
 ): TunnelInfo | null {
-  for (const tunnel of tunnels) {
-    if (
-      tunnel.spec.account !== account ||
-      tunnel.spec.session !== session ||
-      tunnel.spec.remote_port !== remotePort
-    ) {
-      continue;
-    }
-    const overlay = overlaysById[tunnel.id];
-    const activeOverlay =
-      overlay && overlay.snapshotVersion === snapshotVersion ? overlay : null;
-    const effectiveState = activeOverlay?.state ?? tunnel.state;
-    if (effectiveState.state === "failed" || effectiveState.state === "stopped") {
-      continue;
-    }
-    return {
-      ...tunnel,
-      state: effectiveState,
-      healthy: activeOverlay?.healthy !== undefined ? activeOverlay.healthy : tunnel.healthy,
-    };
+  if (tunnelId === null) {
+    return null;
   }
-  return null;
+  const tunnel = tunnels.find((item) => item.id === tunnelId);
+  if (!tunnel) {
+    return null;
+  }
+  const overlay = overlaysById[tunnel.id];
+  const activeOverlay =
+    overlay && overlay.snapshotVersion === snapshotVersion ? overlay : null;
+  const effectiveState = activeOverlay?.state ?? tunnel.state;
+  if (effectiveState.state === "failed" || effectiveState.state === "stopped") {
+    return null;
+  }
+  return {
+    ...tunnel,
+    state: effectiveState,
+    healthy: activeOverlay?.healthy !== undefined ? activeOverlay.healthy : tunnel.healthy,
+  };
 }

@@ -35,7 +35,7 @@ import {
   SquareIcon,
 } from "../sessions/Icons.tsx";
 import { resolveLocalizedText } from "./api.ts";
-import { selectEndpointTunnel, type ForwardLiveOverlay } from "./endpoint.ts";
+import { selectEndpointTunnelById, type ForwardLiveOverlay } from "./endpoint.ts";
 import { EndpointCard } from "./EndpointCard.tsx";
 import { requestCancelPluginRun } from "./runStore.ts";
 import type { PluginInfo, PluginRunDetail } from "./types.ts";
@@ -189,6 +189,7 @@ export interface PluginRunViewProps {
   readonly run: PluginRunDetail;
   readonly plugin: PluginInfo | null;
   readonly snapshot: Snapshot | null;
+  readonly endpointForwardIdsByKey: Readonly<Record<string, number | null>>;
   readonly forwardAddressesById: Readonly<Record<number, ForwardAddresses>>;
   readonly forwardOverlaysById: Readonly<Record<number, ForwardLiveOverlay>>;
   readonly forwardPolicy: ForwardPolicyView | null;
@@ -210,6 +211,7 @@ export function PluginRunView({
   run,
   plugin,
   snapshot,
+  endpointForwardIdsByKey,
   forwardAddressesById,
   forwardOverlaysById,
   forwardPolicy,
@@ -424,7 +426,7 @@ export function PluginRunView({
     (billingCheck.status === "error" ||
       (billingCheck.status === "verified" &&
         billingCheck.accountErrored &&
-        snapshotErroredForAccount));
+        !snapshotNewerThanVerify));
 
   const outputEntries = run.status?.outputs ? Object.entries(run.status.outputs) : [];
   const hasSecretInput =
@@ -734,11 +736,13 @@ export function PluginRunView({
         {run.phase === "ready" &&
           run.outcome !== null &&
           run.endpoints.map((item) => {
-            const activeTunnel = selectEndpointTunnel(
+            const forwardKey = `${run.id}:${item.endpoint.id}`;
+            const trackedForwardId = Object.hasOwn(endpointForwardIdsByKey, forwardKey)
+              ? endpointForwardIdsByKey[forwardKey]
+              : (item.forward?.id ?? null);
+            const activeTunnel = selectEndpointTunnelById(
               snapshot?.tunnels ?? [],
-              run.outcome!.account,
-              run.outcome!.session,
-              item.endpoint.remote_port,
+              trackedForwardId,
               forwardOverlaysById,
               snapshot?.version ?? 0,
             );
@@ -750,6 +754,7 @@ export function PluginRunView({
             return (
               <EndpointCard
                 key={item.endpoint.id}
+                runId={run.id}
                 endpoint={item.endpoint}
                 outcome={run.outcome!}
                 initialError={item.error}

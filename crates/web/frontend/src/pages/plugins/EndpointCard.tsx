@@ -45,13 +45,18 @@ import {
   formatEndpointBindFallback,
   resolveEndpointAddresses,
 } from "./endpoint.ts";
-import { cachePluginForwardAddresses, refreshPluginForwards } from "./runStore.ts";
+import {
+  cachePluginForwardAddresses,
+  refreshPluginForwards,
+  setEndpointForwardId,
+} from "./runStore.ts";
 import type { PluginRunOutcome, ResolvedEndpoint } from "./types.ts";
 
 const COPY_FEEDBACK_MS = 2000;
 const FALLBACK_MODEL_ID = "MODEL";
 
 export interface EndpointCardProps {
+  readonly runId: number;
   readonly endpoint: ResolvedEndpoint;
   readonly outcome: PluginRunOutcome;
   readonly initialError: ApiErrorPayload | null;
@@ -94,6 +99,7 @@ function renderHealthBadge(tunnel: TunnelInfo | null, t: TranslateFn) {
 }
 
 export function EndpointCard({
+  runId,
   endpoint,
   outcome,
   initialError,
@@ -232,6 +238,7 @@ export function EndpointCard({
       health_path: endpoint.health,
     });
     cachePluginForwardAddresses(created);
+    setEndpointForwardId(runId, endpoint.id, created.id);
     await webStore.refreshSnapshot().catch(() => {});
     void refreshPluginForwards().catch(() => {});
   };
@@ -257,6 +264,7 @@ export function EndpointCard({
         if (apiClient.getSessionGeneration() !== gen) {
           return;
         }
+        setEndpointForwardId(runId, endpoint.id, null);
         const body = closed.notice_key
           ? t(closed.notice_key)
           : t("app.b2.forward_closed_billing");
@@ -309,6 +317,7 @@ export function EndpointCard({
       if (apiClient.getSessionGeneration() !== gen) {
         return;
       }
+      setEndpointForwardId(runId, endpoint.id, null);
       await openWithBind(nextBind, localPort);
     } catch (error) {
       if (apiClient.getSessionGeneration() !== gen) {

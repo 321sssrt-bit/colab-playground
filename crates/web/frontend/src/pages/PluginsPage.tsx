@@ -340,6 +340,7 @@ export function PluginsPage({ snapshot, locale, t, navigate, pushToast }: PagePr
           run={runsState.activeRun}
           plugin={activeRunPlugin}
           snapshot={snapshot}
+          endpointForwardIdsByKey={runsState.endpointForwardIdsByKey}
           forwardAddressesById={runsState.forwardAddressesById}
           forwardOverlaysById={runsState.forwardOverlaysById}
           forwardPolicy={sessionsLocal.forwardPolicy}
