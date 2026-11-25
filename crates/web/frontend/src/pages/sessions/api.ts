@@ -3,13 +3,17 @@
  */
 
 import { apiClient, type EventStreamOptions } from "../../lib/api.ts";
+import type { OnExhausted } from "../../lib/constants.ts";
 import type {
+  Accelerator,
   AccountContext,
   AccountId,
   ApiErrorPayload,
   CoreError,
+  DurationSecs,
   ErrorKind,
   ForwardBind,
+  GuardPolicy,
   GuardReport,
   Runtime,
   RuntimeRef,
@@ -129,12 +133,36 @@ export type ProvisionProgressEvent =
     }
   | { readonly event: "failed"; readonly error: ApiErrorPayload | CoreError };
 
+export interface ProvisionSpec {
+  readonly name: string;
+  readonly accelerator: Accelerator;
+  readonly high_mem: boolean;
+  readonly min_vram_mib: number | null;
+  readonly max_attempts: number;
+  readonly retry_delay: DurationSecs;
+  readonly on_exhausted: OnExhausted;
+  readonly guard: GuardPolicy;
+}
+
+export interface ProvisionOutcome {
+  readonly name: string;
+  readonly hardware: {
+    readonly gpu: string | null;
+    readonly vram_mib: number | null;
+  };
+  readonly attempts: number;
+  readonly below_spec: boolean;
+  readonly watchdog: WatchdogInfo | null;
+  readonly started_at: UnixSecs;
+}
+
+export interface AcceptedProvisionResponse {
+  readonly id: number;
+}
+
 export interface ProvisionFinishedEvent {
   readonly phase: "ready" | "cancelled" | "failed";
-  readonly outcome?: {
-    readonly hardware?: { readonly gpu: string | null; readonly vram_mib: number | null };
-    readonly below_spec?: boolean;
-  };
+  readonly outcome?: ProvisionOutcome;
   readonly error?: ApiErrorPayload;
 }
 
@@ -196,6 +224,26 @@ export function stopAllRuntimes(): Promise<StopAllResponse> {
     method: "POST",
     body: {
       confirmed: true,
+    },
+  });
+}
+
+export function fetchSessionTemplate(signal?: AbortSignal): Promise<ProvisionSpec> {
+  return apiClient.request<ProvisionSpec>("/api/sessions/template", {
+    method: "GET",
+    signal,
+  });
+}
+
+export function startProvision(
+  accountContext: AccountContext,
+  spec: ProvisionSpec,
+): Promise<AcceptedProvisionResponse> {
+  return apiClient.request<AcceptedProvisionResponse>("/api/sessions", {
+    method: "POST",
+    body: {
+      account_context: accountContext,
+      spec,
     },
   });
 }

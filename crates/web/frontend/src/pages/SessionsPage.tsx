@@ -27,11 +27,16 @@ import {
   formatEmail,
   formatErrorKind,
   formatErrorMessage,
+  formatHardware,
   groupRuntimesByAccount,
   runtimeKey,
   type FormattedError,
 } from "./sessions/format.ts";
-import { AlertTriangleIcon, CircleStopIcon, RefreshIcon } from "./sessions/Icons.tsx";
+import { AlertTriangleIcon, CircleStopIcon, PlusIcon, RefreshIcon } from "./sessions/Icons.tsx";
+import {
+  NewSessionDialog,
+  type NewSessionDialogRequest,
+} from "./sessions/NewSessionDialog.tsx";
 import { ProvisioningCard } from "./sessions/ProvisioningCard.tsx";
 import { RuntimeCard } from "./sessions/RuntimeCard.tsx";
 import { StopAllDialog } from "./sessions/StopAllDialog.tsx";
@@ -42,12 +47,14 @@ import {
 } from "./sessions/StopRuntimeDialog.tsx";
 import {
   applyForwardEvent,
+  claimProvisionHandled,
   clearEndedRuntimes,
   observeSnapshotTransitions,
   refreshForwards,
   refreshOverviewHints,
   refreshRearmDuration,
   selectForwardsForRuntime,
+  trackProvision,
   useSessionsLocalState,
 } from "./sessions/store.ts";
 import type { PageProps } from "./types.ts";
@@ -61,12 +68,14 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
   >(null);
   const [autoStopDialog, setAutoStopDialog] = useState<AutoStopDialogRequest | null>(null);
   const [forwardDialog, setForwardDialog] = useState<ForwardDialogRequest | null>(null);
+  const [newSessionDialog, setNewSessionDialog] = useState<NewSessionDialogRequest | null>(null);
   const [stopRuntimeDialog, setStopRuntimeDialog] = useState<StopRuntimeDialogRequest | null>(null);
   const [stopAllDialogId, setStopAllDialogId] = useState<number | null>(null);
 
   const prevSnapshotRef = useRef<Snapshot | null>(null);
   const dialogSeqRef = useRef(0);
   const refreshInFlightRef = useRef(false);
+  const dialogTrackingOpIdRef = useRef<number | null>(null);
   const tRef = useRef(t);
   tRef.current = t;
 
@@ -207,6 +216,106 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
     setStopAllDialogId(dialogSeqRef.current);
   }, []);
 
+  const trackedProvision = localState.trackedProvision;
+
+  useEffect(() => {
+    if (activeProvisionOp) {
+      trackProvision(
+        activeProvisionOp.op.id,
+        activeProvisionOp.sessionName,
+        snapshot?.account ?? null,
+      );
+    }
+  }, [activeProvisionOp?.op.id, activeProvisionOp?.sessionName]);
+
+  useEffect(() => {
+    if (!trackedProvision || trackedProvision.phase === "running") {
+      return;
+    }
+    if (!claimProvisionHandled(trackedProvision.operationId)) {
+      return;
+    }
+    void loadSessions();
+    const dialogShowingThisOp =
+      newSessionDialog !== null &&
+      dialogTrackingOpIdRef.current === trackedProvision.operationId;
+    if (dialogShowingThisOp) {
+      return;
+    }
+    if (trackedProvision.phase === "ready") {
+      const name = trackedProvision.outcome?.name ?? trackedProvision.sessionName;
+      if (trackedProvision.outcome?.below_spec) {
+        const hardware =
+          formatHardware(
+            trackedProvision.outcome.hardware?.gpu,
+            trackedProvision.outcome.hardware?.vram_mib,
+            locale,
+            tRef.current,
+          ) ?? tRef.current("app.b2.prov_no_gpu");
+        pushToast({
+          tone: "warning",
+          title: tRef.current("app.b2.provision_ready_toast", { name }),
+          body: tRef.current("app.b2.prov_ready_below", { hardware }),
+        });
+      } else {
+        pushToast({
+          tone: "success",
+          body: tRef.current("app.b2.provision_ready_toast", { name }),
+        });
+      }
+    } else if (trackedProvision.phase === "failed") {
+      const formatted = formatErrorMessage(trackedProvision.finishedError, tRef.current);
+      pushToast({
+        tone: "danger",
+        title: tRef.current("app.b2.new_failed"),
+        body: [formatted.message, formatted.hint].filter(Boolean).join("\n"),
+      });
+    } else if (trackedProvision.phase === "cancelled") {
+      pushToast({
+        tone: "info",
+        body: tRef.current("app.b2.new_cancelled"),
+      });
+    }
+  }, [trackedProvision, newSessionDialog, locale, loadSessions, pushToast]);
+
+  const runningProvisionCardTarget = activeProvisionOp
+    ? { op: activeProvisionOp.op, sessionName: activeProvisionOp.sessionName }
+    : trackedProvision?.phase === "running"
+      ? { op: null, sessionName: trackedProvision.sessionName }
+      : null;
+
+  const openNewSessionModal = useCallback(() => {
+    dialogSeqRef.current += 1;
+    if (activeProvisionOp) {
+      setNewSessionDialog({
+        id: dialogSeqRef.current,
+        mode: "running",
+        operationId: activeProvisionOp.op.id,
+        sessionName: activeProvisionOp.sessionName,
+      });
+      return;
+    }
+    if (trackedProvision?.phase === "running") {
+      setNewSessionDialog({
+        id: dialogSeqRef.current,
+        mode: "running",
+        operationId: trackedProvision.operationId,
+        sessionName: trackedProvision.sessionName,
+      });
+      return;
+    }
+    const ctx = snapshot?.account ?? { revision: 0, active: null };
+    setNewSessionDialog({
+      id: dialogSeqRef.current,
+      mode: "create",
+      accountContext: { revision: ctx.revision, active: ctx.active },
+    });
+  }, [activeProvisionOp, trackedProvision, snapshot?.account]);
+
+  const handleDialogTrackingOperation = useCallback((operationId: number | null) => {
+    dialogTrackingOpIdRef.current = operationId;
+  }, []);
+
   const openAutoStopModal = useCallback(
     (runtime: Runtime, mode: AutoStopDialogMode) => {
       const ctx = snapshot?.account ?? { revision: 0, active: null };
@@ -340,6 +449,16 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
             {stopAllRunning ? <span className="spinner" aria-hidden="true" /> : <CircleStopIcon />}
             <span>{t("web.sessions.stop_all")}</span>
           </button>
+          <button
+            type="button"
+            className="btn btn-primary"
+            data-sessions-new="true"
+            disabled={!environmentReady || Boolean(snapshot?.shutting_down)}
+            onClick={openNewSessionModal}
+          >
+            <PlusIcon />
+            <span>{t("app.b2.new_title")}</span>
+          </button>
         </div>
       </header>
 
@@ -375,13 +494,15 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
           </section>
         ) : (
           <>
-            {activeProvisionOp && (
+            {runningProvisionCardTarget && !newSessionDialog && (
               <ProvisioningCard
-                operation={activeProvisionOp.op}
-                sessionName={activeProvisionOp.sessionName}
+                operation={runningProvisionCardTarget.op}
+                trackedProvision={trackedProvision}
+                sessionName={runningProvisionCardTarget.sessionName}
                 locale={locale}
                 t={t}
                 pushToast={pushToast}
+                onShowDialog={openNewSessionModal}
               />
             )}
 
@@ -470,6 +591,18 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
                             : t("app.b10.sessions_empty_partial_title")}
                         </h2>
                         <p className="empty-state-body">{t("app.sessions.empty.body")}</p>
+                      </div>
+                      <div className="empty-state-actions">
+                        <button
+                          type="button"
+                          className="btn btn-primary"
+                          data-sessions-empty-new="true"
+                          disabled={Boolean(snapshot?.shutting_down)}
+                          onClick={openNewSessionModal}
+                        >
+                          <PlusIcon />
+                          <span>{t("app.b2.new_title")}</span>
+                        </button>
                       </div>
                     </div>
                   </section>
@@ -573,6 +706,20 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
         pushToast={pushToast}
         onClose={() => setStopRuntimeDialog(null)}
         onStopped={handleAutoStopCompleted}
+      />
+
+      <NewSessionDialog
+        request={newSessionDialog}
+        snapshot={snapshot}
+        maxConcurrentSessions={localState.maxConcurrentSessions}
+        activeProvisionOp={activeProvisionOp}
+        trackedProvision={trackedProvision}
+        locale={locale}
+        t={t}
+        navigate={navigate}
+        pushToast={pushToast}
+        onClose={() => setNewSessionDialog(null)}
+        onTrackingOperation={handleDialogTrackingOperation}
       />
 
       <StopAllDialog
