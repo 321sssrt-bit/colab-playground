@@ -149,6 +149,8 @@
   --icon-xs: 0.75rem;
   --icon-sm: 0.875rem;
   --icon-md: 1rem;
+  --icon-lg: 1.25rem;
+  --empty-disc-size: 3rem;
 
   /* Layout metrics (Ely tokens.rs) */
   --sidebar-width: 15rem;
@@ -156,7 +158,10 @@
   --mobile-topbar-height: 3rem;
   --content-max-width: 75rem;
   --dialog-width: 27.5rem;
+  --toast-width: 22.5rem;
   --label-width: 10rem;
+  --prose-width: 20rem;
+  --usage-figure-min: 7.5rem;
   --menu-width: 12.5rem;
   --log-height: 17.5rem;
   --input-num-width: 4.75rem;
@@ -164,6 +169,8 @@
   --z-topbar: 20;
   --z-drawer-backdrop: 30;
   --z-drawer: 40;
+  --z-menu: 50;
+  --z-toast: 60;
 
   accent-color: var(--color-accent);
   scrollbar-color: var(--color-scrollbar-thumb) var(--color-scrollbar-track);

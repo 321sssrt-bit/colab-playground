@@ -74,6 +74,10 @@
 }
 
 /* Account switcher (sidebar.rs AccountSwitcher: transparent, NavItem alignment, chevron-down) */
+.sidebar-account-wrap {
+  position: relative;
+}
+
 .sidebar-account {
   display: flex;
   align-items: center;
@@ -91,7 +95,8 @@
   cursor: pointer;
 }
 
-.sidebar-account:hover {
+.sidebar-account:hover,
+.sidebar-account[aria-expanded="true"] {
   background-color: var(--color-hover);
   color: var(--color-fg);
 }
@@ -102,6 +107,110 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* Account switcher popup menu (1:1 Ely menus/draw.rs surface, heading, radio items, separator) */
+.account-menu-popover {
+  margin: var(--space-0);
+  padding: var(--space-1);
+  min-width: var(--menu-width);
+  max-width: min(calc(100vw - var(--space-4)), var(--prose-width));
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background-color: var(--color-overlay);
+  color: var(--color-fg);
+  box-shadow: var(--shadow-floating);
+}
+
+@supports (position-area: block-end) {
+  .account-menu-popover[popover] {
+    position-area: block-end span-inline-end;
+    position-try-fallbacks: flip-block, flip-inline, flip-block flip-inline;
+    inset: auto;
+    margin-block-start: var(--space-1);
+  }
+}
+
+.account-menu-popover:not([popover]) {
+  position: absolute;
+  inset-block-start: calc(100% + var(--space-1));
+  inset-inline-start: var(--space-0);
+  z-index: var(--z-menu);
+}
+
+.account-menu-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.account-menu-heading {
+  padding: var(--space-1p5) var(--space-2) var(--space-1);
+  font-size: var(--text-xs);
+  font-weight: 500;
+  color: var(--color-fg-subtle);
+}
+
+.account-menu-group {
+  display: flex;
+  flex-direction: column;
+}
+
+.account-menu-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  min-height: var(--control-height-md);
+  padding: var(--space-0) var(--space-2);
+  border: var(--space-0);
+  border-radius: var(--radius-md);
+  background-color: transparent;
+  color: var(--color-fg);
+  font: inherit;
+  font-size: var(--text-sm);
+  text-align: start;
+  cursor: pointer;
+}
+
+.account-menu-item:hover:not(:disabled),
+.account-menu-item:focus-visible:not(:disabled) {
+  background-color: var(--color-hover);
+}
+
+.account-menu-item:disabled {
+  color: var(--color-fg-disabled);
+  cursor: not-allowed;
+}
+
+.account-menu-item-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.account-menu-item[role="menuitemradio"]::before {
+  content: "";
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--icon-sm);
+  font-size: var(--text-xs);
+  font-weight: 700;
+  color: var(--color-fg);
+}
+
+.account-menu-item[role="menuitemradio"][aria-checked="true"]::before {
+  content: "✓";
+}
+
+.account-menu-separator {
+  border: var(--space-0);
+  height: var(--border-width);
+  margin: var(--space-1) var(--space-0);
+  background-color: var(--color-border);
 }
 
 /* Nav items (Ely NavItem: 28px tall, hover fill, left 2px accent indicator on active) */
@@ -218,6 +327,9 @@
   width: 100%;
   max-width: var(--content-max-width);
   margin-inline: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
 }
 
 /* Ely Page frame: 32px title-strip top offset + max-w 1200px, px-10 (40px), py-8 (32px), gap-8 (32px) */
@@ -232,13 +344,37 @@
   gap: var(--space-8);
 }
 
-/* Ely Page header: Xxl 24px semibold title + Md 14px muted subtitle + pb-6 border-b */
+/* Ely Page header: Xxl 24px semibold title + Md 14px muted subtitle + trailing actions + pb-6 border-b */
 .page-header {
   display: flex;
   flex-direction: column;
   gap: var(--space-1);
   padding-bottom: var(--space-6);
   border-bottom: var(--border-width) solid var(--color-border);
+}
+
+.page-header-row {
+  flex-direction: row;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: var(--space-4);
+  flex-wrap: wrap;
+}
+
+.page-header-heading {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.page-header-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  flex-shrink: 0;
 }
 
 .page-title {
@@ -261,6 +397,40 @@
 
 .drawer-backdrop {
   display: none;
+}
+
+/* Fixed Toast viewport (1:1 Ely ToastViewport: bottom-right 24px margin, overlay card + Floating shadow) */
+.toast-viewport {
+  position: fixed;
+  inset-block-end: var(--space-6);
+  inset-inline-end: var(--space-6);
+  z-index: var(--z-toast);
+  width: min(var(--toast-width), calc(100vw - var(--space-8)));
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  pointer-events: none;
+}
+
+.toast-card {
+  pointer-events: auto;
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background-color: var(--color-overlay);
+  color: var(--color-fg);
+  box-shadow: var(--shadow-floating);
+  font-size: var(--text-base);
+}
+
+.toast-body {
+  flex: 1;
+  min-width: 0;
+  color: var(--color-fg);
+  overflow-wrap: anywhere;
 }
 
 /* Mobile responsive drawer & single-line topbar */
@@ -368,6 +538,13 @@
 
   .status-banner {
     padding: var(--space-3) var(--space-4) var(--space-0);
+  }
+
+  .toast-viewport {
+    inset-block-end: var(--space-4);
+    inset-inline-start: var(--space-4);
+    inset-inline-end: var(--space-4);
+    width: auto;
   }
 }
 

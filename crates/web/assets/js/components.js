@@ -61,7 +61,14 @@ export function badge(text, tone = "neutral", extraClass = "") {
   return el("span", { className: ["badge", toneClass, extraClass].filter(Boolean).join(" ") }, text);
 }
 
-export function alertBox({ tone = "info", title = null, body = null, actions = null, live = false } = {}) {
+export function alertBox({
+  tone = "info",
+  title = null,
+  body = null,
+  actions = null,
+  onDismiss = null,
+  live = false,
+} = {}) {
   const iconMap = {
     warning: "alertTriangle",
     danger: "alertCircle",
@@ -88,11 +95,102 @@ export function alertBox({ tone = "info", title = null, body = null, actions = n
     className: `alert alert-${tone}`,
     role: live ? (tone === "danger" ? "alert" : "status") : null,
   };
+  const dismissBtn = onDismiss
+    ? el(
+        "button",
+        {
+          type: "button",
+          className: "btn btn-sm btn-ghost btn-icon alert-dismiss",
+          "aria-label": t("app.action.dismiss"),
+          title: t("app.action.dismiss"),
+          onClick: onDismiss,
+        },
+        icon("x")
+      )
+    : null;
   return el(
     "div",
     attrs,
     el("span", { className: "alert-icon" }, icon(iconMap[tone] || "info", iconToneMap[tone] || "icon-md icon-info")),
-    el("div", { className: "alert-text" }, textChildren)
+    el("div", { className: "alert-text" }, textChildren),
+    dismissBtn
+  );
+}
+
+export function toastCard({ tone = "info", body, onDismiss = null } = {}) {
+  const iconMap = {
+    warning: "alertTriangle",
+    danger: "alertCircle",
+    success: "checkCircle",
+    info: "info",
+  };
+  const iconToneMap = {
+    warning: "icon-md icon-warning",
+    danger: "icon-md icon-danger",
+    success: "icon-md icon-success",
+    info: "icon-md icon-info",
+  };
+  const dismissBtn = onDismiss
+    ? el(
+        "button",
+        {
+          type: "button",
+          className: "btn btn-sm btn-ghost btn-icon alert-dismiss",
+          "aria-label": t("app.action.dismiss"),
+          title: t("app.action.dismiss"),
+          onClick: onDismiss,
+        },
+        icon("x")
+      )
+    : null;
+  return el(
+    "div",
+    {
+      className: "toast-card",
+      role: tone === "danger" ? "alert" : "status",
+    },
+    el("span", { className: "alert-icon" }, icon(iconMap[tone] || "info", iconToneMap[tone] || "icon-md icon-info")),
+    el("div", { className: "toast-body" }, body),
+    dismissBtn
+  );
+}
+
+export function inlineMessage({ tone = "info", text } = {}) {
+  const iconMap = {
+    warning: "alertTriangle",
+    danger: "alertCircle",
+    success: "checkCircle",
+    info: "info",
+  };
+  return el(
+    "div",
+    { className: `inline-msg inline-msg-${tone}` },
+    icon(iconMap[tone] || "info", "icon-xs"),
+    el("span", { className: "inline-msg-text" }, text)
+  );
+}
+
+export function busyLine(text) {
+  return el(
+    "div",
+    { className: "busy-line", role: "status" },
+    el("span", { className: "spinner", "aria-hidden": "true" }),
+    el("span", null, text)
+  );
+}
+
+export function emptyState({ iconName, title, body = null, action = null } = {}) {
+  return el(
+    "section",
+    { className: "empty-state" },
+    el("div", { className: "empty-state-disc", "aria-hidden": "true" }, icon(iconName, "icon-lg")),
+    el(
+      "div",
+      { className: "empty-state-words" },
+      el("h2", { className: "empty-state-title" }, title),
+      body ? el("p", { className: "empty-state-body" }, body) : null
+    ),
+    action ? el("div", { className: "empty-state-actions" }, action) : null
   );
 }
 
