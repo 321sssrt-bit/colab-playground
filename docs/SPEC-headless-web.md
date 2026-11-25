@@ -4,7 +4,7 @@
 
 Colab Playground currently ships only as a desktop GUI application built with GPUI, which requires a graphical desktop environment and windowing libraries (Wayland/X11 on Linux, desktop windows on macOS/Windows). Users running the Google Colab CLI on headless Linux servers, ARM64 workstations without a desktop, or remote SSH machines cannot build or run the desktop interface locally, and therefore lose access to Colab Playground's multi-account management, hardware-targeted session provisioning, live cost Guards, Forward management, and Plugin runner.
 
-Users in these environments do not want a new multi-user cloud platform or a rewritten tool with divergent behavior; they want the exact same Colab Playground desktop application delivered as a CLI-launched headless Web Server that can be operated remotely from any Browser Client while preserving the repository's pure-Rust workflow, safety invariants, and upstream-friendly structure.
+Users in these environments do not want a new multi-user cloud platform or a rewritten tool with divergent behavior; they want the exact same Colab Playground desktop application delivered as a CLI-launched headless Web Server that can be operated remotely from any Browser Client while preserving a pure-Rust backend, single-binary deployment, safety invariants, and upstream-friendly structure.
 
 ## Solution
 
@@ -16,7 +16,7 @@ Users launch the Web Server from the command line (in the ergonomic style of `ki
 
 ### CLI startup, deployment, and Demo data
 
-1. As a headless Linux server user, I want to build the Web Server binary with standard Cargo without installing Wayland, X11, Node.js, npm, or WASM toolchains, so that I can compile and run it natively on desktop-free machines.
+1. As a headless Linux server user, I want to run `colab-playground-web` as a single standalone Rust binary without Wayland, X11, or Node.js installed on the deployment host (building the React + TypeScript + Vite frontend with `pnpm` first and embedding the compiled bundle during Cargo compilation per ADR-0005).
 2. As a developer or evaluator, I want debug builds of the Web Server to default to Demo data and release builds to default to the real Colab CLI (with explicit `--mock`, `--real`, `--mock-scenario`, `--mock-fail`, and `COLAB_PLAYGROUND_BACKEND` support), so that typos or development runs never touch real Google accounts or incur billing.
 3. As a CLI user, I want the Web Server to bind to loopback (`127.0.0.1`) by default and require an explicit `--host` flag (such as `--host 0.0.0.0` or `--host <ip>`) to listen on non-loopback interfaces, so that Colab control is never exposed on a network by accident.
 4. As a CLI user, I want to configure the listen port (`--port`), suppress automatic browser launch (`--no-open`), and allow reverse-proxy hostnames (`--trusted-host`), so that the Web Server fits smoothly into SSH workflows, LAN/Tailscale setups, and systemd services.
@@ -91,13 +91,13 @@ Users launch the Web Server from the command line (in the ergonomic style of `ki
 - Add 5-locale translations in the web crate for basic UI control strings previously supplied by Ely's built-in catalog, and enforce cross-locale key parity across both shared and web catalogs.
 - Extend workspace OS-isolation lint rules and CI jobs to cover the shared and web crates, including a dedicated headless Linux build-and-test job for `colab-playground-web` without X11/Wayland packages, while keeping desktop Ely clippy rules scoped to the desktop crate.
 
-### Backend HTTP/SSE server and zero-toolchain embedded frontend (ADR-0002)
+### Backend HTTP/SSE server and embedded React + TypeScript + Vite frontend (ADR-0005, superseding ADR-0002)
 
-- Build the headless web crate on Rust `axum` with zero Node.js, npm, or WASM build dependencies; embed plain HTML, CSS, and native ES Module JS static assets directly into the binary at compile time.
+- Build the headless web crate on Rust `axum` with a React + TypeScript + Vite frontend (`crates/web/frontend/`, managed with `pnpm`) whose compiled static bundle (`dist/`) is embedded directly into the single Rust binary at compile time via `crates/web/build.rs`. See [`docs/SPEC-web-react-frontend.md`](SPEC-web-react-frontend.md) for the frontend build, static check, and CI contract.
 - Keep all business math (spend integration, ETA, Guard evaluation, quantisation fitting, status formatting) on the Rust server; the browser layer renders server-computed state and dispatches user intents.
-- Use native browser primitives (`<dialog>`, `<form>`, `<select>`) styled via theme CSS custom properties matching the desktop visual hierarchy and light/dark palettes; enforce `Content-Security-Policy: default-src 'self'`.
-- Publish full versioned state snapshots over SSE (rather than fragile incremental DOM patches) so reconnecting or newly opened Browser Clients converge immediately; isolate active form/modal DOM subtrees from background snapshot re-renders so typing is never clobbered.
-- Consume Plugin `secret` inputs directly in the request handler when invoking the backend and exclude them from server state snapshots, broadcast events, and logs.
+- Use native `<dialog>` modals and existing theme CSS custom properties matching the desktop visual hierarchy and light/dark palettes; enforce `Content-Security-Policy: default-src 'self'`.
+- Publish full versioned state snapshots over SSE (rather than fragile incremental DOM patches) so reconnecting or newly opened Browser Clients converge immediately; isolate active form/modal state from background snapshot updates so typing is never clobbered.
+- Consume Plugin `secret` inputs directly on submission and exclude them from client/server shared state snapshots, broadcast events, and logs.
 - Adapt desktop-only actions cleanly: copyable server config path, read-only release link update notice (with repository metadata pointing to the fork while forked), server directory path input for local Plugin install, explicit clickable links for external/OAuth URLs, and browser-driven system language/theme detection.
 
 ### Forward bind modes and three-address model (ADR-0003)
@@ -135,7 +135,7 @@ A good test verifies observable external behavior at the highest practical seam 
 3. **Desktop parity and static invariant seam (existing seam, extended)**:
    - Run the existing desktop UI test suite unchanged to prove extracting the shared crate introduces zero desktop regressions.
    - Split locale-parity tests so every locale key resolves identically across all 5 languages in both shared and web catalogs while retaining desktop Ely catalog and key-usage scans.
-   - Extend OS-isolation source lint tests to the shared and web crates, and add a static test scanning embedded web assets to reject hardcoded user-visible UI strings, hardcoded colors, and inline scripts.
+   - Extend OS-isolation source lint tests to the shared and web crates, and enforce frontend static invariants (`tsc --noEmit`, no unsafe DOM/inline scripts/hardcoded colors, and 5-locale `t("...")` key verification) alongside Rust HTTP/CSP/catalog tests (ADR-0005).
 
 ## Out of Scope
 
@@ -144,11 +144,11 @@ A good test verifies observable external behavior at the highest practical seam 
 - Subpath HTTP/WebSocket reverse proxying of forwarded Colab services.
 - Bypassing or replacing the upstream OS keyring security model with a custom plaintext or file-based Google OAuth vault on headless Linux.
 - Building new upstream Roadmap features not yet in the desktop edition (such as Keep plans, Google Drive / Hugging Face checkpoint persistence, plugin run reattach after server restart, or the Google Colab REST/MCP API backend).
-- Introducing Node.js, npm, Playwright, or Rust WASM toolchains into the repository or CI.
+- Introducing Playwright, Vitest, or Rust WASM toolchains into the repository or CI, or requiring Node.js on deployment hosts.
 - Remote self-updating/overwriting of the Web Server binary from a Browser Client, or exposing a default remote server-process shutdown button.
 
 ## Further Notes
 
-- **Relationship to upstream `scarletkc/colab-playground`**: All changes live on a feature branch of the fork (`feat/headless-web`) and follow upstream's `docs/DESIGN.md` hard safety rules, invariants, and commit/PR conventions (no `Co-Authored-By` agent trailers, never push to `main`). Because ADR-0002 introduces a web presentation shell alongside `docs/DESIGN.md`'s v1 browser/WASM non-goal, any eventual upstream merge remains a product decision for the upstream maintainer.
+- **Relationship to upstream `scarletkc/colab-playground`**: All changes live on feature branches of the fork and follow upstream's `docs/DESIGN.md` hard safety rules, invariants, and commit/PR conventions (no `Co-Authored-By` agent trailers, never push to `main`). Because ADR-0005 (superseding ADR-0002) introduces a web presentation shell alongside `docs/DESIGN.md`'s v1 browser/WASM non-goal, any eventual upstream merge remains a product decision for the upstream maintainer.
 - **Headless Linux keyring prerequisite**: Real-mode operation on headless Linux requires an active D-Bus user session with an unlocked Secret Service backend (not plaintext `keyrings.alt`). Before running real mode on any new target host, verify the Python `keyring` backend state without invoking real `colab` commands.
 - **Data directory coexistence**: Even when the fork lives in an isolated local source workspace, both desktop and web builds share the OS app data directory and the machine's single `colab` CLI credential slot unless isolated via `COLAB_PLAYGROUND_CONFIG_DIR`. Do not run the desktop and web binaries concurrently against the same real account.
