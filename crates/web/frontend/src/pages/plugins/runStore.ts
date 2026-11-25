@@ -69,6 +69,7 @@ const INITIAL_STATE: PluginRunsStoreState = {
 let state: PluginRunsStoreState = INITIAL_STATE;
 let dismissedAutoRunId = 0;
 let highestSeenRunId = 0;
+let pendingAutoAttach = false;
 let runsListInFlight: Promise<PluginRunSummary[]> | null = null;
 let forwardsInFlight: Promise<ForwardView[]> | null = null;
 let forwardsSeq = 0;
@@ -111,6 +112,7 @@ function resetStore(): void {
   stopStream();
   dismissedAutoRunId = 0;
   highestSeenRunId = 0;
+  pendingAutoAttach = false;
   runsListInFlight = null;
   forwardsInFlight = null;
   forwardsSeq += 1;
@@ -280,7 +282,7 @@ function mergeEndpointResults(runId: number, endpoints: readonly PluginRunEndpoi
   for (const item of endpoints) {
     const key = endpointForwardKey(runId, item.endpoint.id);
     const serverForwardId = item.forward?.id ?? null;
-    if ((!Object.hasOwn(nextIds, key) || serverForwardId !== null) && nextIds[key] !== serverForwardId) {
+    if (!Object.hasOwn(nextIds, key)) {
       nextIds[key] = serverForwardId;
       idChanged = true;
     }
@@ -579,15 +581,18 @@ function attachRun(summary: PluginRunSummary): void {
 export function refreshPluginRuns(options?: {
   readonly autoAttach?: boolean;
 }): Promise<PluginRunSummary[]> {
+  const autoAttach = options?.autoAttach ?? true;
+  pendingAutoAttach = pendingAutoAttach || autoAttach;
   if (runsListInFlight) {
     return runsListInFlight;
   }
-  const autoAttach = options?.autoAttach ?? true;
   const gen = apiClient.getSessionGeneration();
   setState({ runsLoading: true, runsError: null });
 
   const promise = listPluginRuns()
     .then((runs) => {
+      const shouldConsiderAutoAttach = pendingAutoAttach;
+      pendingAutoAttach = false;
       if (apiClient.getSessionGeneration() !== gen) {
         return runs;
       }
@@ -598,7 +603,7 @@ export function refreshPluginRuns(options?: {
       });
 
       const newest = runs[0] ?? null;
-      if (autoAttach && newest) {
+      if (shouldConsiderAutoAttach && newest) {
         const isBrandNewRun = newest.id > highestSeenRunId;
         const shouldAutoAttach =
           newest.id > dismissedAutoRunId &&
@@ -625,6 +630,7 @@ export function refreshPluginRuns(options?: {
       return runs;
     })
     .catch((error: unknown) => {
+      pendingAutoAttach = false;
       if (apiClient.getSessionGeneration() === gen && !(error instanceof ApiError && error.isAbort)) {
         setState({ runsLoading: false, runsError: error });
       }
