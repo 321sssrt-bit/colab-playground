@@ -17,6 +17,7 @@ import {
 import type { TranslateFn } from "../../lib/i18n.ts";
 import type { ToastInput } from "../../lib/toast.ts";
 import type {
+  AccountContext,
   AccountId,
   ApiErrorPayload,
   Concern,
@@ -55,6 +56,7 @@ export interface SessionSettingsSummary {
 export interface TrackedProvision {
   readonly operationId: number;
   readonly sessionName: string;
+  readonly accountContext: AccountContext | null;
   readonly events: readonly ProvisionProgressEvent[];
   readonly waitingAttempt: number | null;
   readonly waitingSinceMs: number | null;
@@ -347,11 +349,24 @@ function connectProvisionStream(
  * `finished` frame arrives, surviving dialog hide/show toggles, snapshot operation
  * removal ahead of journal completion, and transient network disconnects.
  */
-export function trackProvision(operationId: number, sessionName: string): void {
+export function trackProvision(
+  operationId: number,
+  sessionName: string,
+  accountContext?: AccountContext | null,
+): void {
   const existing = state.trackedProvision;
   if (existing && existing.operationId === operationId) {
-    if (sessionName && existing.sessionName !== sessionName) {
-      setState({ trackedProvision: { ...existing, sessionName } });
+    const nextName = sessionName && existing.sessionName !== sessionName ? sessionName : existing.sessionName;
+    const nextAccountContext =
+      existing.accountContext === null && accountContext ? accountContext : existing.accountContext;
+    if (nextName !== existing.sessionName || nextAccountContext !== existing.accountContext) {
+      setState({
+        trackedProvision: {
+          ...existing,
+          sessionName: nextName,
+          accountContext: nextAccountContext,
+        },
+      });
     }
     return;
   }
@@ -362,6 +377,7 @@ export function trackProvision(operationId: number, sessionName: string): void {
     trackedProvision: {
       operationId,
       sessionName,
+      accountContext: accountContext ?? null,
       events: [],
       waitingAttempt: null,
       waitingSinceMs: null,

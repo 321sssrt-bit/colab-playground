@@ -259,7 +259,11 @@ export function NewSessionDialog({
       setProvisionDraft(null);
       setAttachedOperationId(request.operationId);
       onTrackingOperationRef.current(request.operationId);
-      trackProvision(request.operationId, request.sessionName);
+      trackProvision(
+        request.operationId,
+        request.sessionName,
+        snapshotRef.current?.account ?? null,
+      );
       setPhase({
         kind: "running",
         operationId: request.operationId,
@@ -300,7 +304,10 @@ export function NewSessionDialog({
         Number.isFinite(parsedLimit) && parsedLimit >= 1
           ? Math.floor(parsedLimit)
           : Math.max(1, maxConcurrentRef.current);
-      const targetAccount = request?.mode === "create" ? request.accountContext.active : null;
+      const targetAccount =
+        request?.mode === "create"
+          ? request.accountContext.active
+          : (attachedTracked.accountContext?.active ?? null);
       setPhase({
         kind: "limit",
         limit: cap,
@@ -333,12 +340,17 @@ export function NewSessionDialog({
   };
 
   const currentAccountContext = snapshot?.account ?? null;
+  const originAccountContext =
+    request === null
+      ? null
+      : request.mode === "create"
+        ? request.accountContext
+        : (attachedTracked?.accountContext ?? null);
   const accountChanged =
-    request !== null &&
-    request.mode === "create" &&
+    originAccountContext !== null &&
     currentAccountContext !== null &&
-    (currentAccountContext.revision !== request.accountContext.revision ||
-      currentAccountContext.active !== request.accountContext.active);
+    (currentAccountContext.revision !== originAccountContext.revision ||
+      currentAccountContext.active !== originAccountContext.active);
 
   const shuttingDown = Boolean(snapshot?.shutting_down);
   const blockedByActiveProvision =
@@ -435,7 +447,7 @@ export function NewSessionDialog({
       setCancelRequested(false);
       setAttachedOperationId(accepted.id);
       onTrackingOperationRef.current(accepted.id);
-      trackProvision(accepted.id, built.spec.name);
+      trackProvision(accepted.id, built.spec.name, request.accountContext);
       setPhase({
         kind: "running",
         operationId: accepted.id,

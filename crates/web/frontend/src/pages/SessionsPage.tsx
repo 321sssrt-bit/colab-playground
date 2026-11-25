@@ -220,7 +220,11 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
 
   useEffect(() => {
     if (activeProvisionOp) {
-      trackProvision(activeProvisionOp.op.id, activeProvisionOp.sessionName);
+      trackProvision(
+        activeProvisionOp.op.id,
+        activeProvisionOp.sessionName,
+        snapshot?.account ?? null,
+      );
     }
   }, [activeProvisionOp?.op.id, activeProvisionOp?.sessionName]);
 
