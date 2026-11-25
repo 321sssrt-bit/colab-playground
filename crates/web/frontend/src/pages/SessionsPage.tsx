@@ -31,9 +31,15 @@ import {
   runtimeKey,
   type FormattedError,
 } from "./sessions/format.ts";
-import { AlertTriangleIcon, RefreshIcon } from "./sessions/Icons.tsx";
+import { AlertTriangleIcon, CircleStopIcon, RefreshIcon } from "./sessions/Icons.tsx";
 import { ProvisioningCard } from "./sessions/ProvisioningCard.tsx";
 import { RuntimeCard } from "./sessions/RuntimeCard.tsx";
+import { StopAllDialog } from "./sessions/StopAllDialog.tsx";
+import {
+  StopRuntimeDialog,
+  stopTargetFromRuntime,
+  type StopRuntimeDialogRequest,
+} from "./sessions/StopRuntimeDialog.tsx";
 import {
   applyForwardEvent,
   clearEndedRuntimes,
@@ -54,6 +60,8 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
     readonly AccountFailureResponse[] | null
   >(null);
   const [autoStopDialog, setAutoStopDialog] = useState<AutoStopDialogRequest | null>(null);
+  const [stopRuntimeDialog, setStopRuntimeDialog] = useState<StopRuntimeDialogRequest | null>(null);
+  const [stopAllDialogId, setStopAllDialogId] = useState<number | null>(null);
 
   const prevSnapshotRef = useRef<Snapshot | null>(null);
   const dialogSeqRef = useRef(0);
@@ -128,7 +136,7 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
     }
     observeSnapshotTransitions(prevSnapshotRef.current, snapshot, locale, t, pushToast);
     prevSnapshotRef.current = snapshot;
-  }, [snapshot, locale, t, pushToast]);
+  }, [snapshot, localState.reconcileSeq, locale, t, pushToast]);
 
   const accounts = snapshot?.accounts?.accounts ?? null;
   const cliReady =
@@ -179,6 +187,28 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
     }
     return set;
   }, [operations]);
+
+  const stopAllRunning = useMemo(
+    () =>
+      operations.some(
+        (entry) =>
+          entry.operation.kind === "domain" && entry.operation.name === "stop_all_runtimes",
+      ),
+    [operations],
+  );
+
+  const openStopRuntimeModal = useCallback((runtime: Runtime) => {
+    dialogSeqRef.current += 1;
+    setStopRuntimeDialog({
+      id: dialogSeqRef.current,
+      ...stopTargetFromRuntime(runtime),
+    });
+  }, []);
+
+  const openStopAllModal = useCallback(() => {
+    dialogSeqRef.current += 1;
+    setStopAllDialogId(dialogSeqRef.current);
+  }, []);
 
   const openAutoStopModal = useCallback(
     (runtime: Runtime, mode: AutoStopDialogMode) => {
@@ -272,6 +302,16 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
             }}
           >
             <RefreshIcon />
+          </button>
+          <button
+            type="button"
+            className="btn"
+            data-sessions-stop-all="true"
+            disabled={!environmentReady || Boolean(snapshot?.shutting_down) || stopAllRunning}
+            onClick={openStopAllModal}
+          >
+            {stopAllRunning ? <span className="spinner" aria-hidden="true" /> : <CircleStopIcon />}
+            <span>{t("web.sessions.stop_all")}</span>
           </button>
         </div>
       </header>
@@ -453,6 +493,7 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
                                   onCancelAutoStop={handleCancelAutoStop}
                                   onSwitchAccount={handleSwitchAccount}
                                   onForwardClosed={handleForwardClosed}
+                                  onRequestStop={openStopRuntimeModal}
                                 />
                               );
                             })}
@@ -481,6 +522,23 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
         t={t}
         pushToast={pushToast}
         onClose={() => setAutoStopDialog(null)}
+        onCompleted={handleAutoStopCompleted}
+      />
+
+      <StopRuntimeDialog
+        request={stopRuntimeDialog}
+        t={t}
+        pushToast={pushToast}
+        onClose={() => setStopRuntimeDialog(null)}
+        onStopped={handleAutoStopCompleted}
+      />
+
+      <StopAllDialog
+        openId={stopAllDialogId}
+        snapshot={snapshot}
+        t={t}
+        pushToast={pushToast}
+        onClose={() => setStopAllDialogId(null)}
         onCompleted={handleAutoStopCompleted}
       />
     </>

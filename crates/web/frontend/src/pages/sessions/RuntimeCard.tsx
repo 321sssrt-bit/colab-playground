@@ -201,6 +201,7 @@ export function RuntimeCard({
                 <button
                   type="button"
                   className="btn btn-sm"
+                  disabled={stopping}
                   onClick={() => onRequestStop(runtime)}
                 >
                   {t("app.b2.stop_action")}

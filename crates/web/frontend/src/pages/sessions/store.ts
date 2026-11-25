@@ -57,6 +57,7 @@ interface SessionsLocalState {
   readonly forwardOverlaysById: Readonly<Record<number, ForwardLiveOverlay>>;
   readonly rearmDurationSecs: number;
   readonly cliInstalled: boolean | null;
+  readonly reconcileSeq: number;
 }
 
 const INITIAL_STATE: SessionsLocalState = {
@@ -65,11 +66,15 @@ const INITIAL_STATE: SessionsLocalState = {
   forwardOverlaysById: {},
   rearmDurationSecs: DEFAULT_REARM_SECS,
   cliInstalled: null,
+  reconcileSeq: 0,
 };
 
 let state: SessionsLocalState = INITIAL_STATE;
 let seenGuardStoppedKeys = new Set<string>();
 let seenVanishedKeys = new Set<string>();
+let pendingUserStopCounts = new Map<string, number>();
+let pendingStopAllCount = 0;
+let deferredPendingKeys = new Set<string>();
 let lastKnownRuntimesByAccount = new Map<AccountId, readonly Runtime[]>();
 let latestSnapshotVersion = 0;
 let forwardsInFlight: Promise<ForwardView[]> | null = null;
@@ -94,6 +99,9 @@ function setState(patch: Partial<SessionsLocalState>): void {
 function resetLocalState(): void {
   seenGuardStoppedKeys = new Set<string>();
   seenVanishedKeys = new Set<string>();
+  pendingUserStopCounts = new Map<string, number>();
+  pendingStopAllCount = 0;
+  deferredPendingKeys = new Set<string>();
   lastKnownRuntimesByAccount = new Map<AccountId, readonly Runtime[]>();
   latestSnapshotVersion = 0;
   forwardsInFlight = null;
@@ -108,10 +116,80 @@ apiClient.subscribeAuth((event) => {
   }
 });
 
+function isStopPending(key: string): boolean {
+  return pendingStopAllCount > 0 || pendingUserStopCounts.has(key);
+}
+
+function flushReleasedDeferredKeys(): void {
+  let hasUnblocked = false;
+  for (const key of deferredPendingKeys) {
+    if (!isStopPending(key)) {
+      deferredPendingKeys.delete(key);
+      hasUnblocked = true;
+    }
+  }
+  if (hasUnblocked) {
+    setState({ reconcileSeq: state.reconcileSeq + 1 });
+  }
+}
+
+/**
+ * Suppresses generic "vanished" notifications while a user-initiated stop for `target`
+ * is in flight, since SSE broadcasts the updated runtime list before the HTTP response returns.
+ */
+export function beginUserStop(target: RuntimeRef): () => void {
+  const key = runtimeKey(target);
+  const gen = apiClient.getSessionGeneration();
+  let released = false;
+  if (key) {
+    pendingUserStopCounts.set(key, (pendingUserStopCounts.get(key) ?? 0) + 1);
+  }
+  return () => {
+    if (released || !key || apiClient.getSessionGeneration() !== gen) {
+      return;
+    }
+    released = true;
+    const remaining = (pendingUserStopCounts.get(key) ?? 0) - 1;
+    if (remaining <= 0) {
+      pendingUserStopCounts.delete(key);
+    } else {
+      pendingUserStopCounts.set(key, remaining);
+    }
+    flushReleasedDeferredKeys();
+  };
+}
+
+/**
+ * Suppresses generic "vanished" notifications while a user-initiated Stop all is in flight.
+ */
+export function beginStopAll(): () => void {
+  const gen = apiClient.getSessionGeneration();
+  let released = false;
+  pendingStopAllCount += 1;
+  return () => {
+    if (released || apiClient.getSessionGeneration() !== gen) {
+      return;
+    }
+    released = true;
+    pendingStopAllCount = Math.max(0, pendingStopAllCount - 1);
+    flushReleasedDeferredKeys();
+  };
+}
+
 export function recordEndedRuntime(entry: EndedRuntime): void {
   const key = runtimeKey(entry.runtime);
+  if (key) {
+    deferredPendingKeys.delete(key);
+  }
+  if (entry.reason.kind === "user" && key) {
+    // Prevent later SSE/Guard vanished checks from replaying a vanished toast for a user stop.
+    seenVanishedKeys.add(key);
+  }
   const existing = state.ended.find((item) => runtimeKey(item.runtime) === key);
-  // Keep a specific user/guard reason if a later generic vanished check sees the same runtime.
+  // Keep a specific guard reason intact, and keep user/guard reasons over later generic vanished checks.
+  if (existing && existing.reason.kind === "guard" && entry.reason.kind !== "guard") {
+    return;
+  }
   if (existing && entry.reason.kind === "vanished" && existing.reason.kind !== "vanished") {
     return;
   }
@@ -281,6 +359,10 @@ export function observeSnapshotTransitions(
 
     for (const ref of report.vanished) {
       const rtKey = runtimeKey(ref);
+      if (isStopPending(rtKey)) {
+        deferredPendingKeys.add(rtKey);
+        continue;
+      }
       guardHandledRuntimeKeys.add(rtKey);
       if (seenVanishedKeys.has(rtKey)) {
         continue;
@@ -336,6 +418,7 @@ export function observeSnapshotTransitions(
       }
       const nextList = nextByAccount.get(accountId) ?? [];
       const prevList = lastKnownRuntimesByAccount.get(accountId);
+      const retainedForAccount: Runtime[] = [];
       if (prevList !== undefined) {
         const liveKeys = new Set(nextList.map((rt) => runtimeKey(rt.id)));
         for (const prevRt of prevList) {
@@ -345,6 +428,13 @@ export function observeSnapshotTransitions(
             guardHandledRuntimeKeys.has(rtKey) ||
             seenVanishedKeys.has(rtKey)
           ) {
+            continue;
+          }
+          if (isStopPending(rtKey)) {
+            // Keep the baseline intact until the in-flight stop settles so a failed or dropped
+            // response still reconciles any already-stopped runtime into Recently ended.
+            deferredPendingKeys.add(rtKey);
+            retainedForAccount.push(prevRt);
             continue;
           }
           seenVanishedKeys.add(rtKey);
@@ -365,7 +455,10 @@ export function observeSnapshotTransitions(
           });
         }
       }
-      lastKnownRuntimesByAccount.set(accountId, nextList);
+      lastKnownRuntimesByAccount.set(
+        accountId,
+        retainedForAccount.length > 0 ? [...nextList, ...retainedForAccount] : nextList,
+      );
     }
   }
 }
