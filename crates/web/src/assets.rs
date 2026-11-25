@@ -98,6 +98,11 @@ pub const STATIC_ASSETS: &[Asset] = &[
         body: include_str!("../assets/js/account-dialogs.js"),
     },
     Asset {
+        path: "js/session-dialogs.js",
+        content_type: JS,
+        body: include_str!("../assets/js/session-dialogs.js"),
+    },
+    Asset {
         path: "js/pages/login.js",
         content_type: JS,
         body: include_str!("../assets/js/pages/login.js"),
@@ -106,6 +111,11 @@ pub const STATIC_ASSETS: &[Asset] = &[
         path: "js/pages/overview.js",
         content_type: JS,
         body: include_str!("../assets/js/pages/overview.js"),
+    },
+    Asset {
+        path: "js/pages/sessions.js",
+        content_type: JS,
+        body: include_str!("../assets/js/pages/sessions.js"),
     },
     Asset {
         path: "js/pages/accounts.js",
@@ -257,6 +267,60 @@ const SHELL_EN_US: Messages = &[
         "web.shell.copy_link_failed",
         "Could not copy automatically. Select the link and copy it manually.",
     ),
+    ("web.sessions.stop_all", "Stop all"),
+    (
+        "web.sessions.stop_all_title",
+        "Stop all runtimes and verify?",
+    ),
+    ("web.sessions.stop_all_action", "Stop all and verify"),
+    (
+        "web.sessions.stop_all_web_note",
+        "Stops every running Colab runtime and cancels in-flight creations. The Web Server keeps running.",
+    ),
+    (
+        "web.sessions.stop_all_verified",
+        "All runtimes stopped and verified gone.",
+    ),
+    (
+        "web.sessions.stop_all_remaining",
+        "Some runtimes could not be confirmed stopped:",
+    ),
+    ("web.sessions.watchdog_armed", "Watchdog armed"),
+    ("web.sessions.auto_stop_extend_title", "Extend auto-stop"),
+    ("web.sessions.auto_stop_set_title", "Set auto-stop"),
+    (
+        "web.sessions.auto_stop_extend_desc",
+        "Add time to {name}'s auto-stop deadline.",
+    ),
+    (
+        "web.sessions.auto_stop_set_desc",
+        "Stop {name} automatically after this duration from now.",
+    ),
+    ("web.sessions.auto_stop_extend_by", "Extend by"),
+    ("web.sessions.auto_stop_after", "Stop after"),
+    ("web.sessions.auto_stop_apply", "Apply"),
+    (
+        "web.sessions.auto_stop_duration_required",
+        "Enter a duration greater than zero.",
+    ),
+    ("web.sessions.template_loading", "Loading defaults…"),
+    (
+        "web.sessions.account_changed",
+        "The active account changed while this dialog was open. Reopen it to start a session on the current account.",
+    ),
+    ("web.forward.bind_label", "Listen address"),
+    ("web.forward.bind_loopback", "Loopback only (127.0.0.1)"),
+    ("web.forward.bind_all", "All interfaces (0.0.0.0)"),
+    ("web.forward.existing_title", "Active forwards on {name}"),
+    (
+        "web.forward.ports_invalid",
+        "Enter port numbers between 1 and 65535.",
+    ),
+    (
+        "web.forward.health_invalid",
+        "Health check path must start with / and contain no spaces.",
+    ),
+    ("web.forward.bind_badge_all", "0.0.0.0"),
 ];
 
 const SHELL_ZH_CN: Messages = &[
@@ -344,6 +408,57 @@ const SHELL_ZH_CN: Messages = &[
         "web.shell.copy_link_failed",
         "无法自动复制，请选中链接后手动复制。",
     ),
+    ("web.sessions.stop_all", "停止全部"),
+    ("web.sessions.stop_all_title", "停止全部运行时并核对结果？"),
+    ("web.sessions.stop_all_action", "停止全部并核对"),
+    (
+        "web.sessions.stop_all_web_note",
+        "将停止所有运行中的 Colab 运行时并取消进行中的创建任务，Web 服务器本身保持运行。",
+    ),
+    (
+        "web.sessions.stop_all_verified",
+        "已停止全部运行时并核对清空。",
+    ),
+    (
+        "web.sessions.stop_all_remaining",
+        "以下运行时未能确认已停止：",
+    ),
+    ("web.sessions.watchdog_armed", "Watchdog 已武装"),
+    ("web.sessions.auto_stop_extend_title", "延期自动停机"),
+    ("web.sessions.auto_stop_set_title", "设置自动停机"),
+    (
+        "web.sessions.auto_stop_extend_desc",
+        "延长 {name} 的自动停机截止时间。",
+    ),
+    (
+        "web.sessions.auto_stop_set_desc",
+        "从现在起经过以下时长后自动停止 {name}。",
+    ),
+    ("web.sessions.auto_stop_extend_by", "延长时间"),
+    ("web.sessions.auto_stop_after", "自动停机时长"),
+    ("web.sessions.auto_stop_apply", "应用"),
+    (
+        "web.sessions.auto_stop_duration_required",
+        "请输入大于 0 的时长。",
+    ),
+    ("web.sessions.template_loading", "正在加载默认配置…"),
+    (
+        "web.sessions.account_changed",
+        "此弹窗打开期间活跃账号已切换，请重新打开后再在当前账号下创建会话。",
+    ),
+    ("web.forward.bind_label", "监听地址"),
+    ("web.forward.bind_loopback", "仅回环地址（127.0.0.1）"),
+    ("web.forward.bind_all", "所有网卡（0.0.0.0）"),
+    ("web.forward.existing_title", "{name} 的已建转发"),
+    (
+        "web.forward.ports_invalid",
+        "请输入 1 到 65535 之间的端口号。",
+    ),
+    (
+        "web.forward.health_invalid",
+        "健康检查路径必须以 / 开头且不能包含空格。",
+    ),
+    ("web.forward.bind_badge_all", "0.0.0.0"),
 ];
 
 const SHELL_ZH_TW: Messages = &[
@@ -431,6 +546,60 @@ const SHELL_ZH_TW: Messages = &[
         "web.shell.copy_link_failed",
         "無法自動複製，請選取連結後手動複製。",
     ),
+    ("web.sessions.stop_all", "停止全部"),
+    (
+        "web.sessions.stop_all_title",
+        "停止全部執行階段並核對結果？",
+    ),
+    ("web.sessions.stop_all_action", "停止全部並核對"),
+    (
+        "web.sessions.stop_all_web_note",
+        "將停止所有執行中的 Colab 執行階段並取消進行中的建立作業，Web 伺服器本身會繼續運作。",
+    ),
+    (
+        "web.sessions.stop_all_verified",
+        "已停止全部執行階段並核對清空。",
+    ),
+    (
+        "web.sessions.stop_all_remaining",
+        "以下執行階段未能確認已停止：",
+    ),
+    ("web.sessions.watchdog_armed", "Watchdog 已武裝"),
+    ("web.sessions.auto_stop_extend_title", "延長自動停機"),
+    ("web.sessions.auto_stop_set_title", "設定自動停機"),
+    (
+        "web.sessions.auto_stop_extend_desc",
+        "延長 {name} 的自動停機截止時間。",
+    ),
+    (
+        "web.sessions.auto_stop_set_desc",
+        "從現在起經過以下時間後自動停止 {name}。",
+    ),
+    ("web.sessions.auto_stop_extend_by", "延長時間"),
+    ("web.sessions.auto_stop_after", "自動停機時長"),
+    ("web.sessions.auto_stop_apply", "套用"),
+    (
+        "web.sessions.auto_stop_duration_required",
+        "請輸入大於 0 的時長。",
+    ),
+    ("web.sessions.template_loading", "正在載入預設值…"),
+    (
+        "web.sessions.account_changed",
+        "此對話框開啟期間活躍帳號已切換，請重新開啟後再於目前帳號下建立工作階段。",
+    ),
+    ("web.forward.bind_label", "監聽位址"),
+    ("web.forward.bind_loopback", "僅迴路位址（127.0.0.1）"),
+    ("web.forward.bind_all", "所有介面（0.0.0.0）"),
+    ("web.forward.existing_title", "{name} 的已建轉發"),
+    (
+        "web.forward.ports_invalid",
+        "請輸入 1 到 65535 之間的連接埠號。",
+    ),
+    (
+        "web.forward.health_invalid",
+        "健康檢查路徑必須以 / 開頭且不可包含空格。",
+    ),
+    ("web.forward.bind_badge_all", "0.0.0.0"),
 ];
 
 const SHELL_JA_JP: Messages = &[
@@ -536,6 +705,63 @@ const SHELL_JA_JP: Messages = &[
         "web.shell.copy_link_failed",
         "自動コピーできませんでした。リンクを選択して手動でコピーしてください。",
     ),
+    ("web.sessions.stop_all", "すべて停止"),
+    (
+        "web.sessions.stop_all_title",
+        "すべてのランタイムを停止して確認しますか？",
+    ),
+    ("web.sessions.stop_all_action", "すべて停止して確認"),
+    (
+        "web.sessions.stop_all_web_note",
+        "実行中のすべての Colab ランタイムを停止し、進行中の作成をキャンセルします。Web サーバーは稼働し続けます。",
+    ),
+    (
+        "web.sessions.stop_all_verified",
+        "すべてのランタイムを停止し、終了を確認しました。",
+    ),
+    (
+        "web.sessions.stop_all_remaining",
+        "停止を確認できなかったランタイムがあります：",
+    ),
+    ("web.sessions.watchdog_armed", "Watchdog 有効"),
+    ("web.sessions.auto_stop_extend_title", "自動停止を延長"),
+    ("web.sessions.auto_stop_set_title", "自動停止を設定"),
+    (
+        "web.sessions.auto_stop_extend_desc",
+        "{name} の自動停止時刻を延長します。",
+    ),
+    (
+        "web.sessions.auto_stop_set_desc",
+        "現在から指定時間後に {name} を自動停止します。",
+    ),
+    ("web.sessions.auto_stop_extend_by", "延長時間"),
+    ("web.sessions.auto_stop_after", "自動停止までの時間"),
+    ("web.sessions.auto_stop_apply", "適用"),
+    (
+        "web.sessions.auto_stop_duration_required",
+        "0 より大きい時間を入力してください。",
+    ),
+    (
+        "web.sessions.template_loading",
+        "デフォルト設定を読み込み中…",
+    ),
+    (
+        "web.sessions.account_changed",
+        "このダイアログを開いている間にアクティブなアカウントが変更されました。現在のアカウントでセッションを開始するには開き直してください。",
+    ),
+    ("web.forward.bind_label", "待ち受けアドレス"),
+    ("web.forward.bind_loopback", "ループバックのみ (127.0.0.1)"),
+    ("web.forward.bind_all", "すべてのインターフェース (0.0.0.0)"),
+    ("web.forward.existing_title", "{name} のアクティブな転送"),
+    (
+        "web.forward.ports_invalid",
+        "1 から 65535 のポート番号を入力してください。",
+    ),
+    (
+        "web.forward.health_invalid",
+        "ヘルスチェックパスは / で始まり、空白を含まないようにしてください。",
+    ),
+    ("web.forward.bind_badge_all", "0.0.0.0"),
 ];
 
 const SHELL_KO_KR: Messages = &[
@@ -647,4 +873,58 @@ const SHELL_KO_KR: Messages = &[
         "web.shell.copy_link_failed",
         "자동으로 복사할 수 없습니다. 링크를 선택해 직접 복사하세요.",
     ),
+    ("web.sessions.stop_all", "모두 중지"),
+    (
+        "web.sessions.stop_all_title",
+        "모든 런타임을 중지하고 확인할까요?",
+    ),
+    ("web.sessions.stop_all_action", "모두 중지 및 확인"),
+    (
+        "web.sessions.stop_all_web_note",
+        "실행 중인 모든 Colab 런타임을 중지하고 진행 중인 생성 작업을 취소합니다. 웹 서버는 계속 실행됩니다.",
+    ),
+    (
+        "web.sessions.stop_all_verified",
+        "모든 런타임을 중지하고 종료를 확인했습니다.",
+    ),
+    (
+        "web.sessions.stop_all_remaining",
+        "중지를 확인하지 못한 런타임이 있습니다:",
+    ),
+    ("web.sessions.watchdog_armed", "Watchdog 활성화됨"),
+    ("web.sessions.auto_stop_extend_title", "자동 중지 연장"),
+    ("web.sessions.auto_stop_set_title", "자동 중지 설정"),
+    (
+        "web.sessions.auto_stop_extend_desc",
+        "{name}의 자동 중지 기한을 연장합니다.",
+    ),
+    (
+        "web.sessions.auto_stop_set_desc",
+        "지금부터 지정한 시간 후에 {name}을(를) 자동으로 중지합니다.",
+    ),
+    ("web.sessions.auto_stop_extend_by", "연장 시간"),
+    ("web.sessions.auto_stop_after", "자동 중지 시간"),
+    ("web.sessions.auto_stop_apply", "적용"),
+    (
+        "web.sessions.auto_stop_duration_required",
+        "0보다 큰 시간을 입력하세요.",
+    ),
+    ("web.sessions.template_loading", "기본값 불러오는 중…"),
+    (
+        "web.sessions.account_changed",
+        "이 대화 상자가 열려 있는 동안 활성 계정이 변경되었습니다. 현재 계정에서 세션을 시작하려면 다시 여세요.",
+    ),
+    ("web.forward.bind_label", "수신 주소"),
+    ("web.forward.bind_loopback", "루프백 전용 (127.0.0.1)"),
+    ("web.forward.bind_all", "모든 인터페이스 (0.0.0.0)"),
+    ("web.forward.existing_title", "{name}의 활성 포워딩"),
+    (
+        "web.forward.ports_invalid",
+        "1에서 65535 사이의 포트 번호를 입력하세요.",
+    ),
+    (
+        "web.forward.health_invalid",
+        "상태 확인 경로는 /로 시작하고 공백이 없어야 합니다.",
+    ),
+    ("web.forward.bind_badge_all", "0.0.0.0"),
 ];

@@ -11,7 +11,9 @@ import { createAccountsPage } from "./pages/accounts.js";
 import { createLoginPage } from "./pages/login.js";
 import { createOverviewPage } from "./pages/overview.js";
 import { createPlaceholderPage } from "./pages/placeholder.js";
+import { createSessionsPage } from "./pages/sessions.js";
 import { createSettingsPage } from "./pages/settings.js";
+import { initSessionDialogs } from "./session-dialogs.js";
 import {
   clearAccountNotice,
   getAccountsView,
@@ -77,10 +79,7 @@ class AppShellController {
     this.loginPage = createLoginPage();
     this.pages = {
       overview: createOverviewPage({ navigate: (id) => this.navigate(id) }),
-      sessions: createPlaceholderPage({
-        titleKey: "app.nav.sessions",
-        subtitleKey: "app.sessions.subtitle",
-      }),
+      sessions: createSessionsPage({ navigate: (id) => this.navigate(id) }),
       plugins: createPlaceholderPage({
         titleKey: "app.nav.plugins",
         subtitleKey: "app.plugins.subtitle",
@@ -92,6 +91,7 @@ class AppShellController {
 
   start() {
     initAccountDialogs();
+    initSessionDialogs({ navigate: (id) => this.navigate(id) });
 
     window.addEventListener("hashchange", () => {
       const raw = window.location.hash.replace(/^#\/?/, "").split("?")[0];
@@ -757,7 +757,8 @@ class AppShellController {
     viewport.appendChild(
       toastCard({
         tone: state.accountNotice.tone || "info",
-        body: state.accountNotice.message,
+        title: state.accountNotice.title || null,
+        body: state.accountNotice.message || null,
         onDismiss: () => clearAccountNotice(),
       })
     );

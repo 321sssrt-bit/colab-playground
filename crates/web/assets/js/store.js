@@ -1,9 +1,12 @@
 import { apiRequest, clearToken, hasToken, setUnauthorizedHandler, streamSse } from "./api.js";
-import { setLanguagePreference } from "./i18n.js";
+import { formatConcern, formatHardware, formatRuntimeCardLabel } from "./format.js";
+import { setLanguagePreference, t } from "./i18n.js";
 import { setAppearancePreference } from "./theme.js";
 
 const INITIAL_BACKOFF_MS = 1000;
 const MAX_BACKOFF_MS = 10000;
+const ENDED_LIMIT = 20;
+const DEFAULT_REARM_SECS = 7200;
 
 const listeners = new Set();
 let sseController = null;
@@ -11,8 +14,43 @@ let reconnectTimer = null;
 let sseGeneration = 0;
 let authGeneration = 0;
 let overviewPromise = null;
+let sessionsPromise = null;
+let forwardsPromise = null;
+let provisionStreamController = null;
+let provisionRetryTimer = null;
+let provisionBackoffMs = INITIAL_BACKOFF_MS;
+let lastForwardsSignature = "";
+let seenGuardReportKey = "";
 let pendingLoginLanguage = null;
 let pendingLoginAppearance = null;
+
+function emptyProvisionState() {
+  return {
+    id: null,
+    sessionName: "",
+    spec: null,
+    phase: "idle", // idle | running | ready | failed | cancelled
+    events: [],
+    latestAtMs: null,
+    outcome: null,
+    error: null,
+    cancelling: false,
+  };
+}
+
+function runtimeKey(ref) {
+  if (!ref) return "";
+  return `${ref.account}/${ref.endpoint || ""}`;
+}
+
+function tunnelsSignature(tunnels) {
+  if (!Array.isArray(tunnels) || tunnels.length === 0) {
+    return "";
+  }
+  return tunnels
+    .map((item) => `${item.id}:${item.state?.state || ""}:${item.healthy ?? ""}:${item.spec?.bind || ""}`)
+    .join("|");
+}
 
 export function recordLoginLanguageChoice(pref) {
   pendingLoginLanguage = pref;
@@ -53,6 +91,15 @@ export const state = {
   accountsUsageError: null,
   dismissedRecovered: false,
   accountNotice: null,
+  sessionsSampledAt: null,
+  sessionsLoading: false,
+  sessionsRefreshing: false,
+  sessionsError: null,
+  sessionsAccountErrors: null,
+  sessionsEnded: [],
+  forwards: [],
+  forwardsLoaded: false,
+  provision: emptyProvisionState(),
 };
 
 export function subscribe(fn) {
@@ -78,9 +125,26 @@ function stopSse() {
   }
 }
 
+function stopProvisionStream() {
+  if (provisionRetryTimer !== null) {
+    window.clearTimeout(provisionRetryTimer);
+    provisionRetryTimer = null;
+  }
+  provisionBackoffMs = INITIAL_BACKOFF_MS;
+  if (provisionStreamController) {
+    provisionStreamController.abort();
+    provisionStreamController = null;
+  }
+}
+
 export function handleSessionLost({ expired = true } = {}) {
   authGeneration += 1;
   overviewPromise = null;
+  sessionsPromise = null;
+  forwardsPromise = null;
+  lastForwardsSignature = "";
+  seenGuardReportKey = "";
+  stopProvisionStream();
   stopSse();
   clearToken();
   state.authenticated = false;
@@ -110,6 +174,15 @@ export function handleSessionLost({ expired = true } = {}) {
   state.accountsUsageError = null;
   state.dismissedRecovered = false;
   state.accountNotice = null;
+  state.sessionsSampledAt = null;
+  state.sessionsLoading = false;
+  state.sessionsRefreshing = false;
+  state.sessionsError = null;
+  state.sessionsAccountErrors = null;
+  state.sessionsEnded = [];
+  state.forwards = [];
+  state.forwardsLoaded = false;
+  state.provision = emptyProvisionState();
   emit("auth");
 }
 
@@ -132,9 +205,138 @@ export async function enterAuthenticatedSession() {
     fetchInitialSnapshot(),
     loadSettings({ applyPrefs: true }),
     loadOverview(),
+    loadForwards(),
     loadPlugins(),
     loadUpdates(),
   ]);
+}
+
+function recordEndedRuntime({ target, label, email, reason }) {
+  if (!target) return;
+  const key = runtimeKey(target);
+  const next = state.sessionsEnded.filter((item) => runtimeKey(item.runtime) !== key);
+  next.unshift({
+    runtime: target,
+    label: label || target.name || target.endpoint || "",
+    email: email || null,
+    reason,
+  });
+  state.sessionsEnded = next.slice(0, ENDED_LIMIT);
+}
+
+function observeGuardReport(prevSnapshot, nextSnapshot) {
+  const report = nextSnapshot?.guard;
+  if (!report || typeof report !== "object") {
+    return;
+  }
+  const decisions = Array.isArray(report.decisions) ? report.decisions : [];
+  const vanished = Array.isArray(report.vanished) ? report.vanished : [];
+  const signature = JSON.stringify({
+    stopped: decisions
+      .filter((d) => d?.stopped)
+      .map((d) => `${runtimeKey(d.session)}:${d.decision?.concerns?.limit || ""}`),
+    vanished: vanished.map((v) => runtimeKey(v)),
+  });
+  if (!signature || signature === seenGuardReportKey) {
+    return;
+  }
+  seenGuardReportKey = signature;
+
+  const prevRuntimes = Array.isArray(prevSnapshot?.runtimes?.runtimes)
+    ? prevSnapshot.runtimes.runtimes
+    : [];
+  const accounts = nextSnapshot?.accounts?.accounts || prevSnapshot?.accounts?.accounts || [];
+  const lookupInfo = (ref) => {
+    const matched = prevRuntimes.find((rt) => runtimeKey(rt.id) === runtimeKey(ref));
+    const acct = accounts.find((a) => a.id === ref?.account);
+    return {
+      label: matched ? formatRuntimeCardLabel(matched) : ref?.name || ref?.endpoint || "",
+      email: matched?.account_email || acct?.email || null,
+    };
+  };
+
+  for (const item of decisions) {
+    if (item?.decision?.decision === "stop" && item.stopped && item.session) {
+      const info = lookupInfo(item.session);
+      const concern = item.decision.concerns;
+      recordEndedRuntime({
+        target: item.session,
+        label: info.label,
+        email: info.email,
+        reason: { kind: "guard", concern },
+      });
+      setNotice({
+        tone: "danger",
+        title: t("app.b2.guard_stopped_title", { name: info.label }),
+        message: formatConcern(concern),
+      });
+    }
+  }
+  for (const ref of vanished) {
+    const info = lookupInfo(ref);
+    recordEndedRuntime({
+      target: ref,
+      label: info.label,
+      email: info.email,
+      reason: { kind: "vanished" },
+    });
+    setNotice({
+      tone: "info",
+      title: t("app.b2.vanished_title", { name: info.label }),
+      message: t("app.b2.ended_vanished"),
+    });
+  }
+}
+
+function syncProvisionWithOperations(snapshot) {
+  const ops = Array.isArray(snapshot?.operations) ? snapshot.operations : [];
+  const activeOp = ops.find((entry) => entry?.operation?.kind === "provision") || null;
+  if (activeOp) {
+    if (state.provision.id === activeOp.id) {
+      if (state.provision.cancelling !== Boolean(activeOp.cancelling)) {
+        state.provision.cancelling = Boolean(activeOp.cancelling);
+        emit("provision");
+      }
+      if (
+        state.provision.phase === "running" &&
+        !provisionStreamController &&
+        provisionRetryTimer === null
+      ) {
+        void consumeProvisionStream(activeOp.id, authGeneration);
+      }
+    } else if (state.provision.phase !== "running") {
+      void attachSessionProvision(activeOp.id, activeOp.operation.session || "");
+    }
+  }
+}
+
+function applySnapshot(next) {
+  if (!next || typeof next !== "object") {
+    return;
+  }
+  if (state.snapshot && typeof next.version === "number" && next.version < state.snapshot.version) {
+    return;
+  }
+  const prev = state.snapshot;
+  state.snapshot = next;
+  // Clear a manual refresh error only when snapshot runtimes actually changed or recovered from an error.
+  const runtimesUpdated =
+    Boolean(next.runtimes) &&
+    !next.runtimes_error &&
+    (!prev ||
+      Boolean(prev.runtimes_error) ||
+      JSON.stringify(prev.runtimes ?? null) !== JSON.stringify(next.runtimes));
+  if (runtimesUpdated) {
+    state.sessionsError = null;
+  }
+  observeGuardReport(prev, next);
+  syncProvisionWithOperations(next);
+  const nextSig = tunnelsSignature(next.tunnels);
+  if (nextSig !== lastForwardsSignature) {
+    lastForwardsSignature = nextSig;
+    void loadForwards();
+  }
+  emit("snapshot");
 }
 
 export async function fetchInitialSnapshot() {
@@ -146,17 +348,6 @@ export async function fetchInitialSnapshot() {
   } catch {
     // 401 is handled globally; transient failure recovers via SSE loop.
   }
-}
-
-function applySnapshot(next) {
-  if (!next || typeof next !== "object") {
-    return;
-  }
-  if (state.snapshot && typeof next.version === "number" && next.version < state.snapshot.version) {
-    return;
-  }
-  state.snapshot = next;
-  emit("snapshot");
 }
 
 async function startSseLoop() {
@@ -182,12 +373,27 @@ async function startSseLoop() {
         if (recovered) {
           void fetchInitialSnapshot();
           void loadOverview({ silent: true });
+          void loadForwards();
+          if (
+            state.provision.phase === "running" &&
+            state.provision.id !== null &&
+            !provisionStreamController
+          ) {
+            if (provisionRetryTimer !== null) {
+              window.clearTimeout(provisionRetryTimer);
+              provisionRetryTimer = null;
+            }
+            provisionBackoffMs = INITIAL_BACKOFF_MS;
+            void consumeProvisionStream(state.provision.id, authGeneration);
+          }
         }
       },
       onEvent: ({ event, data }) => {
         if (generation !== sseGeneration) return;
         if (event === "snapshot") {
           applySnapshot(data);
+        } else if (event === "forward") {
+          void loadForwards();
         }
       },
     });
@@ -482,14 +688,520 @@ export function dismissRecoveredNotice() {
   emit("accounts");
 }
 
-export function setAccountNotice(notice) {
+export function setNotice(notice) {
   state.accountNotice = notice;
-  emit("accounts");
+  emit("notice");
+}
+
+function clearNotice() {
+  state.accountNotice = null;
+  emit("notice");
+}
+
+export function setAccountNotice(notice) {
+  setNotice(notice);
 }
 
 export function clearAccountNotice() {
-  state.accountNotice = null;
-  emit("accounts");
+  clearNotice();
+}
+
+export function clearEndedSessions() {
+  state.sessionsEnded = [];
+  emit("sessions");
+}
+
+export function getBackendNowSecs() {
+  if (state.sessionsSampledAt) {
+    const elapsedSecs = Math.max(0, Math.floor((Date.now() - state.sessionsSampledAt.localMs) / 1000));
+    return state.sessionsSampledAt.serverSecs + elapsedSecs;
+  }
+  return Math.floor(Date.now() / 1000);
+}
+
+export function getRearmDurationSecs() {
+  const configured = state.settings?.defaults?.max_runtime;
+  if (typeof configured === "number" && Number.isFinite(configured) && configured > 0) {
+    return Math.floor(configured);
+  }
+  return DEFAULT_REARM_SECS;
+}
+
+export function getMaxConcurrentSessions() {
+  const configured = state.settings?.defaults?.max_concurrent_sessions;
+  if (typeof configured === "number" && Number.isFinite(configured) && configured >= 1) {
+    return Math.floor(configured);
+  }
+  return 2;
+}
+
+export function getSessionLimitReached() {
+  const runtimes = state.snapshot?.runtimes?.runtimes;
+  if (!Array.isArray(runtimes)) {
+    return null;
+  }
+  const limit = getMaxConcurrentSessions();
+  const counted = runtimes
+    .filter((rt) => rt?.on_active_account && rt?.id?.name)
+    .map((rt) => rt.id.name);
+  if (counted.length >= limit) {
+    return {
+      limit,
+      email: getActiveEmail(),
+      counted,
+    };
+  }
+  return null;
+}
+
+export function isRuntimeStopping(ref) {
+  const key = runtimeKey(ref);
+  const ops = state.snapshot?.operations;
+  return (
+    Array.isArray(ops) &&
+    ops.some(
+      (entry) =>
+        entry?.operation?.kind === "domain" &&
+        entry.operation.name === "stop_runtime" &&
+        entry.operation.key === key
+    )
+  );
+}
+
+export function isRuntimeAutoStopBusy(ref) {
+  const key = runtimeKey(ref);
+  const ops = state.snapshot?.operations;
+  return (
+    Array.isArray(ops) &&
+    ops.some(
+      (entry) =>
+        entry?.operation?.kind === "domain" &&
+        entry.operation.name === "auto_stop" &&
+        entry.operation.key === key
+    )
+  );
+}
+
+export function isStopAllRunning() {
+  const ops = state.snapshot?.operations;
+  return (
+    Array.isArray(ops) &&
+    ops.some(
+      (entry) =>
+        entry?.operation?.kind === "domain" && entry.operation.name === "stop_all_runtimes"
+    )
+  );
+}
+
+export function isProvisionRunning() {
+  if (state.provision.phase === "running") {
+    return true;
+  }
+  const ops = state.snapshot?.operations;
+  return Array.isArray(ops) && ops.some((entry) => entry?.operation?.kind === "provision");
+}
+
+export function getForwardsForRuntime(runtime) {
+  if (!runtime?.id?.name) return [];
+  const account = runtime.id.account;
+  const session = runtime.id.name;
+  const list = state.forwardsLoaded ? state.forwards : state.snapshot?.tunnels || [];
+  return list.filter(
+    (item) => item?.spec?.account === account && item?.spec?.session === session
+  );
+}
+
+export async function loadSessions({ silent = false } = {}) {
+  if (!state.authenticated) return null;
+  if (sessionsPromise) {
+    return sessionsPromise;
+  }
+  const gen = authGeneration;
+  if (silent) {
+    state.sessionsRefreshing = true;
+  } else {
+    state.sessionsLoading = true;
+    state.sessionsError = null;
+  }
+  emit("sessions");
+  sessionsPromise = (async () => {
+    try {
+      const data = await apiRequest("/api/sessions");
+      if (gen !== authGeneration || !state.authenticated) return null;
+      if (typeof data?.sampled_at === "number" && Number.isFinite(data.sampled_at)) {
+        state.sessionsSampledAt = { serverSecs: data.sampled_at, localMs: Date.now() };
+      }
+      state.sessionsAccountErrors = Array.isArray(data?.errors) ? data.errors : [];
+      state.sessionsError = null;
+      void loadForwards();
+      void fetchInitialSnapshot();
+      return data;
+    } catch (err) {
+      if (gen !== authGeneration || (err && err.status === 401)) return null;
+      state.sessionsError = err?.payload || { error: {} };
+      return null;
+    } finally {
+      if (gen === authGeneration) {
+        sessionsPromise = null;
+        state.sessionsLoading = false;
+        state.sessionsRefreshing = false;
+        emit("sessions");
+      }
+    }
+  })();
+  return sessionsPromise;
+}
+
+export async function loadForwards() {
+  if (!state.authenticated) return null;
+  if (forwardsPromise) {
+    return forwardsPromise;
+  }
+  const gen = authGeneration;
+  forwardsPromise = (async () => {
+    try {
+      const list = await apiRequest("/api/forwards");
+      if (gen !== authGeneration || !state.authenticated) return null;
+      if (Array.isArray(list)) {
+        state.forwards = list;
+        state.forwardsLoaded = true;
+        emit("forwards");
+      }
+      return list;
+    } catch {
+      return null;
+    } finally {
+      if (gen === authGeneration) {
+        forwardsPromise = null;
+      }
+    }
+  })();
+  return forwardsPromise;
+}
+
+export async function fetchSessionTemplate() {
+  return apiRequest("/api/sessions/template");
+}
+
+async function consumeProvisionStream(id, gen) {
+  if (provisionRetryTimer !== null) {
+    window.clearTimeout(provisionRetryTimer);
+    provisionRetryTimer = null;
+  }
+  if (provisionStreamController) {
+    provisionStreamController.abort();
+    provisionStreamController = null;
+  }
+  const controller = new AbortController();
+  provisionStreamController = controller;
+  const streamEvents = [];
+  const result = await streamSse(
+    `/api/sessions/${encodeURIComponent(id)}/events`,
+    {},
+    {
+      signal: controller.signal,
+      onOpen: () => {
+        if (gen !== authGeneration || state.provision.id !== id) return;
+        provisionBackoffMs = INITIAL_BACKOFF_MS;
+      },
+      onEvent: ({ event, data }) => {
+        if (gen !== authGeneration || state.provision.id !== id) return;
+        if (event === "progress" && data) {
+          streamEvents.push(data);
+          // Reconnecting replays the server journal from index 0; only advance on new or equal length.
+          if (streamEvents.length >= state.provision.events.length) {
+            const grew = streamEvents.length > state.provision.events.length;
+            state.provision.events = [...streamEvents];
+            if (grew) {
+              state.provision.latestAtMs = Date.now();
+            }
+            emit("provision");
+          }
+        } else if (event === "finished" && data) {
+          state.provision.cancelling = false;
+          if (data.phase === "ready") {
+            state.provision.phase = "ready";
+            state.provision.outcome = data.outcome || null;
+            state.provision.error = null;
+            const readyName = data.outcome?.name || state.provision.sessionName;
+            if (data.outcome?.below_spec) {
+              const hardware =
+                formatHardware(data.outcome.hardware?.gpu, data.outcome.hardware?.vram_mib) ||
+                t("app.b2.prov_no_gpu");
+              setNotice({
+                tone: "warning",
+                title: t("app.b2.provision_ready_toast", { name: readyName }),
+                message: t("app.b2.prov_ready_below", { hardware }),
+              });
+            } else {
+              setNotice({
+                tone: "success",
+                message: t("app.b2.provision_ready_toast", { name: readyName }),
+              });
+            }
+          } else if (data.phase === "cancelled") {
+            state.provision.phase = "cancelled";
+            state.provision.error = null;
+          } else {
+            state.provision.phase = "failed";
+            state.provision.error = data.error ? { error: data.error } : { error: {} };
+          }
+          emit("provision");
+          void Promise.allSettled([
+            loadSessions({ silent: true }),
+            refreshAccountsUsage().catch(() => {}),
+          ]);
+        }
+      },
+    }
+  );
+  if (provisionStreamController === controller) {
+    provisionStreamController = null;
+  }
+  if (gen !== authGeneration || state.provision.id !== id || state.provision.phase !== "running") {
+    return;
+  }
+  if (result.outcome === "aborted" || result.outcome === "unauthorized") {
+    return;
+  }
+  const isTransientHttp =
+    result.outcome === "http_error" &&
+    (result.status === 502 || result.status === 503 || result.status === 504);
+  if (result.outcome === "http_error" && !isTransientHttp) {
+    state.provision.phase = "failed";
+    state.provision.cancelling = false;
+    state.provision.error = result.payload || { error: {} };
+    emit("provision");
+    void loadSessions({ silent: true });
+    return;
+  }
+  // Keep transient network/stream drops in the running state and retry the retained server journal.
+  const delay = provisionBackoffMs;
+  provisionBackoffMs = Math.min(provisionBackoffMs * 2, MAX_BACKOFF_MS);
+  provisionRetryTimer = window.setTimeout(() => {
+    provisionRetryTimer = null;
+    if (
+      gen === authGeneration &&
+      state.authenticated &&
+      state.provision.id === id &&
+      state.provision.phase === "running"
+    ) {
+      void consumeProvisionStream(id, gen);
+    }
+  }, delay);
+}
+
+export async function attachSessionProvision(id, sessionName = "") {
+  if (!state.authenticated || id === null || id === undefined) return;
+  const gen = authGeneration;
+  if (state.provision.id === id) {
+    if (sessionName && !state.provision.sessionName) {
+      state.provision.sessionName = sessionName;
+      emit("provision");
+    }
+    if (
+      state.provision.phase === "running" &&
+      !provisionStreamController &&
+      provisionRetryTimer === null
+    ) {
+      await consumeProvisionStream(id, gen);
+    }
+    return;
+  }
+  state.provision = {
+    id,
+    sessionName,
+    spec: state.provision.spec,
+    phase: "running",
+    events: [],
+    latestAtMs: Date.now(),
+    outcome: null,
+    error: null,
+    cancelling: false,
+  };
+  emit("provision");
+  await consumeProvisionStream(id, gen);
+}
+
+export async function startSessionProvision(spec, accountContext = null) {
+  const gen = authGeneration;
+  const accepted = await apiRequest("/api/sessions", {
+    method: "POST",
+    body: {
+      account_context: accountContext || getAccountContext(),
+      spec,
+    },
+  });
+  if (gen !== authGeneration || !state.authenticated) return null;
+  const id = accepted?.id;
+  if (id === null || id === undefined) {
+    return null;
+  }
+  if (state.provision.id === id) {
+    if (!state.provision.sessionName) {
+      state.provision.sessionName = spec.name;
+    }
+    if (!state.provision.spec) {
+      state.provision.spec = JSON.parse(JSON.stringify(spec));
+    }
+    emit("provision");
+    if (
+      state.provision.phase === "running" &&
+      !provisionStreamController &&
+      provisionRetryTimer === null
+    ) {
+      void consumeProvisionStream(id, gen);
+    }
+    return id;
+  }
+  if (
+    state.provision.phase === "running" &&
+    state.provision.id !== null &&
+    (provisionStreamController || provisionRetryTimer !== null)
+  ) {
+    const ops = Array.isArray(state.snapshot?.operations) ? state.snapshot.operations : [];
+    const currentStillActive = ops.some(
+      (entry) => entry?.operation?.kind === "provision" && entry.id === state.provision.id
+    );
+    const returnedActive = ops.some(
+      (entry) => entry?.operation?.kind === "provision" && entry.id === id
+    );
+    if (currentStillActive && !returnedActive) {
+      return state.provision.id;
+    }
+  }
+  state.provision = {
+    id,
+    sessionName: spec.name,
+    spec: JSON.parse(JSON.stringify(spec)),
+    phase: "running",
+    events: [],
+    latestAtMs: Date.now(),
+    outcome: null,
+    error: null,
+    cancelling: false,
+  };
+  emit("provision");
+  void consumeProvisionStream(id, gen);
+  return id;
+}
+
+export async function cancelSessionProvision() {
+  const id = state.provision.id;
+  if (id === null || id === undefined || state.provision.phase !== "running" || state.provision.cancelling) {
+    return;
+  }
+  state.provision.cancelling = true;
+  emit("provision");
+  try {
+    await apiRequest(`/api/sessions/${encodeURIComponent(id)}/cancel`, {
+      method: "POST",
+      body: {},
+    });
+  } catch {
+    if (state.provision.id === id && state.provision.phase === "running") {
+      state.provision.cancelling = false;
+      emit("provision");
+    }
+  }
+}
+
+export function resetProvisionState() {
+  if (state.provision.phase === "running") {
+    return;
+  }
+  state.provision = emptyProvisionState();
+  emit("provision");
+}
+
+export function notifyProvisionView() {
+  emit("sessions");
+}
+
+export async function stopRuntime(target, { label, email } = {}) {
+  await apiRequest("/api/sessions/stop", {
+    method: "POST",
+    body: { target, confirmed: true },
+  });
+  recordEndedRuntime({
+    target,
+    label: label || target?.name || target?.endpoint || "",
+    email: email || null,
+    reason: { kind: "user" },
+  });
+  setNotice({
+    tone: "success",
+    message: t("app.b2.stop_done", { name: label || target?.name || target?.endpoint || "" }),
+  });
+  void Promise.allSettled([
+    loadSessions({ silent: true }),
+    loadForwards(),
+    refreshAccountsUsage().catch(() => {}),
+  ]);
+}
+
+export async function changeAutoStop(target, action) {
+  const result = await apiRequest("/api/sessions/auto-stop", {
+    method: "POST",
+    body: {
+      account_context: getAccountContext(),
+      target,
+      action,
+    },
+  });
+  void loadSessions({ silent: true });
+  return result;
+}
+
+export async function stopAllRuntimes() {
+  const report = await apiRequest("/api/sessions/stop-all", {
+    method: "POST",
+    body: { confirmed: true },
+  });
+  void Promise.allSettled([
+    loadSessions({ silent: true }),
+    loadForwards(),
+    refreshAccountsUsage().catch(() => {}),
+  ]);
+  return report;
+}
+
+export async function openForward(spec, accountContext = null) {
+  const view = await apiRequest("/api/forwards", {
+    method: "POST",
+    body: {
+      account_context: accountContext || getAccountContext(),
+      account: spec.account,
+      session: spec.session,
+      bind: spec.bind,
+      local_port: spec.local_port,
+      remote_port: spec.remote_port,
+      health_path: spec.health_path,
+    },
+  });
+  if (view && view.id !== undefined) {
+    state.forwards = [...state.forwards.filter((item) => item.id !== view.id), view];
+    state.forwardsLoaded = true;
+    emit("forwards");
+  }
+  void Promise.allSettled([loadForwards(), fetchInitialSnapshot()]);
+  return view;
+}
+
+export async function closeForward(id) {
+  const resp = await apiRequest(`/api/forwards/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+    body: {},
+  });
+  state.forwards = state.forwards.filter((item) => item.id !== id);
+  emit("forwards");
+  setNotice({
+    tone: "info",
+    title: t("app.b2.forward_closed"),
+    message: t(resp?.notice_key || "app.b2.forward_closed_billing"),
+  });
+  void Promise.allSettled([loadForwards(), fetchInitialSnapshot()]);
+  return resp;
 }
 
 export async function startCliInstall(method) {

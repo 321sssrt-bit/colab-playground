@@ -38,18 +38,28 @@ impl ForwardPolicy {
         }
     }
 
+    pub fn all_interfaces_restriction(self) -> Option<&'static str> {
+        if !self.supported_host {
+            Some("windows_or_wsl")
+        } else if self.loopback {
+            Some("loopback_listener")
+        } else {
+            None
+        }
+    }
+
+    pub fn all_interfaces_allowed(self) -> bool {
+        self.all_interfaces_restriction().is_none()
+    }
+
     fn check(self, bind: ForwardBind) -> Result<()> {
         if bind == ForwardBind::Loopback {
             return Ok(());
         }
-        let reason = if !self.supported_host {
-            "windows_or_wsl"
-        } else if self.loopback {
-            "loopback_listener"
-        } else {
-            return Ok(());
-        };
-        Err(Error::new(ErrorKind::Unsupported).with("forward_bind_restriction", reason))
+        if let Some(reason) = self.all_interfaces_restriction() {
+            return Err(Error::new(ErrorKind::Unsupported).with("forward_bind_restriction", reason));
+        }
+        Ok(())
     }
 }
 
