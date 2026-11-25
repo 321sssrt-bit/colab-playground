@@ -36,6 +36,7 @@ class AppShellController {
     this.shellEl = null;
     this.skipLinkEl = null;
     this.sidebarEl = null;
+    this.shellMainEl = null;
     this.topbarEl = null;
     this.bannerEl = null;
     this.pageHostEl = null;
@@ -147,6 +148,7 @@ class AppShellController {
     }
     clear(this.mountNode);
     this.shellMounted = false;
+    this.shellMainEl = null;
     this.drawerOpen = false;
 
     if (!state.authenticated) {
@@ -176,13 +178,20 @@ class AppShellController {
       t("web.shell.skip_to_content")
     );
 
+    this.shellMainEl = el(
+      "div",
+      { className: "shell-main" },
+      this.topbarEl,
+      this.bannerEl,
+      this.pageHostEl
+    );
     this.shellEl = el(
       "div",
       { className: "shell" },
       this.skipLinkEl,
       backdrop,
       this.sidebarEl,
-      el("div", { className: "shell-main" }, this.topbarEl, this.bannerEl, this.pageHostEl)
+      this.shellMainEl
     );
     this.mountNode.appendChild(this.shellEl);
     this.shellMounted = true;
@@ -220,6 +229,13 @@ class AppShellController {
     this.activeRouteId = this.route;
     this.activePage = this.pages[this.route] || this.pages[DEFAULT_ROUTE];
     this.activePage.mount(this.pageHostEl);
+    // Reset scroll position on route change (mirrors desktop RootView::render).
+    if (this.shellMainEl) {
+      this.shellMainEl.scrollTop = 0;
+    }
+    if (window.scrollY > 0) {
+      window.scrollTo(0, 0);
+    }
     this.updateTitle();
   }
 
