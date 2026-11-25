@@ -61,7 +61,7 @@ interface AutoStopResponse {
   readonly warning_key: string | null;
 }
 
-export interface StopAllRemainingItem {
+interface StopAllRemainingItem {
   readonly target: RuntimeRef;
   readonly error: ApiErrorPayload | null;
 }
