@@ -9,7 +9,13 @@ import type { TranslateFn } from "../../lib/i18n.ts";
 import { webStore } from "../../lib/store.ts";
 import type { ToastInput } from "../../lib/toast.ts";
 import type { AccountId, Snapshot } from "../../lib/types.ts";
-import { formatApiError, removeSavedAccount, type FormattedApiError } from "./model.ts";
+import {
+  formatApiError,
+  getAccountRemoveBlock,
+  isAccountChangeBlocked,
+  removeSavedAccount,
+  type FormattedApiError,
+} from "./model.ts";
 
 export interface RemoveTarget {
   readonly id: AccountId;
@@ -42,9 +48,22 @@ export function RemoveAccountDialog({
 
   const targetRef = useRef(target);
   targetRef.current = target;
+  const snapshotRef = useRef(snapshot);
+  snapshotRef.current = snapshot;
   const removingRef = useRef(removing);
   removingRef.current = removing;
   const requestSeqRef = useRef(0);
+
+  const removeBlock = target !== null ? getAccountRemoveBlock(target.id, snapshot) : null;
+  const accountChangeBlocked = isAccountChangeBlocked(snapshot);
+  const removeBlockReason =
+    removeBlock === "active"
+      ? t("app.accounts.remove_active")
+      : removeBlock === "running"
+        ? t("app.accounts.remove_running")
+        : accountChangeBlocked
+          ? t("app.b2.account_change_blocked")
+          : null;
 
   useEffect(() => {
     onRemovingChange?.(removing);
@@ -74,7 +93,16 @@ export function RemoveAccountDialog({
 
   const handleConfirm = useCallback(async () => {
     const current = targetRef.current;
+    const liveSnapshot = snapshotRef.current;
     if (current === null || removingRef.current) {
+      return;
+    }
+    // Re-check remove protection against the latest snapshot before sending DELETE.
+    if (
+      getAccountRemoveBlock(current.id, liveSnapshot) !== null ||
+      isAccountChangeBlocked(liveSnapshot) ||
+      liveSnapshot.shutting_down
+    ) {
       return;
     }
     const seq = requestSeqRef.current;
@@ -82,7 +110,7 @@ export function RemoveAccountDialog({
     setError(null);
 
     try {
-      await removeSavedAccount(current.id, snapshot.account);
+      await removeSavedAccount(current.id, liveSnapshot.account);
       if (seq !== requestSeqRef.current || targetRef.current === null) {
         return;
       }
@@ -96,7 +124,7 @@ export function RemoveAccountDialog({
       setRemoving(false);
       setError(formatApiError(err, t));
     }
-  }, [onClose, pushToast, snapshot.account, t]);
+  }, [onClose, pushToast, t]);
 
   const handleDialogCancel = useCallback(
     (event: React.SyntheticEvent<HTMLDialogElement>) => {
@@ -134,6 +162,17 @@ export function RemoveAccountDialog({
       <div className="dialog-body">
         <p className="dialog-paragraph">{t("app.remove.body")}</p>
 
+        {!removing && removeBlockReason !== null && (
+          <div className="alert alert-warning" role="alert">
+            <span className="alert-icon icon-warning">
+              <AlertIcon />
+            </span>
+            <div className="alert-text">
+              <p className="alert-body">{removeBlockReason}</p>
+            </div>
+          </div>
+        )}
+
         {error !== null && (
           <div className="alert alert-danger" role="alert">
             <span className="alert-icon icon-danger">
@@ -161,7 +200,8 @@ export function RemoveAccountDialog({
         <button
           type="button"
           className="btn btn-danger"
-          disabled={removing || snapshot.shutting_down}
+          disabled={removing || removeBlockReason !== null || snapshot.shutting_down}
+          title={removeBlockReason ?? undefined}
           onClick={() => {
             void handleConfirm();
           }}

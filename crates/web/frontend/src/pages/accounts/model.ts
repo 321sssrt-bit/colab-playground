@@ -294,7 +294,11 @@ export function isUsageOutdated(
     return false;
   }
   const ageSecs = Math.max(0, Math.floor(nowSecs - usageSnap.fetched_at));
-  return usageSnap.stale || usageView?.last_error !== null || ageSecs >= USAGE_OLD_THRESHOLD_SECS;
+  return (
+    usageSnap.stale ||
+    (usageView?.last_error ?? null) !== null ||
+    ageSecs >= USAGE_OLD_THRESHOLD_SECS
+  );
 }
 
 export function formatAccountTimeLeft(
@@ -347,18 +351,22 @@ export function resolveAccountsGate(
     return { kind: "loading" };
   }
 
-  const accountsError = snapshot.accounts_error ?? diagnostics?.accounts_error ?? null;
-  if (accountsError === "wsl_unavailable") {
-    return { kind: "needs_wsl" };
+  // Live SSE errors and recovered account snapshots take precedence over an older probe.
+  if (snapshot.accounts_error !== null) {
+    if (snapshot.accounts_error === "wsl_unavailable") {
+      return { kind: "needs_wsl" };
+    }
+    if (snapshot.accounts_error === "not_installed") {
+      return { kind: "needs_cli" };
+    }
+    if (snapshot.accounts_error === "keyring_unavailable") {
+      return { kind: "keyring_unavailable", hint_key: diagnostics?.keyring.hint_key ?? null };
+    }
+    return { kind: "error", errorKind: snapshot.accounts_error };
   }
-  if (accountsError === "not_installed") {
-    return { kind: "needs_cli" };
-  }
-  if (accountsError === "keyring_unavailable") {
-    return { kind: "keyring_unavailable", hint_key: diagnostics?.keyring.hint_key ?? null };
-  }
-  if (accountsError !== null) {
-    return { kind: "error", errorKind: accountsError };
+
+  if (snapshot.accounts !== null) {
+    return { kind: "ready", accounts: snapshot.accounts };
   }
 
   if (diagnostics !== null) {
@@ -371,13 +379,44 @@ export function resolveAccountsGate(
     if (diagnostics.keyring.status === "unavailable") {
       return { kind: "keyring_unavailable", hint_key: diagnostics.keyring.hint_key };
     }
-  }
-
-  if (snapshot.accounts !== null) {
-    return { kind: "ready", accounts: snapshot.accounts };
+    if (diagnostics.accounts_error !== null) {
+      if (diagnostics.accounts_error === "wsl_unavailable") {
+        return { kind: "needs_wsl" };
+      }
+      if (diagnostics.accounts_error === "not_installed") {
+        return { kind: "needs_cli" };
+      }
+      if (diagnostics.accounts_error === "keyring_unavailable") {
+        return { kind: "keyring_unavailable", hint_key: diagnostics.keyring.hint_key };
+      }
+      return { kind: "error", errorKind: diagnostics.accounts_error };
+    }
   }
 
   return { kind: "loading" };
+}
+
+export function getAccountRemoveBlock(
+  accountId: AccountId,
+  snapshot: Snapshot,
+): RemoveBlock | null {
+  const activeId = snapshot.accounts?.active ?? snapshot.account.active;
+  if (activeId === accountId) {
+    return "active";
+  }
+  const hasListedRuntime =
+    snapshot.runtimes?.runtimes.some((runtime) => runtime.id.account === accountId) ?? false;
+  if (hasListedRuntime) {
+    return "running";
+  }
+  const usageView = snapshot.usage.find((item) => item.account === accountId) ?? null;
+  const accountRecord =
+    snapshot.accounts?.accounts.find((item) => item.id === accountId) ?? null;
+  const usageSnapshot = usageView?.snapshot ?? accountRecord?.usage ?? null;
+  if (usageSnapshot !== null && usageSnapshot.assignments > 0) {
+    return "running";
+  }
+  return null;
 }
 
 export function buildAccountRows(
@@ -390,12 +429,6 @@ export function buildAccountRows(
   for (const item of snapshot.usage) {
     usageByAccount.set(item.account, item);
   }
-  const activeRuntimeAccounts = new Set<AccountId>();
-  if (snapshot.runtimes !== null) {
-    for (const runtime of snapshot.runtimes.runtimes) {
-      activeRuntimeAccounts.add(runtime.id.account);
-    }
-  }
 
   return accountsView.accounts.map((account) => {
     const usage = usageByAccount.get(account.id) ?? null;
@@ -405,10 +438,7 @@ export function buildAccountRows(
     const ageSecs =
       usageSnapshot !== null ? Math.max(0, Math.floor(nowSecs - usageSnapshot.fetched_at)) : null;
     const isStale = isUsageOutdated(usageSnapshot, usage, nowSecs);
-    const hasRunning =
-      activeRuntimeAccounts.has(account.id) ||
-      (usageSnapshot !== null && usageSnapshot.assignments > 0);
-    const removeBlock: RemoveBlock | null = active ? "active" : hasRunning ? "running" : null;
+    const removeBlock = getAccountRemoveBlock(account.id, snapshot);
 
     return {
       account,

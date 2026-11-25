@@ -57,7 +57,7 @@ export function AddAccountDialog({
 
   const [phase, setPhase] = useState<AddPhase>({ kind: "intro" });
   const [code, setCode] = useState("");
-  const [seenServerLoginId, setSeenServerLoginId] = useState(false);
+  const [postBeginVersion, setPostBeginVersion] = useState<number | null>(null);
 
   const phaseRef = useRef<AddPhase>(phase);
   phaseRef.current = phase;
@@ -65,13 +65,52 @@ export function AddAccountDialog({
   openRef.current = open;
   const serverLoginIdRef = useRef<number | null>(snapshot.login_id);
   serverLoginIdRef.current = snapshot.login_id;
+  const postBeginVersionRef = useRef<number | null>(postBeginVersion);
+  postBeginVersionRef.current = postBeginVersion;
   const cancelStartRequestedRef = useRef(false);
   const requestControllerRef = useRef<AbortController | null>(null);
+  const syncControllerRef = useRef<AbortController | null>(null);
   const loginSessionSeqRef = useRef(0);
 
   const abortActiveRequest = useCallback(() => {
     requestControllerRef.current?.abort();
     requestControllerRef.current = null;
+    syncControllerRef.current?.abort();
+    syncControllerRef.current = null;
+  }, []);
+
+  // Pull a post-begin snapshot directly so missed SSE frames during disconnects still detect timeout.
+  const syncPromptSnapshot = useCallback(async (loginId: number, seq: number) => {
+    syncControllerRef.current?.abort();
+    const controller = new AbortController();
+    syncControllerRef.current = controller;
+    try {
+      const latest = await webStore.refreshSnapshot(controller.signal);
+      if (syncControllerRef.current === controller) {
+        syncControllerRef.current = null;
+      }
+      if (seq !== loginSessionSeqRef.current || !openRef.current) {
+        return;
+      }
+      const current = phaseRef.current;
+      if (current.kind !== "code" || current.loginId !== loginId) {
+        return;
+      }
+      setPostBeginVersion(latest.version);
+      const loginOpRunning = latest.operations.some(
+        (pending) =>
+          pending.operation.kind === "login" &&
+          (pending.operation.login_id === undefined || pending.operation.login_id === loginId),
+      );
+      if (latest.login_id !== loginId && !loginOpRunning) {
+        setCode("");
+        setPhase({ kind: "expired" });
+      }
+    } catch {
+      if (syncControllerRef.current === controller) {
+        syncControllerRef.current = null;
+      }
+    }
   }, []);
 
   // Synchronize native top-layer modal visibility with `open` prop.
@@ -84,7 +123,7 @@ export function AddAccountDialog({
       loginSessionSeqRef.current += 1;
       cancelStartRequestedRef.current = false;
       setCode("");
-      setSeenServerLoginId(false);
+      setPostBeginVersion(null);
       const activeServerLoginId = serverLoginIdRef.current;
       if (activeServerLoginId !== null) {
         setPhase({ kind: "other_active", loginId: activeServerLoginId });
@@ -109,6 +148,28 @@ export function AddAccountDialog({
     };
   }, [abortActiveRequest]);
 
+  // Retry post-begin snapshot sync once SSE reconnects if the initial pull failed while offline.
+  useEffect(() => {
+    if (!open || phase.kind !== "code" || postBeginVersion !== null) {
+      return;
+    }
+    const { loginId } = phase;
+    const seq = loginSessionSeqRef.current;
+    let prevStatus = webStore.getState().connectionStatus;
+    return webStore.subscribe(() => {
+      const nextStatus = webStore.getState().connectionStatus;
+      if (
+        prevStatus !== "connected" &&
+        nextStatus === "connected" &&
+        postBeginVersionRef.current === null &&
+        syncControllerRef.current === null
+      ) {
+        void syncPromptSnapshot(loginId, seq);
+      }
+      prevStatus = nextStatus;
+    });
+  }, [open, phase, postBeginVersion, syncPromptSnapshot]);
+
   // Keep modal state synchronized with server-side login timeout or external cancellation via SSE.
   useEffect(() => {
     if (!open) {
@@ -127,8 +188,8 @@ export function AddAccountDialog({
     if (phase.kind === "code") {
       const serverLoginId = snapshot.login_id;
       if (serverLoginId === phase.loginId) {
-        if (!seenServerLoginId) {
-          setSeenServerLoginId(true);
+        if (postBeginVersion === null) {
+          setPostBeginVersion(snapshot.version);
         }
         return;
       }
@@ -139,13 +200,16 @@ export function AddAccountDialog({
       );
       if (
         (serverLoginId !== null && serverLoginId !== phase.loginId) ||
-        (seenServerLoginId && serverLoginId === null && !loginOpRunning)
+        (postBeginVersion !== null &&
+          snapshot.version >= postBeginVersion &&
+          serverLoginId === null &&
+          !loginOpRunning)
       ) {
         setCode("");
         setPhase({ kind: "expired" });
       }
     }
-  }, [open, phase, seenServerLoginId, snapshot.login_id, snapshot.operations]);
+  }, [open, phase, postBeginVersion, snapshot.login_id, snapshot.operations, snapshot.version]);
 
   const performCancelLogin = useCallback(
     async (loginId: number, reopenIntroAfter: boolean) => {
@@ -176,7 +240,7 @@ export function AddAccountDialog({
       pushToast({ tone: "info", body: t("web.add.cancelled_notice") });
       if (reopenIntroAfter) {
         setCode("");
-        setSeenServerLoginId(false);
+        setPostBeginVersion(null);
         setPhase({ kind: "intro" });
       } else {
         onClose();
@@ -189,7 +253,7 @@ export function AddAccountDialog({
     const seq = ++loginSessionSeqRef.current;
     cancelStartRequestedRef.current = false;
     setCode("");
-    setSeenServerLoginId(false);
+    setPostBeginVersion(null);
     setPhase({ kind: "starting" });
 
     const controller = new AbortController();
@@ -208,6 +272,7 @@ export function AddAccountDialog({
       }
 
       setPhase({ kind: "code", loginId: prompt.id, authUrl: prompt.auth_url });
+      void syncPromptSnapshot(prompt.id, seq);
       window.requestAnimationFrame(() => {
         codeInputRef.current?.focus();
       });
@@ -241,7 +306,7 @@ export function AddAccountDialog({
         rolledBack: true,
       });
     }
-  }, [onClose, performCancelLogin, snapshot.account, t]);
+  }, [onClose, performCancelLogin, snapshot.account, syncPromptSnapshot, t]);
 
   const handleCancelOrClose = useCallback(() => {
     const current = phaseRef.current;

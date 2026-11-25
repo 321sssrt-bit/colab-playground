@@ -46,6 +46,7 @@ export function AccountsPage({ snapshot, locale, t, navigate, pushToast }: PageP
   const [usageRefreshError, setUsageRefreshError] = useState<FormattedApiError | null>(null);
   const [adopting, setAdopting] = useState(false);
   const [adoptError, setAdoptError] = useState<FormattedApiError | null>(null);
+  const [recoveredVisible, setRecoveredVisible] = useState(false);
   const [recoveredDismissed, setRecoveredDismissed] = useState(false);
   const [addDialogOpen, setAddDialogOpen] = useState(false);
   const [removeTarget, setRemoveTarget] = useState<RemoveTarget | null>(null);
@@ -180,6 +181,13 @@ export function AccountsPage({ snapshot, locale, t, navigate, pushToast }: PageP
 
   const totals = useMemo(() => computeAccountsTotals(rows), [rows]);
   const unmanagedWarning = useMemo(() => buildUnmanagedWarning(rows, t), [rows, t]);
+
+  // Latch the one-shot server recovery flag so a subsequent background poll does not hide it.
+  useEffect(() => {
+    if (gate.kind === "ready" && gate.accounts.recovered_pending_add && !recoveredDismissed) {
+      setRecoveredVisible(true);
+    }
+  }, [gate, recoveredDismissed]);
 
   // Clear remove target if the account disappears while idle (not mid-confirm, so the
   // in-flight remove handler can still finish its success toast cleanly).
@@ -363,7 +371,7 @@ export function AccountsPage({ snapshot, locale, t, navigate, pushToast }: PageP
 
         {gate.kind === "ready" && (
           <>
-            {gate.accounts.recovered_pending_add && !recoveredDismissed && (
+            {(recoveredVisible || gate.accounts.recovered_pending_add) && !recoveredDismissed && (
               <div className="alert alert-info" role="status">
                 <span className="alert-icon icon-info">
                   <InfoIcon />
@@ -376,7 +384,10 @@ export function AccountsPage({ snapshot, locale, t, navigate, pushToast }: PageP
                   type="button"
                   className="btn btn-ghost btn-sm btn-icon alert-dismiss"
                   aria-label={t("app.action.dismiss")}
-                  onClick={() => setRecoveredDismissed(true)}
+                  onClick={() => {
+                    setRecoveredVisible(false);
+                    setRecoveredDismissed(true);
+                  }}
                 >
                   <CloseIcon />
                 </button>
