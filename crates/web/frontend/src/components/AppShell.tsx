@@ -40,6 +40,11 @@ const FOCUSABLE_SELECTOR =
 
 export type AccountSlotPlacement = "sidebar" | "topbar";
 
+export interface AccountSlotActions {
+  readonly drawerOpen: boolean;
+  readonly closeDrawer: (restoreFocus?: boolean) => void;
+}
+
 function readIsMobileViewport(): boolean {
   if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
     return false;
@@ -89,8 +94,11 @@ export interface AppShellProps {
   readonly onSignOut: () => void;
   /** Optional hook notified when the mobile modal drawer opens or closes. */
   readonly onModalDrawerChange?: (open: boolean) => void;
-  /** Optional renderer replacing the account area in both sidebar and mobile topbar (for #41). */
-  readonly renderAccountSlot?: (placement: AccountSlotPlacement) => ReactNode;
+  /** Optional renderer replacing the account area in both sidebar and mobile topbar. */
+  readonly renderAccountSlot?: (
+    placement: AccountSlotPlacement,
+    actions: AccountSlotActions,
+  ) => ReactNode;
   readonly children: ReactNode;
 }
 
@@ -160,9 +168,20 @@ export function AppShell({
   }, []);
 
   const closeDrawer = useCallback((restoreFocus: boolean) => {
+    if (!modalDrawerOpenRef.current) {
+      setDrawerOpen(false);
+      return;
+    }
     pendingFocusRef.current = restoreFocus ? "menu" : null;
     setDrawerOpen(false);
   }, []);
+
+  const closeDrawerForSlot = useCallback(
+    (restoreFocus = false) => {
+      closeDrawer(restoreFocus);
+    },
+    [closeDrawer],
+  );
 
   useEffect(() => {
     if (!modalDrawerOpen) {
@@ -334,7 +353,12 @@ export function AppShell({
 
           <div className="sidebar-body">
             <div className="sidebar-account-wrap">
-              {renderAccountSlot ? renderAccountSlot("sidebar") : defaultSidebarAccount}
+              {renderAccountSlot
+                ? renderAccountSlot("sidebar", {
+                    drawerOpen: modalDrawerOpen,
+                    closeDrawer: closeDrawerForSlot,
+                  })
+                : defaultSidebarAccount}
             </div>
 
             <nav aria-label={t("web.shell.primary_nav")}>
@@ -441,7 +465,12 @@ export function AppShell({
 
             <div className="topbar-meta">
               <div className="topbar-account-wrap">
-                {renderAccountSlot ? renderAccountSlot("topbar") : defaultTopbarAccount}
+                {renderAccountSlot
+                  ? renderAccountSlot("topbar", {
+                      drawerOpen: modalDrawerOpen,
+                      closeDrawer: closeDrawerForSlot,
+                    })
+                  : defaultTopbarAccount}
               </div>
               <span
                 className={usageBadge.tone === "warning" ? "badge badge-warning" : "badge"}

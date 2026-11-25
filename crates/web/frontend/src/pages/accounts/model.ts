@@ -7,6 +7,7 @@ import { apiClient, ApiError } from "../../lib/api.ts";
 import { formatDuration } from "../../lib/format.ts";
 import type { TranslateFn } from "../../lib/i18n.ts";
 import type {
+  Accelerator,
   Account,
   AccountContext,
   AccountId,
@@ -14,9 +15,43 @@ import type {
   AccountUsageView,
   CoreError,
   ErrorKind,
+  RuntimeRef,
   Snapshot,
+  TrackedSession,
+  TunnelId,
+  TunnelInfo,
   UsageSnapshot,
 } from "../../lib/types.ts";
+
+export interface SwitchTarget {
+  readonly id: AccountId;
+  readonly emailLabel: string;
+}
+
+export interface SwitchConfirmation {
+  readonly from: AccountId | null;
+  readonly to: AccountId;
+  readonly forwards: TunnelId[];
+  readonly managed: [string, string | null][];
+  readonly unmanaged: string[] | null;
+}
+
+export interface AccountSwitchApproval {
+  readonly account_context: AccountContext;
+  readonly confirmation: SwitchConfirmation;
+}
+
+export interface SwitchImpact {
+  readonly from: AccountId | null;
+  readonly to: AccountId;
+  readonly tunnels_closing: TunnelInfo[];
+  readonly sessions_left_running: TrackedSession[];
+  readonly unmanaged_left_running: RuntimeRef[] | null;
+}
+
+export interface AccountSwitchPreview extends AccountSwitchApproval {
+  readonly impact: SwitchImpact;
+}
 
 const USAGE_OLD_THRESHOLD_SECS = 600;
 
@@ -283,6 +318,92 @@ export function removeSavedAccount(
     body: { account_context: accountContext },
     signal,
   });
+}
+
+export function previewAccountSwitch(
+  accountId: AccountId,
+  signal?: AbortSignal,
+): Promise<AccountSwitchPreview> {
+  return apiClient.request<AccountSwitchPreview>(
+    `/api/accounts/${encodeURIComponent(accountId)}/switch`,
+    {
+      method: "GET",
+      signal,
+    },
+  );
+}
+
+export function confirmAccountSwitch(
+  accountId: AccountId,
+  approval: AccountSwitchApproval,
+  signal?: AbortSignal,
+): Promise<AccountsView> {
+  return apiClient.request<AccountsView>(
+    `/api/accounts/${encodeURIComponent(accountId)}/switch`,
+    {
+      method: "POST",
+      body: approval,
+      signal,
+    },
+  );
+}
+
+const ACCELERATOR_KEYS = {
+  NONE: "app.acc.none",
+  T4: "app.acc.t4",
+  L4: "app.acc.l4",
+  G4: "app.acc.g4",
+  A100: "app.acc.a100",
+  H100: "app.acc.h100",
+  V5E1: "app.acc.v5e1",
+  V6E1: "app.acc.v6e1",
+} as const satisfies Record<Accelerator, string>;
+
+export function formatAcceleratorLabel(accelerator: Accelerator, t: TranslateFn): string {
+  return t(ACCELERATOR_KEYS[accelerator]);
+}
+
+export function resolveAccountEmailLabel(
+  accountId: AccountId,
+  snapshot: Snapshot | null,
+  t: TranslateFn,
+  fallback?: string,
+): string {
+  const account = snapshot?.accounts?.accounts.find((item) => item.id === accountId);
+  const usage = snapshot?.usage.find((item) => item.account === accountId);
+  return account?.email ?? usage?.email ?? fallback ?? t("app.accounts.no_email");
+}
+
+export function resolveUnmanagedRuntimeLabel(
+  runtimeRef: RuntimeRef,
+  snapshot: Snapshot | null,
+): string {
+  const listed = snapshot?.runtimes?.runtimes.find(
+    (runtime) =>
+      runtime.id.account === runtimeRef.account && runtime.id.endpoint === runtimeRef.endpoint,
+  );
+  if (listed) {
+    return listed.id.name ?? listed.hardware;
+  }
+  return runtimeRef.name ?? runtimeRef.endpoint;
+}
+
+export function isSwitchImpactEmpty(impact: SwitchImpact): boolean {
+  // Unknown unmanaged runtimes (`null`) may still be billing and must never be treated as empty.
+  return (
+    impact.tunnels_closing.length === 0 &&
+    impact.sessions_left_running.length === 0 &&
+    impact.unmanaged_left_running !== null &&
+    impact.unmanaged_left_running.length === 0
+  );
+}
+
+export function isSwitchConflictError(error: unknown): boolean {
+  return (
+    error instanceof ApiError &&
+    error.status === 409 &&
+    (error.kind === "switch_impact_changed" || error.kind === "account_not_active")
+  );
 }
 
 export function isUsageOutdated(
