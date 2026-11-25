@@ -10,6 +10,7 @@ export function SessionsPage({ snapshot, t }: PageProps) {
   const runtimesError = snapshot?.runtimes_error ?? null;
   const runtimeCount = runtimesView ? runtimesView.runtimes.length : null;
   const accountErrorCount = runtimesView ? runtimesView.errors.length : 0;
+  const hasListError = runtimesError !== null || accountErrorCount > 0;
 
   return (
     <>
@@ -37,7 +38,7 @@ export function SessionsPage({ snapshot, t }: PageProps) {
           </div>
         ) : (
           <>
-            {accountErrorCount > 0 && (
+            {hasListError && (
               <div className="alert alert-warning" role="alert">
                 <span className="alert-icon icon-warning">
                   <AlertIcon />
@@ -53,11 +54,11 @@ export function SessionsPage({ snapshot, t }: PageProps) {
                 <div className="empty-state">
                   <div className="empty-state-words">
                     <h2 className="empty-state-title">
-                      {accountErrorCount > 0
+                      {hasListError
                         ? t("app.b10.sessions_empty_partial_title")
                         : t("app.sessions.empty.title")}
                     </h2>
-                    {accountErrorCount === 0 && (
+                    {!hasListError && (
                       <p className="empty-state-body">{t("app.sessions.empty.body")}</p>
                     )}
                   </div>
