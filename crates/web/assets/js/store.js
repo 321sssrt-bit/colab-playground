@@ -51,9 +51,10 @@ function emptyPluginRunState() {
     plugin: "",
     account: null,
     session: "",
-    provisions: false,
+    provisions: null,
     launched: false,
-    cleanupChecking: false,
+    cleanupResult: null, // null | checking | still_billing | stopped | unknown
+    cleanupRuntime: null,
     runId: null,
     phase: "idle", // idle | running | ready | failed | cancelled
     cancelling: false,
@@ -861,6 +862,55 @@ function appendBoundedLog(entries, additions) {
   }
 }
 
+async function verifyPluginRunCleanup(id, gen) {
+  if (gen !== authGeneration || state.pluginRun.id !== id || !state.pluginRun.session) {
+    return;
+  }
+  state.pluginRun.cleanupResult = "checking";
+  state.pluginRun.cleanupRuntime = null;
+  emit("plugin_run");
+  try {
+    // Wait for any earlier listing to finish, then issue a fresh /api/sessions request so we never
+    // evaluate cleanup against a stale pre-termination snapshot.
+    if (sessionsPromise) {
+      await sessionsPromise.catch(() => null);
+    }
+    const data = await loadSessions({ silent: true });
+    if (gen !== authGeneration || state.pluginRun.id !== id) return;
+    if (!data || !Array.isArray(data.runtimes)) {
+      state.pluginRun.cleanupResult = "unknown";
+      state.pluginRun.cleanupRuntime = null;
+      emit("plugin_run");
+      return;
+    }
+    const targetSession = state.pluginRun.session;
+    const targetAccount = state.pluginRun.account;
+    const matched =
+      data.runtimes.find(
+        (rt) =>
+          rt?.id?.name === targetSession &&
+          (!targetAccount || rt?.id?.account === targetAccount)
+      ) || null;
+    if (matched) {
+      state.pluginRun.cleanupResult = "still_billing";
+      state.pluginRun.cleanupRuntime = matched;
+    } else {
+      const errors = Array.isArray(data.errors) ? data.errors : [];
+      const accountFailed = errors.some(
+        (failure) => !targetAccount || failure?.account === targetAccount
+      );
+      state.pluginRun.cleanupResult = accountFailed ? "unknown" : "stopped";
+      state.pluginRun.cleanupRuntime = null;
+    }
+    emit("plugin_run");
+  } catch {
+    if (gen !== authGeneration || state.pluginRun.id !== id) return;
+    state.pluginRun.cleanupResult = "unknown";
+    state.pluginRun.cleanupRuntime = null;
+    emit("plugin_run");
+  }
+}
+
 async function consumePluginRunStream(id, gen) {
   if (pluginRunRetryTimer !== null) {
     window.clearTimeout(pluginRunRetryTimer);
@@ -973,34 +1023,37 @@ async function consumePluginRunStream(id, gen) {
           if (data.phase === "ready") {
             state.pluginRun.phase = "ready";
             state.pluginRun.error = null;
-            state.pluginRun.cleanupChecking = false;
+            state.pluginRun.cleanupResult = null;
+            state.pluginRun.cleanupRuntime = null;
             const info = (state.plugins || []).find((p) => p?.manifest?.id === state.pluginRun.plugin);
             const name = info ? localized(info.manifest.name) || info.manifest.id : state.pluginRun.plugin;
             setNotice({
               tone: "success",
               message: t("app.b2.run_ready_toast", { name }),
             });
-          } else if (data.phase === "cancelled") {
-            state.pluginRun.phase = "cancelled";
-            state.pluginRun.error = null;
-            state.pluginRun.cleanupChecking = Boolean(state.pluginRun.session);
+            emit("plugin_run");
+            void Promise.allSettled([
+              loadForwards(),
+              loadSessions({ silent: true }),
+              refreshAccountsUsage().catch(() => {}),
+            ]);
           } else {
-            state.pluginRun.phase = "failed";
-            state.pluginRun.error = data.error ? { error: data.error } : { error: {} };
-            state.pluginRun.cleanupChecking = Boolean(state.pluginRun.session);
-          }
-          emit("plugin_run");
-          const sessionRefresh = loadSessions({ silent: true }).finally(() => {
-            if (gen === authGeneration && state.pluginRun.id === id && state.pluginRun.cleanupChecking) {
-              state.pluginRun.cleanupChecking = false;
-              emit("plugin_run");
+            if (data.phase === "cancelled") {
+              state.pluginRun.phase = "cancelled";
+              state.pluginRun.error = null;
+            } else {
+              state.pluginRun.phase = "failed";
+              state.pluginRun.error = data.error ? { error: data.error } : { error: {} };
             }
-          });
-          void Promise.allSettled([
-            loadForwards(),
-            sessionRefresh,
-            refreshAccountsUsage().catch(() => {}),
-          ]);
+            state.pluginRun.cleanupResult = state.pluginRun.session ? "checking" : null;
+            state.pluginRun.cleanupRuntime = null;
+            emit("plugin_run");
+            void Promise.allSettled([
+              loadForwards(),
+              state.pluginRun.session ? verifyPluginRunCleanup(id, gen) : loadSessions({ silent: true }),
+              refreshAccountsUsage().catch(() => {}),
+            ]);
+          }
         }
       },
     }
@@ -1022,15 +1075,15 @@ async function consumePluginRunStream(id, gen) {
     state.pluginRun.phase = "failed";
     state.pluginRun.cancelling = false;
     state.pluginRun.launched = true;
-    state.pluginRun.cleanupChecking = Boolean(state.pluginRun.session);
+    state.pluginRun.cleanupResult = state.pluginRun.session ? "checking" : null;
+    state.pluginRun.cleanupRuntime = null;
     state.pluginRun.error = result.payload || { error: {} };
     emit("plugin_run");
-    void loadSessions({ silent: true }).finally(() => {
-      if (gen === authGeneration && state.pluginRun.id === id && state.pluginRun.cleanupChecking) {
-        state.pluginRun.cleanupChecking = false;
-        emit("plugin_run");
-      }
-    });
+    if (state.pluginRun.session) {
+      void verifyPluginRunCleanup(id, gen);
+    } else {
+      void loadSessions({ silent: true });
+    }
     return;
   }
   // Backoff retry for reverse-proxy 502/503/504 or transient stream drops.
@@ -1065,15 +1118,16 @@ export async function attachPluginRun(summary) {
     return;
   }
   stopPluginRunStream();
-  const provisions = summary.provisions === true;
+  const provisions = typeof summary.provisions === "boolean" ? summary.provisions : null;
   state.pluginRun = {
     id: summary.id,
     plugin: summary.plugin || "",
     account: summary.account || state.snapshot?.account?.active || null,
-    session: provisions ? "" : summary.session || "",
+    session: provisions === false ? summary.session || "" : "",
     provisions,
-    launched: summary.provisions === false && Boolean(summary.session),
-    cleanupChecking: false,
+    launched: provisions === false && Boolean(summary.session),
+    cleanupResult: null,
+    cleanupRuntime: null,
     runId: null,
     phase: "running",
     cancelling: false,
@@ -1171,7 +1225,8 @@ export async function startPluginRun({ spec, existing = null, accountContext = n
     session: provisions ? "" : spec?.target?.name || "",
     provisions,
     launched: !provisions,
-    cleanupChecking: false,
+    cleanupResult: null,
+    cleanupRuntime: null,
     runId: null,
     phase: "running",
     cancelling: false,
@@ -1868,6 +1923,16 @@ export async function stopRuntime(target, { label, email } = {}) {
     tone: "success",
     message: t("app.b2.stop_done", { name: label || target?.name || target?.endpoint || "" }),
   });
+  if (
+    state.pluginRun.cleanupResult === "still_billing" &&
+    state.pluginRun.cleanupRuntime?.id?.name === target?.name &&
+    (!state.pluginRun.cleanupRuntime?.id?.account ||
+      state.pluginRun.cleanupRuntime.id.account === target?.account)
+  ) {
+    state.pluginRun.cleanupResult = "stopped";
+    state.pluginRun.cleanupRuntime = null;
+    emit("plugin_run");
+  }
   void Promise.allSettled([
     loadSessions({ silent: true }),
     loadForwards(),

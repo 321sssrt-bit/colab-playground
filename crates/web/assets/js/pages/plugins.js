@@ -73,19 +73,6 @@ function activeManagedRuntimes() {
   return list.filter((rt) => rt?.on_active_account && rt?.managed && rt?.id?.name);
 }
 
-function findRunRuntime(run) {
-  if (!run?.session) return null;
-  const list = state.snapshot?.runtimes?.runtimes;
-  if (!Array.isArray(list)) return null;
-  return (
-    list.find(
-      (rt) =>
-        rt?.id?.name === run.session &&
-        (!run.account || rt?.id?.account === run.account)
-    ) || null
-  );
-}
-
 function isRuntimeListCompleteFor(account) {
   const view = state.snapshot?.runtimes;
   if (!view || state.snapshot?.runtimes_error) return false;
@@ -171,6 +158,7 @@ function createHfFieldState() {
     filesGen: 0,
     filesKey: "",
     filesRepo: "",
+    filesPreviewActive: false,
     filesStatus: "idle", // idle | loading | ready | error
     filesData: null,
     filesError: null,
@@ -646,6 +634,7 @@ export function createPluginsPage({ navigate }) {
     }
 
     const gen = ++hfState.filesGen;
+    hfState.filesPreviewActive = true;
     hfState.filesKey = cacheKey;
     hfState.filesRepo = trimmed;
     hfState.filesCtx = ctx;
@@ -687,7 +676,7 @@ export function createPluginsPage({ navigate }) {
       hfFitDebounceTimer = null;
       if (!formModel || view !== "form") return;
       for (const [specId, hfState] of formModel.hfStates.entries()) {
-        if (hfState.filesStatus === "idle") continue;
+        if (!hfState.filesPreviewActive) continue;
         const currentRepo = String(formModel.values[specId] ?? "").trim();
         if (!currentRepo) {
           hfState.filesStatus = "idle";
@@ -1641,11 +1630,10 @@ export function createPluginsPage({ navigate }) {
     if (!run.session) {
       return el("p", { className: "caption", dataset: { runCleanup: "no-session" } }, t("app.b2.run_no_session"));
     }
-    if (run.cleanupChecking || state.sessionsLoading || state.sessionsRefreshing) {
+    if (!run.cleanupResult || run.cleanupResult === "checking") {
       return el("p", { className: "caption", dataset: { runCleanup: "checking" } }, t("app.b2.run_checking"));
     }
-    const targetRuntime = findRunRuntime(run);
-    if (targetRuntime) {
+    if (run.cleanupResult === "still_billing" && run.cleanupRuntime) {
       return el(
         "div",
         { className: "run-outcome-section", dataset: { runCleanup: "still-billing" } },
@@ -1659,7 +1647,7 @@ export function createPluginsPage({ navigate }) {
               type: "button",
               className: "btn btn-danger",
               dataset: { runStopRuntime: "true" },
-              onClick: () => openStopRuntimeDialog(targetRuntime),
+              onClick: () => openStopRuntimeDialog(run.cleanupRuntime),
             },
             icon("square"),
             t("app.b2.stop_action")
@@ -1667,7 +1655,7 @@ export function createPluginsPage({ navigate }) {
         )
       );
     }
-    if (isRuntimeListCompleteFor(run.account)) {
+    if (run.cleanupResult === "stopped") {
       return el(
         "div",
         { dataset: { runCleanup: "stopped" } },
@@ -1685,6 +1673,12 @@ export function createPluginsPage({ navigate }) {
     const nodes = [];
     if (run.phase === "running") {
       const cancelling = Boolean(run.cancelling);
+      const cancelNoteKey =
+        run.provisions === true
+          ? "app.b2.run_cancel_note_new"
+          : run.provisions === false
+            ? "app.b2.run_cancel_note_existing"
+            : null;
       nodes.push(
         el(
           "div",
@@ -1703,11 +1697,7 @@ export function createPluginsPage({ navigate }) {
             cancelling ? el("span", { className: "spinner", "aria-hidden": "true" }) : null,
             t(cancelling ? "app.b2.new_cancelling" : "app.action.cancel")
           ),
-          el(
-            "span",
-            { className: "caption" },
-            t(run.provisions ? "app.b2.run_cancel_note_new" : "app.b2.run_cancel_note_existing")
-          )
+          cancelNoteKey ? el("span", { className: "caption" }, t(cancelNoteKey)) : null
         )
       );
     } else if (run.phase === "ready") {
