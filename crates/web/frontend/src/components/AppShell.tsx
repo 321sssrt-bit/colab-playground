@@ -41,7 +41,8 @@ const FOCUSABLE_SELECTOR =
 export type AccountSlotPlacement = "sidebar" | "topbar";
 
 export interface AccountSlotActions {
-  readonly closeDrawer: () => void;
+  readonly drawerOpen: boolean;
+  readonly closeDrawer: (restoreFocus?: boolean) => void;
 }
 
 function readIsMobileViewport(): boolean {
@@ -167,13 +168,20 @@ export function AppShell({
   }, []);
 
   const closeDrawer = useCallback((restoreFocus: boolean) => {
+    if (!modalDrawerOpenRef.current) {
+      setDrawerOpen(false);
+      return;
+    }
     pendingFocusRef.current = restoreFocus ? "menu" : null;
     setDrawerOpen(false);
   }, []);
 
-  const closeDrawerSilent = useCallback(() => {
-    closeDrawer(false);
-  }, [closeDrawer]);
+  const closeDrawerForSlot = useCallback(
+    (restoreFocus = false) => {
+      closeDrawer(restoreFocus);
+    },
+    [closeDrawer],
+  );
 
   useEffect(() => {
     if (!modalDrawerOpen) {
@@ -346,7 +354,10 @@ export function AppShell({
           <div className="sidebar-body">
             <div className="sidebar-account-wrap">
               {renderAccountSlot
-                ? renderAccountSlot("sidebar", { closeDrawer: closeDrawerSilent })
+                ? renderAccountSlot("sidebar", {
+                    drawerOpen: modalDrawerOpen,
+                    closeDrawer: closeDrawerForSlot,
+                  })
                 : defaultSidebarAccount}
             </div>
 
@@ -455,7 +466,10 @@ export function AppShell({
             <div className="topbar-meta">
               <div className="topbar-account-wrap">
                 {renderAccountSlot
-                  ? renderAccountSlot("topbar", { closeDrawer: closeDrawerSilent })
+                  ? renderAccountSlot("topbar", {
+                      drawerOpen: modalDrawerOpen,
+                      closeDrawer: closeDrawerForSlot,
+                    })
                   : defaultTopbarAccount}
               </div>
               <span

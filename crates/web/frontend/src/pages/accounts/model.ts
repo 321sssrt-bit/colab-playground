@@ -22,9 +22,11 @@ import type {
   TunnelInfo,
   UsageSnapshot,
 } from "../../lib/types.ts";
-import type { AccountSwitchRequest } from "../types.ts";
 
-export type SwitchTarget = AccountSwitchRequest;
+export interface SwitchTarget {
+  readonly id: AccountId;
+  readonly emailLabel: string;
+}
 
 export interface SwitchConfirmation {
   readonly from: AccountId | null;

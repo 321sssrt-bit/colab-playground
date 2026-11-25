@@ -31,9 +31,16 @@ import {
   resolveAccountsGate,
   type FormattedApiError,
   type OverviewDiagnostics,
+  type SwitchTarget,
 } from "./accounts/model.ts";
 import { RemoveAccountDialog, type RemoveTarget } from "./accounts/RemoveAccountDialog.tsx";
 import type { PageProps } from "./types.ts";
+
+export interface AccountsPageProps extends PageProps {
+  readonly onRequestSwitchAccount: (target: SwitchTarget) => void;
+  readonly onRequestAddAccount: () => void;
+  readonly addAccountDialogOpen: boolean;
+}
 
 export function AccountsPage({
   snapshot,
@@ -43,8 +50,8 @@ export function AccountsPage({
   pushToast,
   onRequestSwitchAccount,
   onRequestAddAccount,
-  addAccountDialogOpen = false,
-}: PageProps) {
+  addAccountDialogOpen,
+}: AccountsPageProps) {
   const idPrefix = useId();
   const nowSecs = useUsageClockSecs();
 
@@ -242,7 +249,7 @@ export function AccountsPage({
             className="btn btn-primary"
             disabled={!canAdd}
             title={addDisabledTitle}
-            onClick={() => onRequestAddAccount?.()}
+            onClick={onRequestAddAccount}
           >
             <UserPlusIcon />
             <span>{t("app.action.add_account")}</span>
@@ -416,7 +423,7 @@ export function AccountsPage({
                       type="button"
                       className="btn btn-sm"
                       disabled={shuttingDown}
-                      onClick={() => onRequestAddAccount?.()}
+                      onClick={onRequestAddAccount}
                     >
                       {t("web.add.cancel_existing")}
                     </button>
@@ -479,7 +486,7 @@ export function AccountsPage({
                       className="btn btn-primary"
                       disabled={!canAdd}
                       title={addDisabledTitle}
-                      onClick={() => onRequestAddAccount?.()}
+                      onClick={onRequestAddAccount}
                     >
                       <UserPlusIcon />
                       <span>{t("app.action.add_account")}</span>
@@ -621,7 +628,7 @@ export function AccountsPage({
                               disabled={switchDisabled}
                               title={switchTitle}
                               onClick={() =>
-                                onRequestSwitchAccount?.({
+                                onRequestSwitchAccount({
                                   id: row.account.id,
                                   emailLabel: row.emailLabel,
                                 })

@@ -53,14 +53,24 @@ export interface SwitchAccountDialogProps {
   readonly onClose: () => void;
 }
 
-function formatManagedSessionLine(
+function hasEnforcedWatchdog(session: TrackedSession): boolean {
+  const watchdog = session.watchdog;
+  return (
+    watchdog !== null &&
+    watchdog.armed &&
+    !watchdog.cancelled &&
+    (watchdog.deadline !== null || watchdog.idle_timeout !== null)
+  );
+}
+
+function formatWatchedSessionLine(
   session: TrackedSession,
   nowSecs: number,
   t: TranslateFn,
 ): string {
   const hardware = formatAcceleratorLabel(session.accelerator, t);
   const watchdog = session.watchdog;
-  if (watchdog !== null && !watchdog.cancelled && watchdog.deadline !== null) {
+  if (watchdog !== null && watchdog.armed && !watchdog.cancelled && watchdog.deadline !== null) {
     const remainingSecs = watchdog.deadline - nowSecs;
     if (remainingSecs >= 0) {
       return t("app.switch.session_deadline", {
@@ -74,6 +84,27 @@ function formatManagedSessionLine(
     name: session.name,
     hardware,
   });
+}
+
+function formatUnwatchedSessionLine(session: TrackedSession, t: TranslateFn): string {
+  const hardware = formatAcceleratorLabel(session.accelerator, t);
+  const base = t("app.switch.session", {
+    name: session.name,
+    hardware,
+  });
+  const watchdog = session.watchdog;
+  if (watchdog?.cancelled) {
+    return `${base} — ${t("app.b2.auto_stop_cancelled")}`;
+  }
+  const hasConfiguredAutoStop =
+    session.policy.max_runtime !== null ||
+    session.policy.idle_timeout !== null ||
+    watchdog?.deadline !== null ||
+    watchdog?.idle_timeout !== null;
+  if (watchdog !== null && !watchdog.armed && hasConfiguredAutoStop) {
+    return `${base} — ${t("app.b5.runtime_auto_stop_app_only")}`;
+  }
+  return base;
 }
 
 export function SwitchAccountDialog({
@@ -304,6 +335,9 @@ export function SwitchAccountDialog({
 
   const effectiveNowSecs =
     phase.kind === "ready" ? Math.max(phase.previewedAtSecs, nowSecs) : nowSecs;
+  const managedSessions = phase.kind === "ready" ? phase.preview.impact.sessions_left_running : [];
+  const watchedSessions = managedSessions.filter(hasEnforcedWatchdog);
+  const unwatchedSessions = managedSessions.filter((session) => !hasEnforcedWatchdog(session));
 
   return (
     <dialog
@@ -360,13 +394,30 @@ export function SwitchAccountDialog({
                   </div>
                 )}
 
-                {phase.preview.impact.sessions_left_running.length > 0 && (
+                {watchedSessions.length > 0 && (
                   <div className="impact-group">
                     <p className="dialog-paragraph">{t("app.switch.sessions")}</p>
                     <ul className="impact-items">
-                      {phase.preview.impact.sessions_left_running.map((session) => (
+                      {watchedSessions.map((session) => (
                         <li key={`${session.account}:${session.name}`}>
-                          {formatManagedSessionLine(session, effectiveNowSecs, t)}
+                          {formatWatchedSessionLine(session, effectiveNowSecs, t)}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
+                {unwatchedSessions.length > 0 && (
+                  <div className="impact-group">
+                    <p className="dialog-paragraph">
+                      {unwatchedSessions.length === 1
+                        ? t("app.b2.quit_unwatched_one")
+                        : t("app.b2.quit_unwatched_many", { count: unwatchedSessions.length })}
+                    </p>
+                    <ul className="impact-items">
+                      {unwatchedSessions.map((session) => (
+                        <li key={`${session.account}:${session.name}`}>
+                          {formatUnwatchedSessionLine(session, t)}
                         </li>
                       ))}
                     </ul>

@@ -28,10 +28,11 @@ export interface AccountSwitcherMenuProps {
   readonly placement: AccountSlotPlacement;
   readonly snapshot: Snapshot | null;
   readonly t: TranslateFn;
+  readonly drawerOpen?: boolean;
   readonly onNavigateAccounts: () => void;
   readonly onRequestSwitch: (target: SwitchTarget) => void;
   readonly onRequestAddAccount: () => void;
-  readonly onCloseDrawer?: () => void;
+  readonly onCloseDrawer?: (restoreFocus?: boolean) => void;
 }
 
 const FOCUSABLE_MENU_ITEM_SELECTOR = "button:not(:disabled)";
@@ -79,6 +80,7 @@ export function AccountSwitcherMenu({
   placement,
   snapshot,
   t,
+  drawerOpen = false,
   onNavigateAccounts,
   onRequestSwitch,
   onRequestAddAccount,
@@ -399,11 +401,18 @@ export function AccountSwitcherMenu({
                   disabled={switchDisabled}
                   title={switchDisabled ? blockedTitle : emailLabel}
                   onClick={() => {
-                    hideMenu(false);
-                    if (!isActive) {
-                      onCloseDrawer?.();
-                      onRequestSwitch({ id: account.id, emailLabel });
+                    if (isActive) {
+                      hideMenu(true);
+                      return;
                     }
+                    // Anchor focus on a visible control before opening `<dialog>` so Escape/Cancel returns focus cleanly.
+                    if (drawerOpen && placement === "sidebar") {
+                      hideMenu(false);
+                      onCloseDrawer?.(true);
+                    } else {
+                      hideMenu(true);
+                    }
+                    onRequestSwitch({ id: account.id, emailLabel });
                   }}
                 >
                   <span className="account-menu-item-label">{emailLabel}</span>
@@ -421,8 +430,12 @@ export function AccountSwitcherMenu({
             disabled={accountChangeBlocked || shuttingDown}
             title={blockedTitle}
             onClick={() => {
-              hideMenu(false);
-              onCloseDrawer?.();
+              if (drawerOpen && placement === "sidebar") {
+                hideMenu(false);
+                onCloseDrawer?.(true);
+              } else {
+                hideMenu(true);
+              }
               onRequestAddAccount();
             }}
           >
@@ -436,7 +449,7 @@ export function AccountSwitcherMenu({
             role={commandItemRole}
             onClick={() => {
               hideMenu(false);
-              onCloseDrawer?.();
+              onCloseDrawer?.(false);
               onNavigateAccounts();
             }}
           >
