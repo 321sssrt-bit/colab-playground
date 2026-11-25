@@ -117,7 +117,7 @@ export function alertBox({
   );
 }
 
-export function toastCard({ tone = "info", body, onDismiss = null } = {}) {
+export function toastCard({ tone = "info", title = null, body = null, onDismiss = null } = {}) {
   const iconMap = {
     warning: "alertTriangle",
     danger: "alertCircle",
@@ -143,6 +143,13 @@ export function toastCard({ tone = "info", body, onDismiss = null } = {}) {
         icon("x")
       )
     : null;
+  const content = [];
+  if (title) {
+    content.push(el("div", { className: "alert-title" }, title));
+  }
+  if (body) {
+    content.push(el("div", { className: title ? "alert-body" : "toast-body" }, body));
+  }
   return el(
     "div",
     {
@@ -150,7 +157,7 @@ export function toastCard({ tone = "info", body, onDismiss = null } = {}) {
       role: tone === "danger" ? "alert" : "status",
     },
     el("span", { className: "alert-icon" }, icon(iconMap[tone] || "info", iconToneMap[tone] || "icon-md icon-info")),
-    el("div", { className: "toast-body" }, body),
+    el("div", { className: "alert-text" }, content),
     dismissBtn
   );
 }
