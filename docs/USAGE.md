@@ -214,7 +214,7 @@ The first command should return a collection path beginning with
 `/org/freedesktop/secrets/collection/`. The second should return `b false`. If the bus or service
 is unavailable, start the user session and Secret Service provider. If the result is `/` or
 `b true`, create or unlock the default keyring with that provider. Start the Web Server from the
-session that can reach the unlocked keyring and check **Overview → Keyring** before signing in.
+session that can reach the unlocked keyring and check **Overview → OS keyring** before signing in.
 Keep credentials in the OS keyring.
 
 ## Where things are stored

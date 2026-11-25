@@ -49,6 +49,12 @@ fn color_attr(name: &str) -> bool {
     )
 }
 
+fn input_value_is_visible(kind: &str) -> bool {
+    !["hidden", "radio", "checkbox", "range", "color"]
+        .iter()
+        .any(|hidden| kind.eq_ignore_ascii_case(hidden))
+}
+
 fn markup(path: &str, source: &str) -> Hits {
     let mut hits = Vec::new();
     let mut rest = source;
@@ -148,9 +154,7 @@ fn markup(path: &str, source: &str) -> Hits {
             }
         }
         if let Some(at) = input_value
-            && !["hidden", "radio", "checkbox", "range", "color"]
-                .iter()
-                .any(|kind| input_type.is_some_and(|value| value.eq_ignore_ascii_case(kind)))
+            && input_value_is_visible(input_type.unwrap_or_default())
         {
             hits.push((at, CopyText));
         }
@@ -226,13 +230,17 @@ fn lex(source: &str, js: bool) -> Vec<Token<'_>> {
                 && tokens.last().is_none_or(|token| {
                     matches!(
                         token.text,
-                        "(" | "," | "=" | "&" | "|" | "!" | "[" | ":" | "return"
+                        "(" | "," | "=" | "&&" | "||" | "??" | "!" | "[" | ":" | "?" | "return"
                     )
                 }) =>
             {
                 end_quote(&rest[1..], b'/', true) + 1
             }
             '-' if js => 1,
+            '?' if js && (rest.starts_with("??") || rest.starts_with("?.")) => 2,
+            '|' if js && rest.starts_with("||") => 2,
+            '&' if js && rest.starts_with("&&") => 2,
+            '+' if js && rest.starts_with("+=") => 2,
             _ if word(ch) => rest
                 .find(|c| !word(c) || js && c == '-')
                 .unwrap_or(rest.len()),
@@ -247,20 +255,25 @@ fn lex(source: &str, js: bool) -> Vec<Token<'_>> {
     tokens
 }
 
-// Split a template into literal segments and interpolations without treating nested quotes as text.
-fn template(source: &str) -> (usize, Vec<&str>) {
+enum TemplatePart<'a> {
+    Text(&'a str),
+    Expression(usize, &'a str),
+}
+
+fn template(source: &str) -> (usize, Vec<TemplatePart<'_>>) {
     let mut parts = Vec::new();
     let mut rest = &source[1..];
     let mut start = rest;
     while let Some(ch) = rest.chars().next() {
         match ch {
             '`' => {
-                parts.push(&start[..start.len() - rest.len()]);
+                parts.push(TemplatePart::Text(&start[..start.len() - rest.len()]));
                 return (source.len() - rest.len() + 1, parts);
             }
             '$' if rest.starts_with("${") => {
-                parts.push(&start[..start.len() - rest.len()]);
+                parts.push(TemplatePart::Text(&start[..start.len() - rest.len()]));
                 rest = &rest[2..];
+                let expression = rest;
                 let mut depth = 1;
                 while let Some(ch) = rest.chars().next() {
                     let len = match ch {
@@ -272,6 +285,12 @@ fn template(source: &str) -> (usize, Vec<&str>) {
                         }
                         '}' => {
                             depth -= 1;
+                            if depth == 0 {
+                                parts.push(TemplatePart::Expression(
+                                    source.len() - expression.len(),
+                                    &expression[..expression.len() - rest.len()],
+                                ));
+                            }
                             1
                         }
                         _ => ch.len_utf8(),
@@ -297,7 +316,23 @@ fn template(source: &str) -> (usize, Vec<&str>) {
 
 fn has_color(tokens: &[Token<'_>]) -> bool {
     // CSS named colors. Transparent, currentColor and system colors follow the environment.
-    const NAMED: &str = "aliceblue antiquewhite aqua aquamarine azure beige bisque black         blanchedalmond blue blueviolet brown burlywood cadetblue chartreuse chocolate coral         cornflowerblue cornsilk crimson cyan darkblue darkcyan darkgoldenrod darkgray darkgreen         darkgrey darkkhaki darkmagenta darkolivegreen darkorange darkorchid darkred darksalmon         darkseagreen darkslateblue darkslategray darkslategrey darkturquoise darkviolet deeppink         deepskyblue dimgray dimgrey dodgerblue firebrick floralwhite forestgreen fuchsia gainsboro         ghostwhite gold goldenrod gray green greenyellow grey honeydew hotpink indianred indigo         ivory khaki lavender lavenderblush lawngreen lemonchiffon lightblue lightcoral lightcyan         lightgoldenrodyellow lightgray lightgreen lightgrey lightpink lightsalmon lightseagreen         lightskyblue lightslategray lightslategrey lightsteelblue lightyellow lime limegreen linen         magenta maroon mediumaquamarine mediumblue mediumorchid mediumpurple mediumseagreen         mediumslateblue mediumspringgreen mediumturquoise mediumvioletred midnightblue mintcream         mistyrose moccasin navajowhite navy oldlace olive olivedrab orange orangered orchid         palegoldenrod palegreen paleturquoise palevioletred papayawhippuff peachpuff peru pink plum         powderblue purple rebeccapurple red rosybrown royalblue saddlebrown salmon sandybrown         seagreen seashell sienna silver skyblue slateblue slategray slategrey snow springgreen         steelblue tan teal thistle tomato turquoise violet wheat white whitesmoke yellow yellowgreen";
+    const NAMED: &str = "aliceblue antiquewhite aqua aquamarine azure beige bisque black
+        blanchedalmond blue blueviolet brown burlywood cadetblue chartreuse chocolate coral
+        cornflowerblue cornsilk crimson cyan darkblue darkcyan darkgoldenrod darkgray darkgreen
+        darkgrey darkkhaki darkmagenta darkolivegreen darkorange darkorchid darkred darksalmon
+        darkseagreen darkslateblue darkslategray darkslategrey darkturquoise darkviolet deeppink
+        deepskyblue dimgray dimgrey dodgerblue firebrick floralwhite forestgreen fuchsia gainsboro
+        ghostwhite gold goldenrod gray green greenyellow grey honeydew hotpink indianred indigo
+        ivory khaki lavender lavenderblush lawngreen lemonchiffon lightblue lightcoral lightcyan
+        lightgoldenrodyellow lightgray lightgreen lightgrey lightpink lightsalmon lightseagreen
+        lightskyblue lightslategray lightslategrey lightsteelblue lightyellow lime limegreen linen
+        magenta maroon mediumaquamarine mediumblue mediumorchid mediumpurple mediumseagreen
+        mediumslateblue mediumspringgreen mediumturquoise mediumvioletred midnightblue mintcream
+        mistyrose moccasin navajowhite navy oldlace olive olivedrab orange orangered orchid
+        palegoldenrod palegreen paleturquoise palevioletred papayawhip peachpuff peru pink plum
+        powderblue purple rebeccapurple red rosybrown royalblue saddlebrown salmon sandybrown
+        seagreen seashell sienna silver skyblue slateblue slategray slategrey snow springgreen
+        steelblue tan teal thistle tomato turquoise violet wheat white whitesmoke yellow yellowgreen";
     const FUNCTIONS: &[&str] = &[
         "rgb",
         "rgba",
@@ -391,23 +426,26 @@ fn top_level<'a, 's>(
         }
         ")" | "]" | "}" => {
             depth -= 1;
-            depth < 0 && token.text == separator
+            depth < 0
         }
         text => depth == 0 && text == separator,
     })
 }
 
 fn enclosed<'a, 's>(tokens: &'a [Token<'s>]) -> &'a [Token<'s>] {
-    let close = match tokens.first().map(|t| t.text) {
-        Some("(") => ")",
-        Some("[") => "]",
-        Some("{") => "}",
-        _ => return &[],
-    };
-    top_level(&tokens[1..], close).next().unwrap_or_default()
+    match tokens {
+        [
+            Token {
+                text: "(" | "[" | "{",
+                ..
+            },
+            inner @ ..,
+        ] => top_level(inner, "").next().unwrap_or_default(),
+        _ => &[],
+    }
 }
 
-fn literal_copy(tokens: &[Token<'_>], hits: &mut Hits) {
+fn render_literals(tokens: &[Token<'_>], base: usize, visit: &mut impl FnMut(usize, &str)) {
     // A condition can compare a protocol value. Only the result reaches the DOM.
     let first = top_level(tokens, "?").next().unwrap_or_default();
     let result = tokens.get(first.len() + 1..).unwrap_or(first);
@@ -416,22 +454,31 @@ fn literal_copy(tokens: &[Token<'_>], hits: &mut Hits) {
             .next()
             .is_some_and(|part| part.len() < branch.len())
         {
-            literal_copy(branch, hits);
+            render_literals(branch, base, visit);
             continue;
         }
-        for term in top_level(branch, "|")
-            .flat_map(|part| top_level(part, "&"))
+        for term in top_level(branch, "??")
+            .flat_map(|part| top_level(part, "||"))
+            .flat_map(|part| top_level(part, "&&"))
             .flat_map(|part| top_level(part, "+"))
         {
             match term {
-                [token] if token.literal().is_some() => {
-                    let has_prose = if token.text.starts_with('`') {
-                        template(token.text).1.into_iter().any(prose)
-                    } else {
-                        prose(token.name())
-                    };
-                    if has_prose {
-                        hits.push((token.offset, CopyText));
+                [token] => {
+                    if token.text.starts_with('`') {
+                        for part in template(token.text).1 {
+                            match part {
+                                TemplatePart::Text(text) => visit(base + token.offset, text),
+                                TemplatePart::Expression(offset, expression) => {
+                                    render_literals(
+                                        &lex(expression, true),
+                                        base + token.offset + offset,
+                                        visit,
+                                    );
+                                }
+                            }
+                        }
+                    } else if let Some(text) = token.literal() {
+                        visit(base + token.offset, text);
                     }
                 }
                 [
@@ -441,7 +488,7 @@ fn literal_copy(tokens: &[Token<'_>], hits: &mut Hits) {
                     ..,
                 ] if matches!(term.last().unwrap().text, ")" | "]") => {
                     for part in top_level(enclosed(term), ",") {
-                        literal_copy(part, hits);
+                        render_literals(part, base, visit);
                     }
                 }
                 _ => {}
@@ -450,22 +497,28 @@ fn literal_copy(tokens: &[Token<'_>], hits: &mut Hits) {
     }
 }
 
+fn literal_copy(tokens: &[Token<'_>], hits: &mut Hits) {
+    render_literals(tokens, 0, &mut |offset, text| {
+        if prose(text) {
+            hits.push((offset, CopyText));
+        }
+    });
+}
+
 fn js_attr(key: Token<'_>, value: &[Token<'_>], hits: &mut Hits) {
     let name = key.name();
     let lower = name.to_ascii_lowercase();
     if text_attr(&lower) || matches!(name, "ariaLabel" | "confirmLabel" | "cancelLabel") {
         literal_copy(value, hits);
     }
-    if let [token] = value
-        && let Some(literal) = token.literal()
-    {
+    render_literals(value, 0, &mut |offset, literal| {
         if lower.starts_with("on") || script_url(literal) {
-            hits.push((key.offset, Inline));
+            hits.push((offset, Inline));
         }
         if color_attr(&lower) && has_color(&lex(literal, false)) {
-            hits.push((key.offset, Color));
+            hits.push((offset, Color));
         }
-    }
+    });
     if matches!(lower.as_str(), "style" | "srcdoc") {
         hits.push((key.offset, Inline));
     }
@@ -476,12 +529,46 @@ fn script_element(tokens: &[Token<'_>]) -> bool {
         tag.eq_ignore_ascii_case("script") || tag.eq_ignore_ascii_case("style")))
 }
 
+fn js_element_attrs(tag: &str, attrs: &[Token<'_>], hits: &mut Hits) {
+    let properties = || {
+        top_level(enclosed(attrs), ",").filter_map(|property| match property {
+            [key, Token { text: ":", .. }, value @ ..] => Some((*key, value)),
+            _ => None,
+        })
+    };
+    let kind = properties()
+        .find_map(|(key, value)| match value {
+            [kind] if key.name() == "type" => kind.literal(),
+            _ => None,
+        })
+        .unwrap_or_default();
+    for (key, value) in properties() {
+        if key.name() == "value"
+            && (tag == "textarea" || tag == "input" && input_value_is_visible(kind))
+        {
+            literal_copy(value, hits);
+        }
+        js_attr(key, value, hits);
+    }
+}
+
 fn javascript(source: &str) -> Hits {
     let mut hits = Vec::new();
     let tokens = lex(source, true);
     for (index, &token) in tokens.iter().enumerate() {
+        if token.text.starts_with('`') {
+            for part in template(token.text).1 {
+                if let TemplatePart::Expression(offset, expression) = part {
+                    hits.extend(
+                        javascript(expression)
+                            .into_iter()
+                            .map(|(relative, rule)| (token.offset + offset + relative, rule)),
+                    );
+                }
+            }
+        }
         let tail = &tokens[index + 1..];
-        let member = index > 0 && tokens[index - 1].text == ".";
+        let member = index > 0 && matches!(tokens[index - 1].text, "." | "?.");
         let bracket = index > 0
             && tokens[index - 1].text == "["
             && tail.first().is_some_and(|t| t.text == "]");
@@ -499,9 +586,15 @@ fn javascript(source: &str) -> Hits {
         }
         let tail = if bracket { &tail[1..] } else { tail };
         if (member || bracket)
-            && let [Token { text: "=", .. }, value @ ..] = tail
+            && let [
+                Token {
+                    text: "=" | "+=", ..
+                },
+                value @ ..,
+            ] = tail
         {
-            let rhs = top_level(value, ";").next().unwrap_or_default();
+            let statement = top_level(value, ";").next().unwrap_or_default();
+            let rhs = top_level(statement, ",").next().unwrap_or_default();
             if matches!(name, "textContent" | "innerText") {
                 literal_copy(rhs, &mut hits);
             }
@@ -514,18 +607,19 @@ fn javascript(source: &str) -> Hits {
         match name {
             "el" => {
                 let mut args = args();
-                if args.next().is_some_and(script_element) {
+                let tag = args.next().unwrap_or_default();
+                if script_element(tag) {
                     hits.push((token.offset, Inline));
                 }
                 if let Some(attrs) = args
                     .next()
                     .filter(|attr| attr.first().is_some_and(|t| t.text == "{"))
                 {
-                    for property in top_level(enclosed(attrs), ",") {
-                        if let [key, Token { text: ":", .. }, value @ ..] = property {
-                            js_attr(*key, value, &mut hits);
-                        }
-                    }
+                    let tag = match tag {
+                        [tag] => tag.literal().unwrap_or_default(),
+                        _ => "",
+                    };
+                    js_element_attrs(&tag.to_ascii_lowercase(), attrs, &mut hits);
                 }
                 for child in args {
                     literal_copy(child, &mut hits);
@@ -690,6 +784,7 @@ fn css_flags_literal_colors_in_values_and_generated_copy() {
         "p { box-shadow: 0 0 1px #AABBCC88; }",
         "p { color: /* keep this comment */\n RGB(255 0 0 / .5); }",
         "p { --other: var(--token, rebeccapurple) }",
+        "p { color: papayawhip }",
         "p { background: linear-gradient(var(--token), hwb(10 30% 20%)) }",
         "p { background: color(display-p3 0.1 0.5 0.2) }",
     ] {
@@ -733,6 +828,14 @@ fn javascript_flags_literals_at_dom_and_component_calls() {
         ),
         (r#"el(tag, { "aria-label": "Open settings" })"#, CopyText),
         (
+            r#"el("input", { type: "submit", value: "Save changes" })"#,
+            CopyText,
+        ),
+        (
+            r#"el("textarea", { value: "Describe the issue" })"#,
+            CopyText,
+        ),
+        (
             r#"el("b", null, [t("ready"), enabled ? "Really ready" : null])"#,
             CopyText,
         ),
@@ -745,6 +848,44 @@ fn javascript_flags_literals_at_dom_and_component_calls() {
             CopyText,
         ),
         (
+            r#"node.textContent = error?.message ?? "Try again";"#,
+            CopyText,
+        ),
+        (
+            r#"node.textContent = "Fallback" ?? error?.message;"#,
+            CopyText,
+        ),
+        (
+            r#"el("span", null, "Signed in: " + account?.email)"#,
+            CopyText,
+        ),
+        (r#"if (error) { node.textContent = "Failed" }"#, CopyText),
+        (r#"node.textContent += " Retry";"#, CopyText),
+        (
+            r#"el("button", { onClick: () => (node.onclick = "noop()") })"#,
+            Inline,
+        ),
+        (
+            r##"el("a", { href: active ? "javascript:noop()" : "#" })"##,
+            Inline,
+        ),
+        (
+            r#"document.title = `${ready ? "Ready" : t("sign_in")} · ${t("app.name")}`;"#,
+            CopyText,
+        ),
+        (
+            r#"const template = `${el("span", { style: "color: red" })}`;"#,
+            Inline,
+        ),
+        (
+            r##"const template = `${node.setAttribute("fill", "#fff")}`;"##,
+            Color,
+        ),
+        (
+            r#"const template = `${node.innerHTML = source}`;"#,
+            UnsafeDom,
+        ),
+        (
             r#"alertBox({ title: t("warning"), body: "Try again" })"#,
             CopyText,
         ),
@@ -753,6 +894,10 @@ fn javascript_flags_literals_at_dom_and_component_calls() {
             CopyText,
         ),
         (r##"node.setAttribute("fill", "#abc")"##, Color),
+        (
+            r##"node.setAttribute("fill", active ? "#fff" : currentColor)"##,
+            Color,
+        ),
         (r#"node.setAttribute("onfocus", handler)"#, Inline),
         (r#"el("button", {onClick: "noop()"})"#, Inline),
         (r#"document.createElement("script")"#, Inline),
@@ -778,6 +923,8 @@ fn javascript_flags_literals_at_dom_and_component_calls() {
         const url = "https://example.org";
         const match = /^\d+$/.test(value);
         el("button", {className: "btn", onClick: () => run()}, t("submit"));
+        el("input", {type: "radio", value: "keep_last"});
+        el("option", {value: "keep_last"}, t("keep_last"));
         node.textContent = `${format(t("ready"))} · ${count}`;
         node.setAttribute("stroke", "currentColor");
     "#
