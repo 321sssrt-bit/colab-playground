@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useState } from "react";
 
-import { AppShell } from "./components/AppShell.tsx";
+import {
+  AppShell,
+  type AccountSlotActions,
+  type AccountSlotPlacement,
+} from "./components/AppShell.tsx";
 import { BrandIcon } from "./components/Icons.tsx";
 import { ToastViewport } from "./components/ToastViewport.tsx";
 import { useI18n } from "./lib/i18n.ts";
@@ -11,12 +15,15 @@ import { useTheme } from "./lib/theme.ts";
 import { dismissToast, pushToast, toastStore, useToasts } from "./lib/toast.ts";
 import type { AppearancePref, LanguagePref } from "./lib/types.ts";
 import { AccountsPage } from "./pages/AccountsPage.tsx";
+import { AccountSwitcherMenu } from "./pages/accounts/AccountSwitcherMenu.tsx";
+import { AddAccountDialog } from "./pages/accounts/AddAccountDialog.tsx";
+import { SwitchAccountDialog } from "./pages/accounts/SwitchAccountDialog.tsx";
 import { LoginPage } from "./pages/LoginPage.tsx";
 import { OverviewPage } from "./pages/OverviewPage.tsx";
 import { PluginsPage } from "./pages/PluginsPage.tsx";
 import { SessionsPage } from "./pages/SessionsPage.tsx";
 import { SettingsPage } from "./pages/SettingsPage.tsx";
-import type { PageProps } from "./pages/types.ts";
+import type { AccountSwitchRequest, PageProps } from "./pages/types.ts";
 
 function renderRoutePage(route: RouteId, pageProps: PageProps) {
   switch (route) {
@@ -40,6 +47,8 @@ export function App() {
   const { route, navigate } = useRouter();
   const toasts = useToasts();
   const [modalDrawerOpen, setModalDrawerOpen] = useState(false);
+  const [switchTarget, setSwitchTarget] = useState<AccountSwitchRequest | null>(null);
+  const [addAccountDialogOpen, setAddAccountDialogOpen] = useState(false);
   const { t } = i18n;
 
   useEffect(() => {
@@ -47,6 +56,8 @@ export function App() {
       preferenceSync.cancelPending();
       toastStore.clear();
       setModalDrawerOpen(false);
+      setSwitchTarget(null);
+      setAddAccountDialogOpen(false);
       return;
     }
 
@@ -84,8 +95,43 @@ export function App() {
 
   const handleSignOut = useCallback(() => {
     toastStore.clear();
+    setSwitchTarget(null);
+    setAddAccountDialogOpen(false);
     webStore.signOut();
   }, []);
+
+  const handleRequestSwitchAccount = useCallback((target: AccountSwitchRequest) => {
+    setSwitchTarget(target);
+  }, []);
+
+  const handleRequestAddAccount = useCallback(() => {
+    setAddAccountDialogOpen(true);
+  }, []);
+
+  const handleNavigateAccounts = useCallback(() => {
+    navigate("accounts");
+  }, [navigate]);
+
+  const renderAccountSlot = useCallback(
+    (placement: AccountSlotPlacement, actions: AccountSlotActions) => (
+      <AccountSwitcherMenu
+        placement={placement}
+        snapshot={storeState.snapshot}
+        t={t}
+        onNavigateAccounts={handleNavigateAccounts}
+        onRequestSwitch={handleRequestSwitchAccount}
+        onRequestAddAccount={handleRequestAddAccount}
+        onCloseDrawer={actions.closeDrawer}
+      />
+    ),
+    [
+      handleNavigateAccounts,
+      handleRequestAddAccount,
+      handleRequestSwitchAccount,
+      storeState.snapshot,
+      t,
+    ],
+  );
 
   // Avoid rendering unlabeled form controls before the first dictionary loads.
   if (i18n.dict === null) {
@@ -129,6 +175,9 @@ export function App() {
     t,
     navigate,
     pushToast,
+    onRequestSwitchAccount: handleRequestSwitchAccount,
+    onRequestAddAccount: handleRequestAddAccount,
+    addAccountDialogOpen,
   };
 
   return (
@@ -143,9 +192,28 @@ export function App() {
         onNavigate={navigate}
         onSignOut={handleSignOut}
         onModalDrawerChange={setModalDrawerOpen}
+        renderAccountSlot={renderAccountSlot}
       >
         {renderRoutePage(route, pageProps)}
       </AppShell>
+      {storeState.snapshot !== null && (
+        <>
+          <SwitchAccountDialog
+            target={switchTarget}
+            snapshot={storeState.snapshot}
+            t={t}
+            pushToast={pushToast}
+            onClose={() => setSwitchTarget(null)}
+          />
+          <AddAccountDialog
+            open={addAccountDialogOpen}
+            snapshot={storeState.snapshot}
+            t={t}
+            pushToast={pushToast}
+            onClose={() => setAddAccountDialogOpen(false)}
+          />
+        </>
+      )}
       <ToastViewport toasts={toasts} t={t} inert={modalDrawerOpen} onDismiss={dismissToast} />
     </div>
   );

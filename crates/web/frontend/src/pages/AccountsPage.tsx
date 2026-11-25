@@ -15,7 +15,6 @@ import {
   useUsageClockSecs,
 } from "../lib/format.ts";
 import { webStore } from "../lib/store.ts";
-import { AddAccountDialog } from "./accounts/AddAccountDialog.tsx";
 import { RefreshIcon, TerminalIcon, TrashIcon, UserPlusIcon } from "./accounts/Icons.tsx";
 import {
   adoptActiveAccount,
@@ -36,7 +35,16 @@ import {
 import { RemoveAccountDialog, type RemoveTarget } from "./accounts/RemoveAccountDialog.tsx";
 import type { PageProps } from "./types.ts";
 
-export function AccountsPage({ snapshot, locale, t, navigate, pushToast }: PageProps) {
+export function AccountsPage({
+  snapshot,
+  locale,
+  t,
+  navigate,
+  pushToast,
+  onRequestSwitchAccount,
+  onRequestAddAccount,
+  addAccountDialogOpen = false,
+}: PageProps) {
   const idPrefix = useId();
   const nowSecs = useUsageClockSecs();
 
@@ -48,7 +56,6 @@ export function AccountsPage({ snapshot, locale, t, navigate, pushToast }: PageP
   const [adoptError, setAdoptError] = useState<FormattedApiError | null>(null);
   const [recoveredVisible, setRecoveredVisible] = useState(false);
   const [recoveredDismissed, setRecoveredDismissed] = useState(false);
-  const [addDialogOpen, setAddDialogOpen] = useState(false);
   const [removeTarget, setRemoveTarget] = useState<RemoveTarget | null>(null);
   const [removingAccount, setRemovingAccount] = useState(false);
 
@@ -217,7 +224,10 @@ export function AccountsPage({ snapshot, locale, t, navigate, pushToast }: PageP
         : null;
 
   const hasActiveLoginBanner =
-    gate.kind === "ready" && snapshot !== null && snapshot.login_id !== null && !addDialogOpen;
+    gate.kind === "ready" &&
+    snapshot !== null &&
+    snapshot.login_id !== null &&
+    !addAccountDialogOpen;
 
   return (
     <>
@@ -232,7 +242,7 @@ export function AccountsPage({ snapshot, locale, t, navigate, pushToast }: PageP
             className="btn btn-primary"
             disabled={!canAdd}
             title={addDisabledTitle}
-            onClick={() => setAddDialogOpen(true)}
+            onClick={() => onRequestAddAccount?.()}
           >
             <UserPlusIcon />
             <span>{t("app.action.add_account")}</span>
@@ -406,7 +416,7 @@ export function AccountsPage({ snapshot, locale, t, navigate, pushToast }: PageP
                       type="button"
                       className="btn btn-sm"
                       disabled={shuttingDown}
-                      onClick={() => setAddDialogOpen(true)}
+                      onClick={() => onRequestAddAccount?.()}
                     >
                       {t("web.add.cancel_existing")}
                     </button>
@@ -469,7 +479,7 @@ export function AccountsPage({ snapshot, locale, t, navigate, pushToast }: PageP
                       className="btn btn-primary"
                       disabled={!canAdd}
                       title={addDisabledTitle}
-                      onClick={() => setAddDialogOpen(true)}
+                      onClick={() => onRequestAddAccount?.()}
                     >
                       <UserPlusIcon />
                       <span>{t("app.action.add_account")}</span>
@@ -586,6 +596,11 @@ export function AccountsPage({ snapshot, locale, t, navigate, pushToast }: PageP
                       ? row.usage.last_error
                       : null;
 
+                  const switchDisabled = accountChangeBlocked || shuttingDown || removingAccount;
+                  const switchTitle = accountChangeBlocked
+                    ? t("app.b2.account_change_blocked")
+                    : undefined;
+
                   return (
                     <section key={row.account.id} className="card card-compact">
                       <div className="account-card-header">
@@ -599,6 +614,22 @@ export function AccountsPage({ snapshot, locale, t, navigate, pushToast }: PageP
                         </div>
 
                         <div className="account-actions">
+                          {!row.active && (
+                            <button
+                              type="button"
+                              className="btn btn-sm"
+                              disabled={switchDisabled}
+                              title={switchTitle}
+                              onClick={() =>
+                                onRequestSwitchAccount?.({
+                                  id: row.account.id,
+                                  emailLabel: row.emailLabel,
+                                })
+                              }
+                            >
+                              {t("app.accounts.switch")}
+                            </button>
+                          )}
                           <span title={removeTitle}>
                             <button
                               type="button"
@@ -666,23 +697,14 @@ export function AccountsPage({ snapshot, locale, t, navigate, pushToast }: PageP
       </div>
 
       {snapshot !== null && (
-        <>
-          <AddAccountDialog
-            open={addDialogOpen}
-            snapshot={snapshot}
-            t={t}
-            pushToast={pushToast}
-            onClose={() => setAddDialogOpen(false)}
-          />
-          <RemoveAccountDialog
-            target={removeTarget}
-            snapshot={snapshot}
-            t={t}
-            pushToast={pushToast}
-            onRemovingChange={setRemovingAccount}
-            onClose={() => setRemoveTarget(null)}
-          />
-        </>
+        <RemoveAccountDialog
+          target={removeTarget}
+          snapshot={snapshot}
+          t={t}
+          pushToast={pushToast}
+          onRemovingChange={setRemovingAccount}
+          onClose={() => setRemoveTarget(null)}
+        />
       )}
     </>
   );

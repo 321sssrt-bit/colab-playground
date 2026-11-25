@@ -40,6 +40,10 @@ const FOCUSABLE_SELECTOR =
 
 export type AccountSlotPlacement = "sidebar" | "topbar";
 
+export interface AccountSlotActions {
+  readonly closeDrawer: () => void;
+}
+
 function readIsMobileViewport(): boolean {
   if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
     return false;
@@ -89,8 +93,11 @@ export interface AppShellProps {
   readonly onSignOut: () => void;
   /** Optional hook notified when the mobile modal drawer opens or closes. */
   readonly onModalDrawerChange?: (open: boolean) => void;
-  /** Optional renderer replacing the account area in both sidebar and mobile topbar (for #41). */
-  readonly renderAccountSlot?: (placement: AccountSlotPlacement) => ReactNode;
+  /** Optional renderer replacing the account area in both sidebar and mobile topbar. */
+  readonly renderAccountSlot?: (
+    placement: AccountSlotPlacement,
+    actions: AccountSlotActions,
+  ) => ReactNode;
   readonly children: ReactNode;
 }
 
@@ -163,6 +170,10 @@ export function AppShell({
     pendingFocusRef.current = restoreFocus ? "menu" : null;
     setDrawerOpen(false);
   }, []);
+
+  const closeDrawerSilent = useCallback(() => {
+    closeDrawer(false);
+  }, [closeDrawer]);
 
   useEffect(() => {
     if (!modalDrawerOpen) {
@@ -334,7 +345,9 @@ export function AppShell({
 
           <div className="sidebar-body">
             <div className="sidebar-account-wrap">
-              {renderAccountSlot ? renderAccountSlot("sidebar") : defaultSidebarAccount}
+              {renderAccountSlot
+                ? renderAccountSlot("sidebar", { closeDrawer: closeDrawerSilent })
+                : defaultSidebarAccount}
             </div>
 
             <nav aria-label={t("web.shell.primary_nav")}>
@@ -441,7 +454,9 @@ export function AppShell({
 
             <div className="topbar-meta">
               <div className="topbar-account-wrap">
-                {renderAccountSlot ? renderAccountSlot("topbar") : defaultTopbarAccount}
+                {renderAccountSlot
+                  ? renderAccountSlot("topbar", { closeDrawer: closeDrawerSilent })
+                  : defaultTopbarAccount}
               </div>
               <span
                 className={usageBadge.tone === "warning" ? "badge badge-warning" : "badge"}
