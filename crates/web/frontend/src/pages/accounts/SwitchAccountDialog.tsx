@@ -53,6 +53,23 @@ export interface SwitchAccountDialogProps {
   readonly onClose: () => void;
 }
 
+function overlayLiveWatchdog(session: TrackedSession, snapshot: Snapshot): TrackedSession {
+  const live = snapshot.runtimes?.runtimes.find(
+    (runtime) =>
+      runtime.id.account === session.account &&
+      (runtime.id.name === session.name ||
+        (session.endpoint !== null && runtime.id.endpoint === session.endpoint)),
+  );
+  if (!live?.tracked) {
+    return session;
+  }
+  return {
+    ...session,
+    policy: live.tracked.policy,
+    watchdog: live.tracked.watchdog,
+  };
+}
+
 function hasEnforcedWatchdog(session: TrackedSession): boolean {
   const watchdog = session.watchdog;
   return (
@@ -335,7 +352,12 @@ export function SwitchAccountDialog({
 
   const effectiveNowSecs =
     phase.kind === "ready" ? Math.max(phase.previewedAtSecs, nowSecs) : nowSecs;
-  const managedSessions = phase.kind === "ready" ? phase.preview.impact.sessions_left_running : [];
+  const managedSessions =
+    phase.kind === "ready"
+      ? phase.preview.impact.sessions_left_running.map((session) =>
+          overlayLiveWatchdog(session, snapshot),
+        )
+      : [];
   const watchedSessions = managedSessions.filter(hasEnforcedWatchdog);
   const unwatchedSessions = managedSessions.filter((session) => !hasEnforcedWatchdog(session));
 
