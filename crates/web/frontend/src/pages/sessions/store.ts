@@ -9,6 +9,11 @@
 import { useSyncExternalStore } from "react";
 
 import { apiClient } from "../../lib/api.ts";
+import {
+  CORE_DEFAULTS,
+  MIN_CONCURRENT_SESSIONS,
+  START_MAX_RUNTIME_SECS,
+} from "../../lib/constants.ts";
 import type { TranslateFn } from "../../lib/i18n.ts";
 import type { ToastInput } from "../../lib/toast.ts";
 import type {
@@ -32,8 +37,12 @@ import {
 } from "./api.ts";
 import { formatConcern, formatRuntimeCardLabel, runtimeKey } from "./format.ts";
 
-const DEFAULT_REARM_SECS = 7200;
 const ENDED_LIMIT = 20;
+
+export interface SessionSettingsSummary {
+  readonly rearmDurationSecs: number;
+  readonly maxConcurrentSessions: number;
+}
 
 type EndReason =
   | { readonly kind: "user" }
@@ -61,6 +70,7 @@ interface SessionsLocalState {
   readonly forwardPolicyLoading: boolean;
   readonly forwardPolicyError: unknown | null;
   readonly rearmDurationSecs: number;
+  readonly maxConcurrentSessions: number;
   readonly cliInstalled: boolean | null;
   readonly reconcileSeq: number;
 }
@@ -72,7 +82,8 @@ const INITIAL_STATE: SessionsLocalState = {
   forwardPolicy: null,
   forwardPolicyLoading: false,
   forwardPolicyError: null,
-  rearmDurationSecs: DEFAULT_REARM_SECS,
+  rearmDurationSecs: START_MAX_RUNTIME_SECS,
+  maxConcurrentSessions: CORE_DEFAULTS.max_concurrent_sessions,
   cliInstalled: null,
   reconcileSeq: 0,
 };
@@ -88,7 +99,7 @@ let latestSnapshotVersion = 0;
 let forwardsMutationSeq = 0;
 let forwardsInFlight: Promise<ForwardView[]> | null = null;
 let forwardPolicyInFlight: Promise<ForwardPolicyView | null> | null = null;
-let settingsInFlight: Promise<number> | null = null;
+let settingsInFlight: Promise<SessionSettingsSummary> | null = null;
 const listeners = new Set<() => void>();
 
 function emit(): void {
@@ -334,24 +345,40 @@ export function refreshForwards(signal?: AbortSignal): Promise<ForwardView[]> {
   return promise;
 }
 
-export function refreshRearmDuration(signal?: AbortSignal): Promise<number> {
+export function refreshRearmDuration(signal?: AbortSignal): Promise<SessionSettingsSummary> {
   if (settingsInFlight) {
     return settingsInFlight;
   }
   const gen = apiClient.getSessionGeneration();
   const promise = fetchSettings(signal)
     .then((settings) => {
-      const configured = settings.defaults?.max_runtime;
-      const secs =
-        typeof configured === "number" && Number.isFinite(configured) && configured > 0
-          ? Math.floor(configured)
-          : DEFAULT_REARM_SECS;
-      if (apiClient.getSessionGeneration() === gen && state.rearmDurationSecs !== secs) {
-        setState({ rearmDurationSecs: secs });
+      const configuredRearm = settings.defaults?.max_runtime;
+      const rearmDurationSecs =
+        typeof configuredRearm === "number" &&
+        Number.isFinite(configuredRearm) &&
+        configuredRearm > 0
+          ? Math.floor(configuredRearm)
+          : START_MAX_RUNTIME_SECS;
+      const configuredMaxConcurrent = settings.defaults?.max_concurrent_sessions;
+      const maxConcurrentSessions =
+        typeof configuredMaxConcurrent === "number" &&
+        Number.isFinite(configuredMaxConcurrent) &&
+        configuredMaxConcurrent >= MIN_CONCURRENT_SESSIONS
+          ? Math.floor(configuredMaxConcurrent)
+          : CORE_DEFAULTS.max_concurrent_sessions;
+      if (
+        apiClient.getSessionGeneration() === gen &&
+        (state.rearmDurationSecs !== rearmDurationSecs ||
+          state.maxConcurrentSessions !== maxConcurrentSessions)
+      ) {
+        setState({ rearmDurationSecs, maxConcurrentSessions });
       }
-      return secs;
+      return { rearmDurationSecs, maxConcurrentSessions };
     })
-    .catch(() => state.rearmDurationSecs)
+    .catch(() => ({
+      rearmDurationSecs: state.rearmDurationSecs,
+      maxConcurrentSessions: state.maxConcurrentSessions,
+    }))
     .finally(() => {
       if (settingsInFlight === promise) {
         settingsInFlight = null;

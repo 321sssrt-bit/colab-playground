@@ -67,6 +67,10 @@ function getSnapshot(): number {
   return currentNowSecs;
 }
 
+export function getServerNowSecs(): number {
+  return computeNowSecs();
+}
+
 /**
  * Anchors the local 15-second ticker to the backend timestamp from `GET /api/sessions`.
  */

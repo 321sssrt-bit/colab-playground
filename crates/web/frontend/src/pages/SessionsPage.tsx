@@ -11,7 +11,7 @@ import { AlertIcon, SessionsIcon } from "../components/Icons.tsx";
 import { ApiError } from "../lib/api.ts";
 import { webStore } from "../lib/store.ts";
 import type { GuardDecision, Runtime, Snapshot } from "../lib/types.ts";
-import { fetchSessions, type AccountFailureResponse } from "./sessions/api.ts";
+import { fetchSessions, type AccountFailureResponse, type ProvisionFinishedEvent } from "./sessions/api.ts";
 import {
   AutoStopDialog,
   type AutoStopDialogMode,
@@ -31,7 +31,11 @@ import {
   runtimeKey,
   type FormattedError,
 } from "./sessions/format.ts";
-import { AlertTriangleIcon, CircleStopIcon, RefreshIcon } from "./sessions/Icons.tsx";
+import { AlertTriangleIcon, CircleStopIcon, PlusIcon, RefreshIcon } from "./sessions/Icons.tsx";
+import {
+  NewSessionDialog,
+  type NewSessionDialogRequest,
+} from "./sessions/NewSessionDialog.tsx";
 import { ProvisioningCard } from "./sessions/ProvisioningCard.tsx";
 import { RuntimeCard } from "./sessions/RuntimeCard.tsx";
 import { StopAllDialog } from "./sessions/StopAllDialog.tsx";
@@ -61,6 +65,7 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
   >(null);
   const [autoStopDialog, setAutoStopDialog] = useState<AutoStopDialogRequest | null>(null);
   const [forwardDialog, setForwardDialog] = useState<ForwardDialogRequest | null>(null);
+  const [newSessionDialog, setNewSessionDialog] = useState<NewSessionDialogRequest | null>(null);
   const [stopRuntimeDialog, setStopRuntimeDialog] = useState<StopRuntimeDialogRequest | null>(null);
   const [stopAllDialogId, setStopAllDialogId] = useState<number | null>(null);
 
@@ -207,6 +212,52 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
     setStopAllDialogId(dialogSeqRef.current);
   }, []);
 
+  const openNewSessionModal = useCallback(() => {
+    dialogSeqRef.current += 1;
+    if (activeProvisionOp) {
+      setNewSessionDialog({
+        id: dialogSeqRef.current,
+        mode: "running",
+        operationId: activeProvisionOp.op.id,
+        sessionName: activeProvisionOp.sessionName,
+      });
+      return;
+    }
+    const ctx = snapshot?.account ?? { revision: 0, active: null };
+    setNewSessionDialog({
+      id: dialogSeqRef.current,
+      mode: "create",
+      accountContext: { revision: ctx.revision, active: ctx.active },
+    });
+  }, [activeProvisionOp, snapshot?.account]);
+
+  const handleHiddenProvisionFinished = useCallback(
+    (event: ProvisionFinishedEvent, sessionName: string) => {
+      void loadSessions();
+      if (event.phase === "ready") {
+        pushToast({
+          tone: "success",
+          body: tRef.current("app.b2.provision_ready_toast", {
+            name: event.outcome?.name ?? sessionName,
+          }),
+        });
+      } else if (event.phase === "failed") {
+        const formatted = formatErrorMessage(event.error, tRef.current);
+        pushToast({
+          tone: "danger",
+          title: tRef.current("app.b2.new_failed"),
+          body: [formatted.message, formatted.hint].filter(Boolean).join("\n"),
+        });
+      } else if (event.phase === "cancelled") {
+        pushToast({
+          tone: "info",
+          body: tRef.current("app.b2.new_cancelled"),
+        });
+      }
+    },
+    [loadSessions, pushToast],
+  );
+
   const openAutoStopModal = useCallback(
     (runtime: Runtime, mode: AutoStopDialogMode) => {
       const ctx = snapshot?.account ?? { revision: 0, active: null };
@@ -340,6 +391,16 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
             {stopAllRunning ? <span className="spinner" aria-hidden="true" /> : <CircleStopIcon />}
             <span>{t("web.sessions.stop_all")}</span>
           </button>
+          <button
+            type="button"
+            className="btn btn-primary"
+            data-sessions-new="true"
+            disabled={!environmentReady || Boolean(snapshot?.shutting_down)}
+            onClick={openNewSessionModal}
+          >
+            <PlusIcon />
+            <span>{t("app.b2.new_title")}</span>
+          </button>
         </div>
       </header>
 
@@ -375,13 +436,15 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
           </section>
         ) : (
           <>
-            {activeProvisionOp && (
+            {activeProvisionOp && !newSessionDialog && (
               <ProvisioningCard
                 operation={activeProvisionOp.op}
                 sessionName={activeProvisionOp.sessionName}
                 locale={locale}
                 t={t}
                 pushToast={pushToast}
+                onShowDialog={openNewSessionModal}
+                onFinished={handleHiddenProvisionFinished}
               />
             )}
 
@@ -470,6 +533,18 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
                             : t("app.b10.sessions_empty_partial_title")}
                         </h2>
                         <p className="empty-state-body">{t("app.sessions.empty.body")}</p>
+                      </div>
+                      <div className="empty-state-actions">
+                        <button
+                          type="button"
+                          className="btn btn-primary"
+                          data-sessions-empty-new="true"
+                          disabled={Boolean(snapshot?.shutting_down)}
+                          onClick={openNewSessionModal}
+                        >
+                          <PlusIcon />
+                          <span>{t("app.b2.new_title")}</span>
+                        </button>
                       </div>
                     </div>
                   </section>
@@ -573,6 +648,19 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
         pushToast={pushToast}
         onClose={() => setStopRuntimeDialog(null)}
         onStopped={handleAutoStopCompleted}
+      />
+
+      <NewSessionDialog
+        request={newSessionDialog}
+        snapshot={snapshot}
+        maxConcurrentSessions={localState.maxConcurrentSessions}
+        activeProvisionOp={activeProvisionOp}
+        locale={locale}
+        t={t}
+        navigate={navigate}
+        pushToast={pushToast}
+        onClose={() => setNewSessionDialog(null)}
+        onProvisionFinished={handleAutoStopCompleted}
       />
 
       <StopAllDialog

@@ -1,0 +1,809 @@
+/**
+ * Native modal `<dialog>` for starting a new Colab runtime with hardware
+ * targeting, cost guards, concurrent session limit checks, account-change
+ * guard, live SSE provisioning progress, hiding back to the Sessions card,
+ * and cancellation at any point.
+ */
+
+import { useEffect, useId, useRef, useState, type FormEvent, type SyntheticEvent } from "react";
+
+import { AlertIcon, CheckCircleIcon } from "../../components/Icons.tsx";
+import { apiClient, ApiError } from "../../lib/api.ts";
+import { CORE_DEFAULTS } from "../../lib/constants.ts";
+import { resolveActiveAccount } from "../../lib/format.ts";
+import type { TranslateFn } from "../../lib/i18n.ts";
+import type { RouteId } from "../../lib/router.ts";
+import type { ToastInput } from "../../lib/toast.ts";
+import type { AccountContext, Locale, PendingOperation, Snapshot } from "../../lib/types.ts";
+import {
+  cancelProvision,
+  fetchSessionTemplate,
+  startProvision,
+  type ProvisionFinishedEvent,
+  type ProvisionOutcome,
+} from "./api.ts";
+import { formatEmail, formatErrorMessage, type FormattedError } from "./format.ts";
+import { AlertTriangleIcon, PlayIcon, SmallAlertIcon, SmallInfoIcon } from "./Icons.tsx";
+import {
+  acceleratorPrefix,
+  buildProvisionSpecFromDraft,
+  findMeasuredRate,
+  MAX_SESSION_NAME_LEN,
+  ProvisionFields,
+  specToProvisionDraft,
+  type ProvisionDraft,
+  type ProvisionFieldErrorId,
+  type ProvisionFieldsChangeMeta,
+} from "./ProvisionFields.tsx";
+import {
+  formatProvisionHeadline,
+  hasProvisionLines,
+  ProvisionProgress,
+  useProvisionStream,
+} from "./ProvisionProgress.tsx";
+import { refreshRearmDuration } from "./store.ts";
+
+export type NewSessionDialogRequest =
+  | {
+      readonly id: number;
+      readonly mode: "create";
+      readonly accountContext: AccountContext;
+    }
+  | {
+      readonly id: number;
+      readonly mode: "running";
+      readonly operationId: number;
+      readonly sessionName: string;
+    };
+
+export interface NewSessionDialogProps {
+  readonly request: NewSessionDialogRequest | null;
+  readonly snapshot: Snapshot | null;
+  readonly maxConcurrentSessions: number;
+  readonly activeProvisionOp: { readonly op: PendingOperation; readonly sessionName: string } | null;
+  readonly locale: Locale;
+  readonly t: TranslateFn;
+  readonly navigate: (route: RouteId) => void;
+  readonly pushToast: (toast: ToastInput) => number;
+  readonly onClose: () => void;
+  readonly onProvisionFinished: () => void;
+}
+
+type DialogPhase =
+  | { readonly kind: "loading" }
+  | { readonly kind: "load_error"; readonly error: FormattedError }
+  | { readonly kind: "limit"; readonly limit: number; readonly counted: readonly string[] }
+  | { readonly kind: "form" }
+  | { readonly kind: "running"; readonly operationId: number; readonly sessionName: string }
+  | { readonly kind: "ready"; readonly outcome: ProvisionOutcome }
+  | { readonly kind: "failed"; readonly error: FormattedError }
+  | { readonly kind: "cancelled" };
+
+function countNamedRuntimesOnActiveAccount(snapshot: Snapshot | null): string[] {
+  const runtimes = snapshot?.runtimes?.runtimes ?? [];
+  const names: string[] = [];
+  for (const rt of runtimes) {
+    if (rt.on_active_account && rt.id.name) {
+      names.push(rt.id.name);
+    }
+  }
+  return names;
+}
+
+export function NewSessionDialog({
+  request,
+  snapshot,
+  maxConcurrentSessions,
+  activeProvisionOp,
+  locale,
+  t,
+  navigate,
+  pushToast,
+  onClose,
+  onProvisionFinished,
+}: NewSessionDialogProps) {
+  const titleId = useId();
+  const nameInputId = useId();
+  const validationErrorId = useId();
+  const dialogRef = useRef<HTMLDialogElement | null>(null);
+  const nameInputRef = useRef<HTMLInputElement | null>(null);
+  const activeRequestIdRef = useRef<number>(0);
+  const autoNameRef = useRef<string>("");
+  const snapshotRef = useRef(snapshot);
+  snapshotRef.current = snapshot;
+  const maxConcurrentRef = useRef(maxConcurrentSessions);
+  maxConcurrentRef.current = maxConcurrentSessions;
+  const tRef = useRef(t);
+  tRef.current = t;
+
+  const [phase, setPhase] = useState<DialogPhase>({ kind: "loading" });
+  const [nameDraft, setNameDraft] = useState("");
+  const [provisionDraft, setProvisionDraft] = useState<ProvisionDraft | null>(null);
+  const [retryDelaySecs, setRetryDelaySecs] = useState<number>(CORE_DEFAULTS.retry_delay);
+  const [submitting, setSubmitting] = useState(false);
+  const [cancelRequested, setCancelRequested] = useState(false);
+  const [invalidFields, setInvalidFields] = useState<ReadonlySet<ProvisionFieldErrorId>>(
+    () => new Set<ProvisionFieldErrorId>(),
+  );
+  const [submitError, setSubmitError] = useState<FormattedError | null>(null);
+  const [streamOperationId, setStreamOperationId] = useState<number | null>(null);
+  const [reloadSeq, setReloadSeq] = useState(0);
+
+  const loadTemplateAndLimit = (requestId: number, signal: AbortSignal) => {
+    const gen = apiClient.getSessionGeneration();
+    setPhase({ kind: "loading" });
+    setSubmitting(false);
+    setCancelRequested(false);
+    setInvalidFields(new Set<ProvisionFieldErrorId>());
+    setSubmitError(null);
+    setStreamOperationId(null);
+
+    const templatePromise = fetchSessionTemplate(signal);
+    const settingsPromise = refreshRearmDuration(signal)
+      .then((res) => res.maxConcurrentSessions)
+      .catch(() => maxConcurrentRef.current);
+
+    void Promise.all([templatePromise, settingsPromise]).then(
+      ([template, resolvedMaxConcurrent]) => {
+        if (
+          signal.aborted ||
+          apiClient.getSessionGeneration() !== gen ||
+          activeRequestIdRef.current !== requestId
+        ) {
+          return;
+        }
+        const counted = countNamedRuntimesOnActiveAccount(snapshotRef.current);
+        const cap = Math.max(1, resolvedMaxConcurrent);
+        setNameDraft(template.name);
+        autoNameRef.current = template.name;
+        setProvisionDraft(specToProvisionDraft(template));
+        setRetryDelaySecs(template.retry_delay);
+        if (counted.length >= cap) {
+          setPhase({ kind: "limit", limit: cap, counted });
+        } else {
+          setPhase({ kind: "form" });
+        }
+      },
+      (error: unknown) => {
+        if (signal.aborted || (error instanceof ApiError && error.isAbort)) {
+          return;
+        }
+        if (error instanceof ApiError && error.isUnauthorized) {
+          onClose();
+          return;
+        }
+        if (
+          apiClient.getSessionGeneration() !== gen ||
+          activeRequestIdRef.current !== requestId
+        ) {
+          return;
+        }
+        setPhase({ kind: "load_error", error: formatErrorMessage(error, tRef.current) });
+      },
+    );
+  };
+
+  // Initialize dialog strictly once per open (or explicit retry) so SSE pushes never reset user edits.
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!request) {
+      activeRequestIdRef.current = 0;
+      setStreamOperationId(null);
+      if (dialog?.open) {
+        dialog.close();
+      }
+      return;
+    }
+
+    activeRequestIdRef.current = request.id;
+    if (dialog && !dialog.open) {
+      dialog.returnValue = "";
+      dialog.showModal();
+    }
+
+    if (request.mode === "running") {
+      setSubmitting(false);
+      setCancelRequested(false);
+      setSubmitError(null);
+      setInvalidFields(new Set<ProvisionFieldErrorId>());
+      setProvisionDraft(null);
+      setPhase({
+        kind: "running",
+        operationId: request.operationId,
+        sessionName: request.sessionName,
+      });
+      setStreamOperationId(request.operationId);
+      return;
+    }
+
+    const controller = new AbortController();
+    loadTemplateAndLimit(request.id, controller.signal);
+    return () => {
+      controller.abort();
+    };
+  }, [request?.id, reloadSeq]);
+
+  const handleStreamFinished = (finished: ProvisionFinishedEvent) => {
+    setCancelRequested(false);
+    onProvisionFinished();
+    if (finished.phase === "ready" && finished.outcome) {
+      setPhase({ kind: "ready", outcome: finished.outcome });
+      return;
+    }
+    if (finished.phase === "cancelled") {
+      setPhase({ kind: "cancelled" });
+      return;
+    }
+    if (finished.error?.kind === "session_limit_reached") {
+      const parsedLimit = Number(finished.error.args?.limit);
+      const cap =
+        Number.isFinite(parsedLimit) && parsedLimit >= 1
+          ? Math.floor(parsedLimit)
+          : Math.max(1, maxConcurrentRef.current);
+      setPhase({
+        kind: "limit",
+        limit: cap,
+        counted: countNamedRuntimesOnActiveAccount(snapshotRef.current),
+      });
+      return;
+    }
+    setPhase({ kind: "failed", error: formatErrorMessage(finished.error, tRef.current) });
+  };
+
+  const handleStreamError = (error: unknown) => {
+    if (error instanceof ApiError && error.isUnauthorized) {
+      onClose();
+      return;
+    }
+    setCancelRequested(false);
+    setPhase((prev) =>
+      prev.kind === "running"
+        ? { kind: "failed", error: formatErrorMessage(error, tRef.current) }
+        : prev,
+    );
+  };
+
+  const { events, waitingSinceMs } = useProvisionStream({
+    operationId: streamOperationId,
+    onFinished: handleStreamFinished,
+    onStreamError: handleStreamError,
+  });
+
+  const handleDialogCancel = (event: SyntheticEvent<HTMLDialogElement>) => {
+    event.preventDefault();
+    if (!submitting) {
+      onClose();
+    }
+  };
+
+  const handleDialogClose = () => {
+    const dialog = dialogRef.current;
+    if (dialog) {
+      dialog.returnValue = "";
+    }
+    if (request && !submitting) {
+      onClose();
+    }
+  };
+
+  const currentAccountContext = snapshot?.account ?? null;
+  const accountChanged =
+    request !== null &&
+    request.mode === "create" &&
+    currentAccountContext !== null &&
+    (currentAccountContext.revision !== request.accountContext.revision ||
+      currentAccountContext.active !== request.accountContext.active);
+
+  const activeAccount = resolveActiveAccount(snapshot, t);
+  const activeEmail = formatEmail(activeAccount.email, t);
+  const shuttingDown = Boolean(snapshot?.shutting_down);
+  const blockedByActiveProvision = activeProvisionOp !== null && phase.kind === "form";
+
+  const measuredRate = provisionDraft
+    ? findMeasuredRate(
+        snapshot?.runtimes?.runtimes,
+        provisionDraft.accelerator,
+        provisionDraft.high_mem,
+      )
+    : null;
+
+  const handleProvisionFieldsChange = (
+    nextDraft: ProvisionDraft,
+    meta?: ProvisionFieldsChangeMeta,
+  ) => {
+    setProvisionDraft(nextDraft);
+    if (meta?.acceleratorChanged) {
+      const oldPrefix = `${acceleratorPrefix(meta.acceleratorChanged.prev)}-`;
+      const newPrefix = `${acceleratorPrefix(meta.acceleratorChanged.next)}-`;
+      const trimmedCurrent = nameDraft.trim();
+      if (
+        autoNameRef.current.length > 0 &&
+        trimmedCurrent === autoNameRef.current &&
+        trimmedCurrent.startsWith(oldPrefix)
+      ) {
+        const renamed = `${newPrefix}${trimmedCurrent.slice(oldPrefix.length)}`;
+        autoNameRef.current = renamed;
+        setNameDraft(renamed);
+      }
+    }
+    if (invalidFields.size > 0) {
+      setInvalidFields(new Set<ProvisionFieldErrorId>());
+    }
+    if (submitError) {
+      setSubmitError(null);
+    }
+  };
+
+  const focusFirstInvalidControl = (fields: ReadonlySet<ProvisionFieldErrorId>) => {
+    if (fields.has("name")) {
+      nameInputRef.current?.focus();
+      return;
+    }
+    window.requestAnimationFrame(() => {
+      const firstInvalid = dialogRef.current?.querySelector<HTMLElement>('[aria-invalid="true"]');
+      firstInvalid?.focus();
+    });
+  };
+
+  const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (
+      !request ||
+      request.mode !== "create" ||
+      phase.kind !== "form" ||
+      !provisionDraft ||
+      submitting ||
+      accountChanged ||
+      blockedByActiveProvision ||
+      shuttingDown
+    ) {
+      return;
+    }
+
+    const built = buildProvisionSpecFromDraft(nameDraft, provisionDraft, retryDelaySecs);
+    if (!built.ok) {
+      setInvalidFields(built.invalidFields);
+      focusFirstInvalidControl(built.invalidFields);
+      return;
+    }
+
+    const requestId = request.id;
+    const sessionGeneration = apiClient.getSessionGeneration();
+    setSubmitting(true);
+    setInvalidFields(new Set<ProvisionFieldErrorId>());
+    setSubmitError(null);
+
+    try {
+      const accepted = await startProvision(request.accountContext, built.spec);
+      if (
+        apiClient.getSessionGeneration() !== sessionGeneration ||
+        activeRequestIdRef.current !== requestId
+      ) {
+        return;
+      }
+      setSubmitting(false);
+      setCancelRequested(false);
+      setPhase({
+        kind: "running",
+        operationId: accepted.id,
+        sessionName: built.spec.name,
+      });
+      setStreamOperationId(accepted.id);
+    } catch (error) {
+      if (error instanceof ApiError && error.isUnauthorized) {
+        setSubmitting(false);
+        onClose();
+        return;
+      }
+      if (
+        apiClient.getSessionGeneration() !== sessionGeneration ||
+        activeRequestIdRef.current !== requestId
+      ) {
+        return;
+      }
+      setSubmitting(false);
+      if (error instanceof ApiError && error.kind === "session_limit_reached") {
+        const parsedLimit = Number(error.args?.limit);
+        const cap =
+          Number.isFinite(parsedLimit) && parsedLimit >= 1
+            ? Math.floor(parsedLimit)
+            : Math.max(1, maxConcurrentRef.current);
+        setPhase({
+          kind: "limit",
+          limit: cap,
+          counted: countNamedRuntimesOnActiveAccount(snapshotRef.current),
+        });
+        return;
+      }
+      setSubmitError(formatErrorMessage(error, t));
+    }
+  };
+
+  const isOpCancelling =
+    phase.kind === "running" &&
+    (cancelRequested ||
+      (activeProvisionOp?.op.id === phase.operationId && activeProvisionOp.op.cancelling));
+
+  const handleCancelProvision = async () => {
+    if (phase.kind !== "running" || isOpCancelling) {
+      return;
+    }
+    const opId = phase.operationId;
+    setCancelRequested(true);
+    try {
+      await cancelProvision(opId);
+    } catch (error) {
+      if (error instanceof ApiError && error.isUnauthorized) {
+        onClose();
+        return;
+      }
+      if (!(error instanceof ApiError && error.kind === "provision_not_found")) {
+        pushToast({
+          tone: "danger",
+          body: formatErrorMessage(error, t).message,
+        });
+        setCancelRequested(false);
+      }
+    }
+  };
+
+  const handleEditAgain = () => {
+    setSubmitError(null);
+    setInvalidFields(new Set<ProvisionFieldErrorId>());
+    setStreamOperationId(null);
+    if (provisionDraft && request?.mode === "create") {
+      setPhase({ kind: "form" });
+    } else if (request?.mode === "create") {
+      setReloadSeq((seq) => seq + 1);
+    } else {
+      onClose();
+    }
+  };
+
+  const closedByAttr = {
+    closedby: submitting ? "none" : "closerequest",
+  } as Record<string, string>;
+
+  return (
+    <dialog
+      ref={dialogRef}
+      className="modal-dialog"
+      aria-labelledby={titleId}
+      data-dialog-kind={request ? "new_session" : undefined}
+      data-dialog-phase={request ? (submitting ? "submitting" : phase.kind) : undefined}
+      onCancel={handleDialogCancel}
+      onClose={handleDialogClose}
+      {...closedByAttr}
+    >
+      {request && (
+        <>
+          <h1 id={titleId} className="dialog-title">
+            {t("app.b2.new_title")}
+          </h1>
+
+          {phase.kind === "loading" && (
+            <>
+              <div className="dialog-body">
+                <div className="busy-line" role="status" data-new-session-loading="true">
+                  <span className="spinner" aria-hidden="true" />
+                  <span>{t("web.sessions.template_loading")}</span>
+                </div>
+              </div>
+              <div className="modal-actions">
+                <button type="button" className="btn btn-ghost" onClick={onClose}>
+                  {t("app.action.close")}
+                </button>
+              </div>
+            </>
+          )}
+
+          {phase.kind === "load_error" && (
+            <>
+              <div className="dialog-body">
+                <div className="alert alert-danger" role="alert">
+                  <span className="alert-icon icon-danger">
+                    <AlertIcon />
+                  </span>
+                  <div className="alert-text">
+                    <p className="alert-title">{phase.error.message}</p>
+                    {phase.error.hint && <p className="alert-body">{phase.error.hint}</p>}
+                  </div>
+                </div>
+              </div>
+              <div className="modal-actions">
+                <button type="button" className="btn btn-ghost" onClick={onClose}>
+                  {t("app.action.close")}
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-primary"
+                  onClick={() => setReloadSeq((seq) => seq + 1)}
+                >
+                  {t("app.action.retry")}
+                </button>
+              </div>
+            </>
+          )}
+
+          {phase.kind === "limit" && (
+            <>
+              <div className="dialog-body" data-new-session-limit="true">
+                <div className="inline-msg inline-msg-warning" role="status">
+                  <AlertTriangleIcon className="icon-xs icon-warning" />
+                  <span className="inline-msg-text">
+                    {t("app.b3.new_limit_body", {
+                      limit: phase.limit,
+                      email: activeEmail,
+                    })}
+                  </span>
+                </div>
+                {phase.counted.length > 0 && (
+                  <p className="dialog-paragraph">
+                    {t("app.b3.new_limit_counted", {
+                      names: phase.counted.join(t("app.fmt.list_separator")),
+                    })}
+                  </p>
+                )}
+                <p className="dialog-caption">{t("app.b3.new_limit_hint")}</p>
+              </div>
+              <div className="modal-actions">
+                <button type="button" className="btn btn-ghost" onClick={onClose}>
+                  {t("app.action.close")}
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-primary"
+                  data-new-session-open-settings="true"
+                  autoFocus
+                  onClick={() => {
+                    onClose();
+                    navigate("settings");
+                  }}
+                >
+                  {t("app.b3.new_open_settings")}
+                </button>
+              </div>
+            </>
+          )}
+
+          {phase.kind === "form" && provisionDraft && (
+            <form
+              className="dialog-form"
+              noValidate
+              data-new-session-form="true"
+              onSubmit={(event) => void handleSubmit(event)}
+            >
+              <div className="dialog-body">
+                <p className="dialog-paragraph">{t("app.b2.new_intro")}</p>
+
+                {accountChanged && (
+                  <div
+                    className="inline-msg inline-msg-warning"
+                    role="alert"
+                    data-new-session-account-changed="true"
+                  >
+                    <AlertTriangleIcon className="icon-xs icon-warning" />
+                    <span className="inline-msg-text">{t("web.sessions.account_changed")}</span>
+                  </div>
+                )}
+
+                {submitError && (
+                  <div
+                    className="alert alert-danger"
+                    role="alert"
+                    data-new-session-submit-error="true"
+                  >
+                    <span className="alert-icon icon-danger">
+                      <AlertIcon />
+                    </span>
+                    <div className="alert-text">
+                      <p className="alert-title">{submitError.message}</p>
+                      {submitError.hint && <p className="alert-body">{submitError.hint}</p>}
+                    </div>
+                  </div>
+                )}
+
+                {invalidFields.size > 0 && (
+                  <div
+                    id={validationErrorId}
+                    className="inline-msg inline-msg-danger"
+                    role="alert"
+                    data-new-session-validation-error="true"
+                  >
+                    <SmallAlertIcon className="icon-xs icon-danger" />
+                    <span className="inline-msg-text">{t("app.err.invalid_input")}</span>
+                  </div>
+                )}
+
+                <div className="field-group">
+                  <label htmlFor={nameInputId} className="field-label">
+                    {t("app.b2.new_name")}
+                  </label>
+                  <input
+                    ref={nameInputRef}
+                    id={nameInputId}
+                    name="session_name"
+                    type="text"
+                    autoComplete="off"
+                    autoCorrect="off"
+                    autoCapitalize="none"
+                    spellCheck={false}
+                    enterKeyHint="done"
+                    className="input"
+                    required
+                    maxLength={MAX_SESSION_NAME_LEN}
+                    placeholder={t("app.b2.new_name_placeholder")}
+                    aria-invalid={invalidFields.has("name") ? "true" : undefined}
+                    aria-describedby={invalidFields.has("name") ? validationErrorId : undefined}
+                    data-new-session-name="true"
+                    value={nameDraft}
+                    disabled={submitting}
+                    autoFocus
+                    onChange={(event) => {
+                      setNameDraft(event.target.value);
+                      if (invalidFields.has("name")) {
+                        setInvalidFields((prev) => {
+                          const next = new Set(prev);
+                          next.delete("name");
+                          return next;
+                        });
+                      }
+                      if (submitError) {
+                        setSubmitError(null);
+                      }
+                    }}
+                  />
+                </div>
+
+                <ProvisionFields
+                  draft={provisionDraft}
+                  invalidFields={invalidFields}
+                  disabled={submitting}
+                  measuredRate={measuredRate}
+                  errorSummaryId={invalidFields.size > 0 ? validationErrorId : undefined}
+                  locale={locale}
+                  t={t}
+                  onChange={handleProvisionFieldsChange}
+                />
+              </div>
+
+              <div className="modal-actions">
+                <button
+                  type="button"
+                  className="btn btn-ghost"
+                  disabled={submitting}
+                  onClick={onClose}
+                >
+                  {t("app.action.cancel")}
+                </button>
+                <button
+                  type="submit"
+                  className="btn btn-primary"
+                  data-new-session-start="true"
+                  disabled={submitting || accountChanged || blockedByActiveProvision || shuttingDown}
+                >
+                  {submitting ? <span className="spinner" aria-hidden="true" /> : <PlayIcon />}
+                  <span>{t("app.b2.new_start")}</span>
+                </button>
+              </div>
+            </form>
+          )}
+
+          {phase.kind === "running" && (
+            <>
+              <div className="dialog-body" data-new-session-running="true">
+                <p className="field-label" data-new-session-headline="true">
+                  {formatProvisionHeadline(events, t)}
+                </p>
+
+                <ProvisionProgress
+                  events={events}
+                  live={true}
+                  waitingSinceMs={waitingSinceMs}
+                  locale={locale}
+                  t={t}
+                />
+
+                <div className="inline-msg inline-msg-info">
+                  <SmallInfoIcon className="icon-xs icon-info" />
+                  <span className="inline-msg-text">{t("app.b2.new_cancel_note")}</span>
+                </div>
+              </div>
+
+              <div className="modal-actions">
+                <button
+                  type="button"
+                  className="btn btn-ghost"
+                  data-new-session-hide="true"
+                  onClick={onClose}
+                >
+                  {t("app.b2.action_hide")}
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-danger"
+                  data-new-session-cancel="true"
+                  disabled={isOpCancelling}
+                  onClick={() => {
+                    void handleCancelProvision();
+                  }}
+                >
+                  {isOpCancelling && <span className="spinner" aria-hidden="true" />}
+                  <span>{t(isOpCancelling ? "app.b2.new_cancelling" : "app.action.cancel")}</span>
+                </button>
+              </div>
+            </>
+          )}
+
+          {phase.kind === "ready" && (
+            <>
+              <div className="dialog-body" data-new-session-ready="true">
+                <ProvisionProgress events={events} live={false} locale={locale} t={t} />
+                <div className="inline-msg inline-msg-success" role="status">
+                  <CheckCircleIcon />
+                  <span className="inline-msg-text">
+                    {t("app.b2.new_ready", { name: phase.outcome.name })}
+                  </span>
+                </div>
+              </div>
+              <div className="modal-actions">
+                <button type="button" className="btn btn-primary" autoFocus onClick={onClose}>
+                  {t("app.action.close")}
+                </button>
+              </div>
+            </>
+          )}
+
+          {(phase.kind === "failed" || phase.kind === "cancelled") && (
+            <>
+              <div className="dialog-body" data-new-session-terminal={phase.kind}>
+                {hasProvisionLines(events, locale, t) && (
+                  <ProvisionProgress events={events} live={false} locale={locale} t={t} />
+                )}
+
+                {phase.kind === "failed" ? (
+                  <div className="alert alert-danger" role="alert">
+                    <span className="alert-icon icon-danger">
+                      <AlertIcon />
+                    </span>
+                    <div className="alert-text">
+                      <p className="alert-title">{t("app.b2.new_failed")}</p>
+                      <p className="alert-body">
+                        {[phase.error.message, phase.error.hint].filter(Boolean).join("\n")}
+                      </p>
+                    </div>
+                  </div>
+                ) : (
+                  <div
+                    className="inline-msg inline-msg-info"
+                    role="status"
+                    data-provision-cancelled="true"
+                  >
+                    <SmallInfoIcon className="icon-xs icon-info" />
+                    <span className="inline-msg-text">{t("app.b2.new_cancelled")}</span>
+                  </div>
+                )}
+              </div>
+
+              <div className="modal-actions">
+                <button type="button" className="btn btn-ghost" onClick={onClose}>
+                  {t("app.action.close")}
+                </button>
+                {request.mode === "create" && (
+                  <button
+                    type="button"
+                    className="btn btn-primary"
+                    data-new-session-change="true"
+                    onClick={handleEditAgain}
+                  >
+                    {t("app.b2.new_change")}
+                  </button>
+                )}
+              </div>
+            </>
+          )}
+        </>
+      )}
+    </dialog>
+  );
+}
