@@ -286,7 +286,6 @@ export function PluginsPage({ snapshot, locale, t, pushToast }: PageProps) {
                         id={switchId}
                         type="checkbox"
                         role="switch"
-                        {...({ switch: "" } as Record<string, string>)}
                         className="switch-input"
                         checked={plugin.enabled}
                         disabled={busy}
