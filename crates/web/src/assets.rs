@@ -304,6 +304,10 @@ const SHELL_EN_US: Messages = &[
         "Enter a duration greater than zero.",
     ),
     ("web.sessions.template_loading", "Loading defaults…"),
+    (
+        "web.sessions.account_changed",
+        "The active account changed while this dialog was open. Reopen it to start a session on the current account.",
+    ),
     ("web.forward.bind_label", "Listen address"),
     ("web.forward.bind_loopback", "Loopback only (127.0.0.1)"),
     ("web.forward.bind_all", "All interfaces (0.0.0.0)"),
@@ -438,6 +442,10 @@ const SHELL_ZH_CN: Messages = &[
         "请输入大于 0 的时长。",
     ),
     ("web.sessions.template_loading", "正在加载默认配置…"),
+    (
+        "web.sessions.account_changed",
+        "此弹窗打开期间活跃账号已切换，请重新打开后再在当前账号下创建会话。",
+    ),
     ("web.forward.bind_label", "监听地址"),
     ("web.forward.bind_loopback", "仅回环地址（127.0.0.1）"),
     ("web.forward.bind_all", "所有网卡（0.0.0.0）"),
@@ -575,6 +583,10 @@ const SHELL_ZH_TW: Messages = &[
         "請輸入大於 0 的時長。",
     ),
     ("web.sessions.template_loading", "正在載入預設值…"),
+    (
+        "web.sessions.account_changed",
+        "此對話框開啟期間活躍帳號已切換，請重新開啟後再於目前帳號下建立工作階段。",
+    ),
     ("web.forward.bind_label", "監聽位址"),
     ("web.forward.bind_loopback", "僅迴路位址（127.0.0.1）"),
     ("web.forward.bind_all", "所有介面（0.0.0.0）"),
@@ -732,6 +744,10 @@ const SHELL_JA_JP: Messages = &[
     (
         "web.sessions.template_loading",
         "デフォルト設定を読み込み中…",
+    ),
+    (
+        "web.sessions.account_changed",
+        "このダイアログを開いている間にアクティブなアカウントが変更されました。現在のアカウントでセッションを開始するには開き直してください。",
     ),
     ("web.forward.bind_label", "待ち受けアドレス"),
     ("web.forward.bind_loopback", "ループバックのみ (127.0.0.1)"),
@@ -894,6 +910,10 @@ const SHELL_KO_KR: Messages = &[
         "0보다 큰 시간을 입력하세요.",
     ),
     ("web.sessions.template_loading", "기본값 불러오는 중…"),
+    (
+        "web.sessions.account_changed",
+        "이 대화 상자가 열려 있는 동안 활성 계정이 변경되었습니다. 현재 계정에서 세션을 시작하려면 다시 여세요.",
+    ),
     ("web.forward.bind_label", "수신 주소"),
     ("web.forward.bind_loopback", "루프백 전용 (127.0.0.1)"),
     ("web.forward.bind_all", "모든 인터페이스 (0.0.0.0)"),

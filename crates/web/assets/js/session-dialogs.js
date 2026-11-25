@@ -24,6 +24,7 @@ import {
   changeAutoStop,
   closeForward,
   fetchSessionTemplate,
+  getAccountContext,
   getActiveEmail,
   getForwardsForRuntime,
   getMaxConcurrentSessions,
@@ -80,6 +81,57 @@ function safeHttpUrl(raw) {
 
 function cloneSpec(spec) {
   return JSON.parse(JSON.stringify(spec));
+}
+
+function cloneAccountContext(ctx) {
+  return {
+    revision: Number.isFinite(ctx?.revision) ? ctx.revision : 0,
+    active: ctx?.active ?? null,
+  };
+}
+
+function accountContextChanged(captured) {
+  if (!captured) return false;
+  const current = state.snapshot?.account;
+  if (!current) return false;
+  return current.revision !== captured.revision || (current.active ?? null) !== (captured.active ?? null);
+}
+
+async function copyTextToClipboard(text) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      // Fall through to legacy selection copy on non-secure HTTP origins.
+    }
+  }
+  const dialog = getDialogEl();
+  const host = dialog?.open ? dialog : document.body;
+  if (!host) return false;
+  const prevActive = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  const proxy = document.createElement("textarea");
+  proxy.className = "clipboard-proxy";
+  proxy.setAttribute("readonly", "");
+  proxy.setAttribute("aria-hidden", "true");
+  proxy.tabIndex = -1;
+  proxy.value = text;
+  host.appendChild(proxy);
+  let copied = false;
+  try {
+    proxy.focus({ preventScroll: true });
+    proxy.select();
+    proxy.setSelectionRange(0, text.length);
+    copied = Boolean(document.execCommand("copy"));
+  } catch {
+    copied = false;
+  } finally {
+    proxy.remove();
+    if (prevActive && prevActive.isConnected) {
+      prevActive.focus({ preventScroll: true });
+    }
+  }
+  return copied;
 }
 
 function randomHex4() {
@@ -253,6 +305,20 @@ function provisionSentence(ev, done) {
 export function renderProvisionProgress(provision, live) {
   const events = Array.isArray(provision?.events) ? provision.events : [];
   const shown = events.filter((ev) => provisionSentence(ev, true) !== null);
+  // Server omits ProvisionEvent::Ready from progress SSE and reports it on finished.outcome.
+  if (
+    !live &&
+    provision?.phase === "ready" &&
+    provision.outcome &&
+    !shown.some((ev) => ev?.event === "ready")
+  ) {
+    shown.push({
+      event: "ready",
+      gpu: provision.outcome.hardware?.gpu ?? null,
+      vram_mib: provision.outcome.hardware?.vram_mib ?? null,
+      below_spec: Boolean(provision.outcome.below_spec),
+    });
+  }
   const rows = shown.map((ev, index) => {
     const isCurrent = live && index + 1 === shown.length;
     const item = provisionSentence(ev, !isCurrent);
@@ -341,12 +407,12 @@ export function renderForwardRow(forward, { onAfterClose = null } = {}) {
         {
           type: "button",
           className: "btn btn-sm btn-ghost btn-icon",
-          dataset: { forwardCopy: String(forward.id) },
+          dataset: { forwardCopy: String(forward.id), focusKey: `fw:${forward.id}:copy` },
           "aria-label": t("copy.button"),
           title: t("copy.button"),
           onClick: async () => {
-            try {
-              await navigator.clipboard.writeText(copyUrl);
+            const ok = await copyTextToClipboard(copyUrl);
+            if (ok) {
               clear(copyBtnIconHolder);
               copyBtnIconHolder.appendChild(icon("check", "icon-success"));
               announce(t("web.shell.copied"));
@@ -355,7 +421,7 @@ export function renderForwardRow(forward, { onAfterClose = null } = {}) {
                 clear(copyBtnIconHolder);
                 copyBtnIconHolder.appendChild(icon("copy"));
               }, 2000);
-            } catch {
+            } else {
               announce(t("web.shell.copy_link_failed"), "assertive");
             }
           },
@@ -372,7 +438,7 @@ export function renderForwardRow(forward, { onAfterClose = null } = {}) {
           target: "_blank",
           rel: "noopener noreferrer",
           className: "btn btn-sm btn-ghost btn-icon",
-          dataset: { forwardOpen: String(forward.id) },
+          dataset: { forwardOpen: String(forward.id), focusKey: `fw:${forward.id}:open` },
           "aria-label": t("app.b2.action_open_browser"),
           title: t("app.b2.action_open_browser"),
         },
@@ -386,7 +452,7 @@ export function renderForwardRow(forward, { onAfterClose = null } = {}) {
     {
       type: "button",
       className: "btn btn-sm btn-ghost btn-icon",
-      dataset: { forwardClose: String(forward.id) },
+      dataset: { forwardClose: String(forward.id), focusKey: `fw:${forward.id}:close` },
       "aria-label": t(terminal ? "app.action.dismiss" : "app.b2.forward_close"),
       title: t(terminal ? "app.action.dismiss" : "app.b2.forward_close"),
       onClick: async () => {
@@ -626,10 +692,19 @@ async function submitNewSession(model) {
   renderActiveDialog();
 
   try {
-    await startSessionProvision(spec);
+    await startSessionProvision(spec, model.accountContext);
     if (gen !== dialogGeneration || activeDialog !== model) return;
     model.submitting = false;
-    model.phase = "running";
+    if (
+      state.provision.phase === "ready" ||
+      state.provision.phase === "failed" ||
+      state.provision.phase === "cancelled"
+    ) {
+      model.phase = state.provision.phase;
+      model.error = state.provision.error;
+    } else {
+      model.phase = "running";
+    }
     renderActiveDialog();
   } catch (err) {
     if (err && err.status === 401) {
@@ -702,13 +777,23 @@ function renderNewSessionDialog(dialog, model) {
     model.phase = "ready";
     dialog.dataset.dialogPhase = "ready";
     const readyName = prov.outcome?.name || prov.sessionName || model.spec?.name || "";
+    const belowSpec = Boolean(prov.outcome?.below_spec);
+    const hardware =
+      formatHardware(prov.outcome?.hardware?.gpu, prov.outcome?.hardware?.vram_mib) ||
+      t("app.b2.prov_no_gpu");
     dialog.append(
       el("h1", { id: TITLE_ID, className: "dialog-title" }, t("app.b2.new_title")),
       el(
         "div",
         { className: "dialog-body" },
         ...renderProvisionProgress(prov, false),
-        inlineMessage({ tone: "success", text: t("app.b2.new_ready", { name: readyName }) })
+        belowSpec
+          ? alertBox({
+              tone: "warning",
+              title: t("app.b2.new_ready", { name: readyName }),
+              body: t("app.b2.prov_ready_below", { hardware }),
+            })
+          : inlineMessage({ tone: "success", text: t("app.b2.new_ready", { name: readyName }) })
       ),
       el(
         "div",
@@ -1061,6 +1146,10 @@ function renderNewSessionDialog(dialog, model) {
     })
   );
 
+  const accountWarningHost = el("div", { className: "dialog-account-warning" });
+  model.accountWarningHost = accountWarningHost;
+  renderNewSessionAccountWarning(model);
+
   const form = el(
     "form",
     {
@@ -1075,6 +1164,7 @@ function renderNewSessionDialog(dialog, model) {
       "div",
       { className: "dialog-body" },
       el("p", { className: "dialog-paragraph" }, t("app.b2.new_intro")),
+      accountWarningHost,
       model.formError ? alertBox({ tone: "danger", body: model.formError, live: true }) : null,
       el(
         "div",
@@ -1724,12 +1814,21 @@ function renderForwardDialog(dialog, model) {
     },
   });
 
+  const allInterfacesDisabled = isWsl || onLoopbackHost;
+  if (allInterfacesDisabled && model.bind === "all_interfaces") {
+    model.bind = "loopback";
+  }
+
   const bindNoticeHost = el("div", { className: "forward-bind-notices" });
   const renderBindNotices = () => {
     clear(bindNoticeHost);
     if (isWsl) {
       bindNoticeHost.appendChild(
         inlineMessage({ tone: "info", text: t("web.forward.bind_windows_or_wsl") })
+      );
+    } else if (onLoopbackHost) {
+      bindNoticeHost.appendChild(
+        inlineMessage({ tone: "info", text: t("web.forward.bind_loopback_listener") })
       );
     }
     if (model.bind === "all_interfaces") {
@@ -1739,11 +1838,6 @@ function renderForwardDialog(dialog, model) {
           body: t("web.forward.downstream_auth"),
         })
       );
-      if (onLoopbackHost) {
-        bindNoticeHost.appendChild(
-          inlineMessage({ tone: "info", text: t("web.forward.bind_loopback_listener") })
-        );
-      }
     } else {
       bindNoticeHost.appendChild(
         inlineMessage({ tone: "info", text: t("web.forward.server_local") })
@@ -1778,16 +1872,22 @@ function renderForwardDialog(dialog, model) {
       el(
         "label",
         {
-          className: isWsl ? "forward-bind-option forward-bind-option-disabled" : "forward-bind-option",
+          className: allInterfacesDisabled
+            ? "forward-bind-option forward-bind-option-disabled"
+            : "forward-bind-option",
           dataset: { bindOption: "all_interfaces" },
-          title: isWsl ? t("web.forward.bind_windows_or_wsl") : null,
+          title: isWsl
+            ? t("web.forward.bind_windows_or_wsl")
+            : onLoopbackHost
+              ? t("web.forward.bind_loopback_listener")
+              : null,
         },
         el("input", {
           type: "radio",
           name: "forward-bind",
           value: "all_interfaces",
           checked: model.bind === "all_interfaces",
-          disabled: model.submitting || isWsl,
+          disabled: model.submitting || allInterfacesDisabled,
           onChange: () => {
             model.bind = "all_interfaces";
             renderBindNotices();
@@ -1930,14 +2030,17 @@ async function submitForwardForm(model) {
   renderActiveDialog();
 
   try {
-    await openForward({
-      account: model.runtime.id.account,
-      session: model.session,
-      bind: model.bind,
-      local_port: localPort,
-      remote_port: remotePort,
-      health_path: healthTrimmed || null,
-    });
+    await openForward(
+      {
+        account: model.runtime.id.account,
+        session: model.session,
+        bind: model.bind,
+        local_port: localPort,
+        remote_port: remotePort,
+        health_path: healthTrimmed || null,
+      },
+      model.accountContext
+    );
     if (gen !== dialogGeneration || activeDialog !== model) return;
     closeDialogNow();
   } catch (err) {
@@ -1992,6 +2095,21 @@ function renderActiveDialog() {
   }
 }
 
+function renderNewSessionAccountWarning(model) {
+  const host = model?.accountWarningHost;
+  if (!host) return;
+  clear(host);
+  if (accountContextChanged(model.accountContext)) {
+    host.appendChild(
+      alertBox({
+        tone: "warning",
+        body: t("web.sessions.account_changed"),
+        live: true,
+      })
+    );
+  }
+}
+
 async function loadTemplateForDialog(model) {
   const gen = ++dialogGeneration;
   model.phase = "loading_template";
@@ -1999,6 +2117,9 @@ async function loadTemplateForDialog(model) {
   try {
     const spec = await fetchSessionTemplate();
     if (gen !== dialogGeneration || activeDialog !== model) return;
+    if (!model.accountContext?.active && state.snapshot?.account) {
+      model.accountContext = cloneAccountContext(state.snapshot.account);
+    }
     model.spec = spec;
     model.suggestedName = spec.name || makeSuggestedName(spec.accelerator);
     model.nameDraft = model.suggestedName;
@@ -2053,6 +2174,10 @@ export function initSessionDialogs({ navigate } = {}) {
 
     // Isolate active form inputs from background SSE snapshot re-renders.
     if (activeDialog.kind === "new_session") {
+      if (activeDialog.phase === "editing" && reason === "snapshot") {
+        renderNewSessionAccountWarning(activeDialog);
+        return;
+      }
       if (reason === "provision" && activeDialog.phase !== "editing") {
         if (state.provision.phase === "running") {
           activeDialog.phase = "running";
@@ -2098,6 +2223,8 @@ export function openNewSessionDialog() {
       spec: state.provision.spec,
       suggestedName: state.provision.sessionName,
       nameDraft: state.provision.sessionName,
+      accountContext: cloneAccountContext(getAccountContext()),
+      accountWarningHost: null,
       submitting: false,
       formError: null,
       error: null,
@@ -2116,6 +2243,8 @@ export function openNewSessionDialog() {
       spec: null,
       suggestedName: "",
       nameDraft: "",
+      accountContext: cloneAccountContext(getAccountContext()),
+      accountWarningHost: null,
       submitting: false,
       formError: null,
       error: null,
@@ -2132,6 +2261,8 @@ export function openNewSessionDialog() {
     spec: null,
     suggestedName: "",
     nameDraft: "",
+    accountContext: cloneAccountContext(getAccountContext()),
+    accountWarningHost: null,
     submitting: false,
     formError: null,
     error: null,
@@ -2203,6 +2334,7 @@ export function openForwardDialog(runtime) {
     kind: "forward",
     runtime,
     session: runtime.id.name,
+    accountContext: cloneAccountContext(getAccountContext()),
     remoteDraft: String(FORWARD_START_PORT),
     localDraft: String(FORWARD_START_PORT),
     healthDraft: "",

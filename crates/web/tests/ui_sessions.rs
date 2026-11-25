@@ -149,16 +149,23 @@ fn sessions_ui_assets_mount_dialogs_outside_app_and_wire_sessions_route() {
         "web.forward.downstream_auth",
         "web.forward.bind_windows_or_wsl",
         "web.forward.bind_loopback_listener",
+        "web.sessions.account_changed",
         "app.b2.stop_wiped",
         "app.b3.quit_stop_wiped",
         "app.b2.forward_billing_note",
         "app.b2.new_cancel_note",
+        "app.b2.prov_ready_below",
+        "clipboard-proxy",
     ] {
         assert!(
             dialogs_js.contains(marker),
             "session-dialogs.js missing expected key {marker}"
         );
     }
+    assert!(
+        sessions_js.contains("updateCountdowns"),
+        "pages/sessions.js must update countdowns in place without dropping focus"
+    );
 }
 
 #[test]

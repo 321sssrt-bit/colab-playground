@@ -59,6 +59,26 @@ function runtimeKey(ref) {
   return `${ref.account}/${ref.endpoint || ""}`;
 }
 
+function captureFocusKey(container) {
+  if (!container || document.querySelector("dialog[open]")) return null;
+  const active = document.activeElement;
+  if (!(active instanceof HTMLElement) || !container.contains(active)) {
+    return null;
+  }
+  return active.dataset.focusKey || null;
+}
+
+function restoreFocusKey(container, key) {
+  if (!container || !key || document.querySelector("dialog[open]")) return;
+  const candidates = container.querySelectorAll("[data-focus-key]");
+  for (const node of candidates) {
+    if (node instanceof HTMLElement && node.dataset.focusKey === key && !node.hasAttribute("disabled")) {
+      node.focus({ preventScroll: true });
+      return;
+    }
+  }
+}
+
 export function createSessionsPage({ navigate }) {
   let root = null;
   let headerEl = null;
@@ -87,12 +107,14 @@ export function createSessionsPage({ navigate }) {
 
   function renderHeader() {
     if (!headerEl) return;
+    const focusKey = captureFocusKey(headerEl);
     const ready = isEnvironmentReady();
     const runtimes = state.snapshot?.runtimes?.runtimes || [];
     const hasWorkToStop =
       runtimes.length > 0 ||
       isProvisionRunning() ||
       Boolean(state.snapshot?.runtimes_error) ||
+      Boolean(state.sessionsError) ||
       (state.snapshot?.runtimes?.errors?.length || 0) > 0;
     const refreshing = state.sessionsLoading || state.sessionsRefreshing;
 
@@ -112,7 +134,7 @@ export function createSessionsPage({ navigate }) {
           {
             type: "button",
             className: "btn btn-ghost btn-icon",
-            dataset: { sessionsRefresh: "true" },
+            dataset: { sessionsRefresh: "true", focusKey: "header:refresh" },
             "aria-label": t("app.b2.sessions_refresh"),
             title: t("app.b2.sessions_refresh"),
             disabled: !ready || refreshing,
@@ -128,7 +150,7 @@ export function createSessionsPage({ navigate }) {
               {
                 type: "button",
                 className: "btn",
-                dataset: { sessionsStopAll: "true" },
+                dataset: { sessionsStopAll: "true", focusKey: "header:stop-all" },
                 disabled: isStopAllRunning(),
                 onClick: () => openStopAllDialog(),
               },
@@ -141,7 +163,7 @@ export function createSessionsPage({ navigate }) {
           {
             type: "button",
             className: "btn btn-primary",
-            dataset: { sessionsNew: "true" },
+            dataset: { sessionsNew: "true", focusKey: "header:new" },
             disabled: !ready,
             onClick: () => openNewSessionDialog(),
           },
@@ -150,6 +172,7 @@ export function createSessionsPage({ navigate }) {
         )
       )
     );
+    restoreFocusKey(headerEl, focusKey);
   }
 
   function renderProvisioningCard() {
@@ -183,7 +206,7 @@ export function createSessionsPage({ navigate }) {
           {
             type: "button",
             className: "btn btn-sm btn-ghost",
-            dataset: { provisioningShow: "true" },
+            dataset: { provisioningShow: "true", focusKey: "prov:show" },
             onClick: () => openNewSessionDialog(),
           },
           t("app.b2.action_show")
@@ -193,7 +216,7 @@ export function createSessionsPage({ navigate }) {
           {
             type: "button",
             className: "btn btn-sm btn-danger",
-            dataset: { provisioningCancel: "true" },
+            dataset: { provisioningCancel: "true", focusKey: "prov:cancel" },
             disabled: cancelling,
             onClick: () => {
               void cancelSessionProvision();
@@ -274,12 +297,17 @@ export function createSessionsPage({ navigate }) {
       badges.push(badge(t("app.b2.runtime_stopping"), "info"));
     }
 
-    const stat = (statLabel, statValue) =>
+    const key = runtimeKey(runtime.id);
+    const stat = (statLabel, statValue, valueDataset = null) =>
       el(
         "div",
         { className: "session-stat" },
         el("span", { className: "session-stat-label" }, statLabel),
-        el("span", { className: "session-stat-value" }, statValue)
+        el(
+          "span",
+          valueDataset ? { className: "session-stat-value", dataset: valueDataset } : { className: "session-stat-value" },
+          statValue
+        )
       );
 
     const cardChildren = [
@@ -293,10 +321,20 @@ export function createSessionsPage({ navigate }) {
         "div",
         { className: "session-stats-grid" },
         stat(t("app.b2.runtime_hardware"), hardware),
-        stat(t("app.b2.runtime_uptime"), uptime),
+        stat(
+          t("app.b2.runtime_uptime"),
+          uptime,
+          typeof startedAt === "number" && Number.isFinite(startedAt)
+            ? { runtimeUptimeSince: String(startedAt) }
+            : null
+        ),
         stat(t("app.b2.runtime_rate"), rate),
         stat(t("app.b2.runtime_spend"), spend),
-        stat(t("app.b2.runtime_auto_stop"), autoStop)
+        stat(
+          t("app.b2.runtime_auto_stop"),
+          autoStop,
+          hasAutoStop ? { runtimeAutoStopAt: String(runtime.auto_stop_at) } : null
+        )
       ),
     ];
 
@@ -325,6 +363,7 @@ export function createSessionsPage({ navigate }) {
             {
               type: "button",
               className: "btn btn-sm",
+              dataset: { focusKey: `rt:${key}:guard-stop` },
               onClick: () => openStopRuntimeDialog(runtime),
             },
             t("app.b2.stop_action")
@@ -357,6 +396,7 @@ export function createSessionsPage({ navigate }) {
                   {
                     type: "button",
                     className: "btn btn-sm",
+                    dataset: { focusKey: `rt:${key}:guard-extend` },
                     onClick: () => openAutoStopDialog(runtime, "extend"),
                   },
                   t("app.b2.runtime_extend_by", { time: formatDurationSecs(rearmSecs) })
@@ -389,7 +429,7 @@ export function createSessionsPage({ navigate }) {
         {
           type: "button",
           className: "btn btn-sm btn-danger",
-          dataset: { runtimeStop: label },
+          dataset: { runtimeStop: label, focusKey: `rt:${key}:stop` },
           disabled: stopping,
           onClick: () => openStopRuntimeDialog(runtime),
         },
@@ -409,7 +449,7 @@ export function createSessionsPage({ navigate }) {
           {
             type: "button",
             className: "btn btn-sm",
-            dataset: { runtimeSwitch: label },
+            dataset: { runtimeSwitch: label, focusKey: `rt:${key}:switch` },
             onClick: () => openSwitchAccountDialog(accountRecord),
           },
           icon("link"),
@@ -427,7 +467,7 @@ export function createSessionsPage({ navigate }) {
             {
               type: "button",
               className: "btn btn-sm",
-              dataset: { runtimeExtend: label },
+              dataset: { runtimeExtend: label, focusKey: `rt:${key}:extend` },
               disabled: autoStopBusy,
               onClick: () => openAutoStopDialog(runtime, "extend"),
             },
@@ -438,7 +478,7 @@ export function createSessionsPage({ navigate }) {
             {
               type: "button",
               className: "btn btn-sm btn-ghost",
-              dataset: { runtimeCancelAutoStop: label },
+              dataset: { runtimeCancelAutoStop: label, focusKey: `rt:${key}:cancel-auto-stop` },
               disabled: autoStopBusy,
               onClick: () => openCancelAutoStopDialog(runtime),
             },
@@ -452,7 +492,7 @@ export function createSessionsPage({ navigate }) {
             {
               type: "button",
               className: "btn btn-sm",
-              dataset: { runtimeSetAutoStop: label },
+              dataset: { runtimeSetAutoStop: label, focusKey: `rt:${key}:set-auto-stop` },
               disabled: autoStopBusy,
               onClick: () => openAutoStopDialog(runtime, "set"),
             },
@@ -466,7 +506,7 @@ export function createSessionsPage({ navigate }) {
           {
             type: "button",
             className: "btn btn-sm btn-ghost",
-            dataset: { runtimeForward: label },
+            dataset: { runtimeForward: label, focusKey: `rt:${key}:forward` },
             disabled: !named,
             title: named ? null : t("app.b2.runtime_unnamed_reason"),
             onClick: () => openForwardDialog(runtime),
@@ -576,6 +616,7 @@ export function createSessionsPage({ navigate }) {
           {
             type: "button",
             className: "btn btn-sm btn-ghost",
+            dataset: { focusKey: "ended:clear" },
             onClick: () => clearEndedSessions(),
           },
           t("app.b2.action_clear")
@@ -585,8 +626,28 @@ export function createSessionsPage({ navigate }) {
     );
   }
 
+  function updateCountdowns() {
+    if (!bodyEl) return;
+    const nowSecs = getBackendNowSecs();
+    for (const node of bodyEl.querySelectorAll("[data-runtime-uptime-since]")) {
+      const startedAt = Number(node.dataset.runtimeUptimeSince);
+      if (Number.isFinite(startedAt)) {
+        node.textContent = formatDurationSecs(Math.max(0, nowSecs - startedAt));
+      }
+    }
+    for (const node of bodyEl.querySelectorAll("[data-runtime-auto-stop-at]")) {
+      const autoStopAt = Number(node.dataset.runtimeAutoStopAt);
+      if (Number.isFinite(autoStopAt)) {
+        node.textContent = t("app.b2.runtime_auto_stop_in", {
+          time: formatDurationSecs(Math.max(0, autoStopAt - nowSecs)),
+        });
+      }
+    }
+  }
+
   function renderBody() {
     if (!bodyEl) return;
+    const focusKey = captureFocusKey(bodyEl);
     clear(bodyEl);
 
     if (!isEnvironmentReady()) {
@@ -600,12 +661,14 @@ export function createSessionsPage({ navigate }) {
             {
               type: "button",
               className: "btn",
+              dataset: { focusKey: "setup:overview" },
               onClick: () => navigate("overview"),
             },
             t("app.b2.sessions_setup_action")
           ),
         })
       );
+      restoreFocusKey(bodyEl, focusKey);
       return;
     }
 
@@ -627,50 +690,38 @@ export function createSessionsPage({ navigate }) {
 
     const runtimesView = state.snapshot?.runtimes || null;
     const runtimesErr = state.snapshot?.runtimes_error || null;
+    const refreshError = state.sessionsError || null;
 
-    if (!runtimesView && (state.sessionsLoading || !runtimesErr)) {
-      if (state.sessionsError) {
-        const formatted = formatApiError(state.sessionsError);
-        bodyEl.appendChild(
-          alertBox({
-            tone: "danger",
-            title: t("app.b2.sessions_failed"),
-            body: [formatted.message, formatted.hint].filter(Boolean).join("\n"),
-            actions: el(
-              "button",
-              {
-                type: "button",
-                className: "btn btn-sm",
-                onClick: () => {
-                  void loadSessions();
-                },
-              },
-              t("app.action.retry")
-            ),
-          })
-        );
-      } else {
-        bodyEl.appendChild(busyLine(t("app.b2.sessions_loading")));
-      }
-    } else if (!runtimesView && runtimesErr) {
+    if (refreshError || runtimesErr) {
+      const formatted = refreshError ? formatApiError(refreshError) : null;
+      const errBody = formatted
+        ? [formatted.message, formatted.hint].filter(Boolean).join("\n")
+        : formatErrorKind(runtimesErr);
       bodyEl.appendChild(
         alertBox({
           tone: "danger",
           title: t("app.b2.sessions_failed"),
-          body: formatErrorKind(runtimesErr),
+          body: errBody,
           actions: el(
             "button",
             {
               type: "button",
               className: "btn btn-sm",
+              dataset: { focusKey: "retry:sessions" },
               onClick: () => {
-                void loadSessions();
+                void loadSessions({ silent: Boolean(runtimesView) });
               },
             },
             t("app.action.retry")
           ),
         })
       );
+    }
+
+    if (!runtimesView) {
+      if (!refreshError && !runtimesErr) {
+        bodyEl.appendChild(busyLine(t("app.b2.sessions_loading")));
+      }
     } else {
       const accountErrors =
         Array.isArray(state.sessionsAccountErrors) && state.sessionsAccountErrors.length > 0
@@ -707,6 +758,7 @@ export function createSessionsPage({ navigate }) {
               {
                 type: "button",
                 className: "btn btn-primary",
+                dataset: { focusKey: "empty:new" },
                 onClick: () => openNewSessionDialog(),
               },
               icon("plus"),
@@ -726,6 +778,7 @@ export function createSessionsPage({ navigate }) {
     if (endedCard) {
       bodyEl.appendChild(endedCard);
     }
+    restoreFocusKey(bodyEl, focusKey);
   }
 
   function renderAll() {
@@ -748,7 +801,7 @@ export function createSessionsPage({ navigate }) {
       void loadForwards();
       tickTimer = window.setInterval(() => {
         if (root && (state.snapshot?.runtimes?.runtimes?.length || 0) > 0) {
-          renderBody();
+          updateCountdowns();
         }
       }, TICK_INTERVAL_MS);
     },

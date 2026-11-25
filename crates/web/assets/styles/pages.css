@@ -929,3 +929,17 @@
     padding: var(--space-5);
   }
 }
+
+.clipboard-proxy {
+  position: fixed;
+  top: 0;
+  left: -9999px;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.dialog-account-warning:empty {
+  display: none;
+}

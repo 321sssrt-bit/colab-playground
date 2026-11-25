@@ -1,5 +1,5 @@
 import { apiRequest, clearToken, hasToken, setUnauthorizedHandler, streamSse } from "./api.js";
-import { formatConcern, formatRuntimeCardLabel } from "./format.js";
+import { formatConcern, formatHardware, formatRuntimeCardLabel } from "./format.js";
 import { setLanguagePreference, t } from "./i18n.js";
 import { setAppearancePreference } from "./theme.js";
 
@@ -17,6 +17,8 @@ let overviewPromise = null;
 let sessionsPromise = null;
 let forwardsPromise = null;
 let provisionStreamController = null;
+let provisionRetryTimer = null;
+let provisionBackoffMs = INITIAL_BACKOFF_MS;
 let lastForwardsSignature = "";
 let seenGuardReportKey = "";
 let pendingLoginLanguage = null;
@@ -124,6 +126,11 @@ function stopSse() {
 }
 
 function stopProvisionStream() {
+  if (provisionRetryTimer !== null) {
+    window.clearTimeout(provisionRetryTimer);
+    provisionRetryTimer = null;
+  }
+  provisionBackoffMs = INITIAL_BACKOFF_MS;
   if (provisionStreamController) {
     provisionStreamController.abort();
     provisionStreamController = null;
@@ -290,6 +297,13 @@ function syncProvisionWithOperations(snapshot) {
         state.provision.cancelling = Boolean(activeOp.cancelling);
         emit("provision");
       }
+      if (
+        state.provision.phase === "running" &&
+        !provisionStreamController &&
+        provisionRetryTimer === null
+      ) {
+        void consumeProvisionStream(activeOp.id, authGeneration);
+      }
     } else if (state.provision.phase !== "running") {
       void attachSessionProvision(activeOp.id, activeOp.operation.session || "");
     }
@@ -305,6 +319,13 @@ function applySnapshot(next) {
   }
   const prev = state.snapshot;
   state.snapshot = next;
+  if (
+    next.runtimes &&
+    !next.runtimes_error &&
+    (!prev || typeof next.version !== "number" || next.version > prev.version)
+  ) {
+    state.sessionsError = null;
+  }
   observeGuardReport(prev, next);
   syncProvisionWithOperations(next);
   const nextSig = tunnelsSignature(next.tunnels);
@@ -350,6 +371,18 @@ async function startSseLoop() {
           void fetchInitialSnapshot();
           void loadOverview({ silent: true });
           void loadForwards();
+          if (
+            state.provision.phase === "running" &&
+            state.provision.id !== null &&
+            !provisionStreamController
+          ) {
+            if (provisionRetryTimer !== null) {
+              window.clearTimeout(provisionRetryTimer);
+              provisionRetryTimer = null;
+            }
+            provisionBackoffMs = INITIAL_BACKOFF_MS;
+            void consumeProvisionStream(state.provision.id, authGeneration);
+          }
         }
       },
       onEvent: ({ event, data }) => {
@@ -848,19 +881,39 @@ export async function fetchSessionTemplate() {
 }
 
 async function consumeProvisionStream(id, gen) {
-  stopProvisionStream();
-  provisionStreamController = new AbortController();
+  if (provisionRetryTimer !== null) {
+    window.clearTimeout(provisionRetryTimer);
+    provisionRetryTimer = null;
+  }
+  if (provisionStreamController) {
+    provisionStreamController.abort();
+    provisionStreamController = null;
+  }
+  const controller = new AbortController();
+  provisionStreamController = controller;
+  const streamEvents = [];
   const result = await streamSse(
     `/api/sessions/${encodeURIComponent(id)}/events`,
     {},
     {
-      signal: provisionStreamController.signal,
+      signal: controller.signal,
+      onOpen: () => {
+        if (gen !== authGeneration || state.provision.id !== id) return;
+        provisionBackoffMs = INITIAL_BACKOFF_MS;
+      },
       onEvent: ({ event, data }) => {
         if (gen !== authGeneration || state.provision.id !== id) return;
         if (event === "progress" && data) {
-          state.provision.events = [...state.provision.events, data];
-          state.provision.latestAtMs = Date.now();
-          emit("provision");
+          streamEvents.push(data);
+          // Reconnecting replays the server journal from index 0; only advance on new or equal length.
+          if (streamEvents.length >= state.provision.events.length) {
+            const grew = streamEvents.length > state.provision.events.length;
+            state.provision.events = [...streamEvents];
+            if (grew) {
+              state.provision.latestAtMs = Date.now();
+            }
+            emit("provision");
+          }
         } else if (event === "finished" && data) {
           state.provision.cancelling = false;
           if (data.phase === "ready") {
@@ -868,10 +921,21 @@ async function consumeProvisionStream(id, gen) {
             state.provision.outcome = data.outcome || null;
             state.provision.error = null;
             const readyName = data.outcome?.name || state.provision.sessionName;
-            setNotice({
-              tone: "success",
-              message: t("app.b2.provision_ready_toast", { name: readyName }),
-            });
+            if (data.outcome?.below_spec) {
+              const hardware =
+                formatHardware(data.outcome.hardware?.gpu, data.outcome.hardware?.vram_mib) ||
+                t("app.b2.prov_no_gpu");
+              setNotice({
+                tone: "warning",
+                title: t("app.b2.provision_ready_toast", { name: readyName }),
+                message: t("app.b2.prov_ready_below", { hardware }),
+              });
+            } else {
+              setNotice({
+                tone: "success",
+                message: t("app.b2.provision_ready_toast", { name: readyName }),
+              });
+            }
           } else if (data.phase === "cancelled") {
             state.provision.phase = "cancelled";
             state.provision.error = null;
@@ -888,18 +952,56 @@ async function consumeProvisionStream(id, gen) {
       },
     }
   );
-  if (gen !== authGeneration || state.provision.id !== id) return;
-  if (state.provision.phase === "running" && result.outcome !== "aborted") {
+  if (provisionStreamController === controller) {
+    provisionStreamController = null;
+  }
+  if (gen !== authGeneration || state.provision.id !== id || state.provision.phase !== "running") {
+    return;
+  }
+  if (result.outcome === "aborted" || result.outcome === "unauthorized") {
+    return;
+  }
+  if (result.outcome === "http_error") {
     state.provision.phase = "failed";
     state.provision.cancelling = false;
     state.provision.error = result.payload || { error: {} };
     emit("provision");
+    void loadSessions({ silent: true });
+    return;
   }
+  // Keep transient network/stream drops in the running state and retry the retained server journal.
+  const delay = provisionBackoffMs;
+  provisionBackoffMs = Math.min(provisionBackoffMs * 2, MAX_BACKOFF_MS);
+  provisionRetryTimer = window.setTimeout(() => {
+    provisionRetryTimer = null;
+    if (
+      gen === authGeneration &&
+      state.authenticated &&
+      state.provision.id === id &&
+      state.provision.phase === "running"
+    ) {
+      void consumeProvisionStream(id, gen);
+    }
+  }, delay);
 }
 
 export async function attachSessionProvision(id, sessionName = "") {
   if (!state.authenticated || id === null || id === undefined) return;
   const gen = authGeneration;
+  if (state.provision.id === id) {
+    if (sessionName && !state.provision.sessionName) {
+      state.provision.sessionName = sessionName;
+      emit("provision");
+    }
+    if (
+      state.provision.phase === "running" &&
+      !provisionStreamController &&
+      provisionRetryTimer === null
+    ) {
+      await consumeProvisionStream(id, gen);
+    }
+    return;
+  }
   state.provision = {
     id,
     sessionName,
@@ -915,17 +1017,53 @@ export async function attachSessionProvision(id, sessionName = "") {
   await consumeProvisionStream(id, gen);
 }
 
-export async function startSessionProvision(spec) {
+export async function startSessionProvision(spec, accountContext = null) {
   const gen = authGeneration;
   const accepted = await apiRequest("/api/sessions", {
     method: "POST",
     body: {
-      account_context: getAccountContext(),
+      account_context: accountContext || getAccountContext(),
       spec,
     },
   });
   if (gen !== authGeneration || !state.authenticated) return null;
   const id = accepted?.id;
+  if (id === null || id === undefined) {
+    return null;
+  }
+  if (state.provision.id === id) {
+    if (!state.provision.sessionName) {
+      state.provision.sessionName = spec.name;
+    }
+    if (!state.provision.spec) {
+      state.provision.spec = JSON.parse(JSON.stringify(spec));
+    }
+    emit("provision");
+    if (
+      state.provision.phase === "running" &&
+      !provisionStreamController &&
+      provisionRetryTimer === null
+    ) {
+      void consumeProvisionStream(id, gen);
+    }
+    return id;
+  }
+  if (
+    state.provision.phase === "running" &&
+    state.provision.id !== null &&
+    (provisionStreamController || provisionRetryTimer !== null)
+  ) {
+    const ops = Array.isArray(state.snapshot?.operations) ? state.snapshot.operations : [];
+    const currentStillActive = ops.some(
+      (entry) => entry?.operation?.kind === "provision" && entry.id === state.provision.id
+    );
+    const returnedActive = ops.some(
+      (entry) => entry?.operation?.kind === "provision" && entry.id === id
+    );
+    if (currentStillActive && !returnedActive) {
+      return state.provision.id;
+    }
+  }
   state.provision = {
     id,
     sessionName: spec.name,
@@ -1022,11 +1160,11 @@ export async function stopAllRuntimes() {
   return report;
 }
 
-export async function openForward(spec) {
+export async function openForward(spec, accountContext = null) {
   const view = await apiRequest("/api/forwards", {
     method: "POST",
     body: {
-      account_context: getAccountContext(),
+      account_context: accountContext || getAccountContext(),
       account: spec.account,
       session: spec.session,
       bind: spec.bind,
