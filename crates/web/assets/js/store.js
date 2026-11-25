@@ -693,7 +693,7 @@ export function setNotice(notice) {
   emit("notice");
 }
 
-export function clearNotice() {
+function clearNotice() {
   state.accountNotice = null;
   emit("notice");
 }
