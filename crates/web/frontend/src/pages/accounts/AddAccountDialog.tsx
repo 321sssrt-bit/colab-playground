@@ -161,8 +161,7 @@ export function AddAccountDialog({
       if (
         prevStatus !== "connected" &&
         nextStatus === "connected" &&
-        postBeginVersionRef.current === null &&
-        syncControllerRef.current === null
+        postBeginVersionRef.current === null
       ) {
         void syncPromptSnapshot(loginId, seq);
       }
