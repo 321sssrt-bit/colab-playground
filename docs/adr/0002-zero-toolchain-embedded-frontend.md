@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: superseded by ADR-0005
 ---
 
 # 0002: Pure-Rust `axum` backend with zero-toolchain embedded native frontend
