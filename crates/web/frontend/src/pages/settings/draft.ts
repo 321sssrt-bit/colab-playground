@@ -81,7 +81,7 @@ export type DefaultsFieldId =
   | "usage_poll_active"
   | "usage_poll_idle";
 
-export type BuildPatchResult =
+type BuildPatchResult =
   | { readonly ok: true; readonly patch: RuntimeDefaultsPatch; readonly hasChanges: boolean }
   | { readonly ok: false; readonly invalidFields: ReadonlySet<DefaultsFieldId> };
 

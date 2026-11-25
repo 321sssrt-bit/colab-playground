@@ -56,7 +56,6 @@ export const START_IDLE_TIMEOUT_SECS = 30 * SECS_PER_MINUTE;
 export const START_MAX_SPEND_CU = 10;
 export const START_MIN_BALANCE_CU = 5;
 export const START_MIN_VRAM_GIB = 40;
-export const START_MIN_VRAM_MIB = START_MIN_VRAM_GIB * MIB_PER_GIB;
 
 export const ACCELERATOR_OPTIONS: readonly Accelerator[] = [
   "NONE",

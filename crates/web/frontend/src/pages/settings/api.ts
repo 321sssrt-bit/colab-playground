@@ -69,7 +69,7 @@ function readOnExhausted(value: unknown): OnExhausted {
     : CORE_DEFAULTS.on_exhausted;
 }
 
-export function normalizeRuntimeDefaults(raw: Record<string, unknown>): RuntimeDefaults {
+function normalizeRuntimeDefaults(raw: Record<string, unknown>): RuntimeDefaults {
   return {
     max_runtime: readOptionalNonNegInt(raw.max_runtime, CORE_DEFAULTS.max_runtime),
     max_spend_cu: readOptionalNumber(raw.max_spend_cu, CORE_DEFAULTS.max_spend_cu),
