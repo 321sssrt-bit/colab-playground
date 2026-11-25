@@ -69,7 +69,7 @@ function getDialogEl() {
   return document.getElementById(DIALOG_ID);
 }
 
-function safeHttpUrl(raw) {
+export function safeHttpUrl(raw) {
   if (!raw || typeof raw !== "string") return null;
   try {
     const parsed = new URL(raw);
@@ -97,7 +97,7 @@ function accountContextChanged(captured) {
   return current.revision !== captured.revision || (current.active ?? null) !== (captured.active ?? null);
 }
 
-async function copyTextToClipboard(text) {
+export async function copyTextToClipboard(text) {
   if (navigator.clipboard?.writeText) {
     try {
       await navigator.clipboard.writeText(text);
@@ -728,6 +728,234 @@ async function submitNewSession(model) {
   }
 }
 
+export function buildProvisionOptionRows({
+  idPrefix = "prov",
+  spec,
+  disabled = false,
+  onAcceleratorChange = null,
+  onHardwareFitChange = null,
+}) {
+  const isGpu = acceleratorIsGpu(spec.accelerator);
+  const supportsHighMem = acceleratorSupportsHighMem(spec.accelerator);
+
+  const accSelect = el(
+    "select",
+    {
+      id: `${idPrefix}-accelerator`,
+      className: "select select-sm select-inline",
+      "aria-label": t("app.def.accelerator"),
+      disabled,
+      onChange: (event) => {
+        const nextAcc = event.target.value;
+        spec.accelerator = nextAcc;
+        if (!acceleratorSupportsHighMem(nextAcc)) {
+          spec.high_mem = false;
+        }
+        if (!acceleratorIsGpu(nextAcc)) {
+          spec.min_vram_mib = null;
+        }
+        if (onAcceleratorChange) {
+          onAcceleratorChange(nextAcc);
+        }
+      },
+    },
+    ACCELERATORS.map((code) =>
+      el("option", { value: code, selected: spec.accelerator === code }, acceleratorLabel(code))
+    )
+  );
+  accSelect.value = spec.accelerator;
+
+  const highMemId = `${idPrefix}-high-mem`;
+  const highMemToggle = el(
+    "label",
+    { for: highMemId, className: "checkbox-label" },
+    el("input", {
+      id: highMemId,
+      type: "checkbox",
+      className: "checkbox",
+      checked: Boolean(spec.high_mem) && supportsHighMem,
+      disabled: disabled || !supportsHighMem,
+      onChange: (event) => {
+        spec.high_mem = event.target.checked;
+      },
+    }),
+    t("app.def.high_mem")
+  );
+
+  const attemptsInput = el("input", {
+    id: `${idPrefix}-attempts`,
+    type: "number",
+    min: "1",
+    max: String(MAX_ATTEMPTS_CAP),
+    step: "1",
+    className: "input input-sm input-num",
+    "aria-label": t("app.def.attempts"),
+    value: String(Math.max(1, Math.min(MAX_ATTEMPTS_CAP, spec.max_attempts || 1))),
+    disabled,
+    onInput: (event) => {
+      const val = Number.parseInt(event.target.value, 10);
+      if (Number.isFinite(val)) {
+        spec.max_attempts = Math.max(1, Math.min(MAX_ATTEMPTS_CAP, val));
+      }
+    },
+  });
+
+  const exhaustedSelect = el(
+    "select",
+    {
+      id: `${idPrefix}-on-exhausted`,
+      className: "select select-sm select-inline",
+      "aria-label": t("app.def.on_exhausted"),
+      disabled,
+      onChange: (event) => {
+        spec.on_exhausted = event.target.value;
+      },
+    },
+    el("option", { value: "stop_and_fail", selected: spec.on_exhausted === "stop_and_fail" }, t("app.def.exhausted_stop")),
+    el("option", { value: "keep_last", selected: spec.on_exhausted === "keep_last" }, t("app.def.exhausted_keep"))
+  );
+  exhaustedSelect.value = spec.on_exhausted || "stop_and_fail";
+
+  const rows = [
+    provRow(t("app.def.accelerator"), null, accSelect),
+    provRow(t("app.def.high_mem"), null, highMemToggle),
+  ];
+
+  if (isGpu) {
+    rows.push(
+      buildOptionalRow({
+        id: `${idPrefix}-min-vram`,
+        label: t("app.def.min_vram"),
+        hint: t("app.b2.prov_vram_lottery"),
+        enabled: spec.min_vram_mib !== null && spec.min_vram_mib !== undefined,
+        onToggle: (on) => {
+          spec.min_vram_mib = on ? START_MIN_VRAM_MIB : null;
+          if (onHardwareFitChange) onHardwareFitChange();
+        },
+        renderValue: () => {
+          const gib = Math.max(1, Math.round((spec.min_vram_mib ?? START_MIN_VRAM_MIB) / MIB_PER_GIB));
+          return el(
+            "span",
+            { className: "unit-field" },
+            el("input", {
+              id: `${idPrefix}-min-vram-val`,
+              type: "number",
+              min: "1",
+              max: String(MAX_VRAM_GIB),
+              step: "1",
+              className: "input input-sm input-num",
+              "aria-label": t("app.def.min_vram"),
+              value: String(gib),
+              disabled,
+              onInput: (event) => {
+                const val = Number.parseInt(event.target.value, 10);
+                if (Number.isFinite(val)) {
+                  spec.min_vram_mib = Math.max(1, val) * MIB_PER_GIB;
+                  if (onHardwareFitChange) onHardwareFitChange();
+                }
+              },
+            }),
+            el("span", { className: "unit-suffix" }, t("app.unit.gb"))
+          );
+        },
+      })
+    );
+  }
+
+  rows.push(
+    provRow(t("app.def.attempts"), t("app.b2.prov_attempts_billed"), attemptsInput),
+    provRow(t("app.def.on_exhausted"), null, exhaustedSelect),
+    buildOptionalRow({
+      id: `${idPrefix}-max-runtime`,
+      label: t("app.def.max_runtime"),
+      hint: t("app.def.max_runtime_hint"),
+      enabled: spec.guard?.max_runtime !== null && spec.guard?.max_runtime !== undefined,
+      onToggle: (on) => {
+        spec.guard.max_runtime = on ? START_MAX_RUNTIME_SECS : null;
+      },
+      renderValue: () =>
+        buildDurationField(`${idPrefix}-max-runtime`, spec.guard.max_runtime ?? START_MAX_RUNTIME_SECS, (secs) => {
+          spec.guard.max_runtime = secs;
+        }),
+    }),
+    buildOptionalRow({
+      id: `${idPrefix}-max-spend`,
+      label: t("app.def.max_spend"),
+      hint: null,
+      enabled: spec.guard?.max_spend_cu !== null && spec.guard?.max_spend_cu !== undefined,
+      onToggle: (on) => {
+        spec.guard.max_spend_cu = on ? START_SPEND_CU : null;
+      },
+      renderValue: () =>
+        el(
+          "span",
+          { className: "unit-field" },
+          el("input", {
+            id: `${idPrefix}-max-spend-val`,
+            type: "number",
+            min: "0",
+            max: String(MAX_CU_FIELD),
+            step: "any",
+            className: "input input-sm input-num",
+            "aria-label": t("app.def.max_spend"),
+            value: String(spec.guard.max_spend_cu ?? START_SPEND_CU),
+            disabled,
+            onInput: (event) => {
+              const val = Number.parseFloat(event.target.value);
+              spec.guard.max_spend_cu = Number.isFinite(val) ? Math.max(0, val) : 0;
+            },
+          }),
+          el("span", { className: "unit-suffix" }, t("app.unit.cu"))
+        ),
+    }),
+    buildOptionalRow({
+      id: `${idPrefix}-min-balance`,
+      label: t("app.def.min_balance"),
+      hint: null,
+      enabled: spec.guard?.min_balance_cu !== null && spec.guard?.min_balance_cu !== undefined,
+      onToggle: (on) => {
+        spec.guard.min_balance_cu = on ? START_MIN_BALANCE_CU : null;
+      },
+      renderValue: () =>
+        el(
+          "span",
+          { className: "unit-field" },
+          el("input", {
+            id: `${idPrefix}-min-balance-val`,
+            type: "number",
+            min: "0",
+            max: String(MAX_CU_FIELD),
+            step: "any",
+            className: "input input-sm input-num",
+            "aria-label": t("app.def.min_balance"),
+            value: String(spec.guard.min_balance_cu ?? START_MIN_BALANCE_CU),
+            disabled,
+            onInput: (event) => {
+              const val = Number.parseFloat(event.target.value);
+              spec.guard.min_balance_cu = Number.isFinite(val) ? Math.max(0, val) : 0;
+            },
+          }),
+          el("span", { className: "unit-suffix" }, t("app.unit.cu"))
+        ),
+    }),
+    buildOptionalRow({
+      id: `${idPrefix}-idle-timeout`,
+      label: t("app.def.idle"),
+      hint: null,
+      enabled: spec.guard?.idle_timeout !== null && spec.guard?.idle_timeout !== undefined,
+      onToggle: (on) => {
+        spec.guard.idle_timeout = on ? START_IDLE_SECS : null;
+      },
+      renderValue: () =>
+        buildDurationField(`${idPrefix}-idle`, spec.guard.idle_timeout ?? START_IDLE_SECS, (secs) => {
+          spec.guard.idle_timeout = secs;
+        }),
+    })
+  );
+
+  return rows;
+}
+
 function renderNewSessionDialog(dialog, model) {
   dialog.dataset.dialogKind = "new_session";
   const prov = state.provision;
@@ -921,8 +1149,6 @@ function renderNewSessionDialog(dialog, model) {
   dialog.dataset.dialogPhase = "editing";
   const spec = model.spec;
   const blocked = model.submitting || isProvisionRunning();
-  const isGpu = acceleratorIsGpu(spec.accelerator);
-  const supportsHighMem = acceleratorSupportsHighMem(spec.accelerator);
 
   const nameInput = el("input", {
     id: "new-session-name",
@@ -937,218 +1163,20 @@ function renderNewSessionDialog(dialog, model) {
     },
   });
 
-  const accSelect = el(
-    "select",
-    {
-      id: "prov-accelerator",
-      className: "select select-sm select-inline",
-      "aria-label": t("app.def.accelerator"),
-      disabled: blocked,
-      onChange: (event) => {
-        const nextAcc = event.target.value;
-        const prevSuggested = model.suggestedName;
-        spec.accelerator = nextAcc;
-        if (!acceleratorSupportsHighMem(nextAcc)) {
-          spec.high_mem = false;
-        }
-        if (!acceleratorIsGpu(nextAcc)) {
-          spec.min_vram_mib = null;
-        }
-        const nextSuggested = makeSuggestedName(nextAcc, prevSuggested);
-        if (!model.nameDraft || model.nameDraft === prevSuggested) {
-          model.nameDraft = nextSuggested;
-        }
-        model.suggestedName = nextSuggested;
-        renderActiveDialog();
-      },
-    },
-    ACCELERATORS.map((code) =>
-      el("option", { value: code, selected: spec.accelerator === code }, acceleratorLabel(code))
-    )
-  );
-  accSelect.value = spec.accelerator;
-
-  const highMemToggle = el(
-    "label",
-    { for: "prov-high-mem", className: "checkbox-label" },
-    el("input", {
-      id: "prov-high-mem",
-      type: "checkbox",
-      className: "checkbox",
-      checked: Boolean(spec.high_mem) && supportsHighMem,
-      disabled: blocked || !supportsHighMem,
-      onChange: (event) => {
-        spec.high_mem = event.target.checked;
-      },
-    }),
-    t("app.def.high_mem")
-  );
-
-  const attemptsInput = el("input", {
-    id: "prov-attempts",
-    type: "number",
-    min: "1",
-    max: String(MAX_ATTEMPTS_CAP),
-    step: "1",
-    className: "input input-sm input-num",
-    "aria-label": t("app.def.attempts"),
-    value: String(Math.max(1, Math.min(MAX_ATTEMPTS_CAP, spec.max_attempts || 1))),
+  const rows = buildProvisionOptionRows({
+    idPrefix: "prov",
+    spec,
     disabled: blocked,
-    onInput: (event) => {
-      const val = Number.parseInt(event.target.value, 10);
-      if (Number.isFinite(val)) {
-        spec.max_attempts = Math.max(1, Math.min(MAX_ATTEMPTS_CAP, val));
+    onAcceleratorChange: (nextAcc) => {
+      const prevSuggested = model.suggestedName;
+      const nextSuggested = makeSuggestedName(nextAcc, prevSuggested);
+      if (!model.nameDraft || model.nameDraft === prevSuggested) {
+        model.nameDraft = nextSuggested;
       }
+      model.suggestedName = nextSuggested;
+      renderActiveDialog();
     },
   });
-
-  const exhaustedSelect = el(
-    "select",
-    {
-      id: "prov-on-exhausted",
-      className: "select select-sm select-inline",
-      "aria-label": t("app.def.on_exhausted"),
-      disabled: blocked,
-      onChange: (event) => {
-        spec.on_exhausted = event.target.value;
-      },
-    },
-    el("option", { value: "stop_and_fail", selected: spec.on_exhausted === "stop_and_fail" }, t("app.def.exhausted_stop")),
-    el("option", { value: "keep_last", selected: spec.on_exhausted === "keep_last" }, t("app.def.exhausted_keep"))
-  );
-  exhaustedSelect.value = spec.on_exhausted || "stop_and_fail";
-
-  const rows = [
-    provRow(t("app.def.accelerator"), null, accSelect),
-    provRow(t("app.def.high_mem"), null, highMemToggle),
-  ];
-
-  if (isGpu) {
-    rows.push(
-      buildOptionalRow({
-        id: "min-vram",
-        label: t("app.def.min_vram"),
-        hint: t("app.b2.prov_vram_lottery"),
-        enabled: spec.min_vram_mib !== null && spec.min_vram_mib !== undefined,
-        onToggle: (on) => {
-          spec.min_vram_mib = on ? START_MIN_VRAM_MIB : null;
-        },
-        renderValue: () => {
-          const gib = Math.max(1, Math.round((spec.min_vram_mib ?? START_MIN_VRAM_MIB) / MIB_PER_GIB));
-          return el(
-            "span",
-            { className: "unit-field" },
-            el("input", {
-              id: "prov-min-vram",
-              type: "number",
-              min: "1",
-              max: String(MAX_VRAM_GIB),
-              step: "1",
-              className: "input input-sm input-num",
-              "aria-label": t("app.def.min_vram"),
-              value: String(gib),
-              onInput: (event) => {
-                const val = Number.parseInt(event.target.value, 10);
-                if (Number.isFinite(val)) {
-                  spec.min_vram_mib = Math.max(1, val) * MIB_PER_GIB;
-                }
-              },
-            }),
-            el("span", { className: "unit-suffix" }, t("app.unit.gb"))
-          );
-        },
-      })
-    );
-  }
-
-  rows.push(
-    provRow(t("app.def.attempts"), t("app.b2.prov_attempts_billed"), attemptsInput),
-    provRow(t("app.def.on_exhausted"), null, exhaustedSelect),
-    buildOptionalRow({
-      id: "max-runtime",
-      label: t("app.def.max_runtime"),
-      hint: t("app.def.max_runtime_hint"),
-      enabled: spec.guard?.max_runtime !== null && spec.guard?.max_runtime !== undefined,
-      onToggle: (on) => {
-        spec.guard.max_runtime = on ? START_MAX_RUNTIME_SECS : null;
-      },
-      renderValue: () =>
-        buildDurationField("prov-max-runtime", spec.guard.max_runtime ?? START_MAX_RUNTIME_SECS, (secs) => {
-          spec.guard.max_runtime = secs;
-        }),
-    }),
-    buildOptionalRow({
-      id: "max-spend",
-      label: t("app.def.max_spend"),
-      hint: null,
-      enabled: spec.guard?.max_spend_cu !== null && spec.guard?.max_spend_cu !== undefined,
-      onToggle: (on) => {
-        spec.guard.max_spend_cu = on ? START_SPEND_CU : null;
-      },
-      renderValue: () =>
-        el(
-          "span",
-          { className: "unit-field" },
-          el("input", {
-            id: "prov-max-spend",
-            type: "number",
-            min: "0",
-            max: String(MAX_CU_FIELD),
-            step: "any",
-            className: "input input-sm input-num",
-            "aria-label": t("app.def.max_spend"),
-            value: String(spec.guard.max_spend_cu ?? START_SPEND_CU),
-            onInput: (event) => {
-              const val = Number.parseFloat(event.target.value);
-              spec.guard.max_spend_cu = Number.isFinite(val) ? Math.max(0, val) : 0;
-            },
-          }),
-          el("span", { className: "unit-suffix" }, t("app.unit.cu"))
-        ),
-    }),
-    buildOptionalRow({
-      id: "min-balance",
-      label: t("app.def.min_balance"),
-      hint: null,
-      enabled: spec.guard?.min_balance_cu !== null && spec.guard?.min_balance_cu !== undefined,
-      onToggle: (on) => {
-        spec.guard.min_balance_cu = on ? START_MIN_BALANCE_CU : null;
-      },
-      renderValue: () =>
-        el(
-          "span",
-          { className: "unit-field" },
-          el("input", {
-            id: "prov-min-balance",
-            type: "number",
-            min: "0",
-            max: String(MAX_CU_FIELD),
-            step: "any",
-            className: "input input-sm input-num",
-            "aria-label": t("app.def.min_balance"),
-            value: String(spec.guard.min_balance_cu ?? START_MIN_BALANCE_CU),
-            onInput: (event) => {
-              const val = Number.parseFloat(event.target.value);
-              spec.guard.min_balance_cu = Number.isFinite(val) ? Math.max(0, val) : 0;
-            },
-          }),
-          el("span", { className: "unit-suffix" }, t("app.unit.cu"))
-        ),
-    }),
-    buildOptionalRow({
-      id: "idle-timeout",
-      label: t("app.def.idle"),
-      hint: null,
-      enabled: spec.guard?.idle_timeout !== null && spec.guard?.idle_timeout !== undefined,
-      onToggle: (on) => {
-        spec.guard.idle_timeout = on ? START_IDLE_SECS : null;
-      },
-      renderValue: () =>
-        buildDurationField("prov-idle", spec.guard.idle_timeout ?? START_IDLE_SECS, (secs) => {
-          spec.guard.idle_timeout = secs;
-        }),
-    })
-  );
 
   const accountWarningHost = el("div", { className: "dialog-account-warning" });
   model.accountWarningHost = accountWarningHost;
@@ -1728,7 +1756,7 @@ function parsePort(text) {
   return num;
 }
 
-function resolveForwardPolicy() {
+export function resolveForwardPolicy() {
   const policy = state.overview?.forward_policy || null;
   if (policy && typeof policy.all_interfaces_allowed === "boolean") {
     return {

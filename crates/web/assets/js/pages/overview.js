@@ -16,6 +16,7 @@ import {
   getActiveUsage,
   loadOverview,
   refreshUsage,
+  requestOpenPluginForm,
   startCliInstall,
   state,
 } from "../store.js";
@@ -532,7 +533,10 @@ export function createOverviewPage({ navigate }) {
                 {
                   type: "button",
                   className: "btn btn-primary",
-                  onClick: () => navigate("plugins"),
+                  onClick: () => {
+                    requestOpenPluginForm(info.manifest.id);
+                    navigate("plugins");
+                  },
                 },
                 icon("rocket"),
                 t("app.b2.deploy_action")
