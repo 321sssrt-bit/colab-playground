@@ -61,6 +61,17 @@ interface AutoStopResponse {
   readonly warning_key: string | null;
 }
 
+export interface StopAllRemainingItem {
+  readonly target: RuntimeRef;
+  readonly error: ApiErrorPayload | null;
+}
+
+export interface StopAllResponse {
+  readonly verified: boolean;
+  readonly remaining: readonly StopAllRemainingItem[];
+  readonly account_errors: readonly AccountFailureResponse[];
+}
+
 interface OverviewReadinessResponse {
   readonly cli_installed: boolean;
 }
@@ -142,6 +153,25 @@ export function changeAutoStop(
       account_context: accountContext,
       target,
       action,
+    },
+  });
+}
+
+export function stopRuntime(target: RuntimeRef): Promise<void> {
+  return apiClient.request<void>("/api/sessions/stop", {
+    method: "POST",
+    body: {
+      target,
+      confirmed: true,
+    },
+  });
+}
+
+export function stopAllRuntimes(): Promise<StopAllResponse> {
+  return apiClient.request<StopAllResponse>("/api/sessions/stop-all", {
+    method: "POST",
+    body: {
+      confirmed: true,
     },
   });
 }

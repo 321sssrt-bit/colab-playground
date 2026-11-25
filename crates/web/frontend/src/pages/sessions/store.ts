@@ -70,6 +70,8 @@ const INITIAL_STATE: SessionsLocalState = {
 let state: SessionsLocalState = INITIAL_STATE;
 let seenGuardStoppedKeys = new Set<string>();
 let seenVanishedKeys = new Set<string>();
+let pendingUserStopCounts = new Map<string, number>();
+let pendingStopAllCount = 0;
 let lastKnownRuntimesByAccount = new Map<AccountId, readonly Runtime[]>();
 let latestSnapshotVersion = 0;
 let forwardsInFlight: Promise<ForwardView[]> | null = null;
@@ -94,6 +96,8 @@ function setState(patch: Partial<SessionsLocalState>): void {
 function resetLocalState(): void {
   seenGuardStoppedKeys = new Set<string>();
   seenVanishedKeys = new Set<string>();
+  pendingUserStopCounts = new Map<string, number>();
+  pendingStopAllCount = 0;
   lastKnownRuntimesByAccount = new Map<AccountId, readonly Runtime[]>();
   latestSnapshotVersion = 0;
   forwardsInFlight = null;
@@ -108,8 +112,53 @@ apiClient.subscribeAuth((event) => {
   }
 });
 
+/**
+ * Suppresses generic "vanished" notifications while a user-initiated stop for `target`
+ * is in flight, since SSE broadcasts the updated runtime list before the HTTP response returns.
+ */
+export function beginUserStop(target: RuntimeRef): () => void {
+  const key = runtimeKey(target);
+  const gen = apiClient.getSessionGeneration();
+  let released = false;
+  if (key) {
+    pendingUserStopCounts.set(key, (pendingUserStopCounts.get(key) ?? 0) + 1);
+  }
+  return () => {
+    if (released || !key || apiClient.getSessionGeneration() !== gen) {
+      return;
+    }
+    released = true;
+    const remaining = (pendingUserStopCounts.get(key) ?? 0) - 1;
+    if (remaining <= 0) {
+      pendingUserStopCounts.delete(key);
+    } else {
+      pendingUserStopCounts.set(key, remaining);
+    }
+  };
+}
+
+/**
+ * Suppresses generic "vanished" notifications while a user-initiated Stop all is in flight.
+ */
+export function beginStopAll(): () => void {
+  const gen = apiClient.getSessionGeneration();
+  let released = false;
+  pendingStopAllCount += 1;
+  return () => {
+    if (released || apiClient.getSessionGeneration() !== gen) {
+      return;
+    }
+    released = true;
+    pendingStopAllCount = Math.max(0, pendingStopAllCount - 1);
+  };
+}
+
 export function recordEndedRuntime(entry: EndedRuntime): void {
   const key = runtimeKey(entry.runtime);
+  if (entry.reason.kind === "user" && key) {
+    // Prevent later SSE/Guard vanished checks from replaying a vanished toast for a user stop.
+    seenVanishedKeys.add(key);
+  }
   const existing = state.ended.find((item) => runtimeKey(item.runtime) === key);
   // Keep a specific user/guard reason if a later generic vanished check sees the same runtime.
   if (existing && entry.reason.kind === "vanished" && existing.reason.kind !== "vanished") {
@@ -282,7 +331,11 @@ export function observeSnapshotTransitions(
     for (const ref of report.vanished) {
       const rtKey = runtimeKey(ref);
       guardHandledRuntimeKeys.add(rtKey);
-      if (seenVanishedKeys.has(rtKey)) {
+      if (
+        seenVanishedKeys.has(rtKey) ||
+        pendingUserStopCounts.has(rtKey) ||
+        pendingStopAllCount > 0
+      ) {
         continue;
       }
       seenVanishedKeys.add(rtKey);
@@ -343,7 +396,9 @@ export function observeSnapshotTransitions(
           if (
             liveKeys.has(rtKey) ||
             guardHandledRuntimeKeys.has(rtKey) ||
-            seenVanishedKeys.has(rtKey)
+            seenVanishedKeys.has(rtKey) ||
+            pendingUserStopCounts.has(rtKey) ||
+            pendingStopAllCount > 0
           ) {
             continue;
           }
