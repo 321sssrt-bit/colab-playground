@@ -295,6 +295,96 @@ a:hover {
   cursor: pointer;
 }
 
+/* Switch (1:1 Ely Switch: compact pill track with sliding thumb) */
+.switch-label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+  color: var(--color-fg);
+  cursor: pointer;
+}
+
+.switch-input {
+  appearance: none;
+  position: relative;
+  width: var(--space-8);
+  height: var(--space-4);
+  margin: var(--space-0);
+  border: var(--border-width) solid var(--color-border-strong);
+  border-radius: var(--radius-full);
+  background-color: var(--color-sunken);
+  flex: none;
+  cursor: pointer;
+  transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+
+.switch-input::before {
+  content: "";
+  position: absolute;
+  top: var(--space-0p5);
+  inset-inline-start: var(--space-0p5);
+  width: var(--icon-xs);
+  height: var(--icon-xs);
+  border-radius: var(--radius-full);
+  background-color: var(--color-fg-muted);
+  transition: transform 0.15s ease, background-color 0.15s ease;
+}
+
+.switch-input:checked {
+  border-color: var(--color-accent);
+  background-color: var(--color-accent);
+}
+
+.switch-input:checked::before {
+  background-color: var(--color-on-accent);
+  transform: translateX(var(--space-4));
+}
+
+.switch-input:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* Sunken Well (1:1 Ely Well: sunken fill, subtle border, 8px radius, 12px pad) */
+.well {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background-color: var(--color-sunken);
+}
+
+/* Native determinate progress bar (modern-web-guidance: separate vendor pseudo-elements) */
+.stage-progress {
+  appearance: none;
+  display: block;
+  width: 100%;
+  height: var(--space-1p5);
+  border: 0 solid;
+  border-radius: var(--radius-full);
+  background-color: var(--color-border);
+  overflow: clip;
+}
+
+.stage-progress::-webkit-progress-bar {
+  background: transparent;
+}
+
+.stage-progress::-webkit-progress-value {
+  background-color: var(--color-accent);
+  border-radius: var(--radius-full);
+  transition: inline-size 0.3s;
+}
+
+.stage-progress::-moz-progress-bar {
+  background-color: var(--color-accent);
+  border-radius: var(--radius-full);
+  transition: inline-size 0.3s;
+}
+
 .field-group {
   display: flex;
   flex-direction: column;

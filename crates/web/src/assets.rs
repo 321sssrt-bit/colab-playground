@@ -103,6 +103,11 @@ pub const STATIC_ASSETS: &[Asset] = &[
         body: include_str!("../assets/js/session-dialogs.js"),
     },
     Asset {
+        path: "js/plugin-dialogs.js",
+        content_type: JS,
+        body: include_str!("../assets/js/plugin-dialogs.js"),
+    },
+    Asset {
         path: "js/pages/login.js",
         content_type: JS,
         body: include_str!("../assets/js/pages/login.js"),
@@ -116,6 +121,11 @@ pub const STATIC_ASSETS: &[Asset] = &[
         path: "js/pages/sessions.js",
         content_type: JS,
         body: include_str!("../assets/js/pages/sessions.js"),
+    },
+    Asset {
+        path: "js/pages/plugins.js",
+        content_type: JS,
+        body: include_str!("../assets/js/pages/plugins.js"),
     },
     Asset {
         path: "js/pages/accounts.js",
@@ -321,6 +331,51 @@ const SHELL_EN_US: Messages = &[
         "Health check path must start with / and contain no spaces.",
     ),
     ("web.forward.bind_badge_all", "0.0.0.0"),
+    ("web.plugins.manage_token", "Manage token"),
+    ("web.plugins.replace_token", "Replace token"),
+    ("web.plugins.token_required", "Enter a Hugging Face token."),
+    (
+        "web.plugins.source_required",
+        "Enter a server folder path or a Git URL.",
+    ),
+    ("web.plugins.back_to_source", "Edit source"),
+    ("web.plugins.empty_title", "No plugins installed"),
+    (
+        "web.plugins.empty_body",
+        "Install a plugin from a server folder or a Git URL to run scripts on your Colab runtime.",
+    ),
+    (
+        "web.plugins.hf_repo_required",
+        "Enter a model repository (owner/name) first.",
+    ),
+    ("web.plugins.field_required", "Enter a value for {field}."),
+    (
+        "web.plugins.number_invalid",
+        "{field} must be a valid number.",
+    ),
+    (
+        "web.plugins.number_range",
+        "{field} must be between {min} and {max}.",
+    ),
+    ("web.plugins.number_min", "{field} must be at least {min}."),
+    ("web.plugins.number_max", "{field} must be at most {max}."),
+    (
+        "web.plugins.history_skipped",
+        "Earlier log lines were dropped from the server buffer because output grew too fast.",
+    ),
+    (
+        "web.plugins.endpoint_local_curl",
+        "Run this command on the server host, or switch forwarding to all interfaces (0.0.0.0) to call it remotely.",
+    ),
+    (
+        "web.plugins.endpoint_not_forwarded_note",
+        "Turn on forwarding to reach this endpoint.",
+    ),
+    (
+        "web.plugins.endpoint_copy_failed",
+        "Could not copy automatically. Select the text and copy it manually.",
+    ),
+    ("web.plugins.run_loading", "Loading plugin form…"),
 ];
 
 const SHELL_ZH_CN: Messages = &[
@@ -459,6 +514,48 @@ const SHELL_ZH_CN: Messages = &[
         "健康检查路径必须以 / 开头且不能包含空格。",
     ),
     ("web.forward.bind_badge_all", "0.0.0.0"),
+    ("web.plugins.manage_token", "管理令牌"),
+    ("web.plugins.replace_token", "替换令牌"),
+    ("web.plugins.token_required", "请输入 Hugging Face 令牌。"),
+    (
+        "web.plugins.source_required",
+        "请输入服务器目录路径或 Git URL。",
+    ),
+    ("web.plugins.back_to_source", "修改来源"),
+    ("web.plugins.empty_title", "尚未安装插件"),
+    (
+        "web.plugins.empty_body",
+        "从服务器目录或 Git URL 安装插件，即可在 Colab 运行时上运行脚本。",
+    ),
+    (
+        "web.plugins.hf_repo_required",
+        "请先输入模型仓库（owner/name）。",
+    ),
+    ("web.plugins.field_required", "请填写 {field}。"),
+    ("web.plugins.number_invalid", "{field} 必须是有效数字。"),
+    (
+        "web.plugins.number_range",
+        "{field} 必须在 {min} 到 {max} 之间。",
+    ),
+    ("web.plugins.number_min", "{field} 不能小于 {min}。"),
+    ("web.plugins.number_max", "{field} 不能大于 {max}。"),
+    (
+        "web.plugins.history_skipped",
+        "由于日志输出过快，较早的日志已从服务器缓冲区移除。",
+    ),
+    (
+        "web.plugins.endpoint_local_curl",
+        "请在服务器本机运行此命令，或切换到所有网卡（0.0.0.0）转发后再远程调用。",
+    ),
+    (
+        "web.plugins.endpoint_not_forwarded_note",
+        "开启端口转发后即可访问此端点。",
+    ),
+    (
+        "web.plugins.endpoint_copy_failed",
+        "无法自动复制，请选中文本后手动复制。",
+    ),
+    ("web.plugins.run_loading", "正在加载插件表单…"),
 ];
 
 const SHELL_ZH_TW: Messages = &[
@@ -600,6 +697,48 @@ const SHELL_ZH_TW: Messages = &[
         "健康檢查路徑必須以 / 開頭且不可包含空格。",
     ),
     ("web.forward.bind_badge_all", "0.0.0.0"),
+    ("web.plugins.manage_token", "管理權杖"),
+    ("web.plugins.replace_token", "取代權杖"),
+    ("web.plugins.token_required", "請輸入 Hugging Face 權杖。"),
+    (
+        "web.plugins.source_required",
+        "請輸入伺服器目錄路徑或 Git URL。",
+    ),
+    ("web.plugins.back_to_source", "修改來源"),
+    ("web.plugins.empty_title", "尚未安裝外掛"),
+    (
+        "web.plugins.empty_body",
+        "從伺服器目錄或 Git URL 安裝外掛，即可在 Colab 執行階段上執行腳本。",
+    ),
+    (
+        "web.plugins.hf_repo_required",
+        "請先輸入模型儲存庫（owner/name）。",
+    ),
+    ("web.plugins.field_required", "請填寫 {field}。"),
+    ("web.plugins.number_invalid", "{field} 必須是有效數字。"),
+    (
+        "web.plugins.number_range",
+        "{field} 必須介於 {min} 到 {max} 之間。",
+    ),
+    ("web.plugins.number_min", "{field} 不能小於 {min}。"),
+    ("web.plugins.number_max", "{field} 不能大於 {max}。"),
+    (
+        "web.plugins.history_skipped",
+        "由於日誌輸出過快，較早的日誌已從伺服器緩衝區移除。",
+    ),
+    (
+        "web.plugins.endpoint_local_curl",
+        "請在伺服器本機執行此命令，或切換到所有介面（0.0.0.0）轉發後再遠端呼叫。",
+    ),
+    (
+        "web.plugins.endpoint_not_forwarded_note",
+        "開啟連接埠轉發後即可存取此端點。",
+    ),
+    (
+        "web.plugins.endpoint_copy_failed",
+        "無法自動複製，請選取文字後手動複製。",
+    ),
+    ("web.plugins.run_loading", "正在載入外掛表單…"),
 ];
 
 const SHELL_JA_JP: Messages = &[
@@ -762,6 +901,63 @@ const SHELL_JA_JP: Messages = &[
         "ヘルスチェックパスは / で始まり、空白を含まないようにしてください。",
     ),
     ("web.forward.bind_badge_all", "0.0.0.0"),
+    ("web.plugins.manage_token", "トークンを管理"),
+    ("web.plugins.replace_token", "トークンを置き換える"),
+    (
+        "web.plugins.token_required",
+        "Hugging Face トークンを入力してください。",
+    ),
+    (
+        "web.plugins.source_required",
+        "サーバー上のフォルダパスまたは Git URL を入力してください。",
+    ),
+    ("web.plugins.back_to_source", "ソースを編集"),
+    (
+        "web.plugins.empty_title",
+        "プラグインはまだインストールされていません",
+    ),
+    (
+        "web.plugins.empty_body",
+        "サーバー上のフォルダまたは Git URL からプラグインをインストールして、Colab ランタイム上でスクリプトを実行できます。",
+    ),
+    (
+        "web.plugins.hf_repo_required",
+        "先にモデルリポジトリ（owner/name）を入力してください。",
+    ),
+    ("web.plugins.field_required", "{field} を入力してください。"),
+    (
+        "web.plugins.number_invalid",
+        "{field} には有効な数値を入力してください。",
+    ),
+    (
+        "web.plugins.number_range",
+        "{field} は {min} から {max} の間で指定してください。",
+    ),
+    (
+        "web.plugins.number_min",
+        "{field} は {min} 以上で指定してください。",
+    ),
+    (
+        "web.plugins.number_max",
+        "{field} は {max} 以下で指定してください。",
+    ),
+    (
+        "web.plugins.history_skipped",
+        "出力が速すぎたため、古いログ行はサーバーのバッファから破棄されました。",
+    ),
+    (
+        "web.plugins.endpoint_local_curl",
+        "このコマンドはサーバーホスト上で実行するか、すべてのインターフェース (0.0.0.0) に切り替えてリモートから呼び出してください。",
+    ),
+    (
+        "web.plugins.endpoint_not_forwarded_note",
+        "このエンドポイントにアクセスするには転送を有効にしてください。",
+    ),
+    (
+        "web.plugins.endpoint_copy_failed",
+        "自動コピーできませんでした。テキストを選択して手動でコピーしてください。",
+    ),
+    ("web.plugins.run_loading", "プラグインフォームを読み込み中…"),
 ];
 
 const SHELL_KO_KR: Messages = &[
@@ -927,4 +1123,58 @@ const SHELL_KO_KR: Messages = &[
         "상태 확인 경로는 /로 시작하고 공백이 없어야 합니다.",
     ),
     ("web.forward.bind_badge_all", "0.0.0.0"),
+    ("web.plugins.manage_token", "토큰 관리"),
+    ("web.plugins.replace_token", "토큰 교체"),
+    (
+        "web.plugins.token_required",
+        "Hugging Face 토큰을 입력하세요.",
+    ),
+    (
+        "web.plugins.source_required",
+        "서버 폴더 경로 또는 Git URL을 입력하세요.",
+    ),
+    ("web.plugins.back_to_source", "소스 수정"),
+    ("web.plugins.empty_title", "설치된 플러그인이 없습니다"),
+    (
+        "web.plugins.empty_body",
+        "서버 폴더 또는 Git URL에서 플러그인을 설치하여 Colab 런타임에서 스크립트를 실행할 수 있습니다.",
+    ),
+    (
+        "web.plugins.hf_repo_required",
+        "먼저 모델 저장소(owner/name)를 입력하세요.",
+    ),
+    ("web.plugins.field_required", "{field} 값을 입력하세요."),
+    (
+        "web.plugins.number_invalid",
+        "{field}에는 올바른 숫자를 입력하세요.",
+    ),
+    (
+        "web.plugins.number_range",
+        "{field} 값은 {min}에서 {max} 사이여야 합니다.",
+    ),
+    (
+        "web.plugins.number_min",
+        "{field} 값은 {min} 이상이어야 합니다.",
+    ),
+    (
+        "web.plugins.number_max",
+        "{field} 값은 {max} 이하여야 합니다.",
+    ),
+    (
+        "web.plugins.history_skipped",
+        "출력이 너무 빨라 이전 로그 줄이 서버 버퍼에서 삭제되었습니다.",
+    ),
+    (
+        "web.plugins.endpoint_local_curl",
+        "이 명령은 서버 호스트에서 실행하거나 모든 인터페이스(0.0.0.0)로 전환한 후 원격에서 호출하세요.",
+    ),
+    (
+        "web.plugins.endpoint_not_forwarded_note",
+        "이 엔드포인트에 접근하려면 포워딩을 켜세요.",
+    ),
+    (
+        "web.plugins.endpoint_copy_failed",
+        "자동으로 복사할 수 없습니다. 텍스트를 선택해 직접 복사하세요.",
+    ),
+    ("web.plugins.run_loading", "플러그인 양식 불러오는 중…"),
 ];

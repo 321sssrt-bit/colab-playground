@@ -10,9 +10,10 @@ import { icon } from "./icons.js";
 import { createAccountsPage } from "./pages/accounts.js";
 import { createLoginPage } from "./pages/login.js";
 import { createOverviewPage } from "./pages/overview.js";
-import { createPlaceholderPage } from "./pages/placeholder.js";
+import { createPluginsPage } from "./pages/plugins.js";
 import { createSessionsPage } from "./pages/sessions.js";
 import { createSettingsPage } from "./pages/settings.js";
+import { initPluginDialogs } from "./plugin-dialogs.js";
 import { initSessionDialogs } from "./session-dialogs.js";
 import {
   clearAccountNotice,
@@ -80,10 +81,7 @@ class AppShellController {
     this.pages = {
       overview: createOverviewPage({ navigate: (id) => this.navigate(id) }),
       sessions: createSessionsPage({ navigate: (id) => this.navigate(id) }),
-      plugins: createPlaceholderPage({
-        titleKey: "app.nav.plugins",
-        subtitleKey: "app.plugins.subtitle",
-      }),
+      plugins: createPluginsPage({ navigate: (id) => this.navigate(id) }),
       accounts: createAccountsPage({ navigate: (id) => this.navigate(id) }),
       settings: createSettingsPage(),
     };
@@ -92,6 +90,7 @@ class AppShellController {
   start() {
     initAccountDialogs();
     initSessionDialogs({ navigate: (id) => this.navigate(id) });
+    initPluginDialogs();
 
     window.addEventListener("hashchange", () => {
       const raw = window.location.hash.replace(/^#\/?/, "").split("?")[0];

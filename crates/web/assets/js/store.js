@@ -1,12 +1,13 @@
 import { apiRequest, clearToken, hasToken, setUnauthorizedHandler, streamSse } from "./api.js";
 import { formatConcern, formatHardware, formatRuntimeCardLabel } from "./format.js";
-import { setLanguagePreference, t } from "./i18n.js";
+import { localized, setLanguagePreference, t } from "./i18n.js";
 import { setAppearancePreference } from "./theme.js";
 
 const INITIAL_BACKOFF_MS = 1000;
 const MAX_BACKOFF_MS = 10000;
 const ENDED_LIMIT = 20;
 const DEFAULT_REARM_SECS = 7200;
+const RUN_LOG_LINES_KEPT = 2000;
 
 const listeners = new Set();
 let sseController = null;
@@ -16,13 +17,19 @@ let authGeneration = 0;
 let overviewPromise = null;
 let sessionsPromise = null;
 let forwardsPromise = null;
+let pluginsPromise = null;
+let hfTokenPromise = null;
 let provisionStreamController = null;
 let provisionRetryTimer = null;
 let provisionBackoffMs = INITIAL_BACKOFF_MS;
+let pluginRunStreamController = null;
+let pluginRunRetryTimer = null;
+let pluginRunBackoffMs = INITIAL_BACKOFF_MS;
 let lastForwardsSignature = "";
 let seenGuardReportKey = "";
 let pendingLoginLanguage = null;
 let pendingLoginAppearance = null;
+let pendingOpenPluginId = null;
 
 function emptyProvisionState() {
   return {
@@ -35,6 +42,36 @@ function emptyProvisionState() {
     outcome: null,
     error: null,
     cancelling: false,
+  };
+}
+
+function emptyPluginRunState() {
+  return {
+    id: null,
+    plugin: "",
+    account: null,
+    session: "",
+    provisions: null,
+    launched: false,
+    cleanupResult: null, // null | checking | still_billing | stopped | unknown
+    cleanupRuntime: null,
+    phase: "idle", // idle | running | ready | failed | cancelled
+    cancelling: false,
+    provision: { events: [], latestAtMs: null },
+    status: null,
+    logLines: [],
+    logSkippedNotices: [],
+    historySkipped: false,
+    outcome: null,
+    endpoints: [],
+    error: null,
+  };
+}
+
+function emptyHfTokenState() {
+  return {
+    status: "idle", // idle | loading | ready | error
+    saved: false,
   };
 }
 
@@ -69,6 +106,12 @@ export const state = {
   overviewLoading: false,
   overviewError: null,
   plugins: [],
+  pluginsLoaded: false,
+  pluginsLoading: false,
+  pluginsError: null,
+  hfToken: emptyHfTokenState(),
+  pluginBusy: {},
+  pluginRun: emptyPluginRunState(),
   settings: null,
   settingsLoading: false,
   updates: null,
@@ -137,14 +180,40 @@ function stopProvisionStream() {
   }
 }
 
+function stopPluginRunStream() {
+  if (pluginRunRetryTimer !== null) {
+    window.clearTimeout(pluginRunRetryTimer);
+    pluginRunRetryTimer = null;
+  }
+  pluginRunBackoffMs = INITIAL_BACKOFF_MS;
+  if (pluginRunStreamController) {
+    pluginRunStreamController.abort();
+    pluginRunStreamController = null;
+  }
+}
+
+export function requestOpenPluginForm(pluginId) {
+  pendingOpenPluginId = pluginId || null;
+}
+
+export function consumePendingOpenPluginId() {
+  const id = pendingOpenPluginId;
+  pendingOpenPluginId = null;
+  return id;
+}
+
 export function handleSessionLost({ expired = true } = {}) {
   authGeneration += 1;
   overviewPromise = null;
   sessionsPromise = null;
   forwardsPromise = null;
+  pluginsPromise = null;
+  hfTokenPromise = null;
+  pendingOpenPluginId = null;
   lastForwardsSignature = "";
   seenGuardReportKey = "";
   stopProvisionStream();
+  stopPluginRunStream();
   stopSse();
   clearToken();
   state.authenticated = false;
@@ -154,6 +223,12 @@ export function handleSessionLost({ expired = true } = {}) {
   state.overview = null;
   state.overviewError = null;
   state.plugins = [];
+  state.pluginsLoaded = false;
+  state.pluginsLoading = false;
+  state.pluginsError = null;
+  state.hfToken = emptyHfTokenState();
+  state.pluginBusy = {};
+  state.pluginRun = emptyPluginRunState();
   state.settings = null;
   state.updates = null;
   state.updatesError = null;
@@ -310,6 +385,35 @@ function syncProvisionWithOperations(snapshot) {
   }
 }
 
+function syncPluginRunWithOperations(snapshot) {
+  const ops = Array.isArray(snapshot?.operations) ? snapshot.operations : [];
+  const activeOp = ops.find((entry) => entry?.operation?.kind === "plugin_run") || null;
+  if (activeOp) {
+    if (state.pluginRun.id === activeOp.id) {
+      if (state.pluginRun.cancelling !== Boolean(activeOp.cancelling)) {
+        state.pluginRun.cancelling = Boolean(activeOp.cancelling);
+        emit("plugin_run");
+      }
+      if (
+        state.pluginRun.phase === "running" &&
+        !pluginRunStreamController &&
+        pluginRunRetryTimer === null
+      ) {
+        void consumePluginRunStream(activeOp.id, authGeneration);
+      }
+    } else if (state.pluginRun.phase !== "running") {
+      void attachPluginRun({
+        id: activeOp.id,
+        plugin: activeOp.operation.plugin || "",
+        session: activeOp.operation.session || "",
+        account: snapshot?.account?.active || null,
+        provisions: null,
+      });
+      void loadPluginRuns();
+    }
+  }
+}
+
 function applySnapshot(next) {
   if (!next || typeof next !== "object") {
     return;
@@ -331,6 +435,7 @@ function applySnapshot(next) {
   }
   observeGuardReport(prev, next);
   syncProvisionWithOperations(next);
+  syncPluginRunWithOperations(next);
   const nextSig = tunnelsSignature(next.tunnels);
   if (nextSig !== lastForwardsSignature) {
     lastForwardsSignature = nextSig;
@@ -385,6 +490,18 @@ async function startSseLoop() {
             }
             provisionBackoffMs = INITIAL_BACKOFF_MS;
             void consumeProvisionStream(state.provision.id, authGeneration);
+          }
+          if (
+            state.pluginRun.phase === "running" &&
+            state.pluginRun.id !== null &&
+            !pluginRunStreamController
+          ) {
+            if (pluginRunRetryTimer !== null) {
+              window.clearTimeout(pluginRunRetryTimer);
+              pluginRunRetryTimer = null;
+            }
+            pluginRunBackoffMs = INITIAL_BACKOFF_MS;
+            void consumePluginRunStream(state.pluginRun.id, authGeneration);
           }
         }
       },
@@ -464,18 +581,656 @@ export async function loadOverview({ silent = false } = {}) {
   return overviewPromise;
 }
 
-export async function loadPlugins() {
-  if (!state.authenticated) return;
+export async function loadPlugins({ silent = false } = {}) {
+  if (!state.authenticated) return null;
+  if (pluginsPromise) {
+    return pluginsPromise;
+  }
   const gen = authGeneration;
+  if (!silent) {
+    state.pluginsLoading = true;
+    state.pluginsError = null;
+    emit("plugins");
+  }
+  pluginsPromise = (async () => {
+    try {
+      const list = await apiRequest("/api/plugins");
+      if (gen !== authGeneration || !state.authenticated) return null;
+      if (Array.isArray(list)) {
+        state.plugins = list;
+        state.pluginsLoaded = true;
+        state.pluginsError = null;
+      }
+      return state.plugins;
+    } catch (err) {
+      if (gen !== authGeneration || (err && err.status === 401)) return null;
+      state.pluginsError = err?.payload || { error: {} };
+      return null;
+    } finally {
+      if (gen === authGeneration) {
+        pluginsPromise = null;
+        state.pluginsLoading = false;
+        emit("plugins");
+      }
+    }
+  })();
+  return pluginsPromise;
+}
+
+export async function loadHfToken({ silent = false } = {}) {
+  if (!state.authenticated) return null;
+  if (hfTokenPromise) {
+    return hfTokenPromise;
+  }
+  const gen = authGeneration;
+  if (!silent && state.hfToken.status === "idle") {
+    state.hfToken = { ...state.hfToken, status: "loading" };
+    emit("hf_token");
+  }
+  hfTokenPromise = (async () => {
+    try {
+      const data = await apiRequest("/api/plugins/hf/token");
+      if (gen !== authGeneration || !state.authenticated) return null;
+      state.hfToken = {
+        status: "ready",
+        saved: Boolean(data?.saved),
+      };
+      return state.hfToken;
+    } catch (err) {
+      if (gen !== authGeneration || (err && err.status === 401)) return null;
+      state.hfToken = {
+        status: "error",
+        saved: false,
+      };
+      return null;
+    } finally {
+      if (gen === authGeneration) {
+        hfTokenPromise = null;
+        emit("hf_token");
+      }
+    }
+  })();
+  return hfTokenPromise;
+}
+
+export async function saveHfToken(token) {
+  const gen = authGeneration;
+  const data = await apiRequest("/api/plugins/hf/token", {
+    method: "PUT",
+    body: { token },
+  });
+  if (gen === authGeneration && state.authenticated) {
+    state.hfToken = {
+      status: "ready",
+      saved: Boolean(data?.saved ?? true),
+    };
+    emit("hf_token");
+  }
+  return data;
+}
+
+export async function deleteHfToken() {
+  const gen = authGeneration;
+  const data = await apiRequest("/api/plugins/hf/token", {
+    method: "DELETE",
+    body: {},
+  });
+  if (gen === authGeneration && state.authenticated) {
+    state.hfToken = {
+      status: "ready",
+      saved: Boolean(data?.saved ?? false),
+    };
+    emit("hf_token");
+  }
+  return data;
+}
+
+export async function previewPlugin(origin) {
+  return apiRequest("/api/plugins/previews", {
+    method: "POST",
+    body: origin,
+  });
+}
+
+export async function installPlugin(previewId) {
+  const info = await apiRequest(`/api/plugins/previews/${encodeURIComponent(previewId)}`, {
+    method: "POST",
+    body: {},
+  });
+  await loadPlugins({ silent: true });
+  return info;
+}
+
+export async function discardPluginPreview(previewId) {
   try {
-    const list = await apiRequest("/api/plugins");
-    if (gen !== authGeneration || !state.authenticated) return;
-    if (Array.isArray(list)) {
-      state.plugins = list;
+    await apiRequest(`/api/plugins/previews/${encodeURIComponent(previewId)}`, {
+      method: "DELETE",
+      body: {},
+    });
+  } catch {
+    // Preview may already have been consumed or evicted.
+  }
+}
+
+export async function setPluginEnabled(id, enabled) {
+  const gen = authGeneration;
+  state.pluginBusy = { ...state.pluginBusy, [id]: true };
+  emit("plugins");
+  try {
+    await apiRequest(`/api/plugins/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: { enabled: Boolean(enabled) },
+    });
+    if (gen === authGeneration && state.authenticated) {
+      await loadPlugins({ silent: true });
+    }
+  } finally {
+    if (gen === authGeneration) {
+      const next = { ...state.pluginBusy };
+      delete next[id];
+      state.pluginBusy = next;
       emit("plugins");
     }
+  }
+}
+
+export async function removePlugin(id) {
+  const gen = authGeneration;
+  state.pluginBusy = { ...state.pluginBusy, [id]: true };
+  emit("plugins");
+  try {
+    await apiRequest(`/api/plugins/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      body: {},
+    });
+    if (gen === authGeneration && state.authenticated) {
+      await loadPlugins({ silent: true });
+    }
+  } finally {
+    if (gen === authGeneration) {
+      const next = { ...state.pluginBusy };
+      delete next[id];
+      state.pluginBusy = next;
+      emit("plugins");
+    }
+  }
+}
+
+export async function fetchPluginTemplate(pluginId) {
+  return apiRequest(`/api/plugins/${encodeURIComponent(pluginId)}/template`);
+}
+
+export async function searchHfModels(query) {
+  return apiRequest("/api/plugins/hf/search", {
+    method: "POST",
+    body: { query: String(query || "") },
+  });
+}
+
+export async function fetchHfGguf(payload) {
+  return apiRequest("/api/plugins/hf/gguf", {
+    method: "POST",
+    body: payload,
+  });
+}
+
+export function isPluginRunning() {
+  if (state.pluginRun.phase === "running") {
+    return true;
+  }
+  const ops = state.snapshot?.operations;
+  return Array.isArray(ops) && ops.some((entry) => entry?.operation?.kind === "plugin_run");
+}
+
+export function isPluginBusy(pluginId) {
+  if (state.pluginBusy[pluginId]) {
+    return true;
+  }
+  const ops = state.snapshot?.operations;
+  if (!Array.isArray(ops)) return false;
+  return ops.some((entry) => {
+    const op = entry?.operation;
+    if (!op) return false;
+    if (op.kind === "plugin_run" && op.plugin === pluginId) return true;
+    if (
+      op.kind === "domain" &&
+      (op.name === "set_plugin_enabled" || op.name === "remove_plugin") &&
+      op.key === pluginId
+    ) {
+      return true;
+    }
+    return false;
+  });
+}
+
+export function getForwardForEndpoint(account, session, remotePort) {
+  if (!account || !session || !remotePort) return null;
+  const list = state.forwardsLoaded ? state.forwards : state.snapshot?.tunnels || [];
+  return (
+    list.find((item) => {
+      const st = item?.state;
+      const kind = typeof st === "string" ? st : st?.state;
+      const terminal = kind === "failed" || kind === "stopped";
+      return (
+        !terminal &&
+        item?.spec?.account === account &&
+        item?.spec?.session === session &&
+        item?.spec?.remote_port === remotePort
+      );
+    }) || null
+  );
+}
+
+function appendBoundedLog(entries, additions) {
+  for (const item of additions) {
+    entries.push(item);
+  }
+  if (entries.length > RUN_LOG_LINES_KEPT) {
+    entries.splice(0, entries.length - RUN_LOG_LINES_KEPT);
+  }
+}
+
+async function verifyPluginRunCleanup(id, gen) {
+  if (gen !== authGeneration || state.pluginRun.id !== id || !state.pluginRun.session) {
+    return;
+  }
+  state.pluginRun.cleanupResult = "checking";
+  state.pluginRun.cleanupRuntime = null;
+  emit("plugin_run");
+  try {
+    // Wait for any earlier listing to finish, then issue a fresh /api/sessions request so we never
+    // evaluate cleanup against a stale pre-termination snapshot.
+    if (sessionsPromise) {
+      await sessionsPromise.catch(() => null);
+    }
+    const data = await loadSessions({ silent: true });
+    if (gen !== authGeneration || state.pluginRun.id !== id) return;
+    if (!data || !Array.isArray(data.runtimes)) {
+      state.pluginRun.cleanupResult = "unknown";
+      state.pluginRun.cleanupRuntime = null;
+      emit("plugin_run");
+      return;
+    }
+    const targetSession = state.pluginRun.session;
+    const targetAccount = state.pluginRun.account;
+    const matched =
+      data.runtimes.find(
+        (rt) =>
+          rt?.id?.name === targetSession &&
+          (!targetAccount || rt?.id?.account === targetAccount)
+      ) || null;
+    if (matched) {
+      state.pluginRun.cleanupResult = "still_billing";
+      state.pluginRun.cleanupRuntime = matched;
+    } else {
+      const errors = Array.isArray(data.errors) ? data.errors : [];
+      const accountFailed = errors.some(
+        (failure) => !targetAccount || failure?.account === targetAccount
+      );
+      state.pluginRun.cleanupResult = accountFailed ? "unknown" : "stopped";
+      state.pluginRun.cleanupRuntime = null;
+    }
+    emit("plugin_run");
   } catch {
-    // Non-fatal; quick-deploy list simply stays empty.
+    if (gen !== authGeneration || state.pluginRun.id !== id) return;
+    state.pluginRun.cleanupResult = "unknown";
+    state.pluginRun.cleanupRuntime = null;
+    emit("plugin_run");
+  }
+}
+
+async function consumePluginRunStream(id, gen) {
+  if (pluginRunRetryTimer !== null) {
+    window.clearTimeout(pluginRunRetryTimer);
+    pluginRunRetryTimer = null;
+  }
+  if (pluginRunStreamController) {
+    pluginRunStreamController.abort();
+    pluginRunStreamController = null;
+  }
+  const controller = new AbortController();
+  pluginRunStreamController = controller;
+  const streamProvEvents = [];
+  const streamLogEntries = [];
+  let sawHistorySkipped = false;
+
+  const result = await streamSse(
+    `/api/plugins/runs/${encodeURIComponent(id)}/events`,
+    {},
+    {
+      signal: controller.signal,
+      onOpen: () => {
+        if (gen !== authGeneration || state.pluginRun.id !== id) return;
+        pluginRunBackoffMs = INITIAL_BACKOFF_MS;
+      },
+      onEvent: ({ event, data }) => {
+        if (gen !== authGeneration || state.pluginRun.id !== id) return;
+        if (event === "history_skipped") {
+          sawHistorySkipped = true;
+          state.pluginRun.historySkipped = true;
+          emit("plugin_run");
+          return;
+        }
+        if (event === "provision" && data) {
+          state.pluginRun.provisions = true;
+          if (!state.pluginRun.launched) {
+            state.pluginRun.session = "";
+          }
+          streamProvEvents.push(data);
+          if (sawHistorySkipped || streamProvEvents.length >= state.pluginRun.provision.events.length) {
+            const grew = streamProvEvents.length > state.pluginRun.provision.events.length;
+            state.pluginRun.provision.events = [...streamProvEvents];
+            if (grew) {
+              state.pluginRun.provision.latestAtMs = Date.now();
+            }
+            emit("plugin_run");
+          }
+          return;
+        }
+        if (event === "launched" && data) {
+          state.pluginRun.launched = true;
+          if (data.session) state.pluginRun.session = data.session;
+          emit("plugin_run");
+          return;
+        }
+        if (event === "status" && data) {
+          state.pluginRun.launched = true;
+          state.pluginRun.status = data;
+          emit("plugin_run");
+          return;
+        }
+        if (event === "log" && data && Array.isArray(data.lines)) {
+          appendBoundedLog(
+            streamLogEntries,
+            data.lines.map((line) => ({ text: String(line), notice: false }))
+          );
+          if (sawHistorySkipped || streamLogEntries.length >= state.pluginRun.logLines.length) {
+            state.pluginRun.logLines = [...streamLogEntries];
+            emit("plugin_run");
+          }
+          return;
+        }
+        if (event === "log_skipped" && data) {
+          // Keep full-log path notices outside the bounded log ring buffer so later output cannot evict them.
+          const path = String(data.path || "");
+          const noticeText = t(data.message_key || "app.b2.run_log_skipped", { path });
+          const exists = state.pluginRun.logSkippedNotices.some(
+            (entry) => entry.path === path && entry.text === noticeText
+          );
+          if (!exists) {
+            state.pluginRun.logSkippedNotices = [
+              ...state.pluginRun.logSkippedNotices,
+              { path, text: noticeText },
+            ];
+            emit("plugin_run");
+          }
+          return;
+        }
+        if (event === "finished" && data) {
+          state.pluginRun.cancelling = false;
+          state.pluginRun.launched = true;
+          if (data.run?.plugin) state.pluginRun.plugin = data.run.plugin;
+          if (data.run?.account) state.pluginRun.account = data.run.account;
+          if (data.run?.session) state.pluginRun.session = data.run.session;
+          if (typeof data.run?.provisions === "boolean") {
+            state.pluginRun.provisions = data.run.provisions;
+          }
+          state.pluginRun.outcome = data.outcome || null;
+          state.pluginRun.endpoints = Array.isArray(data.endpoints) ? data.endpoints : [];
+          if (data.outcome?.status) {
+            state.pluginRun.status = data.outcome.status;
+          }
+          if (data.outcome?.session) {
+            state.pluginRun.session = data.outcome.session;
+          }
+          if (data.outcome?.account) {
+            state.pluginRun.account = data.outcome.account;
+          }
+
+          if (data.phase === "ready") {
+            state.pluginRun.phase = "ready";
+            state.pluginRun.error = null;
+            state.pluginRun.cleanupResult = null;
+            state.pluginRun.cleanupRuntime = null;
+            const info = (state.plugins || []).find((p) => p?.manifest?.id === state.pluginRun.plugin);
+            const name = info ? localized(info.manifest.name) || info.manifest.id : state.pluginRun.plugin;
+            setNotice({
+              tone: "success",
+              message: t("app.b2.run_ready_toast", { name }),
+            });
+            emit("plugin_run");
+            void Promise.allSettled([
+              loadForwards(),
+              loadSessions({ silent: true }),
+              refreshAccountsUsage().catch(() => {}),
+            ]);
+          } else {
+            if (data.phase === "cancelled") {
+              state.pluginRun.phase = "cancelled";
+              state.pluginRun.error = null;
+            } else {
+              state.pluginRun.phase = "failed";
+              state.pluginRun.error = data.error ? { error: data.error } : { error: {} };
+            }
+            state.pluginRun.cleanupResult = state.pluginRun.session ? "checking" : null;
+            state.pluginRun.cleanupRuntime = null;
+            emit("plugin_run");
+            void Promise.allSettled([
+              loadForwards(),
+              state.pluginRun.session ? verifyPluginRunCleanup(id, gen) : loadSessions({ silent: true }),
+              refreshAccountsUsage().catch(() => {}),
+            ]);
+          }
+        }
+      },
+    }
+  );
+
+  if (pluginRunStreamController === controller) {
+    pluginRunStreamController = null;
+  }
+  if (gen !== authGeneration || state.pluginRun.id !== id || state.pluginRun.phase !== "running") {
+    return;
+  }
+  if (result.outcome === "aborted" || result.outcome === "unauthorized") {
+    return;
+  }
+  const isTransientHttp =
+    result.outcome === "http_error" &&
+    (result.status === 502 || result.status === 503 || result.status === 504);
+  if (result.outcome === "http_error" && !isTransientHttp) {
+    state.pluginRun.phase = "failed";
+    state.pluginRun.cancelling = false;
+    state.pluginRun.launched = true;
+    state.pluginRun.cleanupResult = state.pluginRun.session ? "checking" : null;
+    state.pluginRun.cleanupRuntime = null;
+    state.pluginRun.error = result.payload || { error: {} };
+    emit("plugin_run");
+    if (state.pluginRun.session) {
+      void verifyPluginRunCleanup(id, gen);
+    } else {
+      void loadSessions({ silent: true });
+    }
+    return;
+  }
+  // Backoff retry for reverse-proxy 502/503/504 or transient stream drops.
+  const delay = pluginRunBackoffMs;
+  pluginRunBackoffMs = Math.min(pluginRunBackoffMs * 2, MAX_BACKOFF_MS);
+  pluginRunRetryTimer = window.setTimeout(() => {
+    pluginRunRetryTimer = null;
+    if (
+      gen === authGeneration &&
+      state.authenticated &&
+      state.pluginRun.id === id &&
+      state.pluginRun.phase === "running"
+    ) {
+      void consumePluginRunStream(id, gen);
+    }
+  }, delay);
+}
+
+async function attachPluginRun(summary) {
+  if (!state.authenticated || !summary || summary.id === null || summary.id === undefined) {
+    return;
+  }
+  const gen = authGeneration;
+  if (state.pluginRun.id === summary.id) {
+    if (
+      state.pluginRun.phase === "running" &&
+      !pluginRunStreamController &&
+      pluginRunRetryTimer === null
+    ) {
+      await consumePluginRunStream(summary.id, gen);
+    }
+    return;
+  }
+  stopPluginRunStream();
+  const provisions = typeof summary.provisions === "boolean" ? summary.provisions : null;
+  state.pluginRun = {
+    id: summary.id,
+    plugin: summary.plugin || "",
+    account: summary.account || state.snapshot?.account?.active || null,
+    session: provisions === false ? summary.session || "" : "",
+    provisions,
+    launched: provisions === false && Boolean(summary.session),
+    cleanupResult: null,
+    cleanupRuntime: null,
+    phase: "running",
+    cancelling: false,
+    provision: { events: [], latestAtMs: Date.now() },
+    status: null,
+    logLines: [],
+    logSkippedNotices: [],
+    historySkipped: false,
+    outcome: null,
+    endpoints: [],
+    error: null,
+  };
+  emit("plugin_run");
+  await consumePluginRunStream(summary.id, gen);
+}
+
+export async function loadPluginRuns() {
+  if (!state.authenticated) return [];
+  const gen = authGeneration;
+  try {
+    const runs = await apiRequest("/api/plugins/runs");
+    if (gen !== authGeneration || !state.authenticated || !Array.isArray(runs)) {
+      return [];
+    }
+    if (state.pluginRun.phase === "idle" && runs.length > 0) {
+      const latest = runs.find((item) => !item.finished) || runs[0];
+      if (latest) {
+        void attachPluginRun(latest);
+      }
+    } else if (state.pluginRun.id !== null && state.pluginRun.phase === "running") {
+      const matched = runs.find((item) => item.id === state.pluginRun.id);
+      if (matched) {
+        let changed = false;
+        if (
+          typeof matched.provisions === "boolean" &&
+          (state.pluginRun.provisions !== matched.provisions ||
+            (!matched.provisions && !state.pluginRun.launched && matched.session))
+        ) {
+          state.pluginRun.provisions = matched.provisions;
+          if (!matched.provisions && matched.session) {
+            state.pluginRun.launched = true;
+            state.pluginRun.session = matched.session;
+          } else if (matched.provisions && !state.pluginRun.launched) {
+            state.pluginRun.session = "";
+          }
+          changed = true;
+        }
+        if (matched.account && state.pluginRun.account !== matched.account) {
+          state.pluginRun.account = matched.account;
+          changed = true;
+        }
+        if (changed) {
+          emit("plugin_run");
+        }
+      }
+    }
+    return runs;
+  } catch {
+    return [];
+  }
+}
+
+export async function startPluginRun({ spec, existing = null, accountContext = null }) {
+  const gen = authGeneration;
+  const ctx = accountContext || getAccountContext();
+  const accepted = await apiRequest("/api/plugins/runs", {
+    method: "POST",
+    body: {
+      account_context: ctx,
+      spec,
+      existing,
+    },
+  });
+  if (gen !== authGeneration || !state.authenticated) return null;
+  const id = accepted?.id;
+  if (id === null || id === undefined) {
+    return null;
+  }
+  if (state.pluginRun.id === id) {
+    if (
+      state.pluginRun.phase === "running" &&
+      !pluginRunStreamController &&
+      pluginRunRetryTimer === null
+    ) {
+      void consumePluginRunStream(id, gen);
+    }
+    return id;
+  }
+  stopPluginRunStream();
+  const provisions = spec?.target?.kind === "provision";
+  state.pluginRun = {
+    id,
+    plugin: spec?.plugin || "",
+    account: ctx?.active || null,
+    session: provisions ? "" : spec?.target?.name || "",
+    provisions,
+    launched: !provisions,
+    cleanupResult: null,
+    cleanupRuntime: null,
+    phase: "running",
+    cancelling: false,
+    provision: { events: [], latestAtMs: Date.now() },
+    status: null,
+    logLines: [],
+    logSkippedNotices: [],
+    historySkipped: false,
+    outcome: null,
+    endpoints: [],
+    error: null,
+  };
+  emit("plugin_run");
+  void consumePluginRunStream(id, gen);
+  return id;
+}
+
+export async function cancelPluginRun() {
+  const id = state.pluginRun.id;
+  if (
+    id === null ||
+    id === undefined ||
+    state.pluginRun.phase !== "running" ||
+    state.pluginRun.cancelling
+  ) {
+    return;
+  }
+  state.pluginRun.cancelling = true;
+  emit("plugin_run");
+  try {
+    await apiRequest(`/api/plugins/runs/${encodeURIComponent(id)}/cancel`, {
+      method: "POST",
+      body: {},
+    });
+  } catch {
+    if (state.pluginRun.id === id && state.pluginRun.phase === "running") {
+      state.pluginRun.cancelling = false;
+      emit("plugin_run");
+    }
   }
 }
 
@@ -1133,6 +1888,16 @@ export async function stopRuntime(target, { label, email } = {}) {
     tone: "success",
     message: t("app.b2.stop_done", { name: label || target?.name || target?.endpoint || "" }),
   });
+  if (
+    state.pluginRun.cleanupResult === "still_billing" &&
+    state.pluginRun.cleanupRuntime?.id?.name === target?.name &&
+    (!state.pluginRun.cleanupRuntime?.id?.account ||
+      state.pluginRun.cleanupRuntime.id.account === target?.account)
+  ) {
+    state.pluginRun.cleanupResult = "stopped";
+    state.pluginRun.cleanupRuntime = null;
+    emit("plugin_run");
+  }
   void Promise.allSettled([
     loadSessions({ silent: true }),
     loadForwards(),

@@ -177,6 +177,23 @@ const SHAPES = {
   dot: [
     ["circle", { cx: "12", cy: "12", r: "2", fill: "currentColor" }],
   ],
+  arrowLeft: [
+    ["path", { d: "m12 19-7-7 7-7" }],
+    ["path", { d: "M19 12H5" }],
+  ],
+  search: [
+    ["circle", { cx: "11", cy: "11", r: "8" }],
+    ["path", { d: "m21 21-4.3-4.3" }],
+  ],
+  rotateCcw: [
+    ["path", { d: "M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" }],
+    ["path", { d: "M3 3v5h5" }],
+  ],
+  key: [
+    ["circle", { cx: "7.5", cy: "15.5", r: "5.5" }],
+    ["path", { d: "m21 2-9.6 9.6" }],
+    ["path", { d: "m15.5 7.5 3 3L22 7l-3-3" }],
+  ],
 };
 
 export function icon(name, className = "") {

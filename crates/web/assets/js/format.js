@@ -66,6 +66,33 @@ export function formatNumber(value, decimals = 2) {
   return fixed.replace(/\.0+$/, "").replace(/(\.\d*?[1-9])0+$/, "$1");
 }
 
+export function formatInt(value) {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return "—";
+  }
+  const locale = document.documentElement?.lang || "en-US";
+  try {
+    return new Intl.NumberFormat(locale, { maximumFractionDigits: 0 }).format(Math.round(value));
+  } catch {
+    return String(Math.round(value));
+  }
+}
+
+export function formatBytes(bytes) {
+  if (typeof bytes !== "number" || !Number.isFinite(bytes) || bytes < 0) {
+    return "—";
+  }
+  const mib = bytes / (1024 * 1024);
+  if (mib >= 1024) {
+    return t("app.b2.fmt_gb", { n: formatNumber(mib / 1024, 1) });
+  }
+  if (mib >= 1) {
+    return t("app.b2.fmt_mb", { n: formatNumber(mib, 1) });
+  }
+  const kib = Math.max(0.1, bytes / 1024);
+  return t("app.b2.fmt_kb", { n: formatNumber(kib, 1) });
+}
+
 export function formatApprox(value) {
   return t("app.fmt.approx", { value });
 }
