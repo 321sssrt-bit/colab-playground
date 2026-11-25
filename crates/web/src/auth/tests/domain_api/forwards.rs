@@ -374,3 +374,48 @@ async fn login_closes_forwards_while_guard_polling_is_paused() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn overview_reports_forward_policy_for_loopback_wide_and_wsl_hosts() {
+    if Host::Local.supports_all_interfaces_forward() {
+        let local_loopback = ForwardPolicy::new(Ipv4Addr::LOCALHOST.into(), &Host::Local);
+        exercise_forwards(Some(local_loopback), |client, _| {
+            let overview = client.get("/api/overview");
+            assert_eq!(
+                overview["forward_policy"],
+                json!({
+                    "all_interfaces_allowed": false,
+                    "restriction": "loopback_listener",
+                })
+            );
+        })
+        .await;
+
+        let local_wide = ForwardPolicy::new(Ipv4Addr::UNSPECIFIED.into(), &Host::Local);
+        exercise_forwards(Some(local_wide), |client, _| {
+            let overview = client.get("/api/overview");
+            assert_eq!(
+                overview["forward_policy"],
+                json!({
+                    "all_interfaces_allowed": true,
+                    "restriction": Value::Null,
+                })
+            );
+        })
+        .await;
+    }
+
+    let wsl_host = Host::Wsl { distro: None };
+    let wsl_wide = ForwardPolicy::new(Ipv4Addr::UNSPECIFIED.into(), &wsl_host);
+    exercise_forwards(Some(wsl_wide), |client, _| {
+        let overview = client.get("/api/overview");
+        assert_eq!(
+            overview["forward_policy"],
+            json!({
+                "all_interfaces_allowed": false,
+                "restriction": "windows_or_wsl",
+            })
+        );
+    })
+    .await;
+}

@@ -1724,15 +1724,26 @@ function parsePort(text) {
   return num;
 }
 
+function resolveForwardPolicy() {
+  const policy = state.overview?.forward_policy || null;
+  if (policy && typeof policy.all_interfaces_allowed === "boolean") {
+    return {
+      allInterfacesAllowed: policy.all_interfaces_allowed,
+      restriction: policy.restriction || null,
+    };
+  }
+  if (state.overview?.host?.kind === "wsl") {
+    return { allInterfacesAllowed: false, restriction: "windows_or_wsl" };
+  }
+  if (isLoopbackHostname(window.location.hostname)) {
+    return { allInterfacesAllowed: false, restriction: "loopback_listener" };
+  }
+  return { allInterfacesAllowed: true, restriction: null };
+}
+
 function renderForwardDialog(dialog, model) {
   dialog.dataset.dialogKind = "forward";
   dialog.dataset.dialogPhase = model.submitting ? "submitting" : "editing";
-
-  const isWsl = state.overview?.host?.kind === "wsl";
-  if (isWsl && model.bind === "all_interfaces") {
-    model.bind = "loopback";
-  }
-  const onLoopbackHost = isLoopbackHostname(window.location.hostname);
 
   const errorNodes = [];
   if (model.error) {
@@ -1814,22 +1825,67 @@ function renderForwardDialog(dialog, model) {
     },
   });
 
-  const allInterfacesDisabled = isWsl || onLoopbackHost;
-  if (allInterfacesDisabled && model.bind === "all_interfaces") {
-    model.bind = "loopback";
-  }
-
   const bindNoticeHost = el("div", { className: "forward-bind-notices" });
-  const renderBindNotices = () => {
+  const loopbackRadio = el("input", {
+    type: "radio",
+    name: "forward-bind",
+    value: "loopback",
+    checked: model.bind === "loopback",
+    disabled: model.submitting,
+    onChange: () => {
+      model.bind = "loopback";
+      syncBindPolicy();
+    },
+  });
+  const allInterfacesRadio = el("input", {
+    type: "radio",
+    name: "forward-bind",
+    value: "all_interfaces",
+    checked: model.bind === "all_interfaces",
+    disabled: model.submitting,
+    onChange: () => {
+      model.bind = "all_interfaces";
+      syncBindPolicy();
+    },
+  });
+  const allInterfacesLabel = el(
+    "label",
+    {
+      className: "forward-bind-option",
+      dataset: { bindOption: "all_interfaces" },
+    },
+    allInterfacesRadio,
+    el("span", null, t("web.forward.bind_all"))
+  );
+
+  const syncBindPolicy = () => {
+    const { allInterfacesAllowed, restriction } = resolveForwardPolicy();
+    const allInterfacesDisabled = !allInterfacesAllowed;
+    if (allInterfacesDisabled && model.bind === "all_interfaces") {
+      model.bind = "loopback";
+    }
+    loopbackRadio.checked = model.bind === "loopback";
+    loopbackRadio.disabled = model.submitting;
+    allInterfacesRadio.checked = model.bind === "all_interfaces";
+    allInterfacesRadio.disabled = model.submitting || allInterfacesDisabled;
+    allInterfacesLabel.className = allInterfacesDisabled
+      ? "forward-bind-option forward-bind-option-disabled"
+      : "forward-bind-option";
+    const restrictionText =
+      restriction === "windows_or_wsl"
+        ? t("web.forward.bind_windows_or_wsl")
+        : restriction === "loopback_listener"
+          ? t("web.forward.bind_loopback_listener")
+          : null;
+    if (restrictionText) {
+      allInterfacesLabel.title = restrictionText;
+    } else {
+      allInterfacesLabel.removeAttribute("title");
+    }
+
     clear(bindNoticeHost);
-    if (isWsl) {
-      bindNoticeHost.appendChild(
-        inlineMessage({ tone: "info", text: t("web.forward.bind_windows_or_wsl") })
-      );
-    } else if (onLoopbackHost) {
-      bindNoticeHost.appendChild(
-        inlineMessage({ tone: "info", text: t("web.forward.bind_loopback_listener") })
-      );
+    if (restrictionText) {
+      bindNoticeHost.appendChild(inlineMessage({ tone: "info", text: restrictionText }));
     }
     if (model.bind === "all_interfaces") {
       bindNoticeHost.appendChild(
@@ -1844,7 +1900,8 @@ function renderForwardDialog(dialog, model) {
       );
     }
   };
-  renderBindNotices();
+  model.syncBindPolicy = syncBindPolicy;
+  syncBindPolicy();
 
   const bindFieldset = el(
     "fieldset",
@@ -1856,45 +1913,10 @@ function renderForwardDialog(dialog, model) {
       el(
         "label",
         { className: "forward-bind-option", dataset: { bindOption: "loopback" } },
-        el("input", {
-          type: "radio",
-          name: "forward-bind",
-          value: "loopback",
-          checked: model.bind === "loopback",
-          disabled: model.submitting,
-          onChange: () => {
-            model.bind = "loopback";
-            renderBindNotices();
-          },
-        }),
+        loopbackRadio,
         el("span", null, t("web.forward.bind_loopback"))
       ),
-      el(
-        "label",
-        {
-          className: allInterfacesDisabled
-            ? "forward-bind-option forward-bind-option-disabled"
-            : "forward-bind-option",
-          dataset: { bindOption: "all_interfaces" },
-          title: isWsl
-            ? t("web.forward.bind_windows_or_wsl")
-            : onLoopbackHost
-              ? t("web.forward.bind_loopback_listener")
-              : null,
-        },
-        el("input", {
-          type: "radio",
-          name: "forward-bind",
-          value: "all_interfaces",
-          checked: model.bind === "all_interfaces",
-          disabled: model.submitting || allInterfacesDisabled,
-          onChange: () => {
-            model.bind = "all_interfaces";
-            renderBindNotices();
-          },
-        }),
-        el("span", null, t("web.forward.bind_all"))
-      )
+      allInterfacesLabel
     ),
     bindNoticeHost
   );
@@ -2197,6 +2219,8 @@ export function initSessionDialogs({ navigate } = {}) {
     if (activeDialog.kind === "forward") {
       if (reason === "forwards" || reason === "snapshot") {
         renderForwardExistingSection(activeDialog);
+      } else if (reason === "overview" && activeDialog.syncBindPolicy) {
+        activeDialog.syncBindPolicy();
       }
       return;
     }

@@ -236,6 +236,10 @@ impl WebState {
         self.0.snapshots.subscribe()
     }
 
+    pub fn forward_policy(&self) -> ForwardPolicy {
+        self.0.forward_policy
+    }
+
     pub async fn run_backend<T: Send + 'static>(
         &self,
         work: impl FnOnce(&dyn Backend, &CancelToken) -> Result<T> + Send + 'static,

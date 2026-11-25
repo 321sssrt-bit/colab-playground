@@ -319,11 +319,14 @@ function applySnapshot(next) {
   }
   const prev = state.snapshot;
   state.snapshot = next;
-  if (
-    next.runtimes &&
+  // Clear a manual refresh error only when snapshot runtimes actually changed or recovered from an error.
+  const runtimesUpdated =
+    Boolean(next.runtimes) &&
     !next.runtimes_error &&
-    (!prev || typeof next.version !== "number" || next.version > prev.version)
-  ) {
+    (!prev ||
+      Boolean(prev.runtimes_error) ||
+      JSON.stringify(prev.runtimes ?? null) !== JSON.stringify(next.runtimes));
+  if (runtimesUpdated) {
     state.sessionsError = null;
   }
   observeGuardReport(prev, next);
@@ -961,7 +964,10 @@ async function consumeProvisionStream(id, gen) {
   if (result.outcome === "aborted" || result.outcome === "unauthorized") {
     return;
   }
-  if (result.outcome === "http_error") {
+  const isTransientHttp =
+    result.outcome === "http_error" &&
+    (result.status === 502 || result.status === 503 || result.status === 504);
+  if (result.outcome === "http_error" && !isTransientHttp) {
     state.provision.phase = "failed";
     state.provision.cancelling = false;
     state.provision.error = result.payload || { error: {} };

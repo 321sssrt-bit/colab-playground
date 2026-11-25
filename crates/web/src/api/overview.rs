@@ -30,6 +30,7 @@ const INSTALL_CLI: &str = "install_cli";
 pub(super) struct Overview {
     environment: ProbeReport,
     host: HostCheck,
+    forward_policy: ForwardPolicyView,
     cli_installed: bool,
     helper_available: bool,
     keyring: KeyringCheck,
@@ -38,6 +39,12 @@ pub(super) struct Overview {
     usage: Vec<AccountUsageView>,
     unmanaged_runtimes: UnmanagedRuntimes,
     install_methods: Vec<InstallMethod>,
+}
+
+#[derive(Serialize)]
+struct ForwardPolicyView {
+    all_interfaces_allowed: bool,
+    restriction: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -164,9 +171,15 @@ pub(super) async fn get(State(state): State<StateData>) -> Result<Json<Overview>
     if environment.python3.is_some() {
         install_methods.push(InstallMethod::PipUser);
     }
+    let policy = state.web.forward_policy();
+    let forward_policy = ForwardPolicyView {
+        all_interfaces_allowed: policy.all_interfaces_allowed(),
+        restriction: policy.all_interfaces_restriction(),
+    };
     Ok(Json(Overview {
         environment,
         host,
+        forward_policy,
         cli_installed,
         helper_available,
         keyring,
