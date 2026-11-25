@@ -1,7 +1,7 @@
 /**
  * Plugins management page: installed plugin list (built-in and user plugins),
- * enable/disable switches, empty state, and native `<dialog>` install preview
- * and removal confirmation flows.
+ * enable/disable switches, empty state, and native `<dialog>` flows for
+ * Hugging Face token management, install preview, and plugin removal.
  */
 
 import { useCallback, useEffect, useId, useRef, useState } from "react";
@@ -16,10 +16,17 @@ import {
   resolveLocalizedText,
   setPluginEnabled,
 } from "./plugins/api.ts";
+import { HfTokenDialog } from "./plugins/HfTokenDialog.tsx";
 import { InstallPluginDialog } from "./plugins/InstallPluginDialog.tsx";
 import { RemovePluginDialog, type RemovePluginTarget } from "./plugins/RemovePluginDialog.tsx";
 import type { PluginInfo } from "./plugins/types.ts";
 import type { PageProps } from "./types.ts";
+
+function isHfTokenBusyInSnapshot(operations: readonly PendingOperation[]): boolean {
+  return operations.some(
+    ({ operation }) => operation.kind === "domain" && operation.name === "hf_token",
+  );
+}
 
 function isPluginBusyInSnapshot(id: string, operations: readonly PendingOperation[]): boolean {
   return operations.some(({ operation }) => {
@@ -46,6 +53,7 @@ export function PluginsPage({ snapshot, locale, t, pushToast }: PageProps) {
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [togglingIds, setTogglingIds] = useState<ReadonlySet<string>>(() => new Set());
+  const [tokenDialogOpen, setTokenDialogOpen] = useState(false);
   const [installOpen, setInstallOpen] = useState(false);
   const [removeTarget, setRemoveTarget] = useState<RemovePluginTarget | null>(null);
 
@@ -174,6 +182,14 @@ export function PluginsPage({ snapshot, locale, t, pushToast }: PageProps) {
           <p className="page-subtitle">{t("app.plugins.subtitle")}</p>
         </div>
         <div className="page-header-actions">
+          <button
+            type="button"
+            className="btn"
+            disabled={shuttingDown}
+            onClick={() => setTokenDialogOpen(true)}
+          >
+            {t("app.b2.hf_token_title")}
+          </button>
           <button
             type="button"
             className="btn btn-primary"
@@ -328,6 +344,13 @@ export function PluginsPage({ snapshot, locale, t, pushToast }: PageProps) {
           </>
         )}
       </div>
+
+      <HfTokenDialog
+        open={tokenDialogOpen}
+        t={t}
+        disabled={shuttingDown || isHfTokenBusyInSnapshot(operations)}
+        onClose={() => setTokenDialogOpen(false)}
+      />
 
       <InstallPluginDialog
         open={installOpen}

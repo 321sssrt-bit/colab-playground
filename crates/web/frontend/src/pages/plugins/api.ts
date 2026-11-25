@@ -6,6 +6,7 @@ import { apiClient, ApiError, type ApiClient } from "../../lib/api.ts";
 import type { TranslateFn } from "../../lib/i18n.ts";
 import type { Locale } from "../../lib/types.ts";
 import type {
+  HfTokenStatus,
   LocalizedText,
   PluginInfo,
   PluginOrigin,
@@ -182,6 +183,39 @@ export async function removePlugin(
   client: ApiClient = apiClient,
 ): Promise<void> {
   await client.request<void>(`/api/plugins/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+    body: {},
+    signal,
+  });
+}
+
+export async function getHfTokenStatus(
+  signal?: AbortSignal,
+  client: ApiClient = apiClient,
+): Promise<HfTokenStatus> {
+  return client.request<HfTokenStatus>("/api/plugins/hf/token", {
+    method: "GET",
+    signal,
+  });
+}
+
+export async function saveHfToken(
+  token: string,
+  signal?: AbortSignal,
+  client: ApiClient = apiClient,
+): Promise<HfTokenStatus> {
+  return client.request<HfTokenStatus>("/api/plugins/hf/token", {
+    method: "PUT",
+    body: { token },
+    signal,
+  });
+}
+
+export async function deleteHfToken(
+  signal?: AbortSignal,
+  client: ApiClient = apiClient,
+): Promise<HfTokenStatus> {
+  return client.request<HfTokenStatus>("/api/plugins/hf/token", {
     method: "DELETE",
     body: {},
     signal,
