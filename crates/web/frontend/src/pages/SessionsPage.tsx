@@ -136,7 +136,7 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
     }
     observeSnapshotTransitions(prevSnapshotRef.current, snapshot, locale, t, pushToast);
     prevSnapshotRef.current = snapshot;
-  }, [snapshot, locale, t, pushToast]);
+  }, [snapshot, localState.reconcileSeq, locale, t, pushToast]);
 
   const accounts = snapshot?.accounts?.accounts ?? null;
   const cliReady =

@@ -7,12 +7,12 @@
 import { useEffect, useId, useRef, useState, type SyntheticEvent } from "react";
 
 import { AlertIcon } from "../../components/Icons.tsx";
-import { ApiError } from "../../lib/api.ts";
+import { apiClient, ApiError } from "../../lib/api.ts";
 import type { TranslateFn } from "../../lib/i18n.ts";
 import { webStore } from "../../lib/store.ts";
 import type { ToastInput } from "../../lib/toast.ts";
 import type { Runtime, RuntimeRef } from "../../lib/types.ts";
-import { stopRuntime } from "./api.ts";
+import { fetchSessions, stopRuntime } from "./api.ts";
 import {
   formatEmail,
   formatErrorMessage,
@@ -105,6 +105,7 @@ export function StopRuntimeDialog({
     }
 
     const requestId = request.id;
+    const sessionGeneration = apiClient.getSessionGeneration();
     const stopTarget: StopRuntimeTarget = {
       target: request.target,
       label: request.label,
@@ -116,6 +117,9 @@ export function StopRuntimeDialog({
 
     try {
       await stopRuntime(stopTarget.target);
+      if (apiClient.getSessionGeneration() !== sessionGeneration) {
+        return;
+      }
       recordEndedRuntime({
         runtime: stopTarget.target,
         label: stopTarget.label,
@@ -139,8 +143,15 @@ export function StopRuntimeDialog({
         onClose();
         return;
       }
+      if (apiClient.getSessionGeneration() !== sessionGeneration) {
+        return;
+      }
       if (error instanceof ApiError && error.kind === "session_gone") {
-        void webStore.refreshSnapshot().catch(() => {});
+        // `stop_runtime` returns `session_gone` before updating the backend snapshot, so re-list
+        // runtimes to clear the stale card and let snapshot transitions record it honestly.
+        void fetchSessions()
+          .then(() => webStore.refreshSnapshot())
+          .catch(() => {});
       }
       if (activeRequestIdRef.current !== requestId) {
         return;

@@ -8,11 +8,12 @@
 import { useEffect, useId, useRef, useState, type SyntheticEvent } from "react";
 
 import { AlertIcon } from "../../components/Icons.tsx";
-import { ApiError } from "../../lib/api.ts";
+import { apiClient, ApiError } from "../../lib/api.ts";
 import type { TranslateFn } from "../../lib/i18n.ts";
+import { webStore } from "../../lib/store.ts";
 import type { ToastInput } from "../../lib/toast.ts";
 import type { Account, Runtime, RuntimeRef, Snapshot } from "../../lib/types.ts";
-import { stopAllRuntimes, type StopAllResponse } from "./api.ts";
+import { fetchSessions, stopAllRuntimes, type StopAllResponse } from "./api.ts";
 import {
   formatEmail,
   formatErrorMessage,
@@ -44,6 +45,7 @@ export function StopAllDialog({
 }: StopAllDialogProps) {
   const titleId = useId();
   const dialogRef = useRef<HTMLDialogElement | null>(null);
+  const cancelButtonRef = useRef<HTMLButtonElement | null>(null);
   const closeButtonRef = useRef<HTMLButtonElement | null>(null);
   const activeOpenIdRef = useRef<number>(0);
 
@@ -76,10 +78,15 @@ export function StopAllDialog({
     }
   }, [openId]);
 
-  // Restore focus inside the open modal when submitting controls swap out for the result summary.
+  // Keep focus inside the open modal when actions swap between confirm and result phases.
   useEffect(() => {
-    if (openId !== null && phase === "result") {
+    if (openId === null) {
+      return;
+    }
+    if (phase === "result") {
       closeButtonRef.current?.focus();
+    } else if (phase === "confirm") {
+      cancelButtonRef.current?.focus();
     }
   }, [openId, phase]);
 
@@ -141,6 +148,7 @@ export function StopAllDialog({
     }
 
     const requestOpenId = openId;
+    const sessionGeneration = apiClient.getSessionGeneration();
     const preStopRuntimes = liveRuntimes;
     const preStopAccounts = liveAccounts;
     setCapturedRuntimes(preStopRuntimes);
@@ -152,6 +160,9 @@ export function StopAllDialog({
     const releasePending = beginStopAll();
     try {
       const report = await stopAllRuntimes();
+      if (apiClient.getSessionGeneration() !== sessionGeneration) {
+        return;
+      }
       const remainingKeys = new Set(report.remaining.map((item) => runtimeKey(item.target)));
       const erroredAccounts = new Set(report.account_errors.map((item) => item.account));
       for (const rt of preStopRuntimes) {
@@ -183,6 +194,14 @@ export function StopAllDialog({
         onClose();
         return;
       }
+      if (apiClient.getSessionGeneration() !== sessionGeneration) {
+        return;
+      }
+      // Refresh runtimes in the background so any runtimes stopped before a verification-listing
+      // failure still reconcile into the live list and Recently ended once listing succeeds.
+      void fetchSessions()
+        .then(() => webStore.refreshSnapshot())
+        .catch(() => {});
       if (activeOpenIdRef.current !== requestOpenId) {
         return;
       }
@@ -383,20 +402,22 @@ export function StopAllDialog({
                 {!result?.verified && (
                   <button
                     type="button"
-                    className="btn btn-danger"
-                    data-stop-all-confirm="true"
+                    className="btn"
+                    data-stop-all-retry="true"
                     onClick={() => {
-                      void handleConfirm();
+                      setResult(null);
+                      setSubmitError(null);
+                      setPhase("confirm");
                     }}
                   >
-                    <SquareIcon />
-                    <span>{t("web.sessions.stop_all_action")}</span>
+                    {t("app.action.retry")}
                   </button>
                 )}
               </>
             ) : (
               <>
                 <button
+                  ref={cancelButtonRef}
                   type="button"
                   className="btn btn-ghost"
                   disabled={submitting}
