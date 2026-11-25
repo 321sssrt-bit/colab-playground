@@ -6,8 +6,14 @@
  * `crates/web/src/api/plugins.rs`, and `crates/web/src/state/plugins.rs`.
  */
 
-import type { AccountId, ApiErrorPayload } from "../../lib/types.ts";
-import type { ForwardView, ProvisionProgressEvent } from "../sessions/api.ts";
+import type {
+  Accelerator,
+  AccountContext,
+  AccountId,
+  ApiErrorPayload,
+  RuntimeRef,
+} from "../../lib/types.ts";
+import type { ForwardView, ProvisionProgressEvent, ProvisionSpec } from "../sessions/api.ts";
 
 export type LocalizedText = Readonly<Record<string, string>>;
 
@@ -19,12 +25,18 @@ export type PluginOrigin =
 
 export type PluginInputKind = "text" | "number" | "bool" | "select" | "secret" | "hf-model";
 
+export type PluginInputValue = boolean | number | string;
+
 export interface PluginInputSpec {
   readonly id: string;
   readonly type: PluginInputKind;
   readonly required: boolean;
   readonly label: LocalizedText;
   readonly help: LocalizedText;
+  readonly default?: PluginInputValue | null;
+  readonly options?: readonly string[];
+  readonly min?: number | null;
+  readonly max?: number | null;
 }
 
 export interface PluginStageSpec {
@@ -83,6 +95,89 @@ export interface PluginPreviewResponse {
 
 export interface HfTokenStatus {
   readonly saved: boolean;
+}
+
+export type PluginRunTarget =
+  | { readonly kind: "existing"; readonly name: string }
+  | ({ readonly kind: "provision" } & ProvisionSpec);
+
+export interface PluginRunTemplateSpec {
+  readonly plugin: string;
+  readonly inputs: Readonly<Record<string, PluginInputValue>>;
+  readonly target: PluginRunTarget;
+  readonly stop_on_failure: boolean;
+}
+
+export interface StartPluginRunRequest {
+  readonly account_context: AccountContext;
+  readonly spec: PluginRunTemplateSpec;
+  readonly existing: RuntimeRef | null;
+}
+
+export interface AcceptedPluginRun {
+  readonly id: number;
+}
+
+export interface HfModel {
+  readonly id: string;
+  readonly downloads: number;
+  readonly likes: number;
+  readonly gated: boolean;
+}
+
+export type KvType = "f16" | "q8_0" | "q4_0";
+
+export interface GgufFile {
+  readonly path: string;
+  readonly size: number;
+}
+
+export interface GgufVariant {
+  readonly quant: string;
+  readonly files: readonly string[];
+  readonly size: number;
+}
+
+export interface GgufListing {
+  readonly variants: readonly GgufVariant[];
+  readonly mmproj: readonly GgufFile[];
+}
+
+export interface GgufFitOptions {
+  readonly vram_mib?: number | null;
+  readonly ctx?: number;
+  readonly model_ctx?: number | null;
+  readonly kv_bytes_per_token?: number | null;
+  readonly mmproj_bytes?: number;
+  readonly kv?: KvType | null;
+}
+
+export interface GgufEstimateRequest {
+  readonly repo: string;
+  readonly accelerator?: Accelerator | null;
+  readonly fit?: GgufFitOptions;
+  readonly quant?: string | null;
+}
+
+export interface GgufFitChoice {
+  readonly quant: string;
+  readonly kv: KvType;
+  readonly ctx: number;
+  readonly estimate_mib: number;
+  readonly budget_mib: number;
+  readonly ctx_reduced: boolean;
+  readonly kv_reduced: boolean;
+}
+
+export interface GgufFitEntry {
+  readonly vram_mib: number;
+  readonly fit: GgufFitChoice | null;
+  readonly fit_error: ApiErrorPayload | null;
+}
+
+export interface GgufEstimateResponse {
+  readonly listing: GgufListing;
+  readonly fits: readonly GgufFitEntry[];
 }
 
 export interface PluginRunMetadata {

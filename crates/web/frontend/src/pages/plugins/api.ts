@@ -6,12 +6,18 @@ import { apiClient, ApiError, type ApiClient, type EventStreamOptions } from "..
 import type { TranslateFn } from "../../lib/i18n.ts";
 import type { Locale } from "../../lib/types.ts";
 import type {
+  AcceptedPluginRun,
+  GgufEstimateRequest,
+  GgufEstimateResponse,
+  HfModel,
   HfTokenStatus,
   LocalizedText,
   PluginInfo,
   PluginOrigin,
   PluginPreviewResponse,
   PluginRunSummary,
+  PluginRunTemplateSpec,
+  StartPluginRunRequest,
 } from "./types.ts";
 
 const BYTES_PER_KIB = 1024;
@@ -21,6 +27,28 @@ const MIN_DISPLAY_KIB = 0.1;
 const SIZE_FRACTION_DIGITS = 1;
 
 const SCP_GIT_URL_RE = /^[A-Za-z0-9._-]+@[A-Za-z0-9.:[\]@_-]+:[^-]/;
+// Mirrors `crates/core/src/plugins.rs::is_repo_id`.
+const HF_REPO_SEGMENT_RE = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,95}$/;
+
+export function isValidHfRepoId(raw: string): boolean {
+  const trimmed = raw.trim();
+  const slash = trimmed.indexOf("/");
+  if (slash <= 0 || trimmed.indexOf("/", slash + 1) !== -1) {
+    return false;
+  }
+  const owner = trimmed.slice(0, slash);
+  const name = trimmed.slice(slash + 1);
+  return HF_REPO_SEGMENT_RE.test(owner) && HF_REPO_SEGMENT_RE.test(name);
+}
+
+export function formatInteger(value: number, locale: Locale): string {
+  const safe = Number.isFinite(value) ? Math.max(0, Math.round(value)) : 0;
+  try {
+    return new Intl.NumberFormat(locale, { maximumFractionDigits: 0 }).format(safe);
+  } catch {
+    return String(safe);
+  }
+}
 
 /**
  * Classifies a user-entered plugin source as a Git URL or a server directory path,
@@ -219,6 +247,53 @@ export async function deleteHfToken(
   return client.request<HfTokenStatus>("/api/plugins/hf/token", {
     method: "DELETE",
     body: {},
+    signal,
+  });
+}
+
+export async function fetchPluginRunTemplate(
+  id: string,
+  signal?: AbortSignal,
+  client: ApiClient = apiClient,
+): Promise<PluginRunTemplateSpec> {
+  return client.request<PluginRunTemplateSpec>(`/api/plugins/${encodeURIComponent(id)}/template`, {
+    method: "GET",
+    signal,
+  });
+}
+
+export async function searchHfModels(
+  query: string,
+  signal?: AbortSignal,
+  client: ApiClient = apiClient,
+): Promise<HfModel[]> {
+  return client.request<HfModel[]>("/api/plugins/hf/search", {
+    method: "POST",
+    body: { query },
+    signal,
+  });
+}
+
+export async function fetchHfGgufEstimate(
+  request: GgufEstimateRequest,
+  signal?: AbortSignal,
+  client: ApiClient = apiClient,
+): Promise<GgufEstimateResponse> {
+  return client.request<GgufEstimateResponse>("/api/plugins/hf/gguf", {
+    method: "POST",
+    body: request,
+    signal,
+  });
+}
+
+export async function startPluginRun(
+  request: StartPluginRunRequest,
+  signal?: AbortSignal,
+  client: ApiClient = apiClient,
+): Promise<AcceptedPluginRun> {
+  return client.request<AcceptedPluginRun>("/api/plugins/runs", {
+    method: "POST",
+    body: request,
     signal,
   });
 }
