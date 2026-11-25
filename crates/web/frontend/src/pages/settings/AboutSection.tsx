@@ -139,7 +139,13 @@ export const AboutSection = memo(function AboutSection({
             <span className="settings-row-title">{t("app.settings.version.title")}</span>
           </div>
           <div className="settings-row-control">
-            <span className="mono">{updateNotice?.current_version ?? "—"}</span>
+            <span className="mono">
+              {updateNotice !== null
+                ? updateNotice.current_version
+                : updateError !== null
+                  ? t("app.summary.unknown")
+                  : "—"}
+            </span>
           </div>
         </div>
 

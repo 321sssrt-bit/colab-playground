@@ -1,7 +1,12 @@
 /**
- * Pure draft model, validation, and dirty-state comparison for the isolated
- * Defaults form. Keeps raw text while editing so incomplete numeric input is
- * never overwritten mid-keystroke.
+ * Pure draft model, per-field diffing, validation, and partial-patch builder
+ * for the isolated Defaults form.
+ *
+ * Only fields edited by the user (or explicitly reset to core defaults) are
+ * validated and included in the PATCH payload, so untouched backend values
+ * (such as sub-minute durations, non-GiB-aligned VRAM thresholds, or
+ * backend-accepted values outside UI input bounds) are never silently
+ * rewritten or falsely flagged as unsaved.
  */
 
 import {
@@ -31,6 +36,7 @@ import {
   type RuntimeDefaults,
 } from "../../lib/constants.ts";
 import type { Accelerator } from "../../lib/types.ts";
+import type { RuntimeDefaultsPatch } from "./api.ts";
 
 export interface DurationDraft {
   readonly hours: string;
@@ -60,6 +66,8 @@ export interface DefaultsDraft {
   readonly usage_poll_idle: DurationDraft;
 }
 
+export type DefaultsFieldKey = keyof RuntimeDefaults;
+
 export type DefaultsFieldId =
   | "max_runtime"
   | "max_spend_cu"
@@ -73,11 +81,28 @@ export type DefaultsFieldId =
   | "usage_poll_active"
   | "usage_poll_idle";
 
-export type ParseDraftResult =
-  | { readonly ok: true; readonly value: RuntimeDefaults }
+export type BuildPatchResult =
+  | { readonly ok: true; readonly patch: RuntimeDefaultsPatch; readonly hasChanges: boolean }
   | { readonly ok: false; readonly invalidFields: ReadonlySet<DefaultsFieldId> };
 
 const INTEGER_RE = /^\d+$/;
+
+const ALL_DEFAULT_FIELDS: readonly DefaultsFieldKey[] = [
+  "max_runtime",
+  "max_spend_cu",
+  "min_balance_cu",
+  "idle_timeout",
+  "max_concurrent_sessions",
+  "max_attempts",
+  "retry_delay",
+  "on_exhausted",
+  "usage_poll_active",
+  "usage_poll_idle",
+  "accelerator",
+  "high_mem",
+  "min_vram_mib",
+  "winddown_grace",
+];
 
 function secsToDurationDraft(totalSecs: number, withSeconds: boolean): DurationDraft {
   const safe = Math.max(0, Math.round(totalSecs));
@@ -93,6 +118,14 @@ function secsToDurationDraft(totalSecs: number, withSeconds: boolean): DurationD
     minutes: String(minutes),
     seconds: String(seconds),
   };
+}
+
+function durationDraftEqual(a: DurationDraft, b: DurationDraft, withSeconds: boolean): boolean {
+  return (
+    a.hours.trim() === b.hours.trim() &&
+    a.minutes.trim() === b.minutes.trim() &&
+    (!withSeconds || a.seconds.trim() === b.seconds.trim())
+  );
 }
 
 export function defaultsToDraft(d: RuntimeDefaults): DefaultsDraft {
@@ -166,174 +199,264 @@ function parseDurationDraft(
   return total;
 }
 
-export function parseDefaultsDraft(draft: DefaultsDraft): ParseDraftResult {
+function isFieldDraftModified(
+  draft: DefaultsDraft,
+  initial: DefaultsDraft,
+  field: DefaultsFieldKey,
+): boolean {
+  switch (field) {
+    case "max_runtime":
+      return (
+        draft.max_runtime_enabled !== initial.max_runtime_enabled ||
+        (draft.max_runtime_enabled && !durationDraftEqual(draft.max_runtime, initial.max_runtime, false))
+      );
+    case "max_spend_cu":
+      return (
+        draft.max_spend_enabled !== initial.max_spend_enabled ||
+        (draft.max_spend_enabled && draft.max_spend_cu.trim() !== initial.max_spend_cu.trim())
+      );
+    case "min_balance_cu":
+      return (
+        draft.min_balance_enabled !== initial.min_balance_enabled ||
+        (draft.min_balance_enabled && draft.min_balance_cu.trim() !== initial.min_balance_cu.trim())
+      );
+    case "idle_timeout":
+      return (
+        draft.idle_timeout_enabled !== initial.idle_timeout_enabled ||
+        (draft.idle_timeout_enabled && !durationDraftEqual(draft.idle_timeout, initial.idle_timeout, false))
+      );
+    case "max_concurrent_sessions":
+      return draft.max_concurrent_sessions.trim() !== initial.max_concurrent_sessions.trim();
+    case "max_attempts":
+      return draft.max_attempts.trim() !== initial.max_attempts.trim();
+    case "retry_delay":
+      return !durationDraftEqual(draft.retry_delay, initial.retry_delay, true);
+    case "on_exhausted":
+      return draft.on_exhausted !== initial.on_exhausted;
+    case "usage_poll_active":
+      return !durationDraftEqual(draft.usage_poll_active, initial.usage_poll_active, true);
+    case "usage_poll_idle":
+      return !durationDraftEqual(draft.usage_poll_idle, initial.usage_poll_idle, true);
+    case "accelerator":
+      return draft.accelerator !== initial.accelerator;
+    case "high_mem":
+      return draft.high_mem !== initial.high_mem;
+    case "min_vram_mib":
+      return (
+        draft.min_vram_enabled !== initial.min_vram_enabled ||
+        (draft.min_vram_enabled && draft.min_vram_gib.trim() !== initial.min_vram_gib.trim())
+      );
+    case "winddown_grace":
+      return !durationDraftEqual(draft.winddown_grace, initial.winddown_grace, true);
+  }
+}
+
+export function diffFieldsFromCore(serverDefaults: RuntimeDefaults): ReadonlySet<DefaultsFieldKey> {
+  const diff = new Set<DefaultsFieldKey>();
+  for (const field of ALL_DEFAULT_FIELDS) {
+    if (serverDefaults[field] !== CORE_DEFAULTS[field]) {
+      diff.add(field);
+    }
+  }
+  return diff;
+}
+
+export function buildDefaultsPatch(
+  draft: DefaultsDraft,
+  serverDefaults: RuntimeDefaults,
+  forceInclude: ReadonlySet<DefaultsFieldKey> = new Set<DefaultsFieldKey>(),
+): BuildPatchResult {
+  const initial = defaultsToDraft(serverDefaults);
   const invalidFields = new Set<DefaultsFieldId>();
+  const patch: { -readonly [K in DefaultsFieldKey]?: RuntimeDefaults[K] } = {};
 
-  let maxRuntime: number | null = null;
-  if (draft.max_runtime_enabled) {
-    const parsed = parseDurationDraft(draft.max_runtime, {
-      withSeconds: false,
+  const shouldEvaluate = (field: DefaultsFieldKey): boolean =>
+    forceInclude.has(field) || isFieldDraftModified(draft, initial, field);
+
+  if (shouldEvaluate("max_runtime")) {
+    if (!draft.max_runtime_enabled) {
+      if (serverDefaults.max_runtime !== null) {
+        patch.max_runtime = null;
+      }
+    } else {
+      const parsed = parseDurationDraft(draft.max_runtime, {
+        withSeconds: false,
+        minSecs: MIN_DURATION_SECS,
+      });
+      if (parsed === null) {
+        invalidFields.add("max_runtime");
+      } else if (parsed !== serverDefaults.max_runtime) {
+        patch.max_runtime = parsed;
+      }
+    }
+  }
+
+  if (shouldEvaluate("max_spend_cu")) {
+    if (!draft.max_spend_enabled) {
+      if (serverDefaults.max_spend_cu !== null) {
+        patch.max_spend_cu = null;
+      }
+    } else {
+      const parsed = parseFloatInRange(draft.max_spend_cu, MIN_CU_FIELD, MAX_CU_FIELD);
+      if (parsed === null) {
+        invalidFields.add("max_spend_cu");
+      } else if (parsed !== serverDefaults.max_spend_cu) {
+        patch.max_spend_cu = parsed;
+      }
+    }
+  }
+
+  if (shouldEvaluate("min_balance_cu")) {
+    if (!draft.min_balance_enabled) {
+      if (serverDefaults.min_balance_cu !== null) {
+        patch.min_balance_cu = null;
+      }
+    } else {
+      const parsed = parseFloatInRange(draft.min_balance_cu, MIN_CU_FIELD, MAX_CU_FIELD);
+      if (parsed === null) {
+        invalidFields.add("min_balance_cu");
+      } else if (parsed !== serverDefaults.min_balance_cu) {
+        patch.min_balance_cu = parsed;
+      }
+    }
+  }
+
+  if (shouldEvaluate("idle_timeout")) {
+    if (!draft.idle_timeout_enabled) {
+      if (serverDefaults.idle_timeout !== null) {
+        patch.idle_timeout = null;
+      }
+    } else {
+      const parsed = parseDurationDraft(draft.idle_timeout, {
+        withSeconds: false,
+        minSecs: MIN_DURATION_SECS,
+      });
+      if (parsed === null) {
+        invalidFields.add("idle_timeout");
+      } else if (parsed !== serverDefaults.idle_timeout) {
+        patch.idle_timeout = parsed;
+      }
+    }
+  }
+
+  if (shouldEvaluate("max_concurrent_sessions")) {
+    const parsed = parseIntInRange(
+      draft.max_concurrent_sessions,
+      MIN_CONCURRENT_SESSIONS,
+      MAX_CONCURRENT_SESSIONS,
+    );
+    if (parsed === null) {
+      invalidFields.add("max_concurrent_sessions");
+    } else if (parsed !== serverDefaults.max_concurrent_sessions) {
+      patch.max_concurrent_sessions = parsed;
+    }
+  }
+
+  if (shouldEvaluate("max_attempts")) {
+    const parsed = parseIntInRange(draft.max_attempts, MIN_ATTEMPTS, MAX_ATTEMPTS_CAP);
+    if (parsed === null) {
+      invalidFields.add("max_attempts");
+    } else if (parsed !== serverDefaults.max_attempts) {
+      patch.max_attempts = parsed;
+    }
+  }
+
+  if (shouldEvaluate("retry_delay")) {
+    const parsed = parseDurationDraft(draft.retry_delay, {
+      withSeconds: true,
       minSecs: MIN_DURATION_SECS,
     });
     if (parsed === null) {
-      invalidFields.add("max_runtime");
-    } else {
-      maxRuntime = parsed;
+      invalidFields.add("retry_delay");
+    } else if (parsed !== serverDefaults.retry_delay) {
+      patch.retry_delay = parsed;
     }
   }
 
-  let maxSpend: number | null = null;
-  if (draft.max_spend_enabled) {
-    const parsed = parseFloatInRange(draft.max_spend_cu, MIN_CU_FIELD, MAX_CU_FIELD);
+  if (shouldEvaluate("on_exhausted") && draft.on_exhausted !== serverDefaults.on_exhausted) {
+    patch.on_exhausted = draft.on_exhausted;
+  }
+
+  if (shouldEvaluate("accelerator") && draft.accelerator !== serverDefaults.accelerator) {
+    patch.accelerator = draft.accelerator;
+  }
+
+  if (shouldEvaluate("high_mem") && draft.high_mem !== serverDefaults.high_mem) {
+    patch.high_mem = draft.high_mem;
+  }
+
+  if (shouldEvaluate("min_vram_mib")) {
+    if (!draft.min_vram_enabled) {
+      if (serverDefaults.min_vram_mib !== null) {
+        patch.min_vram_mib = null;
+      }
+    } else {
+      const parsedGib = parseIntInRange(draft.min_vram_gib, MIN_VRAM_GIB, MAX_VRAM_GIB);
+      if (parsedGib === null) {
+        invalidFields.add("min_vram_mib");
+      } else {
+        const parsedMib = parsedGib * MIB_PER_GIB;
+        if (parsedMib !== serverDefaults.min_vram_mib) {
+          patch.min_vram_mib = parsedMib;
+        }
+      }
+    }
+  }
+
+  if (shouldEvaluate("winddown_grace")) {
+    const parsed = parseDurationDraft(draft.winddown_grace, {
+      withSeconds: true,
+      minSecs: 0,
+    });
     if (parsed === null) {
-      invalidFields.add("max_spend_cu");
-    } else {
-      maxSpend = parsed;
+      invalidFields.add("winddown_grace");
+    } else if (parsed !== serverDefaults.winddown_grace) {
+      patch.winddown_grace = parsed;
     }
   }
 
-  let minBalance: number | null = null;
-  if (draft.min_balance_enabled) {
-    const parsed = parseFloatInRange(draft.min_balance_cu, MIN_CU_FIELD, MAX_CU_FIELD);
-    if (parsed === null) {
-      invalidFields.add("min_balance_cu");
-    } else {
-      minBalance = parsed;
-    }
-  }
-
-  let idleTimeout: number | null = null;
-  if (draft.idle_timeout_enabled) {
-    const parsed = parseDurationDraft(draft.idle_timeout, {
-      withSeconds: false,
+  if (shouldEvaluate("usage_poll_active")) {
+    const parsed = parseDurationDraft(draft.usage_poll_active, {
+      withSeconds: true,
       minSecs: MIN_DURATION_SECS,
     });
     if (parsed === null) {
-      invalidFields.add("idle_timeout");
-    } else {
-      idleTimeout = parsed;
+      invalidFields.add("usage_poll_active");
+    } else if (parsed !== serverDefaults.usage_poll_active) {
+      patch.usage_poll_active = parsed;
     }
   }
 
-  const maxConcurrent = parseIntInRange(
-    draft.max_concurrent_sessions,
-    MIN_CONCURRENT_SESSIONS,
-    MAX_CONCURRENT_SESSIONS,
-  );
-  if (maxConcurrent === null) {
-    invalidFields.add("max_concurrent_sessions");
-  }
-
-  const maxAttempts = parseIntInRange(draft.max_attempts, MIN_ATTEMPTS, MAX_ATTEMPTS_CAP);
-  if (maxAttempts === null) {
-    invalidFields.add("max_attempts");
-  }
-
-  const retryDelay = parseDurationDraft(draft.retry_delay, {
-    withSeconds: true,
-    minSecs: MIN_DURATION_SECS,
-  });
-  if (retryDelay === null) {
-    invalidFields.add("retry_delay");
-  }
-
-  let minVramMib: number | null = null;
-  if (draft.min_vram_enabled) {
-    const parsedGib = parseIntInRange(draft.min_vram_gib, MIN_VRAM_GIB, MAX_VRAM_GIB);
-    if (parsedGib === null) {
-      invalidFields.add("min_vram_mib");
-    } else {
-      minVramMib = parsedGib * MIB_PER_GIB;
+  if (shouldEvaluate("usage_poll_idle")) {
+    const parsed = parseDurationDraft(draft.usage_poll_idle, {
+      withSeconds: true,
+      minSecs: MIN_DURATION_SECS,
+    });
+    if (parsed === null) {
+      invalidFields.add("usage_poll_idle");
+    } else if (parsed !== serverDefaults.usage_poll_idle) {
+      patch.usage_poll_idle = parsed;
     }
   }
 
-  const winddownGrace = parseDurationDraft(draft.winddown_grace, {
-    withSeconds: true,
-    minSecs: 0,
-  });
-  if (winddownGrace === null) {
-    invalidFields.add("winddown_grace");
-  }
-
-  const pollActive = parseDurationDraft(draft.usage_poll_active, {
-    withSeconds: true,
-    minSecs: MIN_DURATION_SECS,
-  });
-  if (pollActive === null) {
-    invalidFields.add("usage_poll_active");
-  }
-
-  const pollIdle = parseDurationDraft(draft.usage_poll_idle, {
-    withSeconds: true,
-    minSecs: MIN_DURATION_SECS,
-  });
-  if (pollIdle === null) {
-    invalidFields.add("usage_poll_idle");
-  }
-
-  if (
-    invalidFields.size > 0 ||
-    maxConcurrent === null ||
-    maxAttempts === null ||
-    retryDelay === null ||
-    winddownGrace === null ||
-    pollActive === null ||
-    pollIdle === null
-  ) {
+  if (invalidFields.size > 0) {
     return { ok: false, invalidFields };
   }
 
   return {
     ok: true,
-    value: {
-      max_runtime: maxRuntime,
-      max_spend_cu: maxSpend,
-      min_balance_cu: minBalance,
-      idle_timeout: idleTimeout,
-      max_concurrent_sessions: maxConcurrent,
-      max_attempts: maxAttempts,
-      retry_delay: retryDelay,
-      on_exhausted: draft.on_exhausted,
-      usage_poll_active: pollActive,
-      usage_poll_idle: pollIdle,
-      accelerator: draft.accelerator,
-      high_mem: draft.high_mem,
-      min_vram_mib: minVramMib,
-      winddown_grace: winddownGrace,
-    },
+    patch,
+    hasChanges: Object.keys(patch).length > 0,
   };
 }
 
-export function areDefaultsEqual(a: RuntimeDefaults, b: RuntimeDefaults): boolean {
-  return (
-    a.max_runtime === b.max_runtime &&
-    a.max_spend_cu === b.max_spend_cu &&
-    a.min_balance_cu === b.min_balance_cu &&
-    a.idle_timeout === b.idle_timeout &&
-    a.max_concurrent_sessions === b.max_concurrent_sessions &&
-    a.max_attempts === b.max_attempts &&
-    a.retry_delay === b.retry_delay &&
-    a.on_exhausted === b.on_exhausted &&
-    a.usage_poll_active === b.usage_poll_active &&
-    a.usage_poll_idle === b.usage_poll_idle &&
-    a.accelerator === b.accelerator &&
-    a.high_mem === b.high_mem &&
-    a.min_vram_mib === b.min_vram_mib &&
-    a.winddown_grace === b.winddown_grace
-  );
-}
-
-function canonicalizeBaseline(baseline: RuntimeDefaults): RuntimeDefaults {
-  const roundTripped = parseDefaultsDraft(defaultsToDraft(baseline));
-  return roundTripped.ok ? roundTripped.value : baseline;
-}
-
-export function isDraftDirty(draft: DefaultsDraft, baseline: RuntimeDefaults): boolean {
-  const parsed = parseDefaultsDraft(draft);
-  if (!parsed.ok) {
-    return true;
-  }
-  return !areDefaultsEqual(parsed.value, canonicalizeBaseline(baseline));
+export function isDraftDirty(
+  draft: DefaultsDraft,
+  serverDefaults: RuntimeDefaults,
+  forceInclude: ReadonlySet<DefaultsFieldKey> = new Set<DefaultsFieldKey>(),
+): boolean {
+  const result = buildDefaultsPatch(draft, serverDefaults, forceInclude);
+  return !result.ok || result.hasChanges;
 }
 
 export function toggleOptionalField(
@@ -388,7 +511,15 @@ export function toggleOptionalField(
   }
 }
 
-export function isDraftAtCoreDefaults(draft: DefaultsDraft): boolean {
-  const parsed = parseDefaultsDraft(draft);
-  return parsed.ok && areDefaultsEqual(parsed.value, CORE_DEFAULTS);
+export function isDraftAtCoreDefaults(
+  draft: DefaultsDraft,
+  serverDefaults: RuntimeDefaults,
+  forceInclude: ReadonlySet<DefaultsFieldKey> = new Set<DefaultsFieldKey>(),
+): boolean {
+  const result = buildDefaultsPatch(draft, serverDefaults, forceInclude);
+  if (!result.ok) {
+    return false;
+  }
+  const effective: RuntimeDefaults = { ...serverDefaults, ...result.patch };
+  return ALL_DEFAULT_FIELDS.every((field) => effective[field] === CORE_DEFAULTS[field]);
 }

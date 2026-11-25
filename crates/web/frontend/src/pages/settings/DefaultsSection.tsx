@@ -30,14 +30,17 @@ import {
 } from "../../lib/constants.ts";
 import type { Dictionary, TranslateFn } from "../../lib/i18n.ts";
 import type { Accelerator } from "../../lib/types.ts";
+import type { RuntimeDefaultsPatch } from "./api.ts";
 import {
+  buildDefaultsPatch,
   defaultsToDraft,
+  diffFieldsFromCore,
   isDraftAtCoreDefaults,
   isDraftDirty,
-  parseDefaultsDraft,
   toggleOptionalField,
   type DefaultsDraft,
   type DefaultsFieldId,
+  type DefaultsFieldKey,
   type DurationDraft,
 } from "./draft.ts";
 
@@ -146,7 +149,7 @@ export interface DefaultsSectionProps {
   readonly saving: boolean;
   readonly saveError: string | null;
   readonly savedNotice: boolean;
-  readonly onSave: (next: RuntimeDefaults) => Promise<boolean>;
+  readonly onSave: (patch: RuntimeDefaultsPatch) => Promise<boolean>;
   readonly onClearFeedback: () => void;
 }
 
@@ -161,6 +164,9 @@ export const DefaultsSection = memo(function DefaultsSection({
 }: DefaultsSectionProps) {
   const idBase = useId();
   const [draft, setDraft] = useState<DefaultsDraft>(() => defaultsToDraft(serverDefaults));
+  const [forceInclude, setForceInclude] = useState<ReadonlySet<DefaultsFieldKey>>(
+    () => new Set<DefaultsFieldKey>(),
+  );
   const [invalidFields, setInvalidFields] = useState<ReadonlySet<DefaultsFieldId>>(
     () => new Set<DefaultsFieldId>(),
   );
@@ -170,15 +176,26 @@ export const DefaultsSection = memo(function DefaultsSection({
     if (lastServerRef.current !== serverDefaults) {
       lastServerRef.current = serverDefaults;
       setDraft(defaultsToDraft(serverDefaults));
+      setForceInclude(new Set<DefaultsFieldKey>());
       setInvalidFields(new Set<DefaultsFieldId>());
     }
   }, [serverDefaults]);
 
-  const dirty = isDraftDirty(draft, serverDefaults);
-  const atCoreDefaults = isDraftAtCoreDefaults(draft);
+  const dirty = isDraftDirty(draft, serverDefaults, forceInclude);
+  const atCoreDefaults = isDraftAtCoreDefaults(draft, serverDefaults, forceInclude);
 
-  const updateDraft = (updater: (prev: DefaultsDraft) => DefaultsDraft): void => {
+  const updateField = (
+    field: DefaultsFieldKey,
+    updater: (prev: DefaultsDraft) => DefaultsDraft,
+  ): void => {
     setDraft(updater);
+    if (forceInclude.has(field)) {
+      setForceInclude((prev) => {
+        const next = new Set(prev);
+        next.delete(field);
+        return next;
+      });
+    }
     if (invalidFields.size > 0) {
       setInvalidFields(new Set<DefaultsFieldId>());
     }
@@ -192,23 +209,28 @@ export const DefaultsSection = memo(function DefaultsSection({
     if (saving || !dirty) {
       return;
     }
-    const parsed = parseDefaultsDraft(draft);
-    if (!parsed.ok) {
-      setInvalidFields(parsed.invalidFields);
+    const result = buildDefaultsPatch(draft, serverDefaults, forceInclude);
+    if (!result.ok) {
+      setInvalidFields(result.invalidFields);
+      return;
+    }
+    if (!result.hasChanges) {
       return;
     }
     setInvalidFields(new Set<DefaultsFieldId>());
-    await onSave(parsed.value);
+    await onSave(result.patch);
   };
 
   const handleDiscard = (): void => {
     setDraft(defaultsToDraft(serverDefaults));
+    setForceInclude(new Set<DefaultsFieldKey>());
     setInvalidFields(new Set<DefaultsFieldId>());
     onClearFeedback();
   };
 
   const handleResetToDefaults = (): void => {
     setDraft(defaultsToDraft(CORE_DEFAULTS));
+    setForceInclude(diffFieldsFromCore(serverDefaults));
     setInvalidFields(new Set<DefaultsFieldId>());
     onClearFeedback();
   };
@@ -246,7 +268,7 @@ export const DefaultsSection = memo(function DefaultsSection({
                   disabled={saving}
                   aria-label={`${t("app.def.max_runtime")} — ${t("app.def.limit")}`}
                   onChange={(event) =>
-                    updateDraft((prev) =>
+                    updateField("max_runtime", (prev) =>
                       toggleOptionalField(prev, "max_runtime", event.target.checked),
                     )
                   }
@@ -260,7 +282,9 @@ export const DefaultsSection = memo(function DefaultsSection({
                     invalid={invalidFields.has("max_runtime")}
                     disabled={saving}
                     t={t}
-                    onChange={(next) => updateDraft((prev) => ({ ...prev, max_runtime: next }))}
+                    onChange={(next) =>
+                      updateField("max_runtime", (prev) => ({ ...prev, max_runtime: next }))
+                    }
                   />
                 ) : (
                   <span className="caption">{t("app.def.no_limit")}</span>
@@ -286,7 +310,7 @@ export const DefaultsSection = memo(function DefaultsSection({
                   disabled={saving}
                   aria-label={`${t("app.def.max_spend")} — ${t("app.def.limit")}`}
                   onChange={(event) =>
-                    updateDraft((prev) =>
+                    updateField("max_spend_cu", (prev) =>
                       toggleOptionalField(prev, "max_spend_cu", event.target.checked),
                     )
                   }
@@ -305,7 +329,10 @@ export const DefaultsSection = memo(function DefaultsSection({
                       disabled={saving}
                       aria-invalid={invalidFields.has("max_spend_cu") ? "true" : undefined}
                       onChange={(event) =>
-                        updateDraft((prev) => ({ ...prev, max_spend_cu: event.target.value }))
+                        updateField("max_spend_cu", (prev) => ({
+                          ...prev,
+                          max_spend_cu: event.target.value,
+                        }))
                       }
                     />
                     <span className="unit-suffix">{t("app.unit.cu")}</span>
@@ -334,7 +361,7 @@ export const DefaultsSection = memo(function DefaultsSection({
                   disabled={saving}
                   aria-label={`${t("app.def.min_balance")} — ${t("app.def.limit")}`}
                   onChange={(event) =>
-                    updateDraft((prev) =>
+                    updateField("min_balance_cu", (prev) =>
                       toggleOptionalField(prev, "min_balance_cu", event.target.checked),
                     )
                   }
@@ -353,7 +380,10 @@ export const DefaultsSection = memo(function DefaultsSection({
                       disabled={saving}
                       aria-invalid={invalidFields.has("min_balance_cu") ? "true" : undefined}
                       onChange={(event) =>
-                        updateDraft((prev) => ({ ...prev, min_balance_cu: event.target.value }))
+                        updateField("min_balance_cu", (prev) => ({
+                          ...prev,
+                          min_balance_cu: event.target.value,
+                        }))
                       }
                     />
                     <span className="unit-suffix">{t("app.unit.cu")}</span>
@@ -380,7 +410,7 @@ export const DefaultsSection = memo(function DefaultsSection({
                   disabled={saving}
                   aria-label={`${t("app.def.idle")} — ${t("app.def.limit")}`}
                   onChange={(event) =>
-                    updateDraft((prev) =>
+                    updateField("idle_timeout", (prev) =>
                       toggleOptionalField(prev, "idle_timeout", event.target.checked),
                     )
                   }
@@ -394,7 +424,9 @@ export const DefaultsSection = memo(function DefaultsSection({
                     invalid={invalidFields.has("idle_timeout")}
                     disabled={saving}
                     t={t}
-                    onChange={(next) => updateDraft((prev) => ({ ...prev, idle_timeout: next }))}
+                    onChange={(next) =>
+                      updateField("idle_timeout", (prev) => ({ ...prev, idle_timeout: next }))
+                    }
                   />
                 ) : (
                   <span className="caption">{t("app.def.no_limit")}</span>
@@ -424,7 +456,7 @@ export const DefaultsSection = memo(function DefaultsSection({
                 disabled={saving}
                 aria-invalid={invalidFields.has("max_concurrent_sessions") ? "true" : undefined}
                 onChange={(event) =>
-                  updateDraft((prev) => ({
+                  updateField("max_concurrent_sessions", (prev) => ({
                     ...prev,
                     max_concurrent_sessions: event.target.value,
                   }))
@@ -456,7 +488,10 @@ export const DefaultsSection = memo(function DefaultsSection({
                 disabled={saving}
                 aria-invalid={invalidFields.has("max_attempts") ? "true" : undefined}
                 onChange={(event) =>
-                  updateDraft((prev) => ({ ...prev, max_attempts: event.target.value }))
+                  updateField("max_attempts", (prev) => ({
+                    ...prev,
+                    max_attempts: event.target.value,
+                  }))
                 }
               />
             </div>
@@ -475,7 +510,9 @@ export const DefaultsSection = memo(function DefaultsSection({
                 invalid={invalidFields.has("retry_delay")}
                 disabled={saving}
                 t={t}
-                onChange={(next) => updateDraft((prev) => ({ ...prev, retry_delay: next }))}
+                onChange={(next) =>
+                  updateField("retry_delay", (prev) => ({ ...prev, retry_delay: next }))
+                }
               />
             </div>
           </div>
@@ -494,7 +531,7 @@ export const DefaultsSection = memo(function DefaultsSection({
                 value={draft.on_exhausted}
                 disabled={saving}
                 onChange={(event) =>
-                  updateDraft((prev) => ({
+                  updateField("on_exhausted", (prev) => ({
                     ...prev,
                     on_exhausted: event.target.value as OnExhausted,
                   }))
@@ -523,7 +560,7 @@ export const DefaultsSection = memo(function DefaultsSection({
                 value={draft.accelerator}
                 disabled={saving}
                 onChange={(event) =>
-                  updateDraft((prev) => ({
+                  updateField("accelerator", (prev) => ({
                     ...prev,
                     accelerator: event.target.value as Accelerator,
                   }))
@@ -554,7 +591,7 @@ export const DefaultsSection = memo(function DefaultsSection({
                 checked={draft.high_mem}
                 disabled={saving}
                 onChange={(event) =>
-                  updateDraft((prev) => ({ ...prev, high_mem: event.target.checked }))
+                  updateField("high_mem", (prev) => ({ ...prev, high_mem: event.target.checked }))
                 }
               />
             </div>
@@ -577,7 +614,7 @@ export const DefaultsSection = memo(function DefaultsSection({
                   disabled={saving}
                   aria-label={`${t("app.def.min_vram")} — ${t("app.def.limit")}`}
                   onChange={(event) =>
-                    updateDraft((prev) =>
+                    updateField("min_vram_mib", (prev) =>
                       toggleOptionalField(prev, "min_vram_mib", event.target.checked),
                     )
                   }
@@ -596,7 +633,10 @@ export const DefaultsSection = memo(function DefaultsSection({
                       disabled={saving}
                       aria-invalid={invalidFields.has("min_vram_mib") ? "true" : undefined}
                       onChange={(event) =>
-                        updateDraft((prev) => ({ ...prev, min_vram_gib: event.target.value }))
+                        updateField("min_vram_mib", (prev) => ({
+                          ...prev,
+                          min_vram_gib: event.target.value,
+                        }))
                       }
                     />
                     <span className="unit-suffix">{t("app.unit.gb")}</span>
@@ -622,7 +662,9 @@ export const DefaultsSection = memo(function DefaultsSection({
                 invalid={invalidFields.has("winddown_grace")}
                 disabled={saving}
                 t={t}
-                onChange={(next) => updateDraft((prev) => ({ ...prev, winddown_grace: next }))}
+                onChange={(next) =>
+                  updateField("winddown_grace", (prev) => ({ ...prev, winddown_grace: next }))
+                }
               />
             </div>
           </div>
@@ -641,7 +683,12 @@ export const DefaultsSection = memo(function DefaultsSection({
                 invalid={invalidFields.has("usage_poll_active")}
                 disabled={saving}
                 t={t}
-                onChange={(next) => updateDraft((prev) => ({ ...prev, usage_poll_active: next }))}
+                onChange={(next) =>
+                  updateField("usage_poll_active", (prev) => ({
+                    ...prev,
+                    usage_poll_active: next,
+                  }))
+                }
               />
             </div>
           </div>
@@ -659,7 +706,9 @@ export const DefaultsSection = memo(function DefaultsSection({
                 invalid={invalidFields.has("usage_poll_idle")}
                 disabled={saving}
                 t={t}
-                onChange={(next) => updateDraft((prev) => ({ ...prev, usage_poll_idle: next }))}
+                onChange={(next) =>
+                  updateField("usage_poll_idle", (prev) => ({ ...prev, usage_poll_idle: next }))
+                }
               />
             </div>
           </div>

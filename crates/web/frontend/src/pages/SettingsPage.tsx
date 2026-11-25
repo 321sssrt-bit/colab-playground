@@ -7,7 +7,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { AlertIcon, CloseIcon } from "../components/Icons.tsx";
-import type { RuntimeDefaults } from "../lib/constants.ts";
 import { useI18n } from "../lib/i18n.ts";
 import { preferenceSync } from "../lib/preferences.ts";
 import { useTheme } from "../lib/theme.ts";
@@ -20,6 +19,7 @@ import {
   isAbortError,
   patchDefaults,
   type LoadedSettings,
+  type RuntimeDefaultsPatch,
   type UpdateNotice,
 } from "./settings/api.ts";
 import { DefaultsSection } from "./settings/DefaultsSection.tsx";
@@ -160,7 +160,7 @@ export function SettingsPage({ snapshot, t, pushToast }: PageProps) {
   }, []);
 
   const handleSaveDefaults = useCallback(
-    async (nextDefaults: RuntimeDefaults): Promise<boolean> => {
+    async (patch: RuntimeDefaultsPatch): Promise<boolean> => {
       saveAbortRef.current?.abort();
       const controller = new AbortController();
       saveAbortRef.current = controller;
@@ -170,7 +170,7 @@ export function SettingsPage({ snapshot, t, pushToast }: PageProps) {
       setSavedNotice(false);
 
       try {
-        const updated = await patchDefaults(nextDefaults, controller.signal);
+        const updated = await patchDefaults(patch, controller.signal);
         if (controller.signal.aborted) {
           return false;
         }

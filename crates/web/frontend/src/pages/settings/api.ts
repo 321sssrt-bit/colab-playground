@@ -111,8 +111,10 @@ export async function fetchSettings(signal?: AbortSignal): Promise<LoadedSetting
   return toLoadedSettings(view);
 }
 
+export type RuntimeDefaultsPatch = Partial<RuntimeDefaults>;
+
 export async function patchDefaults(
-  defaults: RuntimeDefaults,
+  defaults: RuntimeDefaultsPatch,
   signal?: AbortSignal,
 ): Promise<LoadedSettings> {
   const view = await apiClient.request<SettingsView>("/api/settings", {
