@@ -53,7 +53,7 @@ export function InstallPluginDialog({
 
   const dialogRef = useRef<HTMLDialogElement | null>(null);
   const sourceInputRef = useRef<HTMLInputElement | null>(null);
-  const previewNameRef = useRef<HTMLParagraphElement | null>(null);
+  const previewCancelRef = useRef<HTMLButtonElement | null>(null);
   const checkSeqRef = useRef(0);
   const installAbortRef = useRef<AbortController | null>(null);
   const activePreviewIdRef = useRef<string | null>(null);
@@ -110,7 +110,9 @@ export function InstallPluginDialog({
 
   useEffect(() => {
     if (open && phase === "preview") {
-      previewNameRef.current?.focus();
+      // Focus the safe Cancel action in `.modal-actions` so keyboard users land on a clear
+      // unclipped control while pointer clicks do not trigger a clipped focus ring in `.dialog-body`.
+      previewCancelRef.current?.focus();
     }
   }, [open, phase]);
 
@@ -407,9 +409,7 @@ export function InstallPluginDialog({
           <>
             <div className="dialog-body">
               <div className="plugin-facts">
-                <p className="plugin-card-name" ref={previewNameRef} tabIndex={-1}>
-                  {previewName}
-                </p>
+                <p className="plugin-card-name">{previewName}</p>
                 {previewDescription && <p className="caption">{previewDescription}</p>}
 
                 <div className="plugin-fact-row">
@@ -481,6 +481,7 @@ export function InstallPluginDialog({
                 {t("web.plugins.back_to_source")}
               </button>
               <button
+                ref={previewCancelRef}
                 type="button"
                 className="btn"
                 disabled={isInstalling}
