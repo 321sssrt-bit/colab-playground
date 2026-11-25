@@ -2,7 +2,7 @@
  * Plugins management API client and pure formatting/origin helpers.
  */
 
-import { apiClient, ApiError, type ApiClient } from "../../lib/api.ts";
+import { apiClient, ApiError, type ApiClient, type EventStreamOptions } from "../../lib/api.ts";
 import type { TranslateFn } from "../../lib/i18n.ts";
 import type { Locale } from "../../lib/types.ts";
 import type {
@@ -11,6 +11,7 @@ import type {
   PluginInfo,
   PluginOrigin,
   PluginPreviewResponse,
+  PluginRunSummary,
 } from "./types.ts";
 
 const BYTES_PER_KIB = 1024;
@@ -219,5 +220,38 @@ export async function deleteHfToken(
     method: "DELETE",
     body: {},
     signal,
+  });
+}
+
+export async function listPluginRuns(
+  signal?: AbortSignal,
+  client: ApiClient = apiClient,
+): Promise<PluginRunSummary[]> {
+  return client.request<PluginRunSummary[]>("/api/plugins/runs", {
+    method: "GET",
+    signal,
+  });
+}
+
+export async function cancelPluginRun(
+  id: number,
+  signal?: AbortSignal,
+  client: ApiClient = apiClient,
+): Promise<void> {
+  await client.request<void>(`/api/plugins/runs/${encodeURIComponent(String(id))}/cancel`, {
+    method: "POST",
+    body: {},
+    signal,
+  });
+}
+
+export function openPluginRunEventStream(
+  id: number,
+  options: Omit<EventStreamOptions, "body">,
+  client: ApiClient = apiClient,
+): Promise<void> {
+  return client.openEventStream(`/api/plugins/runs/${encodeURIComponent(String(id))}/events`, {
+    ...options,
+    body: {},
   });
 }
