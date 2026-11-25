@@ -66,31 +66,40 @@ export interface OverviewReadinessResponse {
 }
 
 export type ProvisionProgressEvent =
-  | { readonly event: "allocating"; readonly attempt: number; readonly of: number }
+  | { readonly event: "allocating"; readonly attempt: number; readonly max_attempts: number }
+  | { readonly event: "allocated"; readonly attempt: number }
   | {
       readonly event: "allocation_failed";
       readonly attempt: number;
       readonly error: ApiErrorPayload | CoreError;
     }
-  | { readonly event: "probed"; readonly gpu: string | null; readonly vram_mib: number | null }
+  | {
+      readonly event: "probed";
+      readonly attempt?: number;
+      readonly gpu: string | null;
+      readonly vram_mib: number | null;
+    }
   | {
       readonly event: "rejected";
-      readonly got_mib: number | null;
-      readonly min_mib: number;
+      readonly attempt?: number;
+      readonly gpu: string | null;
+      readonly vram_mib: number | null;
+      readonly min_vram_mib: number;
     }
-  | { readonly event: "releasing" }
-  | { readonly event: "reconciling" }
-  | { readonly event: "orphan_released" }
-  | { readonly event: "orphan_left" }
-  | { readonly event: "retrying"; readonly wait_secs: number }
+  | { readonly event: "releasing"; readonly attempt?: number }
+  | { readonly event: "reconciling"; readonly attempt?: number }
+  | { readonly event: "orphan_detected"; readonly endpoint: string; readonly released: boolean }
+  | { readonly event: "retrying"; readonly attempt?: number; readonly delay_secs: number }
   | { readonly event: "watchdog_started"; readonly deadline: UnixSecs | null }
   | { readonly event: "watchdog_failed"; readonly error: ApiErrorPayload | CoreError }
   | {
       readonly event: "ready";
+      readonly name?: string;
       readonly gpu: string | null;
       readonly vram_mib: number | null;
       readonly below_spec?: boolean;
-    };
+    }
+  | { readonly event: "failed"; readonly error: ApiErrorPayload | CoreError };
 
 export interface ProvisionFinishedEvent {
   readonly phase: "ready" | "cancelled" | "failed";

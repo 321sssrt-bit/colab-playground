@@ -304,7 +304,6 @@ export function AutoStopDialog({
                   { name: label },
                 )}
               </p>
-              <p className="dialog-caption">{t("app.def.max_runtime_hint")}</p>
 
               {accountChanged && (
                 <div className="inline-msg inline-msg-warning">

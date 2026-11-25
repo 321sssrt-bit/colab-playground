@@ -68,8 +68,9 @@ export function ForwardRow({ forward, t, pushToast, onAfterClose }: ForwardRowPr
   const addresses = forward.addresses ?? null;
   const openUrl = safeHttpUrl(addresses?.open_url);
   const copyUrl = addresses?.copy_url ?? addresses?.open_url ?? null;
-  const displayAddr = openUrl ?? `127.0.0.1:${forward.spec.local_port}`;
   const isAllInterfaces = forward.spec.bind === "all_interfaces";
+  const bindFallback = `${isAllInterfaces ? "0.0.0.0" : "127.0.0.1"}:${forward.spec.local_port}`;
+  const displayAddr = copyUrl ?? openUrl ?? bindFallback;
 
   const handleCopy = async () => {
     if (!copyUrl) {

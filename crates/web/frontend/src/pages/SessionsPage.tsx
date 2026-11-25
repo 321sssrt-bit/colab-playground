@@ -37,7 +37,7 @@ import { RuntimeCard } from "./sessions/RuntimeCard.tsx";
 import {
   applyForwardEvent,
   clearEndedRuntimes,
-  observeGuardTransitions,
+  observeSnapshotTransitions,
   refreshForwards,
   refreshRearmDuration,
   selectForwardsForRuntime,
@@ -105,9 +105,11 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
     });
   }, []);
 
-  const tunnelIdsSignature = useMemo(() => {
+  const tunnelAddressSignature = useMemo(() => {
     const tunnels = snapshot?.tunnels ?? [];
-    return tunnels.map((item) => item.id).join(",");
+    return tunnels
+      .map((item) => `${item.id}:${item.spec.bind}:${item.spec.local_port}:${item.spec.remote_port}`)
+      .join(",");
   }, [snapshot?.tunnels]);
 
   useEffect(() => {
@@ -115,7 +117,7 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
       return;
     }
     void refreshForwards().catch(() => {});
-  }, [tunnelIdsSignature, Boolean(snapshot)]);
+  }, [tunnelAddressSignature, Boolean(snapshot)]);
 
   useEffect(() => {
     if (!snapshot) {
@@ -124,7 +126,7 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
     if (snapshot.runtimes && snapshot.runtimes.errors.length === 0) {
       setAccountErrorsOverride(null);
     }
-    observeGuardTransitions(prevSnapshotRef.current, snapshot, locale, t, pushToast);
+    observeSnapshotTransitions(prevSnapshotRef.current, snapshot, locale, t, pushToast);
     prevSnapshotRef.current = snapshot;
   }, [snapshot, locale, t, pushToast]);
 
@@ -438,7 +440,7 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
                                   forwards={selectForwardsForRuntime(
                                     runtime,
                                     localState,
-                                    snapshot.tunnels,
+                                    snapshot,
                                   )}
                                   rearmDurationSecs={localState.rearmDurationSecs}
                                   stopping={stoppingKeys.has(key)}

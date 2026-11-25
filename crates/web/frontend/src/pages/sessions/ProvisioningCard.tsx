@@ -62,7 +62,7 @@ function formatProvisionSentence(
   completed: boolean,
   locale: Locale,
   t: TranslateFn,
-): ProvisionSentence {
+): ProvisionSentence | null {
   const hw = (gpu: string | null, vramMib: number | null) =>
     formatHardware(gpu, vramMib, locale, t) ?? t("app.b2.prov_no_gpu");
 
@@ -71,10 +71,13 @@ function formatProvisionSentence(
       return {
         text: t(completed ? "app.b3.prov_allocated" : "app.b2.prov_allocating", {
           n: ev.attempt,
-          of: ev.of,
+          of: ev.max_attempts,
         }),
         tone: "busy",
       };
+    case "allocated":
+    case "failed":
+      return null;
     case "allocation_failed":
       return {
         text: t("app.b2.prov_allocation_failed", {
@@ -90,8 +93,8 @@ function formatProvisionSentence(
     case "rejected":
       return {
         text: t("app.b2.prov_rejected", {
-          got: ev.got_mib !== null ? formatVram(ev.got_mib, locale, t) : t("app.b2.prov_no_gpu"),
-          min: formatVram(ev.min_mib, locale, t),
+          got: ev.vram_mib !== null ? formatVram(ev.vram_mib, locale, t) : t("app.b2.prov_no_gpu"),
+          min: formatVram(ev.min_vram_mib, locale, t),
         }),
         tone: "warn",
       };
@@ -105,14 +108,14 @@ function formatProvisionSentence(
         text: t(completed ? "app.b11.prov_reconciled" : "app.b11.prov_reconciling"),
         tone: "busy",
       };
-    case "orphan_released":
-      return { text: t("app.b2.prov_orphan_released"), tone: "good" };
-    case "orphan_left":
-      return { text: t("app.b2.prov_orphan_left"), tone: "bad" };
+    case "orphan_detected":
+      return ev.released
+        ? { text: t("app.b2.prov_orphan_released"), tone: "good" }
+        : { text: t("app.b2.prov_orphan_left"), tone: "bad" };
     case "retrying":
       return {
         text: t(completed ? "app.b3.prov_retried" : "app.b2.prov_retrying", {
-          time: formatShortWait(ev.wait_secs, t),
+          time: formatShortWait(ev.delay_secs, t),
         }),
         tone: "busy",
       };
@@ -130,6 +133,8 @@ function formatProvisionSentence(
         }),
         tone: ev.below_spec ? "warn" : "good",
       };
+    default:
+      return null;
   }
 }
 
@@ -137,7 +142,7 @@ function formatHeadline(events: readonly ProvisionProgressEvent[], t: TranslateF
   for (let i = events.length - 1; i >= 0; i -= 1) {
     const ev = events[i];
     if (ev.event === "allocating") {
-      return t("app.b2.prov_attempt", { n: ev.attempt, of: ev.of });
+      return t("app.b2.prov_attempt", { n: ev.attempt, of: ev.max_attempts });
     }
     if (ev.event === "reconciling") {
       return t("app.b11.prov_reconciling");
@@ -244,6 +249,13 @@ export function ProvisioningCard({
     }
   };
 
+  const visibleEvents = events.filter(
+    (ev) => formatProvisionSentence(ev, true, locale, t) !== null,
+  );
+  // Server emits `allocated` once Colab answers `allocating`, so only a trailing `allocating` is waiting.
+  const allocatingAnswered =
+    lastEvent !== null && lastEvent.event === "allocated";
+
   return (
     <section className="card card-compact" data-sessions-provisioning="true">
       <div className="card-header">
@@ -253,11 +265,16 @@ export function ProvisioningCard({
         </div>
       </div>
 
-      {events.length > 0 && (
+      {visibleEvents.length > 0 && (
         <div className="progress-list" data-provision-progress="true">
-          {events.map((ev, index) => {
-            const isCurrent = index + 1 === events.length;
+          {visibleEvents.map((ev, index) => {
+            const isCurrent =
+              index + 1 === visibleEvents.length &&
+              !(ev.event === "allocating" && allocatingAnswered);
             const sentence = formatProvisionSentence(ev, !isCurrent, locale, t);
+            if (!sentence) {
+              return null;
+            }
             return (
               <div className="progress-row" key={`${ev.event}-${index}`}>
                 <span className="progress-marker">
