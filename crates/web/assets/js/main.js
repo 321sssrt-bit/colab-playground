@@ -64,7 +64,8 @@ class AppShellController {
     window.addEventListener("hashchange", () => {
       const raw = window.location.hash.replace(/^#\/?/, "").split("?")[0];
       if (raw === "main-content") {
-        if (this.pageHostEl) this.pageHostEl.focus({ preventScroll: true });
+        const target = this.pageHostEl?.querySelector("#page-heading") || this.pageHostEl;
+        if (target) target.focus();
         return;
       }
       const next = parseHashRoute();
@@ -165,7 +166,7 @@ class AppShellController {
     this.loginPage.unmount();
     this.buildShell();
     this.renderChrome();
-    this.mountCurrentRoute({ focusMain: true });
+    this.mountCurrentRoute();
   }
 
   buildShell() {
@@ -185,7 +186,7 @@ class AppShellController {
         onClick: (event) => {
           event.preventDefault();
           const target = this.pageHostEl?.querySelector("#page-heading") || this.pageHostEl;
-          if (target) target.focus({ preventScroll: true });
+          if (target) target.focus();
         },
       },
       t("web.shell.skip_to_content")
