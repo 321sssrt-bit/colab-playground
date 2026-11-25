@@ -83,10 +83,6 @@ export function formatCuRate(value: number, locale: Locale, t: TranslateFn): str
   return t("app.fmt.cu_rate", { value: formatNumber(value, locale) });
 }
 
-export function formatApprox(value: string, t: TranslateFn): string {
-  return t("app.fmt.approx", { value });
-}
-
 export function formatDuration(totalSecs: number, t: TranslateFn): string {
   const secs = Number.isFinite(totalSecs) ? Math.max(0, Math.floor(totalSecs)) : 0;
   if (secs < SECS_PER_MINUTE) {

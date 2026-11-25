@@ -31,14 +31,6 @@ const ROUTE_TITLE_KEYS = {
   settings: "app.nav.settings",
 } as const;
 
-const ROUTE_SUBTITLE_KEYS = {
-  overview: "app.overview.subtitle",
-  sessions: "app.sessions.subtitle",
-  plugins: "app.plugins.subtitle",
-  accounts: "app.accounts.subtitle",
-  settings: "app.settings.subtitle",
-} as const;
-
 export interface ParsedHashRoute {
   readonly route: RouteId;
   readonly canonical: boolean;
@@ -92,10 +84,6 @@ export function parseHashRoute(rawHash: string): ParsedHashRoute {
 
 export function getRouteTitle(route: RouteId, t: TranslateFn): string {
   return t(ROUTE_TITLE_KEYS[route]);
-}
-
-export function getRouteSubtitle(route: RouteId, t: TranslateFn): string {
-  return t(ROUTE_SUBTITLE_KEYS[route]);
 }
 
 export function formatDocumentTitle(route: RouteId, t: TranslateFn): string {
