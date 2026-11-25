@@ -68,7 +68,7 @@ interface GgufPreviewData {
 
 type GgufState =
   | { readonly kind: "idle" }
-  | { readonly kind: "loading"; readonly repo: string; readonly previous: GgufPreviewData | null }
+  | { readonly kind: "loading"; readonly repo: string }
   | { readonly kind: "ready"; readonly data: GgufPreviewData }
   | { readonly kind: "error"; readonly message: string };
 
@@ -271,20 +271,13 @@ export function HfModelField({
     const delayMs = immediate ? 0 : FIT_RECALC_DEBOUNCE_MS;
     const targetRepo = activeRepo;
 
+    // Clear stale fit lines immediately when parameters change so outdated numbers are never shown.
+    setGgufState({ kind: "loading", repo: targetRepo });
+
     const runFetch = () => {
       const seq = ++ggufSeqRef.current;
       const controller = new AbortController();
       ggufAbortRef.current = controller;
-
-      setGgufState((prev) => {
-        const previous =
-          prev.kind === "ready" && prev.data.repo === targetRepo
-            ? prev.data
-            : prev.kind === "loading" && prev.previous?.repo === targetRepo
-              ? prev.previous
-              : null;
-        return { kind: "loading", repo: targetRepo, previous };
-      });
 
       const fit: GgufFitOptions = {
         ctx,
@@ -396,12 +389,7 @@ export function HfModelField({
   }
   const describedBy = describedByParts.length > 0 ? describedByParts.join(" ") : undefined;
 
-  const previewData =
-    ggufState.kind === "ready"
-      ? ggufState.data
-      : ggufState.kind === "loading"
-        ? ggufState.previous
-        : null;
+  const previewData = ggufState.kind === "ready" ? ggufState.data : null;
 
   return (
     <div className="field-group" data-plugin-input={input.id} data-plugin-input-kind="hf-model">

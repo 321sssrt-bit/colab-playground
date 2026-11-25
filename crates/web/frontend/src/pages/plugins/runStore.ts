@@ -71,6 +71,7 @@ let dismissedAutoRunId = 0;
 let highestSeenRunId = 0;
 let pendingAutoAttach = false;
 let runsListInFlight: Promise<PluginRunSummary[]> | null = null;
+let runsListSeq = 0;
 let forwardsInFlight: Promise<ForwardView[]> | null = null;
 let forwardsSeq = 0;
 let streamSeq = 0;
@@ -114,6 +115,7 @@ function resetStore(): void {
   highestSeenRunId = 0;
   pendingAutoAttach = false;
   runsListInFlight = null;
+  runsListSeq += 1;
   forwardsInFlight = null;
   forwardsSeq += 1;
   state = INITIAL_STATE;
@@ -549,6 +551,9 @@ function connectRunStream(
 }
 
 function attachRun(summary: PluginRunSummary): void {
+  // Invalidate any pre-submit `/api/plugins/runs` fetch so a delayed stale list cannot drop this run.
+  runsListSeq += 1;
+  runsListInFlight = null;
   highestSeenRunId = Math.max(highestSeenRunId, summary.id);
   const runs = state.runs.some((item) => item.id === summary.id)
     ? state.runs
@@ -592,14 +597,15 @@ export function refreshPluginRuns(options?: {
     return runsListInFlight;
   }
   const gen = apiClient.getSessionGeneration();
+  const seq = ++runsListSeq;
 
   const promise = listPluginRuns()
     .then((runs) => {
+      if (apiClient.getSessionGeneration() !== gen || seq !== runsListSeq) {
+        return state.runs as PluginRunSummary[];
+      }
       const shouldConsiderAutoAttach = pendingAutoAttach;
       pendingAutoAttach = false;
-      if (apiClient.getSessionGeneration() !== gen) {
-        return runs;
-      }
       setState({ runs });
 
       const newest = runs[0] ?? null;
@@ -631,7 +637,9 @@ export function refreshPluginRuns(options?: {
       return runs;
     })
     .catch(() => {
-      pendingAutoAttach = false;
+      if (seq === runsListSeq) {
+        pendingAutoAttach = false;
+      }
       return state.runs as PluginRunSummary[];
     })
     .finally(() => {

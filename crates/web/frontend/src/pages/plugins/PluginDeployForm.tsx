@@ -253,6 +253,10 @@ function validateNonSecretInput(
   return { ok: true, value: trimmed };
 }
 
+function isSelectUnsetAllowed(spec: PluginInputSpec): boolean {
+  return spec.type === "select" && !spec.required && (spec.default === undefined || spec.default === null);
+}
+
 function buildInitialFieldState(
   plugin: PluginInfo,
   template: PluginRunTemplateSpec,
@@ -269,8 +273,7 @@ function buildInitialFieldState(
     if (input.type === "bool") {
       bools[input.id] = value === true;
     } else if (input.type === "select") {
-      texts[input.id] =
-        typeof value === "string" && value.length > 0 ? value : (input.options?.[0] ?? "");
+      texts[input.id] = typeof value === "string" && value.length > 0 ? value : "";
     } else if (input.type === "number") {
       texts[input.id] =
         typeof value === "number" && Number.isFinite(value)
@@ -509,41 +512,33 @@ export function PluginDeployForm({
 
   // Monitor the picked existing runtime against live snapshots: unpick cleanly if stopped or account switched.
   useEffect(() => {
-    if (!selectedExisting || !snapshot?.runtimes || snapshot.runtimes_error !== null) {
+    if (!selectedExisting || !snapshot) {
       return;
     }
     const activeAccount = snapshot.accounts?.active ?? snapshot.account.active ?? null;
-    if (!activeAccount) {
+    if (!activeAccount || selectedExisting.account !== activeAccount) {
       setTargetLost({ kind: "other_account", name: selectedExisting.name });
       setSelectedExisting(null);
       return;
     }
-    if (snapshot.runtimes.errors.some((err) => err.account === activeAccount)) {
-      return;
-    }
-    if (selectedExisting.account !== activeAccount) {
-      setTargetLost({ kind: "other_account", name: selectedExisting.name });
-      setSelectedExisting(null);
+    if (
+      !snapshot.runtimes ||
+      snapshot.runtimes_error !== null ||
+      snapshot.runtimes.errors.some((err) => err.account === activeAccount)
+    ) {
       return;
     }
     const matched = snapshot.runtimes.runtimes.find(
       (rt) =>
         rt.on_active_account &&
         rt.managed &&
-        rt.id.account === activeAccount &&
+        rt.id.account === selectedExisting.account &&
+        rt.id.endpoint === selectedExisting.runtime.endpoint &&
         rt.id.name === selectedExisting.name,
     );
     if (!matched) {
       setTargetLost({ kind: "ended", name: selectedExisting.name });
       setSelectedExisting(null);
-      return;
-    }
-    if (matched.id.endpoint !== selectedExisting.runtime.endpoint) {
-      setSelectedExisting({
-        name: selectedExisting.name,
-        account: activeAccount,
-        runtime: matched.id,
-      });
     }
   }, [selectedExisting, snapshot]);
 
@@ -559,7 +554,9 @@ export function PluginDeployForm({
     return (
       activeManagedRuntimes.find(
         (rt) =>
-          rt.id.account === selectedExisting.account && rt.id.name === selectedExisting.name,
+          rt.id.account === selectedExisting.account &&
+          rt.id.endpoint === selectedExisting.runtime.endpoint &&
+          rt.id.name === selectedExisting.name,
       ) ?? null
     );
   }, [activeManagedRuntimes, selectedExisting]);
@@ -678,10 +675,6 @@ export function PluginDeployForm({
 
   const validateSingleFieldOnBlur = (spec: PluginInputSpec) => {
     if (spec.type === "secret") {
-      const raw = secretInputRefs.current.get(spec.id)?.value ?? "";
-      if (raw.length > MAX_TEXT_LEN || raw.includes("\0")) {
-        setFieldErrors((prev) => ({ ...prev, [spec.id]: t("app.err.invalid_input") }));
-      }
       return;
     }
     const rawText = textValues[spec.id] ?? "";
@@ -694,15 +687,15 @@ export function PluginDeployForm({
     }
   };
 
-  const handleTargetChange = (nextName: string) => {
+  const handleTargetChange = (nextKey: string) => {
     setTargetLost(null);
     setSubmitError(null);
     setProvisionInvalidFields(new Set());
-    if (!nextName) {
+    if (!nextKey) {
       setSelectedExisting(null);
       return;
     }
-    const matched = activeManagedRuntimes.find((rt) => rt.id.name === nextName);
+    const matched = activeManagedRuntimes.find((rt) => runtimeKey(rt.id) === nextKey);
     if (!matched || !matched.id.name) {
       setSelectedExisting(null);
       return;
@@ -734,8 +727,7 @@ export function PluginDeployForm({
       if (input.type === "secret") {
         // Read plaintext directly from the DOM node only at submit time; never store in state.
         const raw = secretInputRefs.current.get(input.id)?.value ?? "";
-        const trimmed = raw.trim();
-        if (trimmed.length === 0) {
+        if (raw.trim().length === 0) {
           if (input.required) {
             const fieldLabel = resolveLocalizedText(input.label, locale, input.id);
             nextFieldErrors[input.id] = t("web.plugins.field_required", { field: fieldLabel });
@@ -743,7 +735,8 @@ export function PluginDeployForm({
         } else if (raw.length > MAX_TEXT_LEN || raw.includes("\0")) {
           nextFieldErrors[input.id] = t("app.err.invalid_input");
         } else {
-          builtInputs[input.id] = trimmed;
+          // Preserve exact secret bytes (including leading/trailing whitespace) to match backend contract.
+          builtInputs[input.id] = raw;
         }
         continue;
       }
@@ -768,16 +761,19 @@ export function PluginDeployForm({
     let nextProvisionInvalid: ReadonlySet<ProvisionFieldErrorId> = new Set();
 
     if (selectedExisting !== null) {
+      if (selectedExisting.account !== currentAccountContext.active) {
+        setTargetLost({ kind: "other_account", name: selectedExisting.name });
+        setSelectedExisting(null);
+        return;
+      }
       const liveMatch = activeManagedRuntimes.find(
         (rt) =>
-          rt.id.account === currentAccountContext.active && rt.id.name === selectedExisting.name,
+          rt.id.account === selectedExisting.account &&
+          rt.id.endpoint === selectedExisting.runtime.endpoint &&
+          rt.id.name === selectedExisting.name,
       );
       if (!liveMatch) {
-        setTargetLost({
-          kind:
-            selectedExisting.account !== currentAccountContext.active ? "other_account" : "ended",
-          name: selectedExisting.name,
-        });
+        setTargetLost({ kind: "ended", name: selectedExisting.name });
         setSelectedExisting(null);
         return;
       }
@@ -1050,6 +1046,11 @@ export function PluginDeployForm({
                               clearFieldError(input.id);
                             }}
                           >
+                            {(isSelectUnsetAllowed(input) || (textValues[input.id] ?? "") === "") && (
+                              <option value="" disabled={input.required}>
+                                {t("select.placeholder")}
+                              </option>
+                            )}
                             {(input.options ?? []).map((opt) => (
                               <option key={opt} value={opt}>
                                 {opt}
@@ -1102,7 +1103,6 @@ export function PluginDeployForm({
                             aria-invalid={fieldError ? "true" : undefined}
                             aria-describedby={describedBy}
                             onInput={() => clearFieldError(input.id)}
-                            onBlur={() => validateSingleFieldOnBlur(input)}
                           />
                         ) : (
                           <input
@@ -1208,14 +1208,14 @@ export function PluginDeployForm({
                   id={targetSelectId}
                   name="run_target"
                   className="select select-inline"
-                  value={selectedExisting?.name ?? ""}
+                  value={selectedExisting ? runtimeKey(selectedExisting.runtime) : ""}
                   disabled={submitting}
                   data-plugin-run-target="true"
                   onChange={(event) => handleTargetChange(event.target.value)}
                 >
                   <option value="">{t("app.b2.run_target_new")}</option>
                   {activeManagedRuntimes.map((rt) => (
-                    <option key={runtimeKey(rt.id)} value={rt.id.name ?? ""}>
+                    <option key={runtimeKey(rt.id)} value={runtimeKey(rt.id)}>
                       {rt.id.name}
                     </option>
                   ))}
