@@ -45,6 +45,7 @@ import {
 } from "../store.js";
 
 const HF_FIT_DEBOUNCE_MS = 250;
+const HF_SEARCH_DEBOUNCE_MS = 280;
 
 function pluginDisplayName(info) {
   if (!info?.manifest) return "";
@@ -122,6 +123,61 @@ function createCopyButton({ text, ariaLabel, failKey = "web.plugins.endpoint_cop
   );
 }
 
+function resolveEndpointUrls(forward, ep) {
+  const localPort = forward?.spec?.local_port ?? ep.remote_port;
+  const pathTrimmed = String(ep.path || "/").replace(/\/+$/, "");
+  const serverLocalFallbackUrl = `http://127.0.0.1:${localPort}${pathTrimmed}`;
+  const addresses = forward?.addresses || null;
+  const rawOpen = safeHttpUrl(addresses?.open_url);
+  if (!rawOpen) {
+    return {
+      openUrl: null,
+      copyUrl: addresses?.copy_url || null,
+      openaiBaseUrl: addresses?.openai_base_url || null,
+      displayUrl: addresses?.copy_url || serverLocalFallbackUrl,
+      serverLocalFallbackUrl,
+    };
+  }
+  // Re-apply the plugin manifest's declared path and kind over the server-validated origin so
+  // re-opening or re-binding a forward through /api/forwards keeps custom endpoint paths intact.
+  const origin = new URL(rawOpen).origin;
+  const fullUrl = `${origin}${pathTrimmed}`;
+  if (ep.kind === "openai") {
+    return {
+      openUrl: origin,
+      copyUrl: fullUrl,
+      openaiBaseUrl: fullUrl,
+      displayUrl: fullUrl,
+      serverLocalFallbackUrl,
+    };
+  }
+  return {
+    openUrl: fullUrl,
+    copyUrl: fullUrl,
+    openaiBaseUrl: null,
+    displayUrl: fullUrl,
+    serverLocalFallbackUrl,
+  };
+}
+
+function createHfFieldState() {
+  return {
+    queryDraft: "",
+    searchGen: 0,
+    searchTimer: null,
+    searchStatus: "idle", // idle | loading | ready | error
+    results: [],
+    searchError: null,
+    filesGen: 0,
+    filesKey: "",
+    filesRepo: "",
+    filesStatus: "idle", // idle | loading | ready | error
+    filesData: null,
+    filesError: null,
+    filesCtx: 0,
+  };
+}
+
 function buildOpenAiCurl(baseUrl, modelId, hasSecretKey) {
   const safeModel = String(modelId || "MODEL").replace(/[\r\n'"]/g, "");
   const authLine = hasSecretKey ? ' \\\n  -H "Authorization: Bearer $API_KEY"' : "";
@@ -152,17 +208,35 @@ export function createPluginsPage({ navigate }) {
     return (state.plugins || []).find((p) => p?.manifest?.id === id) || null;
   }
 
-  function clearHfFitDebounce() {
+  function clearHfTimers() {
     if (hfFitDebounceTimer !== null) {
       window.clearTimeout(hfFitDebounceTimer);
       hfFitDebounceTimer = null;
     }
+    if (formModel?.hfStates) {
+      for (const hfState of formModel.hfStates.values()) {
+        if (hfState.searchTimer !== null) {
+          window.clearTimeout(hfState.searchTimer);
+          hfState.searchTimer = null;
+        }
+      }
+    }
+  }
+
+  function getHfState(specId) {
+    if (!formModel) return null;
+    let entry = formModel.hfStates.get(specId);
+    if (!entry) {
+      entry = createHfFieldState();
+      formModel.hfStates.set(specId, entry);
+    }
+    return entry;
   }
 
   async function openRunForm(pluginId) {
     const info = findPlugin(pluginId);
     if (!info || !info.enabled) return;
-    clearHfFitDebounce();
+    clearHfTimers();
     const gen = ++formOpenGeneration;
     view = "form";
     formDom = null;
@@ -181,17 +255,7 @@ export function createPluginsPage({ navigate }) {
       existingAccount: null,
       targetLost: null,
       stopOnFailure: true,
-      hfQueryDraft: "",
-      hfSearchGen: 0,
-      hfSearchStatus: "idle", // idle | loading | ready | error
-      hfResults: [],
-      hfSearchError: null,
-      hfFilesGen: 0,
-      hfFilesRepo: "",
-      hfFilesStatus: "idle", // idle | loading | ready | error
-      hfFilesData: null,
-      hfFilesError: null,
-      hfFilesCtx: 0,
+      hfStates: new Map(),
     };
     renderAll();
 
@@ -251,7 +315,7 @@ export function createPluginsPage({ navigate }) {
   }
 
   function showList() {
-    clearHfFitDebounce();
+    clearHfTimers();
     formOpenGeneration += 1;
     view = "list";
     formModel = null;
@@ -261,7 +325,7 @@ export function createPluginsPage({ navigate }) {
 
   function showRun() {
     if (!state.pluginRun || state.pluginRun.phase === "idle") return;
-    clearHfFitDebounce();
+    clearHfTimers();
     view = "run";
     formDom = null;
     logBoxEl = null;
@@ -505,36 +569,69 @@ export function createPluginsPage({ navigate }) {
     return Math.floor(parsed);
   }
 
-  async function runHfSearch(query) {
+  async function runHfSearch(specId, query) {
     if (!formModel) return;
-    const gen = ++formModel.hfSearchGen;
-    formModel.hfSearchStatus = "loading";
-    formModel.hfSearchError = null;
-    renderHfResultsSlot();
+    const hfState = getHfState(specId);
+    if (!hfState) return;
+    if (hfState.searchTimer !== null) {
+      window.clearTimeout(hfState.searchTimer);
+      hfState.searchTimer = null;
+    }
+    const gen = ++hfState.searchGen;
+    hfState.searchStatus = "loading";
+    hfState.searchError = null;
+    renderHfResultsSlot(specId);
 
     try {
       const models = await searchHfModels(query);
-      if (!formModel || gen !== formModel.hfSearchGen) return;
-      formModel.hfResults = Array.isArray(models) ? models : [];
-      formModel.hfSearchStatus = "ready";
-      formModel.hfSearchError = null;
-      renderHfResultsSlot();
+      if (!formModel || gen !== hfState.searchGen) return;
+      hfState.results = Array.isArray(models) ? models : [];
+      hfState.searchStatus = "ready";
+      hfState.searchError = null;
+      renderHfResultsSlot(specId);
     } catch (err) {
       if (err && err.status === 401) return;
-      if (!formModel || gen !== formModel.hfSearchGen) return;
-      formModel.hfSearchStatus = "error";
-      formModel.hfSearchError = err?.payload || { error: {} };
-      renderHfResultsSlot();
+      if (!formModel || gen !== hfState.searchGen) return;
+      hfState.searchStatus = "error";
+      hfState.searchError = err?.payload || { error: {} };
+      renderHfResultsSlot(specId);
     }
   }
 
-  async function runHfFiles(repo, { force = false } = {}) {
+  function scheduleHfSearch(specId, query) {
     if (!formModel) return;
+    const hfState = getHfState(specId);
+    if (!hfState) return;
+    if (hfState.searchTimer !== null) {
+      window.clearTimeout(hfState.searchTimer);
+      hfState.searchTimer = null;
+    }
+    const trimmed = String(query || "").trim();
+    if (!trimmed) {
+      hfState.searchGen += 1;
+      hfState.searchStatus = "idle";
+      hfState.results = [];
+      hfState.searchError = null;
+      renderHfResultsSlot(specId);
+      return;
+    }
+    hfState.searchTimer = window.setTimeout(() => {
+      hfState.searchTimer = null;
+      if (formModel && view === "form") {
+        void runHfSearch(specId, hfState.queryDraft);
+      }
+    }, HF_SEARCH_DEBOUNCE_MS);
+  }
+
+  async function runHfFiles(specId, repo, { force = false } = {}) {
+    if (!formModel) return;
+    const hfState = getHfState(specId);
+    if (!hfState) return;
     const trimmed = String(repo || "").trim();
     if (!trimmed) {
-      formModel.hfFilesStatus = "error";
-      formModel.hfFilesError = { error: { message_key: "web.plugins.hf_repo_required" } };
-      renderHfFilesSlot();
+      hfState.filesStatus = "error";
+      hfState.filesError = { error: { message_key: "web.plugins.hf_repo_required" } };
+      renderHfFilesSlot(specId);
       return;
     }
     const info = findPlugin(formModel.pluginId);
@@ -542,22 +639,19 @@ export function createPluginsPage({ navigate }) {
     const quant = currentQuantForPreview(info);
     const accelerator = formModel.provision?.accelerator || "A100";
     const vramMib = formModel.provision?.min_vram_mib ?? null;
+    const cacheKey = JSON.stringify([trimmed, accelerator, vramMib, ctx, quant]);
 
-    if (
-      !force &&
-      formModel.hfFilesRepo === trimmed &&
-      formModel.hfFilesStatus === "ready" &&
-      formModel.hfFilesCtx === ctx
-    ) {
+    if (!force && hfState.filesKey === cacheKey && hfState.filesStatus === "ready") {
       return;
     }
 
-    const gen = ++formModel.hfFilesGen;
-    formModel.hfFilesRepo = trimmed;
-    formModel.hfFilesCtx = ctx;
-    formModel.hfFilesStatus = "loading";
-    formModel.hfFilesError = null;
-    renderHfFilesSlot();
+    const gen = ++hfState.filesGen;
+    hfState.filesKey = cacheKey;
+    hfState.filesRepo = trimmed;
+    hfState.filesCtx = ctx;
+    hfState.filesStatus = "loading";
+    hfState.filesError = null;
+    renderHfFilesSlot(specId);
 
     try {
       const data = await fetchHfGguf({
@@ -569,56 +663,71 @@ export function createPluginsPage({ navigate }) {
         },
         quant,
       });
-      if (!formModel || gen !== formModel.hfFilesGen) return;
-      formModel.hfFilesData = data;
-      formModel.hfFilesStatus = "ready";
-      formModel.hfFilesError = null;
-      renderHfFilesSlot();
+      if (!formModel || gen !== hfState.filesGen) return;
+      hfState.filesData = data;
+      hfState.filesStatus = "ready";
+      hfState.filesError = null;
+      renderHfFilesSlot(specId);
     } catch (err) {
       if (err && err.status === 401) return;
-      if (!formModel || gen !== formModel.hfFilesGen) return;
-      formModel.hfFilesStatus = "error";
-      formModel.hfFilesError = err?.payload || { error: {} };
-      renderHfFilesSlot();
+      if (!formModel || gen !== hfState.filesGen) return;
+      hfState.filesStatus = "error";
+      hfState.filesError = err?.payload || { error: {} };
+      renderHfFilesSlot(specId);
     }
   }
 
   function scheduleHfFilesRefresh() {
-    if (!formModel || !formModel.hfFilesRepo) return;
-    clearHfFitDebounce();
+    if (!formModel || !formModel.hfStates || formModel.hfStates.size === 0) return;
+    if (hfFitDebounceTimer !== null) {
+      window.clearTimeout(hfFitDebounceTimer);
+      hfFitDebounceTimer = null;
+    }
     hfFitDebounceTimer = window.setTimeout(() => {
       hfFitDebounceTimer = null;
-      if (formModel && formModel.hfFilesRepo && view === "form") {
-        void runHfFiles(formModel.hfFilesRepo, { force: true });
+      if (!formModel || view !== "form") return;
+      for (const [specId, hfState] of formModel.hfStates.entries()) {
+        if (hfState.filesStatus === "idle") continue;
+        const currentRepo = String(formModel.values[specId] ?? "").trim();
+        if (!currentRepo) {
+          hfState.filesStatus = "idle";
+          hfState.filesData = null;
+          hfState.filesError = null;
+          hfState.filesKey = "";
+          hfState.filesRepo = "";
+          renderHfFilesSlot(specId);
+          continue;
+        }
+        void runHfFiles(specId, currentRepo, { force: true });
       }
     }, HF_FIT_DEBOUNCE_MS);
   }
 
-  function renderHfResultsSlot() {
-    const host = formDom?.hfResultsHost;
-    if (!host || !host.isConnected || !formModel) return;
+  function renderHfResultsSlot(specId) {
+    const host = formDom?.hfSlots?.get(specId)?.resultsHost;
+    const hfState = getHfState(specId);
+    if (!host || !host.isConnected || !formModel || !hfState) return;
     clear(host);
-    if (formModel.hfSearchStatus === "loading") {
+    if (hfState.searchStatus === "loading") {
       host.appendChild(el("span", { className: "caption" }, t("app.b2.hf_searching")));
       return;
     }
-    if (formModel.hfSearchStatus === "error") {
+    if (hfState.searchStatus === "error") {
       host.appendChild(
-        inlineMessage({ tone: "warning", text: formatApiError(formModel.hfSearchError).message })
+        inlineMessage({ tone: "warning", text: formatApiError(hfState.searchError).message })
       );
       return;
     }
-    if (formModel.hfSearchStatus === "ready") {
-      if (formModel.hfResults.length === 0) {
+    if (hfState.searchStatus === "ready") {
+      if (hfState.results.length === 0) {
         host.appendChild(el("span", { className: "caption" }, t("app.b2.hf_no_results")));
         return;
       }
-      const hfInputId = formDom.hfInputId;
       host.appendChild(
         el(
           "div",
-          { className: "hf-results-list", dataset: { hfResults: "true" } },
-          formModel.hfResults.map((model) =>
+          { className: "hf-results-list", dataset: { hfResults: specId } },
+          hfState.results.map((model) =>
             el(
               "button",
               {
@@ -626,13 +735,13 @@ export function createPluginsPage({ navigate }) {
                 className: "hf-result-item",
                 dataset: { hfResult: model.id },
                 onClick: () => {
-                  if (!formModel || !hfInputId) return;
-                  formModel.values[hfInputId] = model.id;
-                  const inputEl = formDom?.fieldInputs?.get(hfInputId);
+                  if (!formModel) return;
+                  formModel.values[specId] = model.id;
+                  const inputEl = formDom?.fieldInputs?.get(specId);
                   if (inputEl) {
                     inputEl.value = model.id;
                   }
-                  void runHfFiles(model.id, { force: true });
+                  void runHfFiles(specId, model.id, { force: true });
                 },
               },
               el("span", { className: "hf-result-id" }, model.id),
@@ -650,26 +759,27 @@ export function createPluginsPage({ navigate }) {
     }
   }
 
-  function renderHfFilesSlot() {
-    const host = formDom?.hfFilesHost;
-    if (!host || !host.isConnected || !formModel) return;
+  function renderHfFilesSlot(specId) {
+    const host = formDom?.hfSlots?.get(specId)?.filesHost;
+    const hfState = getHfState(specId);
+    if (!host || !host.isConnected || !formModel || !hfState) return;
     clear(host);
-    if (formModel.hfFilesStatus === "loading") {
+    if (hfState.filesStatus === "loading") {
       host.appendChild(el("span", { className: "caption" }, t("app.b2.hf_listing")));
       return;
     }
-    if (formModel.hfFilesStatus === "error") {
+    if (hfState.filesStatus === "error") {
       host.appendChild(
-        inlineMessage({ tone: "warning", text: formatApiError(formModel.hfFilesError).message })
+        inlineMessage({ tone: "warning", text: formatApiError(hfState.filesError).message })
       );
       return;
     }
-    if (formModel.hfFilesStatus !== "ready" || !formModel.hfFilesData) {
+    if (hfState.filesStatus !== "ready" || !hfState.filesData) {
       return;
     }
 
-    const listing = formModel.hfFilesData.listing;
-    const fits = Array.isArray(formModel.hfFilesData.fits) ? formModel.hfFilesData.fits : [];
+    const listing = hfState.filesData.listing;
+    const fits = Array.isArray(hfState.filesData.fits) ? hfState.filesData.fits : [];
     const variants = Array.isArray(listing?.variants) ? listing.variants : [];
     const sep = t("app.fmt.list_separator");
     const variantLabels = variants.map((v) => `${v.quant} (${formatBytes(v.size)})`);
@@ -685,7 +795,7 @@ export function createPluginsPage({ navigate }) {
     if (fits.length === 0) {
       nodes.push(el("p", { className: "caption" }, t("app.b2.quant_no_gpu")));
     } else {
-      const ctxAssumed = formModel.hfFilesCtx === 0;
+      const ctxAssumed = hfState.filesCtx === 0;
       for (const item of fits) {
         const gpu = formatVram(item.vram_mib);
         let lineText;
@@ -706,7 +816,7 @@ export function createPluginsPage({ navigate }) {
     }
 
     nodes.push(el("p", { className: "caption" }, t("app.b2.quant_estimate_note")));
-    host.appendChild(el("div", { className: "quant-preview", dataset: { quantPreview: "true" } }, nodes));
+    host.appendChild(el("div", { className: "quant-preview", dataset: { quantPreview: specId } }, nodes));
   }
 
   function syncFormLiveSlots() {
@@ -1151,9 +1261,7 @@ export function createPluginsPage({ navigate }) {
     const desc = localized(info.manifest.description);
     const fieldInputs = new Map();
     const secretInputs = new Map();
-    let hfInputId = null;
-    let hfResultsHost = null;
-    let hfFilesHost = null;
+    const hfSlots = new Map();
 
     const fieldNodes = (info.manifest.inputs || []).map((spec) => {
       const inputDomId = `plugin-input-${spec.id}`;
@@ -1239,6 +1347,19 @@ export function createPluginsPage({ navigate }) {
           dataset: { pluginField: spec.id, pluginFieldType: spec.type },
           onInput: (event) => {
             formModel.values[spec.id] = event.target.value;
+            if (spec.type === "hf-model") {
+              const hfState = getHfState(spec.id);
+              const nextRepo = event.target.value.trim();
+              if (hfState && hfState.filesStatus !== "idle" && nextRepo !== hfState.filesRepo) {
+                hfState.filesGen += 1;
+                hfState.filesStatus = "idle";
+                hfState.filesData = null;
+                hfState.filesError = null;
+                hfState.filesKey = "";
+                hfState.filesRepo = "";
+                renderHfFilesSlot(spec.id);
+              }
+            }
           },
         });
         fieldInputs.set(spec.id, inputEl);
@@ -1258,26 +1379,30 @@ export function createPluginsPage({ navigate }) {
       }
 
       if (spec.type === "hf-model") {
-        hfInputId = spec.id;
-        hfResultsHost = el("div", { className: "hf-results-slot" });
-        hfFilesHost = el("div", { className: "hf-files-slot" });
+        const hfState = getHfState(spec.id);
+        const resultsHost = el("div", { className: "hf-results-slot" });
+        const filesHost = el("div", { className: "hf-files-slot" });
+        hfSlots.set(spec.id, { resultsHost, filesHost });
         const searchInput = el("input", {
           id: `hf-search-input-${spec.id}`,
           type: "search",
           className: "input",
           placeholder: t("app.b2.hf_search_placeholder"),
           "aria-label": t("app.b2.hf_search"),
-          value: formModel.hfQueryDraft,
+          value: hfState ? hfState.queryDraft : "",
           autocomplete: "off",
           spellcheck: "false",
-          dataset: { hfSearchInput: "true" },
+          dataset: { hfSearchInput: spec.id },
           onInput: (event) => {
-            formModel.hfQueryDraft = event.target.value;
+            if (hfState) {
+              hfState.queryDraft = event.target.value;
+            }
+            scheduleHfSearch(spec.id, event.target.value);
           },
           onKeydown: (event) => {
             if (event.key === "Enter") {
               event.preventDefault();
-              void runHfSearch(formModel.hfQueryDraft);
+              void runHfSearch(spec.id, hfState ? hfState.queryDraft : "");
             }
           },
         });
@@ -1295,9 +1420,9 @@ export function createPluginsPage({ navigate }) {
                 {
                   type: "button",
                   className: "btn",
-                  dataset: { hfSearchButton: "true" },
+                  dataset: { hfSearchButton: spec.id },
                   onClick: () => {
-                    void runHfSearch(formModel.hfQueryDraft);
+                    void runHfSearch(spec.id, hfState ? hfState.queryDraft : "");
                   },
                 },
                 icon("search"),
@@ -1308,16 +1433,16 @@ export function createPluginsPage({ navigate }) {
                 {
                   type: "button",
                   className: "btn btn-ghost",
-                  dataset: { hfListFiles: "true" },
+                  dataset: { hfListFiles: spec.id },
                   onClick: () => {
-                    void runHfFiles(formModel.values[spec.id], { force: true });
+                    void runHfFiles(spec.id, formModel.values[spec.id], { force: true });
                   },
                 },
                 t("app.b2.hf_list_files")
               )
             ),
-            hfResultsHost,
-            hfFilesHost
+            resultsHost,
+            filesHost
           )
         );
       }
@@ -1365,9 +1490,7 @@ export function createPluginsPage({ navigate }) {
     formDom = {
       fieldInputs,
       secretInputs,
-      hfInputId,
-      hfResultsHost,
-      hfFilesHost,
+      hfSlots,
       hfTokenBannerHost,
       targetSelect,
       targetLostHost,
@@ -1436,8 +1559,10 @@ export function createPluginsPage({ navigate }) {
     bodyEl.appendChild(formEl);
     renderTargetOptionsSlot();
     renderTargetDetailsSlot();
-    renderHfResultsSlot();
-    renderHfFilesSlot();
+    for (const specId of hfSlots.keys()) {
+      renderHfResultsSlot(specId);
+      renderHfFilesSlot(specId);
+    }
     renderFormErrorSlot();
     syncFormLiveSlots();
   }
@@ -1516,6 +1641,9 @@ export function createPluginsPage({ navigate }) {
     if (!run.session) {
       return el("p", { className: "caption", dataset: { runCleanup: "no-session" } }, t("app.b2.run_no_session"));
     }
+    if (run.cleanupChecking || state.sessionsLoading || state.sessionsRefreshing) {
+      return el("p", { className: "caption", dataset: { runCleanup: "checking" } }, t("app.b2.run_checking"));
+    }
     const targetRuntime = findRunRuntime(run);
     if (targetRuntime) {
       return el(
@@ -1538,9 +1666,6 @@ export function createPluginsPage({ navigate }) {
           )
         )
       );
-    }
-    if (state.sessionsLoading || state.sessionsRefreshing) {
-      return el("p", { className: "caption", dataset: { runCleanup: "checking" } }, t("app.b2.run_checking"));
     }
     if (isRuntimeListCompleteFor(run.account)) {
       return el(
@@ -1705,15 +1830,8 @@ export function createPluginsPage({ navigate }) {
     const stateKind = typeof st === "string" ? st : st?.state;
     const isUp = Boolean(forward && stateKind === "up");
     const isForwarded = Boolean(forward);
-    const localPort = forward?.spec?.local_port ?? ep.remote_port;
-    const pathTrimmed = String(ep.path || "/").replace(/\/+$/, "");
     const addresses = forward?.addresses || null;
-
-    const openUrl = safeHttpUrl(addresses?.open_url);
-    const copyUrl = addresses?.copy_url || addresses?.open_url || null;
-    const openaiBaseUrl = addresses?.openai_base_url || null;
-    const serverLocalFallbackUrl = `http://127.0.0.1:${localPort}${pathTrimmed}`;
-    const displayUrl = copyUrl || serverLocalFallbackUrl;
+    const { openUrl, openaiBaseUrl, displayUrl, serverLocalFallbackUrl } = resolveEndpointUrls(forward, ep);
     const isAllInterfaces = forward?.spec?.bind === "all_interfaces";
     const busy = endpointBusy.has(ep.id);
 
@@ -1918,7 +2036,8 @@ export function createPluginsPage({ navigate }) {
 
   function renderLogCard(run, keepScrollTop = null) {
     const lines = Array.isArray(run.logLines) ? run.logLines : [];
-    if (lines.length === 0 && !run.historySkipped) {
+    const skippedNotices = Array.isArray(run.logSkippedNotices) ? run.logSkippedNotices : [];
+    if (lines.length === 0 && !run.historySkipped && skippedNotices.length === 0) {
       logBoxEl = null;
       return null;
     }
@@ -1929,6 +2048,13 @@ export function createPluginsPage({ navigate }) {
       run.historySkipped
         ? el("div", { className: "run-log-line run-log-line-notice" }, t("web.plugins.history_skipped"))
         : null,
+      skippedNotices.map((entry) =>
+        el(
+          "div",
+          { className: "run-log-line run-log-line-notice", dataset: { logSkipped: entry.path || "true" } },
+          entry.text
+        )
+      ),
       lines.map((entry) =>
         el(
           "div",
@@ -1968,8 +2094,8 @@ export function createPluginsPage({ navigate }) {
     clear(bodyEl);
     const info = findPlugin(run.plugin);
 
-    if (run.provisions && Array.isArray(run.provision?.events) && run.provision.events.length > 0) {
-      const provisioning = run.phase === "running" && !run.session;
+    if (Array.isArray(run.provision?.events) && run.provision.events.length > 0) {
+      const provisioning = run.phase === "running" && !run.launched;
       bodyEl.appendChild(
         el(
           "section",
@@ -2281,7 +2407,7 @@ export function createPluginsPage({ navigate }) {
     },
 
     unmount() {
-      clearHfFitDebounce();
+      clearHfTimers();
       root = null;
       headerEl = null;
       bodyEl = null;

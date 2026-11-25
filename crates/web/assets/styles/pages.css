@@ -1246,6 +1246,10 @@
   color: var(--color-warning);
 }
 
+.hf-token-delete-slot {
+  display: contents;
+}
+
 @media (max-width: 640px) {
   .hf-result-item {
     flex-direction: column;

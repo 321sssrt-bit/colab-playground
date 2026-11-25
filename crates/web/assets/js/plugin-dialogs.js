@@ -481,6 +481,63 @@ function hfTokenStatusBadge() {
   return badge(t("app.summary.unknown"), "neutral");
 }
 
+function buildHfDeleteButton(model) {
+  return el(
+    "button",
+    {
+      type: "button",
+      className: "btn btn-danger",
+      dataset: { hfTokenDelete: "true" },
+      disabled: model.submitting,
+      onClick: async () => {
+        if (model.submitting) return;
+        const gen = ++dialogGeneration;
+        model.submitting = true;
+        model.error = null;
+        model.validationError = null;
+        renderActiveDialog();
+        try {
+          await deleteHfToken();
+          if (gen !== dialogGeneration) return;
+          setNotice({ tone: "info", message: t("app.b2.hf_token_deleted") });
+          announce(t("app.b2.hf_token_deleted"));
+          closeDialogNow();
+        } catch (err) {
+          if (err && err.status === 401) {
+            closeDialogNow();
+            return;
+          }
+          if (gen !== dialogGeneration || activeDialog !== model) return;
+          model.submitting = false;
+          model.error = err?.payload || { error: {} };
+          renderActiveDialog();
+        }
+      },
+    },
+    icon("trash2"),
+    t("app.b2.action_delete")
+  );
+}
+
+function syncHfTokenDialogLive(model) {
+  if (!model || model.kind !== "hf_token" || !model.liveSlots) return;
+  const { statusHost, deleteHost, submitLabelEl } = model.liveSlots;
+  const saved = state.hfToken.status === "ready" && state.hfToken.saved;
+  if (statusHost?.isConnected) {
+    clear(statusHost);
+    statusHost.appendChild(hfTokenStatusBadge());
+  }
+  if (deleteHost?.isConnected) {
+    clear(deleteHost);
+    if (saved) {
+      deleteHost.appendChild(buildHfDeleteButton(model));
+    }
+  }
+  if (submitLabelEl?.isConnected) {
+    submitLabelEl.textContent = t(saved ? "web.plugins.replace_token" : "app.b2.action_save");
+  }
+}
+
 function renderHfTokenDialog(dialog, model) {
   dialog.dataset.dialogKind = "hf_token";
   dialog.dataset.dialogPhase = model.submitting ? "submitting" : "editing";
@@ -501,12 +558,17 @@ function renderHfTokenDialog(dialog, model) {
     autofocus: true,
   });
 
+  const statusHost = el("div", { className: "plugin-card-title-row" }, hfTokenStatusBadge());
+  const deleteHost = el("span", { className: "hf-token-delete-slot" }, saved ? buildHfDeleteButton(model) : null);
+  const submitLabelEl = el(
+    "span",
+    null,
+    t(saved ? "web.plugins.replace_token" : "app.b2.action_save")
+  );
+  model.liveSlots = { statusHost, deleteHost, submitLabelEl };
+
   const bodyNodes = [
-    el(
-      "div",
-      { className: "plugin-card-title-row" },
-      hfTokenStatusBadge()
-    ),
+    statusHost,
     el("p", { className: "dialog-paragraph" }, t("app.b2.hf_token_hint")),
   ];
 
@@ -577,43 +639,7 @@ function renderHfTokenDialog(dialog, model) {
     el(
       "div",
       { className: "modal-actions" },
-      saved
-        ? el(
-            "button",
-            {
-              type: "button",
-              className: "btn btn-danger",
-              dataset: { hfTokenDelete: "true" },
-              disabled: model.submitting,
-              onClick: async () => {
-                if (model.submitting) return;
-                const gen = ++dialogGeneration;
-                model.submitting = true;
-                model.error = null;
-                model.validationError = null;
-                renderActiveDialog();
-                try {
-                  await deleteHfToken();
-                  if (gen !== dialogGeneration) return;
-                  setNotice({ tone: "info", message: t("app.b2.hf_token_deleted") });
-                  announce(t("app.b2.hf_token_deleted"));
-                  closeDialogNow();
-                } catch (err) {
-                  if (err && err.status === 401) {
-                    closeDialogNow();
-                    return;
-                  }
-                  if (gen !== dialogGeneration || activeDialog !== model) return;
-                  model.submitting = false;
-                  model.error = err?.payload || { error: {} };
-                  renderActiveDialog();
-                }
-              },
-            },
-            icon("trash2"),
-            t("app.b2.action_delete")
-          )
-        : null,
+      deleteHost,
       el(
         "button",
         {
@@ -633,7 +659,7 @@ function renderHfTokenDialog(dialog, model) {
           disabled: model.submitting,
         },
         model.submitting ? el("span", { className: "spinner", "aria-hidden": "true" }) : null,
-        t(saved ? "web.plugins.replace_token" : "app.b2.action_save")
+        submitLabelEl
       )
     )
   );
@@ -684,10 +710,14 @@ export function initPluginDialogs() {
     });
   }
 
-  // Isolate active dialog inputs from background SSE snapshot refreshes.
+  // Isolate active dialog inputs from background SSE snapshot refreshes; update only non-input HF token status slots.
   subscribe((_, reason) => {
     if (reason === "auth" && !state.authenticated) {
       closeDialogNow();
+      return;
+    }
+    if (reason === "hf_token" && activeDialog?.kind === "hf_token" && !activeDialog.submitting) {
+      syncHfTokenDialogLive(activeDialog);
     }
   });
 

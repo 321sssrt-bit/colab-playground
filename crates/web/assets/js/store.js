@@ -52,12 +52,15 @@ function emptyPluginRunState() {
     account: null,
     session: "",
     provisions: false,
+    launched: false,
+    cleanupChecking: false,
     runId: null,
     phase: "idle", // idle | running | ready | failed | cancelled
     cancelling: false,
     provision: { events: [], latestAtMs: null },
     status: null,
     logLines: [],
+    logSkippedNotices: [],
     historySkipped: false,
     outcome: null,
     endpoints: [],
@@ -406,9 +409,10 @@ function syncPluginRunWithOperations(snapshot) {
         plugin: activeOp.operation.plugin || "",
         session: activeOp.operation.session || "",
         account: snapshot?.account?.active || null,
-        provisions: false,
+        provisions: null,
         finished: false,
       });
+      void loadPluginRuns();
     }
   }
 }
@@ -890,6 +894,10 @@ async function consumePluginRunStream(id, gen) {
           return;
         }
         if (event === "provision" && data) {
+          state.pluginRun.provisions = true;
+          if (!state.pluginRun.launched) {
+            state.pluginRun.session = "";
+          }
           streamProvEvents.push(data);
           if (sawHistorySkipped || streamProvEvents.length >= state.pluginRun.provision.events.length) {
             const grew = streamProvEvents.length > state.pluginRun.provision.events.length;
@@ -902,12 +910,14 @@ async function consumePluginRunStream(id, gen) {
           return;
         }
         if (event === "launched" && data) {
+          state.pluginRun.launched = true;
           if (data.session) state.pluginRun.session = data.session;
           if (data.run_id) state.pluginRun.runId = data.run_id;
           emit("plugin_run");
           return;
         }
         if (event === "status" && data) {
+          state.pluginRun.launched = true;
           state.pluginRun.status = data;
           emit("plugin_run");
           return;
@@ -924,18 +934,24 @@ async function consumePluginRunStream(id, gen) {
           return;
         }
         if (event === "log_skipped" && data) {
-          const noticeText = t(data.message_key || "app.b2.run_log_skipped", {
-            path: data.path || "",
-          });
-          appendBoundedLog(streamLogEntries, [{ text: noticeText, notice: true }]);
-          if (sawHistorySkipped || streamLogEntries.length >= state.pluginRun.logLines.length) {
-            state.pluginRun.logLines = [...streamLogEntries];
+          // Keep full-log path notices outside the bounded log ring buffer so later output cannot evict them.
+          const path = String(data.path || "");
+          const noticeText = t(data.message_key || "app.b2.run_log_skipped", { path });
+          const exists = state.pluginRun.logSkippedNotices.some(
+            (entry) => entry.path === path && entry.text === noticeText
+          );
+          if (!exists) {
+            state.pluginRun.logSkippedNotices = [
+              ...state.pluginRun.logSkippedNotices,
+              { path, text: noticeText },
+            ];
             emit("plugin_run");
           }
           return;
         }
         if (event === "finished" && data) {
           state.pluginRun.cancelling = false;
+          state.pluginRun.launched = true;
           if (data.run?.plugin) state.pluginRun.plugin = data.run.plugin;
           if (data.run?.account) state.pluginRun.account = data.run.account;
           if (data.run?.session) state.pluginRun.session = data.run.session;
@@ -957,6 +973,7 @@ async function consumePluginRunStream(id, gen) {
           if (data.phase === "ready") {
             state.pluginRun.phase = "ready";
             state.pluginRun.error = null;
+            state.pluginRun.cleanupChecking = false;
             const info = (state.plugins || []).find((p) => p?.manifest?.id === state.pluginRun.plugin);
             const name = info ? localized(info.manifest.name) || info.manifest.id : state.pluginRun.plugin;
             setNotice({
@@ -966,14 +983,22 @@ async function consumePluginRunStream(id, gen) {
           } else if (data.phase === "cancelled") {
             state.pluginRun.phase = "cancelled";
             state.pluginRun.error = null;
+            state.pluginRun.cleanupChecking = Boolean(state.pluginRun.session);
           } else {
             state.pluginRun.phase = "failed";
             state.pluginRun.error = data.error ? { error: data.error } : { error: {} };
+            state.pluginRun.cleanupChecking = Boolean(state.pluginRun.session);
           }
           emit("plugin_run");
+          const sessionRefresh = loadSessions({ silent: true }).finally(() => {
+            if (gen === authGeneration && state.pluginRun.id === id && state.pluginRun.cleanupChecking) {
+              state.pluginRun.cleanupChecking = false;
+              emit("plugin_run");
+            }
+          });
           void Promise.allSettled([
             loadForwards(),
-            loadSessions({ silent: true }),
+            sessionRefresh,
             refreshAccountsUsage().catch(() => {}),
           ]);
         }
@@ -996,9 +1021,16 @@ async function consumePluginRunStream(id, gen) {
   if (result.outcome === "http_error" && !isTransientHttp) {
     state.pluginRun.phase = "failed";
     state.pluginRun.cancelling = false;
+    state.pluginRun.launched = true;
+    state.pluginRun.cleanupChecking = Boolean(state.pluginRun.session);
     state.pluginRun.error = result.payload || { error: {} };
     emit("plugin_run");
-    void loadSessions({ silent: true });
+    void loadSessions({ silent: true }).finally(() => {
+      if (gen === authGeneration && state.pluginRun.id === id && state.pluginRun.cleanupChecking) {
+        state.pluginRun.cleanupChecking = false;
+        emit("plugin_run");
+      }
+    });
     return;
   }
   // Backoff retry for reverse-proxy 502/503/504 or transient stream drops.
@@ -1033,18 +1065,22 @@ export async function attachPluginRun(summary) {
     return;
   }
   stopPluginRunStream();
+  const provisions = summary.provisions === true;
   state.pluginRun = {
     id: summary.id,
     plugin: summary.plugin || "",
     account: summary.account || state.snapshot?.account?.active || null,
-    session: summary.session || "",
-    provisions: Boolean(summary.provisions),
+    session: provisions ? "" : summary.session || "",
+    provisions,
+    launched: summary.provisions === false && Boolean(summary.session),
+    cleanupChecking: false,
     runId: null,
     phase: "running",
     cancelling: false,
     provision: { events: [], latestAtMs: Date.now() },
     status: null,
     logLines: [],
+    logSkippedNotices: [],
     historySkipped: false,
     outcome: null,
     endpoints: [],
@@ -1066,6 +1102,32 @@ export async function loadPluginRuns() {
       const latest = runs.find((item) => !item.finished) || runs[0];
       if (latest) {
         void attachPluginRun(latest);
+      }
+    } else if (state.pluginRun.id !== null && state.pluginRun.phase === "running") {
+      const matched = runs.find((item) => item.id === state.pluginRun.id);
+      if (matched) {
+        let changed = false;
+        if (
+          typeof matched.provisions === "boolean" &&
+          (state.pluginRun.provisions !== matched.provisions ||
+            (!matched.provisions && !state.pluginRun.launched && matched.session))
+        ) {
+          state.pluginRun.provisions = matched.provisions;
+          if (!matched.provisions && matched.session) {
+            state.pluginRun.launched = true;
+            state.pluginRun.session = matched.session;
+          } else if (matched.provisions && !state.pluginRun.launched) {
+            state.pluginRun.session = "";
+          }
+          changed = true;
+        }
+        if (matched.account && state.pluginRun.account !== matched.account) {
+          state.pluginRun.account = matched.account;
+          changed = true;
+        }
+        if (changed) {
+          emit("plugin_run");
+        }
       }
     }
     return runs;
@@ -1106,14 +1168,17 @@ export async function startPluginRun({ spec, existing = null, accountContext = n
     id,
     plugin: spec?.plugin || "",
     account: ctx?.active || null,
-    session: provisions ? spec?.target?.name || "" : spec?.target?.name || "",
+    session: provisions ? "" : spec?.target?.name || "",
     provisions,
+    launched: !provisions,
+    cleanupChecking: false,
     runId: null,
     phase: "running",
     cancelling: false,
     provision: { events: [], latestAtMs: Date.now() },
     status: null,
     logLines: [],
+    logSkippedNotices: [],
     historySkipped: false,
     outcome: null,
     endpoints: [],
