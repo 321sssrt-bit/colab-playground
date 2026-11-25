@@ -9,6 +9,7 @@ import type {
   ApiErrorPayload,
   CoreError,
   ErrorKind,
+  ForwardBind,
   GuardReport,
   Runtime,
   RuntimeRef,
@@ -40,8 +41,23 @@ export interface ForwardAddresses {
   readonly warning_key: string | null;
 }
 
+export interface ForwardPolicyView {
+  readonly all_interfaces_allowed: boolean;
+  readonly restriction: "windows_or_wsl" | "loopback_listener" | string | null;
+}
+
 export interface ForwardView extends TunnelInfo {
   readonly addresses?: ForwardAddresses | null;
+}
+
+export interface OpenForwardPayload {
+  readonly account_context: AccountContext;
+  readonly account: AccountId;
+  readonly session: string;
+  readonly bind: ForwardBind;
+  readonly local_port: number;
+  readonly remote_port: number;
+  readonly health_path: string | null;
 }
 
 interface ClosedForwardResponse {
@@ -74,6 +90,7 @@ export interface StopAllResponse {
 
 interface OverviewReadinessResponse {
   readonly cli_installed: boolean;
+  readonly forward_policy?: ForwardPolicyView | null;
 }
 
 export type ProvisionProgressEvent =
@@ -132,6 +149,13 @@ export function fetchForwards(signal?: AbortSignal): Promise<ForwardView[]> {
   return apiClient.request<ForwardView[]>("/api/forwards", {
     method: "GET",
     signal,
+  });
+}
+
+export function openForward(payload: OpenForwardPayload): Promise<ForwardView> {
+  return apiClient.request<ForwardView>("/api/forwards", {
+    method: "POST",
+    body: payload,
   });
 }
 

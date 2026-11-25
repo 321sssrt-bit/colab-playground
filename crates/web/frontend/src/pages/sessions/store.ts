@@ -24,8 +24,10 @@ import type {
 } from "../../lib/types.ts";
 import {
   fetchForwards,
+  fetchOverviewReadiness,
   fetchSettings,
   type ForwardAddresses,
+  type ForwardPolicyView,
   type ForwardView,
 } from "./api.ts";
 import { formatConcern, formatRuntimeCardLabel, runtimeKey } from "./format.ts";
@@ -55,6 +57,7 @@ interface SessionsLocalState {
   readonly ended: readonly EndedRuntime[];
   readonly forwardAddressesById: Readonly<Record<number, ForwardAddresses>>;
   readonly forwardOverlaysById: Readonly<Record<number, ForwardLiveOverlay>>;
+  readonly forwardPolicy: ForwardPolicyView | null;
   readonly rearmDurationSecs: number;
   readonly cliInstalled: boolean | null;
   readonly reconcileSeq: number;
@@ -64,6 +67,7 @@ const INITIAL_STATE: SessionsLocalState = {
   ended: [],
   forwardAddressesById: {},
   forwardOverlaysById: {},
+  forwardPolicy: null,
   rearmDurationSecs: DEFAULT_REARM_SECS,
   cliInstalled: null,
   reconcileSeq: 0,
@@ -77,7 +81,9 @@ let pendingStopAllCount = 0;
 let deferredPendingKeys = new Set<string>();
 let lastKnownRuntimesByAccount = new Map<AccountId, readonly Runtime[]>();
 let latestSnapshotVersion = 0;
+let forwardsMutationSeq = 0;
 let forwardsInFlight: Promise<ForwardView[]> | null = null;
+let forwardPolicyInFlight: Promise<ForwardPolicyView | null> | null = null;
 let settingsInFlight: Promise<number> | null = null;
 const listeners = new Set<() => void>();
 
@@ -104,7 +110,9 @@ function resetLocalState(): void {
   deferredPendingKeys = new Set<string>();
   lastKnownRuntimesByAccount = new Map<AccountId, readonly Runtime[]>();
   latestSnapshotVersion = 0;
+  forwardsMutationSeq += 1;
   forwardsInFlight = null;
+  forwardPolicyInFlight = null;
   settingsInFlight = null;
   state = INITIAL_STATE;
   emit();
@@ -204,11 +212,64 @@ export function clearEndedRuntimes(): void {
   setState({ ended: [] });
 }
 
-export function setCliInstalledHint(installed: boolean): void {
+function setCliInstalledHint(installed: boolean): void {
   if (state.cliInstalled === installed) {
     return;
   }
   setState({ cliInstalled: installed });
+}
+
+function setForwardPolicy(policy: ForwardPolicyView | null): void {
+  const prev = state.forwardPolicy;
+  if (
+    prev?.all_interfaces_allowed === policy?.all_interfaces_allowed &&
+    prev?.restriction === policy?.restriction
+  ) {
+    return;
+  }
+  setState({ forwardPolicy: policy });
+}
+
+export function refreshOverviewHints(signal?: AbortSignal): Promise<ForwardPolicyView | null> {
+  if (forwardPolicyInFlight) {
+    return forwardPolicyInFlight;
+  }
+  const gen = apiClient.getSessionGeneration();
+  const promise = fetchOverviewReadiness(signal)
+    .then((overview) => {
+      if (apiClient.getSessionGeneration() === gen) {
+        setCliInstalledHint(Boolean(overview.cli_installed));
+        if (overview.forward_policy) {
+          setForwardPolicy(overview.forward_policy);
+        }
+      }
+      return overview.forward_policy ?? null;
+    })
+    .finally(() => {
+      if (forwardPolicyInFlight === promise) {
+        forwardPolicyInFlight = null;
+      }
+    });
+  forwardPolicyInFlight = promise;
+  return promise;
+}
+
+/**
+ * Caches server-validated addresses immediately from a `POST /api/forwards` response
+ * so the new row renders its links and notices without waiting for `GET /api/forwards`.
+ */
+export function recordForwardAddresses(view: ForwardView): void {
+  if (!view.addresses) {
+    return;
+  }
+  forwardsMutationSeq += 1;
+  forwardsInFlight = null;
+  setState({
+    forwardAddressesById: {
+      ...state.forwardAddressesById,
+      [view.id]: view.addresses,
+    },
+  });
 }
 
 /**
@@ -238,9 +299,10 @@ export function refreshForwards(signal?: AbortSignal): Promise<ForwardView[]> {
     return forwardsInFlight;
   }
   const gen = apiClient.getSessionGeneration();
+  const seq = ++forwardsMutationSeq;
   const promise = fetchForwards(signal)
     .then((list) => {
-      if (apiClient.getSessionGeneration() === gen) {
+      if (apiClient.getSessionGeneration() === gen && seq === forwardsMutationSeq) {
         const nextAddresses: Record<number, ForwardAddresses> = {};
         for (const fw of list) {
           if (fw.addresses) {
