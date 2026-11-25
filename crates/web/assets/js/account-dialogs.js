@@ -751,7 +751,6 @@ function renderAddDialog(dialog, model) {
     return;
   }
 
-  // phase === "failed"
   const formatted = formatApiError(model.error);
   dialog.append(
     title,

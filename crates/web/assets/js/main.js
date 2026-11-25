@@ -632,7 +632,6 @@ class AppShellController {
       this.renderAccountSwitcher();
     }
 
-    // Navigation
     this.sidebarNavEl.setAttribute("aria-label", t("web.shell.primary_nav"));
     clear(this.sidebarNavEl);
     this.sidebarNavEl.appendChild(
@@ -662,7 +661,6 @@ class AppShellController {
       )
     );
 
-    // Sidebar bottom badges + Sign out
     clear(this.sidebarFooterEl);
     this.sidebarFooterEl.append(
       el(
