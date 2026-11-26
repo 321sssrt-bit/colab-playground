@@ -215,12 +215,21 @@ export function buildUsageBadge(
   const text = freshness.outdated ? `${baseText} (${t("app.usage.outdated")})` : baseText;
 
   const tipLines: string[] = [];
-  if (snap.balance_cu <= 0) {
-    tipLines.push(t("app.usage.tip.empty"));
+  let isDepleted = false;
+  if (active.usage !== null) {
+    if (active.usage.eta === null) {
+      tipLines.push(t("app.usage.tip.idle"));
+    } else if (active.usage.eta <= 0) {
+      tipLines.push(t("app.usage.tip.empty"));
+      isDepleted = true;
+    } else {
+      tipLines.push(t("app.usage.tip.left", { time: formatDuration(active.usage.eta, t) }));
+    }
   } else if (snap.rate_cu_per_hour <= 0) {
     tipLines.push(t("app.usage.tip.idle"));
-  } else if (active.usage?.eta !== null && active.usage?.eta !== undefined) {
-    tipLines.push(t("app.usage.tip.left", { time: formatDuration(active.usage.eta, t) }));
+  } else if (snap.balance_cu <= 0) {
+    tipLines.push(t("app.usage.tip.empty"));
+    isDepleted = true;
   } else {
     tipLines.push(t("app.shell.usage.hint"));
   }
@@ -235,7 +244,7 @@ export function buildUsageBadge(
   return {
     text,
     tooltip: tipLines.join("\n"),
-    tone: freshness.outdated || snap.balance_cu <= 0 ? "warning" : "neutral",
+    tone: freshness.outdated || isDepleted ? "warning" : "neutral",
     outdated: freshness.outdated,
   };
 }
