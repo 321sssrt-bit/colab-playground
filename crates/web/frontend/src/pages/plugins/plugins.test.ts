@@ -19,7 +19,9 @@ import type {
 import {
   buildGgufFitKey,
   cancelPluginPreview,
+  findInspectPluginOpId,
   planGgufEstimateFetch,
+  shouldSendGlobalPreviewCancel,
 } from "./api.ts";
 import { selectEndpointTunnelByPort, stripAnsi } from "./endpoint.ts";
 import { createPluginCacheStore, pluginCacheStore } from "./pluginCache.ts";
@@ -910,4 +912,249 @@ test("replaying an already-finished ready run does not emit a stale Ready toast"
   runsStore.dispose();
   pluginCache.dispose();
   toast.dispose();
+});
+
+test("verifyRunBilling waits for pre-finish /api/sessions to settle and fetches fresh post-finish sessions", async () => {
+  const vmStillBilling = makeRuntime("acc-1", "gpu-leak");
+  const web = createFakeWebStore(makeSnapshot({ version: 1 }));
+
+  let sessionsRefreshing = true;
+  let callCount = 0;
+  let resolveStale!: (value: SessionsListResponse) => void;
+  const stalePromise = new Promise<SessionsListResponse>((resolve) => {
+    resolveStale = resolve;
+  });
+
+  const appData = {
+    getState: () => ({ sessionsRefreshing }),
+    refreshSessions: () => {
+      callCount += 1;
+      if (callCount === 1) {
+        return stalePromise;
+      }
+      web.setSnapshot(
+        makeSnapshot({ version: 2, runtimes: { runtimes: [vmStillBilling], errors: [] } }),
+      );
+      return Promise.resolve({
+        account_context: { revision: 1, active: "acc-1" },
+        sampled_at: 1_700_000_010,
+        runtimes: [vmStillBilling],
+        errors: [],
+        guard: null,
+        guard_error: null,
+      } satisfies SessionsListResponse);
+    },
+  } as unknown as AppDataStore;
+
+  const harness = createFakeClient(async (_method, path) => {
+    if (path === "/api/plugins/runs") {
+      return [
+        {
+          id: 20,
+          plugin: "llama-cpp",
+          account: "acc-1",
+          session: "gpu-leak",
+          provisions: true,
+          finished: true,
+          phase: "failed",
+        } satisfies PluginRunSummary,
+      ];
+    }
+    return [];
+  });
+
+  const pluginCache = createPluginCacheStore({ client: harness.client, store: web.store });
+  const runsStore = createPluginRunsStore({
+    client: harness.client,
+    store: web.store,
+    appData,
+    forwards: makeFakeForwards().forwards,
+    pluginCache,
+    toast: createToastStore(),
+    t: (key) => key,
+  });
+
+  await runsStore.refreshPluginRuns({ autoAttach: false });
+  const verifyPromise = runsStore.verifyRunBilling(20);
+
+  // Stale pre-finish request resolves empty (sampled before VM existed).
+  sessionsRefreshing = false;
+  resolveStale({
+    account_context: { revision: 1, active: "acc-1" },
+    sampled_at: 1_700_000_001,
+    runtimes: [],
+    errors: [],
+    guard: null,
+    guard_error: null,
+  });
+
+  const result = await verifyPromise;
+  assert.equal(callCount, 2, "must issue a fresh post-finish /api/sessions call");
+  assert.equal(result?.status, "verified");
+  assert.equal(result?.runtime?.id.name, "gpu-leak");
+
+  runsStore.dispose();
+  pluginCache.dispose();
+});
+
+test("fast submitted run still emits Ready toast once even if /api/plugins/runs already returned finished=true", async () => {
+  const web = createFakeWebStore(makeSnapshot());
+  const toast = createToastStore();
+  const harness = createFakeClient(async (_method, path) => {
+    if (path === "/api/plugins") {
+      return [makePlugin("llama-cpp", true)];
+    }
+    if (path === "/api/plugins/runs") {
+      return [
+        {
+          id: 42,
+          plugin: "llama-cpp",
+          account: "acc-1",
+          session: "fast-run",
+          provisions: false,
+          finished: true,
+          phase: "ready",
+        } satisfies PluginRunSummary,
+      ];
+    }
+    return [];
+  });
+
+  const pluginCache = createPluginCacheStore({ client: harness.client, store: web.store });
+  await pluginCache.ensurePlugins();
+  const runsStore = createPluginRunsStore({
+    client: harness.client,
+    store: web.store,
+    appData: {} as AppDataStore,
+    forwards: makeFakeForwards().forwards,
+    pluginCache,
+    toast,
+    t: (key, args) => `${key}:${String(args?.name ?? "")}`,
+    getLocale: () => "en-US",
+  });
+
+  // Runs list already observed `finished: true, phase: "ready"` before submit 202 returned.
+  await runsStore.refreshPluginRuns({ autoAttach: false });
+  runsStore.openPluginRun(42, {
+    id: 42,
+    plugin: "llama-cpp",
+    account: "acc-1",
+    session: "fast-run",
+    provisions: false,
+    finished: false,
+    phase: "running",
+  });
+
+  const stream = harness.streams.get("/api/plugins/runs/42/events");
+  assert.ok(stream);
+  stream.emitFrame({
+    event: "finished",
+    data: JSON.stringify({
+      phase: "ready",
+      run: { plugin: "llama-cpp", account: "acc-1", session: "fast-run", provisions: false },
+      outcome: {
+        session: "fast-run",
+        account: "acc-1",
+        run_id: "r42",
+        status: { state: "ready", stage: null, progress: null, message: null, outputs: {} },
+      },
+      endpoints: [],
+      error: null,
+    }),
+    id: null,
+  });
+  stream.finish();
+  await Promise.resolve();
+
+  assert.equal(toast.getToasts().length, 1);
+  assert.equal(toast.getToasts()[0]?.body, "app.b2.run_ready_toast:llama.cpp");
+  assert.equal(runsStore.hasToastedReadyRun(42), true);
+
+  runsStore.dispose();
+  pluginCache.dispose();
+  toast.dispose();
+});
+
+test("volatile deploy secret stash survives route unmount for same draft and wipes on close or logout", () => {
+  const web = createFakeWebStore(makeSnapshot());
+  const harness = createFakeClient(async () => []);
+  const pluginCache = createPluginCacheStore({ client: harness.client, store: web.store });
+  const runsStore = createPluginRunsStore({
+    client: harness.client,
+    store: web.store,
+    appData: {} as AppDataStore,
+    forwards: makeFakeForwards().forwards,
+    pluginCache,
+    toast: createToastStore(),
+    t: (key) => key,
+  });
+
+  runsStore.openPluginDeployForm("llama-cpp");
+  const openSeq = runsStore.getState().formOpenSeq;
+  runsStore.stashDeploySecrets("llama-cpp", openSeq, [["api_key", "sk-route-secret"]]);
+
+  // Secrets must never appear in serialized store state / deployDraft.
+  assert.equal(JSON.stringify(runsStore.getState()).includes("sk-route-secret"), false);
+
+  // Single-use restore hands secret back to DOM input and clears stash.
+  const restored = runsStore.takeStashedDeploySecrets("llama-cpp", openSeq);
+  assert.equal(restored?.get("api_key"), "sk-route-secret");
+  assert.equal(runsStore.takeStashedDeploySecrets("llama-cpp", openSeq), null);
+
+  // Closing the form wipes any stashed secret.
+  runsStore.stashDeploySecrets("llama-cpp", openSeq, [["api_key", "sk-wiped"]]);
+  runsStore.closePluginDeployForm();
+  assert.equal(runsStore.takeStashedDeploySecrets("llama-cpp", openSeq), null);
+
+  runsStore.dispose();
+  pluginCache.dispose();
+});
+
+test("pluginCacheStore refreshes catalog when cross-tab plugin mutation op completes and preview cancel respects op ownership", async () => {
+  const web = createFakeWebStore(makeSnapshot({ version: 1 }));
+  let enabledOnServer = true;
+  const harness = createFakeClient(async (_method, path) => {
+    if (path === "/api/plugins") {
+      return [makePlugin("llama-cpp", enabledOnServer)];
+    }
+    return [];
+  });
+
+  const pluginCache = createPluginCacheStore({ client: harness.client, store: web.store });
+  await pluginCache.ensurePlugins();
+  assert.equal(pluginCache.getPluginById("llama-cpp")?.enabled, true);
+
+  // Another tab starts and completes `set_plugin_enabled` on `llama-cpp`.
+  web.setSnapshot(
+    makeSnapshot({
+      version: 2,
+      operations: [
+        {
+          id: 55,
+          operation: { kind: "domain", name: "set_plugin_enabled", key: "llama-cpp" },
+          cancelling: false,
+        },
+      ],
+    }),
+  );
+  enabledOnServer = false;
+  web.setSnapshot(makeSnapshot({ version: 3, operations: [] }));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(pluginCache.getPluginById("llama-cpp")?.enabled, false);
+
+  // Preview cancel guard: Tab B observing Tab A's pre-existing `inspect_plugin` op must not send global cancel.
+  const tabAOps = [
+    {
+      id: 77,
+      operation: { kind: "domain", name: "inspect_plugin", key: "" } as const,
+      cancelling: false,
+    },
+  ];
+  assert.equal(findInspectPluginOpId(tabAOps), 77);
+  assert.equal(shouldSendGlobalPreviewCancel(77, tabAOps), false);
+  assert.equal(shouldSendGlobalPreviewCancel(null, tabAOps), true);
+  assert.equal(shouldSendGlobalPreviewCancel(null, []), false);
+
+  pluginCache.dispose();
 });

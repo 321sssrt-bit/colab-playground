@@ -17,16 +17,19 @@ import {
 import { AlertIcon, InfoIcon } from "../../components/Icons.tsx";
 import { ApiError } from "../../lib/api.ts";
 import type { TranslateFn } from "../../lib/i18n.ts";
+import { webStore } from "../../lib/store.ts";
 import type { Locale } from "../../lib/types.ts";
 import {
   cancelPluginPreview,
   discardPluginPreview,
+  findInspectPluginOpId,
   formatPluginApiError,
   formatScriptBytes,
   installPluginPreview,
   parsePluginOrigin,
   previewPlugin,
   resolveLocalizedText,
+  shouldSendGlobalPreviewCancel,
 } from "./api.ts";
 import type { PluginInfo, PluginPreviewResponse } from "./types.ts";
 
@@ -58,6 +61,7 @@ export function InstallPluginDialog({
   const checkSeqRef = useRef(0);
   const checkAbortRef = useRef<AbortController | null>(null);
   const checkingRef = useRef(false);
+  const preExistingInspectOpIdRef = useRef<number | null>(null);
   const installAbortRef = useRef<AbortController | null>(null);
   const activePreviewIdRef = useRef<string | null>(null);
   const openRef = useRef(open);
@@ -84,12 +88,19 @@ export function InstallPluginDialog({
 
   const cancelInFlightCheck = useCallback(() => {
     const wasChecking = checkingRef.current;
+    const preExistingOpId = preExistingInspectOpIdRef.current;
     checkingRef.current = false;
+    preExistingInspectOpIdRef.current = null;
+    // Always abort our own HTTP request so backend `CancelOperationOnDrop` cancels only
+    // an operation started by this request.
     checkAbortRef.current?.abort();
     checkAbortRef.current = null;
-    if (wasChecking) {
-      // Explicitly cancel the backend `inspect_plugin` job (`git clone`) even if a proxy
-      // delays propagating the aborted HTTP connection.
+    if (
+      wasChecking &&
+      shouldSendGlobalPreviewCancel(preExistingOpId, webStore.getState().snapshot?.operations)
+    ) {
+      // Proxy-buffering fallback: only call the global cancel endpoint when this tab did not
+      // collide with a pre-existing `inspect_plugin` op owned by another tab.
       void cancelPluginPreview().catch(() => {});
     }
   }, []);
@@ -199,6 +210,9 @@ export function InstallPluginDialog({
     const controller = new AbortController();
     checkAbortRef.current = controller;
     checkingRef.current = true;
+    preExistingInspectOpIdRef.current = findInspectPluginOpId(
+      webStore.getState().snapshot?.operations,
+    );
 
     setSourceInvalid(false);
     setErrorMessage(null);
@@ -236,6 +250,7 @@ export function InstallPluginDialog({
       if (checkAbortRef.current === controller) {
         checkAbortRef.current = null;
         checkingRef.current = false;
+        preExistingInspectOpIdRef.current = null;
       }
     }
   };

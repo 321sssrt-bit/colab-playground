@@ -127,7 +127,9 @@ export function PluginsPage({ snapshot, locale, t, navigate, pushToast }: PagePr
 
   useEffect(() => {
     mountedRef.current = true;
-    void pluginCacheStore.ensurePlugins().catch(() => {});
+    // Stale-while-revalidate: renders cached plugins immediately without loading flash while
+    // picking up enable/disable/remove mutations made in another tab.
+    void pluginCacheStore.refreshPlugins().catch(() => {});
     void refreshPluginRuns({ autoAttach: true });
     return () => {
       mountedRef.current = false;

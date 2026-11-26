@@ -71,6 +71,12 @@ const INITIAL_STATE: PluginCacheState = {
   hfToken: { kind: "idle" },
 };
 
+const PLUGIN_CATALOG_MUTATION_OPS: ReadonlySet<string> = new Set([
+  "set_plugin_enabled",
+  "remove_plugin",
+  "install_plugin",
+]);
+
 function hasHfTokenOp(operations: readonly PendingOperation[] | undefined): boolean {
   if (!operations) {
     return false;
@@ -78,6 +84,21 @@ function hasHfTokenOp(operations: readonly PendingOperation[] | undefined): bool
   return operations.some(
     ({ operation }) => operation.kind === "domain" && operation.name === "hf_token",
   );
+}
+
+function getPluginCatalogMutationOpIds(
+  operations: readonly PendingOperation[] | undefined,
+): string {
+  if (!operations) {
+    return "";
+  }
+  return operations
+    .filter(
+      ({ operation }) =>
+        operation.kind === "domain" && PLUGIN_CATALOG_MUTATION_OPS.has(operation.name),
+    )
+    .map((op) => op.id)
+    .join(",");
 }
 
 /**
@@ -95,6 +116,9 @@ export function createPluginCacheStore(
   let tokenSeq = 0;
   let localTokenMutationActive = false;
   let prevExternalHfTokenBusy = hasHfTokenOp(store.getState().snapshot?.operations);
+  let prevPluginCatalogOpIds = getPluginCatalogMutationOpIds(
+    store.getState().snapshot?.operations,
+  );
 
   let pluginsInFlight: InFlight<readonly PluginInfo[]> | null = null;
   let tokenCheckInFlight: InFlight<HfTokenState> | null = null;
@@ -138,6 +162,7 @@ export function createPluginCacheStore(
     abortAllInFlight();
     localTokenMutationActive = false;
     prevExternalHfTokenBusy = false;
+    prevPluginCatalogOpIds = "";
     setState(INITIAL_STATE);
   };
 
@@ -241,11 +266,28 @@ export function createPluginCacheStore(
     if (disposed) {
       return;
     }
-    const busy = hasHfTokenOp(store.getState().snapshot?.operations);
+    const operations = store.getState().snapshot?.operations;
+    const busy = hasHfTokenOp(operations);
     const finishedExternally = prevExternalHfTokenBusy && !busy && !localTokenMutationActive;
     prevExternalHfTokenBusy = busy;
     if (finishedExternally && state.hfToken.kind !== "idle" && client.isAuthenticated()) {
       void refreshHfTokenStatus({ silent: true }).catch(() => {});
+    }
+
+    const nextCatalogOpIds = getPluginCatalogMutationOpIds(operations);
+    const prevCatalogIds = prevPluginCatalogOpIds;
+    prevPluginCatalogOpIds = nextCatalogOpIds;
+    if (
+      prevCatalogIds &&
+      prevCatalogIds !== nextCatalogOpIds &&
+      state.plugins !== null &&
+      client.isAuthenticated()
+    ) {
+      const nextSet = new Set(nextCatalogOpIds ? nextCatalogOpIds.split(",") : []);
+      const anyCompleted = prevCatalogIds.split(",").some((id) => !nextSet.has(id));
+      if (anyCompleted) {
+        void refreshPlugins().catch(() => {});
+      }
     }
   });
 

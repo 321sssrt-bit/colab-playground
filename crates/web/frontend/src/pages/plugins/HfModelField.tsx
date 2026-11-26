@@ -117,6 +117,7 @@ export function HfModelField({
   const ggufSeqRef = useRef(0);
   const immediateGgufRef = useRef(false);
   const forceRefreshGgufRef = useRef(false);
+  const pendingRefreshRepoRef = useRef<string | null>(null);
 
   const [searchQuery, setSearchQuery] = useState(() => persistedDraft?.searchQuery ?? "");
   const [searchState, setSearchState] = useState<SearchState>(() =>
@@ -282,16 +283,26 @@ export function HfModelField({
     if (!activeRepo) {
       ggufSeqRef.current += 1;
       forceRefreshGgufRef.current = false;
+      pendingRefreshRepoRef.current = null;
       setGgufState({ kind: "idle" });
       return;
     }
 
     const immediate = immediateGgufRef.current;
     immediateGgufRef.current = false;
-    const forceRefresh = forceRefreshGgufRef.current;
+    const explicitRefresh = forceRefreshGgufRef.current;
     forceRefreshGgufRef.current = false;
 
     const targetRepo = activeRepo;
+    if (explicitRefresh) {
+      pendingRefreshRepoRef.current = targetRepo;
+    } else if (
+      pendingRefreshRepoRef.current !== null &&
+      pendingRefreshRepoRef.current !== targetRepo
+    ) {
+      pendingRefreshRepoRef.current = null;
+    }
+    const forceRefresh = pendingRefreshRepoRef.current === targetRepo;
     const targetFitKey = buildGgufFitKey(targetRepo, {
       accelerator,
       vramMib,
@@ -349,6 +360,9 @@ export function HfModelField({
           if (controller.signal.aborted || !mountedRef.current || seq !== ggufSeqRef.current) {
             return;
           }
+          if (plan.refresh && pendingRefreshRepoRef.current === targetRepo) {
+            pendingRefreshRepoRef.current = null;
+          }
           setGgufState({
             kind: "ready",
             data: { repo: targetRepo, requestedCtx: ctx, fitKey: targetFitKey, response },
@@ -362,6 +376,9 @@ export function HfModelField({
             (err instanceof ApiError && err.isAbort)
           ) {
             return;
+          }
+          if (plan.refresh && pendingRefreshRepoRef.current === targetRepo) {
+            pendingRefreshRepoRef.current = null;
           }
           setGgufState({ kind: "error", message: formatPluginApiError(err, tRef.current) });
         })

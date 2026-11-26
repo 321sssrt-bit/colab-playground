@@ -20,7 +20,7 @@ import type {
   PluginRunTemplateSpec,
   StartPluginRunRequest,
 } from "./types.ts";
-import type { Accelerator } from "../../lib/types.ts";
+import type { Accelerator, PendingOperation } from "../../lib/types.ts";
 
 const BYTES_PER_KIB = 1024;
 const BYTES_PER_MIB = BYTES_PER_KIB * BYTES_PER_KIB;
@@ -193,6 +193,36 @@ export async function cancelPluginPreview(
     body: {},
     signal,
   });
+}
+
+/**
+ * Finds the active `inspect_plugin` operation ID in `snapshot.operations`, if any.
+ */
+export function findInspectPluginOpId(
+  operations: readonly PendingOperation[] | undefined,
+): number | null {
+  if (!operations) {
+    return null;
+  }
+  const matched = operations.find(
+    ({ operation }) => operation.kind === "domain" && operation.name === "inspect_plugin",
+  );
+  return matched ? matched.id : null;
+}
+
+/**
+ * Returns true only when this tab's preview check did not collide with an `inspect_plugin`
+ * operation already running before submit and an `inspect_plugin` op is currently active.
+ * Prevents a second tab that hit (or is about to hit) `409 Busy` from cancelling tab A's check.
+ */
+export function shouldSendGlobalPreviewCancel(
+  preExistingInspectOpId: number | null,
+  currentOperations: readonly PendingOperation[] | undefined,
+): boolean {
+  if (preExistingInspectOpId !== null) {
+    return false;
+  }
+  return findInspectPluginOpId(currentOperations) !== null;
 }
 
 export async function installPluginPreview(

@@ -52,10 +52,13 @@ import {
 import { HfModelField, type HfGgufFitParams } from "./HfModelField.tsx";
 import { pluginCacheStore } from "./pluginCache.ts";
 import {
+  clearStashedPluginDeploySecrets,
   latchPluginDeployOriginAccountContext,
   loadPluginDeployFormTemplate,
   reconcilePluginDeployTarget,
+  stashPluginDeploySecrets,
   submitPluginDeployRun,
+  takeStashedPluginDeploySecrets,
   updatePluginDeployDraft,
   type DeployTemplateMapper,
 } from "./runStore.ts";
@@ -380,20 +383,50 @@ export function PluginDeployForm({
   const draftOpenSeq = activeDraft?.openSeq ?? 0;
 
   const clearSecretInputs = useCallback(() => {
+    clearStashedPluginDeploySecrets();
     for (const inputEl of secretInputRefs.current.values()) {
       inputEl.value = "";
     }
   }, []);
 
   useEffect(() => {
+    if (loadPhase !== "ready" || draftOpenSeq <= 0) {
+      return;
+    }
+    const restored = takeStashedPluginDeploySecrets(plugin.manifest.id, draftOpenSeq);
+    if (!restored) {
+      return;
+    }
+    for (const [id, value] of restored) {
+      const inputEl = secretInputRefs.current.get(id);
+      if (inputEl) {
+        inputEl.value = value;
+      }
+    }
+  }, [loadPhase, plugin.manifest.id, draftOpenSeq]);
+
+  useEffect(() => {
     mountedRef.current = true;
+    const activePluginId = plugin.manifest.id;
+    const activeOpenSeq = draftOpenSeq;
     return () => {
       mountedRef.current = false;
       submitAbortRef.current?.abort();
       submitAbortRef.current = null;
-      clearSecretInputs();
+      if (activeOpenSeq > 0) {
+        const entries: Array<readonly [string, string]> = [];
+        for (const [id, inputEl] of secretInputRefs.current.entries()) {
+          if (inputEl.value.length > 0) {
+            entries.push([id, inputEl.value]);
+          }
+        }
+        stashPluginDeploySecrets(activePluginId, activeOpenSeq, entries);
+      }
+      for (const inputEl of secretInputRefs.current.values()) {
+        inputEl.value = "";
+      }
     };
-  }, [clearSecretInputs]);
+  }, [plugin.manifest.id, draftOpenSeq]);
 
   useEffect(() => {
     setResolvedMaxConcurrent(maxConcurrentSessions);

@@ -28,6 +28,7 @@ import type {
   ForwardView,
   Locale,
   RuntimeRef,
+  SessionsListResponse,
   Snapshot,
 } from "../../lib/types.ts";
 import type { ProvisionProgressEvent } from "../sessions/api.ts";
@@ -128,6 +129,16 @@ export interface PluginRunsStore {
   ): void;
   latchDeployOriginAccountContext(snapshotAccount: AccountContext | null): void;
   reconcileDeployTarget(snapshot: Snapshot | null): void;
+  stashDeploySecrets(
+    pluginId: string,
+    openSeq: number,
+    entries: readonly (readonly [string, string])[],
+  ): void;
+  takeStashedDeploySecrets(
+    pluginId: string,
+    openSeq: number,
+  ): ReadonlyMap<string, string> | null;
+  clearStashedDeploySecrets(): void;
   setEndpointForwardId(runId: number, endpointId: string, forwardId: number | null): void;
   cachePluginForwardAddresses(view: ForwardView): void;
   refreshPluginForwards(signal?: AbortSignal): Promise<ForwardView[]>;
@@ -484,8 +495,16 @@ export function createPluginRunsStore(options: PluginRunsStoreOptions = {}): Plu
 
   const streamsByRunId = new Map<number, StreamHandle>();
   const toastedReadyRunIds = new Set<number>();
+  const submittedLiveRunIds = new Set<number>();
   const billingInFlightByRunId = new Map<number, Promise<PluginRunBillingCheck | null>>();
   const billingSeqByRunId = new Map<number, number>();
+  // Volatile, non-serialized in-memory handoff for masked secret inputs across route switches
+  // while the same deploy draft stays open (never enters React state or `deployDraft`).
+  let stashedDeploySecrets: {
+    readonly pluginId: string;
+    readonly openSeq: number;
+    readonly values: Map<string, string>;
+  } | null = null;
   let templateInFlight: {
     readonly key: string;
     readonly generation: number;
@@ -564,8 +583,10 @@ export function createPluginRunsStore(options: PluginRunsStoreOptions = {}): Plu
     runsListSeq += 1;
     prevPluginRunOpIds = "";
     toastedReadyRunIds.clear();
+    submittedLiveRunIds.clear();
     billingInFlightByRunId.clear();
     billingSeqByRunId.clear();
+    stashedDeploySecrets = null;
     state = INITIAL_STATE;
     emit();
   };
@@ -658,8 +679,29 @@ export function createPluginRunsStore(options: PluginRunsStoreOptions = {}): Plu
       },
     });
 
-    const promise = appData
-      .refreshSessions()
+    const fetchPostFinishSessions = async (): Promise<SessionsListResponse> => {
+      // If a `/api/sessions` listing was already in flight before the run finished, wait for it
+      // to settle and then start a fresh post-finish request so a pre-failure empty list cannot
+      // hide a still-billing VM.
+      if (appData.getState?.().sessionsRefreshing === true) {
+        await appData.refreshSessions().catch(() => {});
+        if (
+          disposed ||
+          client.getSessionGeneration() !== gen ||
+          billingSeqByRunId.get(runId) !== seq
+        ) {
+          throw new ApiError({
+            status: 0,
+            kind: "cancelled",
+            message: "billing verification superseded",
+            isAbort: true,
+          });
+        }
+      }
+      return appData.refreshSessions();
+    };
+
+    const promise = fetchPostFinishSessions()
       .then((sessions): PluginRunBillingCheck | null => {
         if (
           disposed ||
@@ -847,6 +889,7 @@ export function createPluginRunsStore(options: PluginRunsStoreOptions = {}): Plu
       if (!finished) {
         return false;
       }
+      const isLiveCompletion = !wasAlreadyFinished || submittedLiveRunIds.has(runId);
       mergeEndpointResults(runId, finished.endpoints);
       updateRunDetail(runId, (prev) => ({
         ...prev,
@@ -861,7 +904,7 @@ export function createPluginRunsStore(options: PluginRunsStoreOptions = {}): Plu
         endpoints: finished.endpoints,
         error: finished.error,
         streamError: null,
-        finishedLive: !wasAlreadyFinished,
+        finishedLive: isLiveCompletion,
       }));
       setState({
         runs: state.runs.map((item) =>
@@ -880,11 +923,11 @@ export function createPluginRunsStore(options: PluginRunsStoreOptions = {}): Plu
           [runId]: finished.phase,
         },
       });
-      if (finished.phase === "ready" && !wasAlreadyFinished) {
+      if (finished.phase === "ready" && isLiveCompletion) {
         announceReadyOnce(runId, finished.run.plugin);
       } else if (
         (finished.phase === "failed" || finished.phase === "cancelled") &&
-        !wasAlreadyFinished
+        isLiveCompletion
       ) {
         void verifyRunBilling(runId).catch(() => {});
       }
@@ -1031,6 +1074,7 @@ export function createPluginRunsStore(options: PluginRunsStoreOptions = {}): Plu
     if (alreadyStreaming || alreadyHasCompleteDetail) {
       if (selectView) {
         abortTemplateInFlight();
+        stashedDeploySecrets = null;
         setState({
           runs,
           selectedRunId: summary.id,
@@ -1051,6 +1095,7 @@ export function createPluginRunsStore(options: PluginRunsStoreOptions = {}): Plu
 
     if (selectView) {
       abortTemplateInFlight();
+      stashedDeploySecrets = null;
     }
 
     setState({
@@ -1078,12 +1123,13 @@ export function createPluginRunsStore(options: PluginRunsStoreOptions = {}): Plu
       reconnectTimer: null,
     };
     streamsByRunId.set(summary.id, handle);
+    const wasAlreadyFinished = summary.finished && !submittedLiveRunIds.has(summary.id);
     connectRunStream(
       summary.id,
       handle,
       handle.seq,
       globalStreamSeq,
-      summary.finished,
+      wasAlreadyFinished,
       0,
       false,
     );
@@ -1223,9 +1269,21 @@ export function createPluginRunsStore(options: PluginRunsStoreOptions = {}): Plu
   });
 
   const openPluginRun = (id: number, fallbackSummary?: PluginRunSummary): void => {
+    const isFreshSubmit = fallbackSummary !== undefined && !fallbackSummary.finished;
+    if (isFreshSubmit) {
+      submittedLiveRunIds.add(id);
+    }
     const existing = state.runs.find((item) => item.id === id) ?? fallbackSummary ?? null;
     if (existing) {
       attachRun(existing);
+      if (isFreshSubmit) {
+        const detail = state.detailsById[id];
+        if (detail?.phase === "ready") {
+          announceReadyOnce(id, detail.plugin);
+        } else if (detail?.phase === "failed" || detail?.phase === "cancelled") {
+          void verifyRunBilling(id).catch(() => {});
+        }
+      }
       return;
     }
     void refreshPluginRuns({ autoAttach: false }).then((runs) => {
@@ -1241,6 +1299,7 @@ export function createPluginRunsStore(options: PluginRunsStoreOptions = {}): Plu
     dismissedAutoRunId = Math.max(dismissedAutoRunId, latestId);
     pendingAutoAttach = false;
     abortTemplateInFlight();
+    stashedDeploySecrets = null;
     // Do NOT stop active SSE streams here: background plugin runs stay connected.
     const nextOpenSeq = state.formOpenSeq + 1;
     const originAccountContext = resolveDeployOriginAccountContext(
@@ -1257,12 +1316,14 @@ export function createPluginRunsStore(options: PluginRunsStoreOptions = {}): Plu
 
   const closePluginDeployForm = (): void => {
     if (state.selectedFormPluginId === null && state.deployDraft === null) {
+      stashedDeploySecrets = null;
       return;
     }
     const latestId = state.runs[0]?.id ?? state.selectedRunId ?? 0;
     dismissedAutoRunId = Math.max(dismissedAutoRunId, latestId);
     pendingAutoAttach = false;
     abortTemplateInFlight();
+    stashedDeploySecrets = null;
     setState({ selectedFormPluginId: null, deployDraft: null });
   };
 
@@ -1270,6 +1331,7 @@ export function createPluginRunsStore(options: PluginRunsStoreOptions = {}): Plu
     const latestId = state.runs[0]?.id ?? state.selectedRunId ?? 0;
     dismissedAutoRunId = Math.max(dismissedAutoRunId, latestId);
     abortTemplateInFlight();
+    stashedDeploySecrets = null;
     // Do NOT stop active SSE streams here: leaving run detail keeps streaming live in background.
     setState({ selectedRunId: null, selectedFormPluginId: null, deployDraft: null });
   };
@@ -1489,6 +1551,41 @@ export function createPluginRunsStore(options: PluginRunsStoreOptions = {}): Plu
     latchDeployOriginAccountContext,
     reconcileDeployTarget,
 
+    stashDeploySecrets(
+      pluginId: string,
+      openSeq: number,
+      entries: readonly (readonly [string, string])[],
+    ): void {
+      const current = state.deployDraft;
+      if (!current || current.pluginId !== pluginId || current.openSeq !== openSeq) {
+        stashedDeploySecrets = null;
+        return;
+      }
+      const values = new Map<string, string>();
+      for (const [id, raw] of entries) {
+        if (raw.length > 0) {
+          values.set(id, raw);
+        }
+      }
+      stashedDeploySecrets = values.size > 0 ? { pluginId, openSeq, values } : null;
+    },
+
+    takeStashedDeploySecrets(
+      pluginId: string,
+      openSeq: number,
+    ): ReadonlyMap<string, string> | null {
+      const current = stashedDeploySecrets;
+      if (!current || current.pluginId !== pluginId || current.openSeq !== openSeq) {
+        return null;
+      }
+      stashedDeploySecrets = null;
+      return current.values;
+    },
+
+    clearStashedDeploySecrets(): void {
+      stashedDeploySecrets = null;
+    },
+
     setEndpointForwardId(runId: number, endpointId: string, forwardId: number | null): void {
       const key = endpointForwardKey(runId, endpointId);
       if (state.endpointForwardIdsByKey[key] === forwardId) {
@@ -1520,6 +1617,7 @@ export function createPluginRunsStore(options: PluginRunsStoreOptions = {}): Plu
 
     dispose(): void {
       disposed = true;
+      stashedDeploySecrets = null;
       unsubscribeAuth();
       unsubscribeStore();
       stopAllStreams();
@@ -1626,6 +1724,35 @@ export function latchPluginDeployOriginAccountContext(
  */
 export function reconcilePluginDeployTarget(snapshot: Snapshot | null): void {
   pluginRunsStore.reconcileDeployTarget(snapshot);
+}
+
+/**
+ * Temporarily stashes non-empty masked secret inputs in volatile memory across a route unmount
+ * while the same deploy draft stays open (never enters React state or `deployDraft`).
+ */
+export function stashPluginDeploySecrets(
+  pluginId: string,
+  openSeq: number,
+  entries: readonly (readonly [string, string])[],
+): void {
+  pluginRunsStore.stashDeploySecrets(pluginId, openSeq, entries);
+}
+
+/**
+ * Restores and clears volatile stashed secret inputs for the active deploy draft upon remount.
+ */
+export function takeStashedPluginDeploySecrets(
+  pluginId: string,
+  openSeq: number,
+): ReadonlyMap<string, string> | null {
+  return pluginRunsStore.takeStashedDeploySecrets(pluginId, openSeq);
+}
+
+/**
+ * Immediately wipes any volatile stashed deploy secrets.
+ */
+export function clearStashedPluginDeploySecrets(): void {
+  pluginRunsStore.clearStashedDeploySecrets();
 }
 
 /**
