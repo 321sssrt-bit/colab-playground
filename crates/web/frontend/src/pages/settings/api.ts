@@ -14,7 +14,6 @@ import type { TranslateFn } from "../../lib/i18n.ts";
 import type {
   Accelerator,
   ApiErrorPayload,
-  DismissSettingsNoticeResponse,
   SettingsNotice,
   SettingsPatch,
   SettingsView,
@@ -187,16 +186,6 @@ export async function patchCheckUpdates(
   signal?: AbortSignal,
 ): Promise<LoadedSettings> {
   return patchSettings({ check_updates: checkUpdates }, signal);
-}
-
-export async function dismissSettingsNotice(
-  signal?: AbortSignal,
-): Promise<DismissSettingsNoticeResponse> {
-  return apiClient.request<DismissSettingsNoticeResponse>("/api/settings/notice/dismiss", {
-    method: "POST",
-    body: {},
-    signal,
-  });
 }
 
 export function isAbortError(error: unknown): boolean {

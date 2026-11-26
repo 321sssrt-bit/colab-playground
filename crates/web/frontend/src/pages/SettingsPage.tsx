@@ -34,7 +34,6 @@ import { GeneralSection } from "./settings/GeneralSection.tsx";
 import { HostSection, type HostSaveError } from "./settings/HostSection.tsx";
 import { LimitFocusCard } from "./settings/LimitFocusCard.tsx";
 import { settingsNoticeStore } from "./settings/noticeStore.ts";
-import "./settings/settings.css";
 import type { PageProps } from "./types.ts";
 
 export interface SettingsPageProps extends PageProps {
@@ -609,7 +608,6 @@ export function SettingsPage({
         focused={hostFirst}
         hostError={hostError}
         savedNotice={hostSavedNotice}
-        dict={i18n.dict}
         t={t}
         onWslDistroChange={handleWslDistroChange}
         onDraftChange={handleHostDraftChange}
@@ -632,7 +630,6 @@ export function SettingsPage({
           <LimitFocusCard
             serverDefaults={settings.defaults}
             draftValue={resolvedDefaultsDraft.draft.max_concurrent_sessions}
-            dict={i18n.dict}
             saving={savingAnyDefaults}
             saveError={limitSaveErrorText}
             savedNotice={limitSavedNotice}

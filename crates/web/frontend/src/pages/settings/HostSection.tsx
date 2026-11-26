@@ -7,7 +7,7 @@
 import { memo, useEffect, useId, useMemo, useRef, type FormEvent } from "react";
 
 import { AlertIcon, CheckCircleIcon } from "../../components/Icons.tsx";
-import type { Dictionary, TranslateFn } from "../../lib/i18n.ts";
+import type { TranslateFn } from "../../lib/i18n.ts";
 import { scrollSettingsToTop } from "./focus.ts";
 
 export interface HostSaveError {
@@ -27,7 +27,6 @@ export interface HostSectionProps {
   readonly focused: boolean;
   readonly hostError: HostSaveError | null;
   readonly savedNotice: boolean;
-  readonly dict: Dictionary | null;
   readonly t: TranslateFn;
   readonly onWslDistroChange: (distro: string | null) => void;
   readonly onDraftChange: (colabPath: string, colabPython: string) => void;

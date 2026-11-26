@@ -11,7 +11,7 @@ import {
   MIN_CONCURRENT_SESSIONS,
   type RuntimeDefaults,
 } from "../../lib/constants.ts";
-import type { Dictionary, TranslateFn } from "../../lib/i18n.ts";
+import type { TranslateFn } from "../../lib/i18n.ts";
 import { scrollSettingsToTop } from "./focus.ts";
 
 const INTEGER_RE = /^\d+$/;
@@ -35,7 +35,6 @@ function parseConcurrentLimit(raw: string): number | null {
 export interface LimitFocusCardProps {
   readonly serverDefaults: RuntimeDefaults;
   readonly draftValue: string;
-  readonly dict: Dictionary | null;
   readonly saving: boolean;
   readonly saveError: string | null;
   readonly savedNotice: boolean;
