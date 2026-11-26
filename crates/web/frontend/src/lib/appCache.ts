@@ -223,6 +223,7 @@ export interface AppDataState {
   readonly overviewLoading: boolean;
   readonly overviewError: unknown | null;
   readonly usesWsl: boolean | null;
+  readonly usesWslResolved: boolean;
   readonly sessionsRefreshing: boolean;
   readonly sessionsError: unknown | null;
   readonly sessionsAccountErrors: readonly AccountFailureResponse[] | null;
@@ -279,6 +280,7 @@ const INITIAL_STATE: AppDataState = {
   overviewLoading: false,
   overviewError: null,
   usesWsl: null,
+  usesWslResolved: false,
   sessionsRefreshing: false,
   sessionsError: null,
   sessionsAccountErrors: null,
@@ -330,6 +332,7 @@ export function createAppDataStore(options: AppDataStoreOptions = {}): AppDataSt
       next.overviewLoading === state.overviewLoading &&
       next.overviewError === state.overviewError &&
       next.usesWsl === state.usesWsl &&
+      next.usesWslResolved === state.usesWslResolved &&
       next.sessionsRefreshing === state.sessionsRefreshing &&
       next.sessionsError === state.sessionsError &&
       next.sessionsAccountErrors === state.sessionsAccountErrors &&
@@ -431,6 +434,7 @@ export function createAppDataStore(options: AppDataStoreOptions = {}): AppDataSt
             overviewLoading: false,
             overviewError: null,
             usesWsl: data.host.kind === "wsl",
+            usesWslResolved: true,
           });
         }
         return data;
@@ -650,6 +654,7 @@ export function createAppDataStore(options: AppDataStoreOptions = {}): AppDataSt
           const summary = extractSessionSettings(settings.defaults);
           setState({
             ...summary,
+            usesWslResolved: true,
             ...(typeof settings.uses_wsl === "boolean" ? { usesWsl: settings.uses_wsl } : {}),
           });
           return summary;
@@ -659,10 +664,15 @@ export function createAppDataStore(options: AppDataStoreOptions = {}): AppDataSt
           maxConcurrentSessions: state.maxConcurrentSessions,
         };
       })
-      .catch(() => ({
-        rearmDurationSecs: state.rearmDurationSecs,
-        maxConcurrentSessions: state.maxConcurrentSessions,
-      }))
+      .catch(() => {
+        if (!disposed && client.getSessionGeneration() === generation && seq === settingsSeq) {
+          setState({ usesWslResolved: true });
+        }
+        return {
+          rearmDurationSecs: state.rearmDurationSecs,
+          maxConcurrentSessions: state.maxConcurrentSessions,
+        };
+      })
       .finally(() => {
         if (settingsInFlight?.promise === promise) {
           settingsInFlight = null;

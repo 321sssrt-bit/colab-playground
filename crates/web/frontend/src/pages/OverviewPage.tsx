@@ -53,10 +53,14 @@ export function OverviewPage({ snapshot, locale, t, navigate, pushToast }: PageP
   }, [appData.overview, appData.overviewError, appData.overviewLoading]);
 
   useEffect(() => {
-    if (appData.overview === null && appData.overviewError !== null && appData.usesWsl === null) {
+    if (
+      appData.overview === null &&
+      appData.overviewError !== null &&
+      !appData.usesWslResolved
+    ) {
       void appDataStore.refreshSessionDefaults().catch(() => {});
     }
-  }, [appData.overview, appData.overviewError, appData.usesWsl]);
+  }, [appData.overview, appData.overviewError, appData.usesWslResolved]);
 
   useEffect(() => {
     cliInstallStore.hydrateFromOverview(appData.overview?.cli_install);
@@ -159,8 +163,13 @@ export function OverviewPage({ snapshot, locale, t, navigate, pushToast }: PageP
     [effectiveAccounts, nowSecs, overview?.unmanaged_runtimes, snapshot, t],
   );
 
+  const awaitingHostKind =
+    overview === null &&
+    probeError !== null &&
+    probeErrorKind !== "wsl_unavailable" &&
+    !appData.usesWslResolved;
   const initialLoading =
-    overview === null && probeError === null && probing && !installActive;
+    (overview === null && probeError === null && probing && !installActive) || awaitingHostKind;
 
   return (
     <>

@@ -110,6 +110,7 @@ export function createCliInstallStore(options: CliInstallStoreOptions = {}): Cli
   let totalLinesSeen = 0;
   let hydratedTerminalKey: string | null = null;
   let lastHydratedOverviewView: CliInstallView | null = null;
+  let minSnapshotVersionForIdleReset = 0;
   let refreshedSucceededId: number | null = null;
   let statusFetchInFlight: {
     readonly generation: number;
@@ -167,11 +168,19 @@ export function createCliInstallStore(options: CliInstallStoreOptions = {}): Cli
     }
   };
 
+  const bumpIdleResetWatermark = (): void => {
+    const nextVersion = (store.getState().snapshot?.version ?? 0) + 1;
+    if (nextVersion > minSnapshotVersionForIdleReset) {
+      minSnapshotVersionForIdleReset = nextVersion;
+    }
+  };
+
   const reset = (keepPreferredMethod = false): void => {
     abortStream();
     abortStatusFetch();
     totalLinesSeen = 0;
     hydratedTerminalKey = null;
+    minSnapshotVersionForIdleReset = 0;
     if (!keepPreferredMethod) {
       lastHydratedOverviewView = null;
     }
@@ -210,6 +219,11 @@ export function createCliInstallStore(options: CliInstallStoreOptions = {}): Cli
     const incomingLines = keepCurrentLines ? state.lines : sanitizeInstallLines(view.lines);
     if (!keepCurrentLines) {
       totalLinesSeen = view.lines.length;
+    }
+    if (view.phase !== "idle" || view.id !== null) {
+      bumpIdleResetWatermark();
+    } else {
+      minSnapshotVersionForIdleReset = 0;
     }
     const notFound = view.phase === "not_found";
     if (isTerminalPhase(view.phase)) {
@@ -362,6 +376,7 @@ export function createCliInstallStore(options: CliInstallStoreOptions = {}): Cli
     }
     const generation = client.getSessionGeneration();
     abortStream();
+    bumpIdleResetWatermark();
     const seq = ++streamSeq;
     const controller = new AbortController();
     activeStream = { seq, id: targetId, controller };
@@ -466,9 +481,11 @@ export function createCliInstallStore(options: CliInstallStoreOptions = {}): Cli
     }
   };
 
-  const applySummary = (summary: CliInstallSummary): void => {
+  const applySummary = (summary: CliInstallSummary, snapshotVersion: number): void => {
     if (summary.phase === "idle" && summary.id === null) {
-      if (startingLocal) {
+      // Ignore pre-install snapshots whose version predates this install session so returning
+      // to Overview before `/api/events` advances never aborts an active stream or clears logs.
+      if (startingLocal || snapshotVersion < minSnapshotVersionForIdleReset) {
         return;
       }
       if (state.phase !== "idle" || state.id !== null || state.lines.length > 0) {
@@ -559,7 +576,7 @@ export function createCliInstallStore(options: CliInstallStoreOptions = {}): Cli
     }
 
     if (snapshot.cli_install !== undefined) {
-      applySummary(snapshot.cli_install);
+      applySummary(snapshot.cli_install, snapshot.version);
     } else {
       const runningOp = findRunningInstallOp(snapshot);
       if (runningOp !== null && !startingLocal && activeStream === null) {
@@ -612,6 +629,7 @@ export function createCliInstallStore(options: CliInstallStoreOptions = {}): Cli
     const generation = client.getSessionGeneration();
     abortStream();
     abortStatusFetch();
+    bumpIdleResetWatermark();
     const seq = ++streamSeq;
     const controller = new AbortController();
     activeStream = { seq, id: null, controller };

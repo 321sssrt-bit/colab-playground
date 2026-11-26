@@ -1676,6 +1676,24 @@ test("cliInstallStore survives route-switch remount, recheck cycle with identica
 
   await store.signIn("secret-key");
 
+  // Deliver an initial pre-install snapshot at version 1 with idle cli_install.
+  eventsSse.sendFrame(
+    "snapshot",
+    makeSnapshot({
+      version: 1,
+      cli_install: {
+        id: null,
+        method: null,
+        phase: "idle",
+        cancelling: false,
+        line_count: 0,
+        error_kind: null,
+      },
+    }),
+    "1",
+  );
+  await flushAsync();
+
   // Initial overview hydrate before install starts.
   const cachedIdleView = {
     id: null,
@@ -1690,11 +1708,14 @@ test("cliInstallStore survives route-switch remount, recheck cycle with identica
   };
   installStore.hydrateFromOverview(cachedIdleView);
 
-  // Start install -> ANSI codes stripped -> remounting Overview with stale cached idle view must NOT wipe live logs.
+  // Start install -> ANSI codes stripped -> remounting Overview runs both syncWithServer() (still
+  // observing pre-install version 1 idle snapshot) and hydrateFromOverview(cachedIdleView); neither
+  // may abort the active install stream or wipe buffered logs.
   const startPromise = installStore.startInstall("uv");
   installSse.sendFrame("started", { id: 7, method: "uv" });
   installSse.sendFrame("line", { stream: "stdout", text: "\u001B[32minstalled to ~/.local/bin\u001B[0m" });
   await flushAsync();
+  installStore.syncWithServer();
   installStore.hydrateFromOverview(cachedIdleView);
   installStore.hydrateFromOverview({ ...cachedIdleView });
   assert.equal(installStore.getState().id, 7);
@@ -2034,8 +2055,10 @@ test("appDataStore captures usesWsl from settings and clears cached overview whe
   });
 
   await store.signIn("secret-key");
+  assert.equal(appData.getState().usesWslResolved, false);
   await appData.refreshSessionDefaults();
   assert.equal(appData.getState().usesWsl, true);
+  assert.equal(appData.getState().usesWslResolved, true);
 
   await appData.ensureOverview();
   assert.equal(overviewCalls, 1);
@@ -2057,6 +2080,7 @@ test("appDataStore captures usesWsl from settings and clears cached overview whe
   await flushAsync();
   assert.equal(appData.getState().overview, null);
   assert.equal(appData.getState().usesWsl, true);
+  assert.equal(appData.getState().usesWslResolved, true);
 
   await appData.ensureOverview();
   assert.equal(overviewCalls, 2);
