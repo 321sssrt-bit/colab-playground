@@ -40,12 +40,15 @@ pub(super) struct Plugins {
 #[derive(Default)]
 struct GgufCache {
     generation: u64,
+    next_seq: u64,
     entries: VecDeque<(String, GgufListing)>,
     inflight: BTreeMap<String, Arc<InflightGguf>>,
+    latest_seq: BTreeMap<String, u64>,
 }
 
 struct InflightGguf {
     generation: u64,
+    seq: u64,
     result: watch::Sender<Option<Result<GgufListing>>>,
 }
 
@@ -465,20 +468,28 @@ impl WebState {
                 {
                     (inflight.result.subscribe(), None)
                 } else {
+                    cache.next_seq += 1;
+                    let seq = cache.next_seq;
                     let inflight = Arc::new(InflightGguf {
                         generation: cache.generation,
+                        seq,
                         result: watch::channel(None).0,
                     });
                     let rx = inflight.result.subscribe();
+                    cache.latest_seq.insert(repo.clone(), seq);
                     cache.inflight.insert(repo.clone(), inflight.clone());
                     (rx, Some(inflight))
                 }
             } else {
+                cache.next_seq += 1;
+                let seq = cache.next_seq;
                 let inflight = Arc::new(InflightGguf {
                     generation: cache.generation,
+                    seq,
                     result: watch::channel(None).0,
                 });
                 let rx = inflight.result.subscribe();
+                cache.latest_seq.insert(repo.clone(), seq);
                 cache.inflight.insert(repo.clone(), inflight.clone());
                 (rx, Some(inflight))
             }
@@ -488,6 +499,7 @@ impl WebState {
             // Detached so aborting one HTTP requester lets concurrent waiters reuse the fetch.
             let state = self.clone();
             let generation = flight.generation;
+            let seq = flight.seq;
             tokio::spawn(async move {
                 let lookup_repo = repo.clone();
                 let result = state
@@ -502,26 +514,32 @@ impl WebState {
                     {
                         cache.inflight.remove(&repo);
                     }
-                    if cache.generation == generation {
+                    if cache.generation == generation && cache.latest_seq.get(&repo) == Some(&seq) {
                         match &result {
                             Ok(listing) => {
                                 if let Some(index) =
                                     cache.entries.iter().position(|(key, _)| key == &repo)
                                 {
                                     cache.entries.remove(index);
-                                } else if cache.entries.len() == GGUF_CACHE_LIMIT {
-                                    cache.entries.pop_front();
+                                } else if cache.entries.len() == GGUF_CACHE_LIMIT
+                                    && let Some((evicted, _)) = cache.entries.pop_front()
+                                    && !cache.inflight.contains_key(&evicted)
+                                {
+                                    cache.latest_seq.remove(&evicted);
                                 }
                                 cache.entries.push_back((repo, listing.clone()));
                             }
-                            Err(_) if refresh => {
-                                if let Some(index) =
-                                    cache.entries.iter().position(|(key, _)| key == &repo)
+                            Err(_) => {
+                                if refresh
+                                    && let Some(index) =
+                                        cache.entries.iter().position(|(key, _)| key == &repo)
                                 {
                                     cache.entries.remove(index);
                                 }
+                                if !cache.entries.iter().any(|(key, _)| key == &repo) {
+                                    cache.latest_seq.remove(&repo);
+                                }
                             }
-                            Err(_) => {}
                         }
                     }
                 }
@@ -577,6 +595,7 @@ impl WebState {
         cache.generation += 1;
         cache.entries.clear();
         cache.inflight.clear();
+        cache.latest_seq.clear();
     }
 
     pub fn install_plugin(&self, id: String) -> Result<Submission<PluginInfo>> {

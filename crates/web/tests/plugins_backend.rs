@@ -441,6 +441,7 @@ impl Backend for TestBackend {
 
     fn hf_files(&self, repo: &str, _cancel: &CancelToken) -> Result<GgufListing> {
         self.hf_calls.fetch_add(1, Ordering::SeqCst);
+        let version = self.hf_version.load(Ordering::SeqCst) as u64;
         if let Some(gate) = self.hf_gate.lock().unwrap().take() {
             let _ = gate.started.send(());
             if let Some(rx) = gate.release.lock().unwrap().take() {
@@ -450,7 +451,6 @@ impl Backend for TestBackend {
         if *self.hf_fail.lock().unwrap() {
             return Err(Error::new(ErrorKind::Http));
         }
-        let version = self.hf_version.load(Ordering::SeqCst) as u64;
         Ok(GgufListing {
             variants: vec![GgufVariant {
                 quant: "Q4_K_M".into(),
@@ -974,6 +974,42 @@ async fn gguf_listing_cache_reuses_per_repo_and_supports_explicit_refresh() {
         .await
         .unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 5);
+
+    // An older non-refresh fetch finishing after a newer explicit refresh must not overwrite
+    // the refreshed cache entry.
+    let race_repo = "unsloth/Refresh-Race-GGUF";
+    backend.hf_version.store(1, Ordering::SeqCst);
+    let (stale_started_tx, stale_started_rx) = mpsc::channel();
+    let (stale_release_tx, stale_release_rx) = mpsc::channel();
+    *backend.hf_gate.lock().unwrap() = Some(HfGate {
+        started: stale_started_tx,
+        release: Mutex::new(Some(stale_release_rx)),
+    });
+    let stale_state = state.clone();
+    let stale_req =
+        tokio::spawn(async move { stale_state.hf_gguf_listing(race_repo.into(), false).await });
+    tokio::task::spawn_blocking(move || stale_started_rx.recv_timeout(Duration::from_secs(5)))
+        .await
+        .unwrap()
+        .expect("stale fetch started");
+
+    // While the v1 fetch is blocked, an explicit refresh fetches v2 and completes first.
+    backend.hf_version.store(2, Ordering::SeqCst);
+    let refreshed_race = state.hf_gguf_listing(race_repo.into(), true).await.unwrap();
+    assert_eq!(refreshed_race.variants[0].size, 8_000_000_000);
+    assert_eq!(calls.load(Ordering::SeqCst), 7);
+
+    // Release the older v1 fetch; it returns v1 to its own caller but must not overwrite v2.
+    let _ = stale_release_tx.send(());
+    let stale_result = stale_req.await.unwrap().unwrap();
+    assert_eq!(stale_result.variants[0].size, 4_000_000_000);
+
+    let after_race = state
+        .hf_gguf_listing(race_repo.into(), false)
+        .await
+        .unwrap();
+    assert_eq!(after_race, refreshed_race);
+    assert_eq!(calls.load(Ordering::SeqCst), 7);
 }
 
 struct Server(Child);
