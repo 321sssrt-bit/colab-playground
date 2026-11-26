@@ -20,7 +20,9 @@ import {
   buildGgufFitKey,
   cancelPluginPreview,
   findInspectPluginOpId,
+  getHfTokenBadgeMeta,
   planGgufEstimateFetch,
+  resolvePluginRunBannerPhase,
   shouldSendGlobalPreviewCancel,
 } from "./api.ts";
 import { selectEndpointTunnelByPort, stripAnsi } from "./endpoint.ts";
@@ -1197,4 +1199,55 @@ test("pluginCacheStore refreshes catalog after in-flight GET /api/plugins when c
   assert.equal(shouldSendGlobalPreviewCancel(null, []), false);
 
   pluginCache.dispose();
+});
+
+test("resolvePluginRunBannerPhase reflects RunSummary.phase and getHfTokenBadgeMeta surfaces error states cleanly", () => {
+  const t = (key: string) => key;
+
+  assert.equal(
+    resolvePluginRunBannerPhase({ phase: "running", finished: false }, undefined),
+    "running",
+  );
+  assert.equal(
+    resolvePluginRunBannerPhase({ phase: "ready", finished: true }, "running"),
+    "ready",
+  );
+  assert.equal(
+    resolvePluginRunBannerPhase({ phase: "failed", finished: true }, "running"),
+    "failed",
+  );
+  assert.equal(
+    resolvePluginRunBannerPhase({ phase: "cancelled", finished: true }, "running"),
+    "cancelled",
+  );
+  assert.equal(
+    resolvePluginRunBannerPhase({ phase: "running", finished: false }, "ready"),
+    "ready",
+  );
+
+  assert.deepEqual(getHfTokenBadgeMeta({ kind: "idle" }, t), {
+    status: "loading",
+    className: "badge",
+    text: "app.summary.unknown",
+  });
+  assert.deepEqual(getHfTokenBadgeMeta({ kind: "loading" }, t), {
+    status: "loading",
+    className: "badge",
+    text: "app.summary.unknown",
+  });
+  assert.deepEqual(getHfTokenBadgeMeta({ kind: "ready", saved: true }, t), {
+    status: "saved",
+    className: "badge badge-success",
+    text: "app.b2.hf_token_stored",
+  });
+  assert.deepEqual(getHfTokenBadgeMeta({ kind: "ready", saved: false }, t), {
+    status: "none",
+    className: "badge",
+    text: "app.b2.hf_token_none",
+  });
+  assert.deepEqual(getHfTokenBadgeMeta({ kind: "error", error: new Error("keyring locked") }, t), {
+    status: "error",
+    className: "badge badge-warning",
+    text: "app.b2.hf_token_unknown",
+  });
 });

@@ -20,7 +20,7 @@ import {
 import { AlertIcon, CheckCircleIcon } from "../../components/Icons.tsx";
 import { ApiError } from "../../lib/api.ts";
 import type { TranslateFn } from "../../lib/i18n.ts";
-import { formatPluginApiError } from "./api.ts";
+import { formatPluginApiError, getHfTokenBadgeMeta } from "./api.ts";
 import { pluginCacheStore, usePluginCacheStore } from "./pluginCache.ts";
 
 export interface HfTokenDialogProps {
@@ -300,23 +300,7 @@ export function HfTokenDialog({
 
   const loadStateErrorMessage =
     hfToken.kind === "error" ? formatPluginApiError(hfToken.error, t) : null;
-
-  const badgeClass =
-    hfToken.kind === "ready"
-      ? hfToken.saved
-        ? "badge badge-success"
-        : "badge"
-      : hfToken.kind === "error"
-        ? "badge badge-warning"
-        : "badge";
-  const badgeText =
-    hfToken.kind === "ready"
-      ? hfToken.saved
-        ? t("app.b2.hf_token_stored")
-        : t("app.b2.hf_token_none")
-      : hfToken.kind === "error"
-        ? t("app.b2.hf_token_unknown")
-        : t("app.summary.unknown");
+  const badge = getHfTokenBadgeMeta(hfToken, t);
 
   const describedBy = tokenInvalid && errorMessage ? `${hintId} ${errorId}` : hintId;
 
@@ -332,7 +316,7 @@ export function HfTokenDialog({
         <h1 className="dialog-title" id={titleId}>
           {t("app.b2.hf_token_title")}
         </h1>
-        <span className={badgeClass}>{badgeText}</span>
+        <span className={badge.className}>{badge.text}</span>
       </div>
 
       <form className="dialog-form" method="post" onSubmit={handleSaveSubmit} noValidate>

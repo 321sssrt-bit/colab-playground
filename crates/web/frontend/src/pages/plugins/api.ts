@@ -10,12 +10,14 @@ import type {
   GgufEstimateRequest,
   GgufEstimateResponse,
   HfModel,
+  HfTokenState,
   HfTokenStatus,
   KvType,
   LocalizedText,
   PluginInfo,
   PluginOrigin,
   PluginPreviewResponse,
+  PluginRunPhase,
   PluginRunSummary,
   PluginRunTemplateSpec,
   StartPluginRunRequest,
@@ -150,6 +152,65 @@ export function formatPluginApiError(error: unknown, t: TranslateFn): string {
     return primary || t("app.err.other");
   }
   return t("app.err.other");
+}
+
+export interface HfTokenBadgeMeta {
+  readonly status: "saved" | "none" | "error" | "loading";
+  readonly className: string;
+  readonly text: string;
+}
+
+/**
+ * Resolves the status badge presentation for the Hugging Face token cache state.
+ * Shared by the Plugins list card and the modal token dialog so error states always
+ * surface clearly and never retain a stale `saved` badge.
+ */
+export function getHfTokenBadgeMeta(hfToken: HfTokenState, t: TranslateFn): HfTokenBadgeMeta {
+  if (hfToken.kind === "ready") {
+    return hfToken.saved
+      ? {
+          status: "saved",
+          className: "badge badge-success",
+          text: t("app.b2.hf_token_stored"),
+        }
+      : {
+          status: "none",
+          className: "badge",
+          text: t("app.b2.hf_token_none"),
+        };
+  }
+  if (hfToken.kind === "error") {
+    return {
+      status: "error",
+      className: "badge badge-warning",
+      text: t("app.b2.hf_token_unknown"),
+    };
+  }
+  return {
+    status: "loading",
+    className: "badge",
+    text: t("app.summary.unknown"),
+  };
+}
+
+/**
+ * Resolves the display phase for a Plugins list top run banner, preferring terminal
+ * phases from `RunSummary.phase` or live SSE updates so banners never stall on "running".
+ */
+export function resolvePluginRunBannerPhase(
+  run: Pick<PluginRunSummary, "phase" | "finished">,
+  knownPhase: PluginRunPhase | undefined,
+): PluginRunPhase | null {
+  if (run.phase && run.phase !== "running") {
+    return run.phase;
+  }
+  if (knownPhase && knownPhase !== "running") {
+    return knownPhase;
+  }
+  if (run.phase === "running" || !run.finished) {
+    return "running";
+  }
+  return null;
 }
 
 export async function listPlugins(

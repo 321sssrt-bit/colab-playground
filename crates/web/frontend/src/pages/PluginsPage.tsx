@@ -22,14 +22,17 @@ import {
 import {
   formatPluginApiError,
   resolveLocalizedText,
+  resolvePluginRunBannerPhase,
   setPluginEnabled,
 } from "./plugins/api.ts";
+import { HfTokenCard } from "./plugins/HfTokenCard.tsx";
 import { HfTokenDialog } from "./plugins/HfTokenDialog.tsx";
 import { InstallPluginDialog } from "./plugins/InstallPluginDialog.tsx";
 import { pluginCacheStore, usePluginCacheStore } from "./plugins/pluginCache.ts";
 import { PluginDeployForm, RocketIcon } from "./plugins/PluginDeployForm.tsx";
 import { PluginRunView } from "./plugins/PluginRunView.tsx";
 import { RemovePluginDialog, type RemovePluginTarget } from "./plugins/RemovePluginDialog.tsx";
+import "./plugins/plugins.css";
 import {
   canRunPluginAgain,
   closePluginDeployForm,
@@ -67,29 +70,43 @@ function isPluginBusyInSnapshot(id: string, operations: readonly PendingOperatio
   });
 }
 
+function getInspectPluginOpState(
+  operations: readonly PendingOperation[],
+): { readonly busy: boolean; readonly cancelling: boolean } {
+  const matched = operations.find(
+    ({ operation }) => operation.kind === "domain" && operation.name === "inspect_plugin",
+  );
+  return {
+    busy: matched !== undefined,
+    cancelling: matched?.cancelling === true,
+  };
+}
+
 function bannerMetaForRun(
   run: PluginRunSummary,
   knownPhase: PluginRunPhase | undefined,
   pluginName: string,
   t: PageProps["t"],
-): { readonly tone: "info" | "success" | "danger"; readonly text: string } {
-  const phase: PluginRunPhase | null =
-    knownPhase && knownPhase !== "running"
-      ? knownPhase
-      : run.phase ?? (!run.finished ? "running" : null);
+): {
+  readonly phase: PluginRunPhase | null;
+  readonly tone: "info" | "success" | "danger";
+  readonly text: string;
+} {
+  const phase = resolvePluginRunBannerPhase(run, knownPhase);
   if (phase === "running") {
-    return { tone: "info", text: t("app.b2.run_banner_running", { name: pluginName }) };
+    return { phase, tone: "info", text: t("app.b2.run_banner_running", { name: pluginName }) };
   }
   if (phase === "ready") {
-    return { tone: "success", text: t("app.b2.run_banner_ready", { name: pluginName }) };
+    return { phase, tone: "success", text: t("app.b2.run_banner_ready", { name: pluginName }) };
   }
   if (phase === "failed") {
-    return { tone: "danger", text: t("app.b2.run_banner_failed", { name: pluginName }) };
+    return { phase, tone: "danger", text: t("app.b2.run_banner_failed", { name: pluginName }) };
   }
   if (phase === "cancelled") {
-    return { tone: "info", text: t("app.b2.run_banner_cancelled", { name: pluginName }) };
+    return { phase, tone: "info", text: t("app.b2.run_banner_cancelled", { name: pluginName }) };
   }
   return {
+    phase: null,
     tone: "info",
     text: `${pluginName} · ${t("app.b2.run_on_session", { name: run.session })}`,
   };
@@ -130,6 +147,8 @@ export function PluginsPage({ snapshot, locale, t, navigate, pushToast }: PagePr
     // Stale-while-revalidate: renders cached plugins immediately without loading flash while
     // picking up enable/disable/remove mutations made in another tab.
     void pluginCacheStore.refreshPlugins().catch(() => {});
+    // Hydrate cached HF token status once per session for the list page card without re-probing keyring.
+    void pluginCacheStore.ensureHfTokenStatus().catch(() => {});
     void refreshPluginRuns({ autoAttach: true });
     return () => {
       mountedRef.current = false;
@@ -232,16 +251,42 @@ export function PluginsPage({ snapshot, locale, t, navigate, pushToast }: PagePr
 
   const shuttingDown = snapshot?.shutting_down === true;
   const operations = snapshot?.operations ?? [];
+  const inspectOp = getInspectPluginOpState(operations);
+  const hfTokenBusy = shuttingDown || isHfTokenBusyInSnapshot(operations);
+
+  const handleInstallCheckCancelled = useCallback(() => {
+    pushToast({
+      tone: "info",
+      body: t("app.install.cancelled"),
+    });
+  }, [pushToast, t]);
 
   const handleRunAgain = useCallback(
     (pluginId: string) => {
+      if (shuttingDown) {
+        return;
+      }
       const target = pluginCacheStore.getPluginById(pluginId);
       if (!canRunPluginAgain(target, shuttingDown)) {
+        const name = pluginCacheStore.resolvePluginName(pluginId, locale);
+        pushToast(
+          target
+            ? {
+                tone: "warning",
+                title: t("app.b2.run_again"),
+                body: `${name} · ${t("app.b2.plugin_off")}`,
+              }
+            : {
+                tone: "warning",
+                title: name,
+                body: t("app.err.plugin_not_found"),
+              },
+        );
         return;
       }
       openPluginDeployForm(pluginId);
     },
-    [shuttingDown],
+    [shuttingDown, locale, pushToast, t],
   );
 
   const isViewingRunDetail =
@@ -362,15 +407,8 @@ export function PluginsPage({ snapshot, locale, t, navigate, pushToast }: PagePr
             <div className="page-header-actions">
               <button
                 type="button"
-                className="btn"
-                disabled={shuttingDown}
-                onClick={() => setTokenDialogOpen(true)}
-              >
-                {t("app.b2.hf_token_title")}
-              </button>
-              <button
-                type="button"
                 className="btn btn-primary"
+                data-plugin-install-open="true"
                 disabled={shuttingDown}
                 onClick={() => setInstallOpen(true)}
               >
@@ -381,7 +419,7 @@ export function PluginsPage({ snapshot, locale, t, navigate, pushToast }: PagePr
 
           <div className="page-sections">
             {runsState.runs.length > 0 && (
-              <section className="card card-compact" data-plugin-runs-list="true">
+              <section className="card card-compact plugin-runs-list" data-plugin-runs-list="true">
                 {runsState.runs.map((runSummary) => {
                   const matchedPlugin =
                     plugins?.find((item) => item.manifest.id === runSummary.plugin) ?? null;
@@ -410,6 +448,7 @@ export function PluginsPage({ snapshot, locale, t, navigate, pushToast }: PagePr
                       className="plugin-run-banner"
                       key={runSummary.id}
                       data-plugin-run-banner={String(runSummary.id)}
+                      data-plugin-run-phase={meta.phase ?? "unknown"}
                     >
                       <div className="plugin-run-banner-msg">
                         <div className={msgClass}>
@@ -589,6 +628,13 @@ export function PluginsPage({ snapshot, locale, t, navigate, pushToast }: PagePr
                 })}
               </>
             )}
+
+            <HfTokenCard
+              hfToken={pluginCache.hfToken}
+              disabled={hfTokenBusy}
+              t={t}
+              pushToast={pushToast}
+            />
           </div>
         </>
       )}
@@ -596,16 +642,19 @@ export function PluginsPage({ snapshot, locale, t, navigate, pushToast }: PagePr
       <HfTokenDialog
         open={tokenDialogOpen}
         t={t}
-        disabled={shuttingDown || isHfTokenBusyInSnapshot(operations)}
+        disabled={hfTokenBusy}
         onClose={() => setTokenDialogOpen(false)}
       />
 
       <InstallPluginDialog
         open={installOpen}
+        inspectBusy={inspectOp.busy}
+        inspectCancelling={inspectOp.cancelling}
         locale={locale}
         t={t}
         onClose={() => setInstallOpen(false)}
         onInstalled={handleInstalled}
+        onCheckCancelled={handleInstallCheckCancelled}
       />
 
       <RemovePluginDialog

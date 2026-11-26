@@ -1154,11 +1154,47 @@ export function PluginDeployForm({
                   <InfoIcon />
                   <span className="inline-msg-text">{t("app.b2.run_hf_token_sent")}</span>
                 </div>
+              ) : hfTokenState.kind === "error" ? (
+                <div
+                  className="alert alert-warning"
+                  role="alert"
+                  data-plugin-hf-token="error"
+                >
+                  <span className="alert-icon icon-warning">
+                    <AlertTriangleIcon />
+                  </span>
+                  <div className="alert-text">
+                    <p className="alert-title">{t("app.b2.hf_token_unknown")}</p>
+                    <p className="alert-body">{formatPluginApiError(hfTokenState.error, t)}</p>
+                    <div className="alert-actions">
+                      <button
+                        type="button"
+                        className="btn btn-sm"
+                        disabled={shuttingDown || submitting}
+                        data-plugin-retry-hf-token="true"
+                        onClick={() => {
+                          void pluginCacheStore.refreshHfTokenStatus().catch(() => {});
+                        }}
+                      >
+                        {t("app.action.retry")}
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-sm btn-ghost"
+                        disabled={shuttingDown || submitting}
+                        data-plugin-open-hf-token="true"
+                        onClick={onOpenHfTokenDialog}
+                      >
+                        {t("web.plugins.manage_token")}
+                      </button>
+                    </div>
+                  </div>
+                </div>
               ) : (
                 <div
                   className="alert alert-info"
                   role="status"
-                  data-plugin-hf-token={hfTokenState.kind === "error" ? "unknown" : "missing"}
+                  data-plugin-hf-token="missing"
                 >
                   <span className="alert-icon icon-info">
                     <InfoIcon />
@@ -1400,6 +1436,26 @@ export function PluginDeployForm({
                 </p>
               )}
             </section>
+
+            {!plugin.enabled && (
+              <div
+                className="alert alert-warning"
+                role="alert"
+                data-plugin-disabled-warning="true"
+              >
+                <span className="alert-icon icon-warning">
+                  <AlertTriangleIcon />
+                </span>
+                <div className="alert-text">
+                  <p className="alert-body">{`${pluginName} · ${t("app.b2.plugin_off")}`}</p>
+                  <div className="alert-actions">
+                    <button type="button" className="btn btn-sm" onClick={onBack}>
+                      {t("app.b2.action_back")}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
 
             {submitError && (
               <div className="alert alert-danger" role="alert" data-plugin-form-error="true">
