@@ -33,7 +33,7 @@ use colab_playground_core::{
     vm::{RunState, RunStatus},
 };
 use colab_playground_web::state::{
-    AccountContext, Submission, WebState,
+    AccountContext, Operation, Submission, WebState,
     plugins::{RUN_LOG_LINES_KEPT, RunEvent, RunPhase},
 };
 use serde_json::{Value, json};
@@ -44,9 +44,15 @@ use ureq::{
 };
 
 enum RunBehavior {
-    ChattyReady { total_lines: usize },
+    ChattyReady {
+        total_lines: usize,
+        pad_bytes: usize,
+        extra_statuses: usize,
+    },
     Fail(ErrorKind),
-    HoldUntilCancelled { started: mpsc::Sender<()> },
+    HoldUntilCancelled {
+        started: mpsc::Sender<()>,
+    },
 }
 
 enum GitPreviewBehavior {
@@ -61,6 +67,11 @@ enum GitPreviewBehavior {
     },
 }
 
+struct HfGate {
+    started: mpsc::Sender<()>,
+    release: Mutex<Option<mpsc::Receiver<()>>>,
+}
+
 struct TestBackend {
     inner: MockBackend,
     run_behavior: Mutex<Option<RunBehavior>>,
@@ -68,6 +79,8 @@ struct TestBackend {
     hf_calls: Arc<AtomicUsize>,
     hf_fail: Mutex<bool>,
     hf_version: AtomicUsize,
+    hf_gate: Mutex<Option<HfGate>>,
+    secret_gate: Mutex<Option<HfGate>>,
 }
 
 impl TestBackend {
@@ -79,6 +92,8 @@ impl TestBackend {
             hf_calls: Arc::new(AtomicUsize::new(0)),
             hf_fail: Mutex::new(false),
             hf_version: AtomicUsize::new(1),
+            hf_gate: Mutex::new(None),
+            secret_gate: Mutex::new(None),
         }
     }
 
@@ -321,7 +336,11 @@ impl Backend for TestBackend {
             RunTarget::Provision(p) => p.name.clone(),
         };
         match behavior {
-            Some(RunBehavior::ChattyReady { total_lines }) => {
+            Some(RunBehavior::ChattyReady {
+                total_lines,
+                pad_bytes,
+                extra_statuses,
+            }) => {
                 let _ = events.send(PluginRunEvent::Launched {
                     session: session.clone(),
                     run_id: "run-chatty".into(),
@@ -333,14 +352,31 @@ impl Backend for TestBackend {
                     message: Some("downloading".into()),
                     ..Default::default()
                 }));
+                let pad = "x".repeat(pad_bytes);
+                let make_line = |i: usize| {
+                    if pad.is_empty() {
+                        format!("line-{i}")
+                    } else {
+                        format!("line-{i}:{pad}")
+                    }
+                };
                 // Mix a large batch with single-line log events to exercise both trim paths.
                 let batch_count = total_lines.min(1_500);
-                let batch: Vec<String> = (0..batch_count).map(|i| format!("line-{i}")).collect();
+                let batch: Vec<String> = (0..batch_count).map(make_line).collect();
                 let _ = events.send(PluginRunEvent::Log { lines: batch });
                 for i in batch_count..total_lines {
                     let _ = events.send(PluginRunEvent::Log {
-                        lines: vec![format!("line-{i}")],
+                        lines: vec![make_line(i)],
                     });
+                }
+                for step in 0..extra_statuses {
+                    let _ = events.send(PluginRunEvent::Status(RunStatus {
+                        state: RunState::Running,
+                        stage: Some("download".into()),
+                        progress: Some(0.5),
+                        message: Some(format!("status-{step}")),
+                        ..Default::default()
+                    }));
                 }
                 let status = RunStatus {
                     state: RunState::Ready,
@@ -390,6 +426,12 @@ impl Backend for TestBackend {
     }
 
     fn delete_secret(&self, name: &str, cancel: &CancelToken) -> Result<()> {
+        if let Some(gate) = self.secret_gate.lock().unwrap().take() {
+            let _ = gate.started.send(());
+            if let Some(rx) = gate.release.lock().unwrap().take() {
+                let _ = rx.recv_timeout(Duration::from_secs(5));
+            }
+        }
         self.inner.delete_secret(name, cancel)
     }
 
@@ -399,6 +441,12 @@ impl Backend for TestBackend {
 
     fn hf_files(&self, repo: &str, _cancel: &CancelToken) -> Result<GgufListing> {
         self.hf_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(gate) = self.hf_gate.lock().unwrap().take() {
+            let _ = gate.started.send(());
+            if let Some(rx) = gate.release.lock().unwrap().take() {
+                let _ = rx.recv_timeout(Duration::from_secs(5));
+            }
+        }
         if *self.hf_fail.lock().unwrap() {
             return Err(Error::new(ErrorKind::Http));
         }
@@ -492,12 +540,20 @@ async fn wait_run_finished(state: &WebState, id: u64) -> RunPhase {
 async fn run_log_keeps_newest_2000_lines_and_replays_on_reconnect() {
     let backend = Arc::new(TestBackend::new());
     let total_lines = RUN_LOG_LINES_KEPT + 350;
-    backend.set_run_behavior(RunBehavior::ChattyReady { total_lines });
-    let state = WebState::start(backend).await.unwrap();
+    backend.set_run_behavior(RunBehavior::ChattyReady {
+        total_lines,
+        pad_bytes: 0,
+        extra_statuses: 0,
+    });
+    let state = WebState::start(backend.clone()).await.unwrap();
     let (account, runtime, session_name) = ready_context(&state).await;
 
     let run_id = state
-        .start_plugin_run(account, existing_run_spec(session_name), Some(runtime))
+        .start_plugin_run(
+            account.clone(),
+            existing_run_spec(session_name.clone()),
+            Some(runtime.clone()),
+        )
         .await
         .unwrap();
     assert_eq!(wait_run_finished(&state, run_id).await, RunPhase::Ready);
@@ -543,6 +599,51 @@ async fn run_log_keeps_newest_2000_lines_and_replays_on_reconnect() {
     assert_eq!(replayed_lines.len(), RUN_LOG_LINES_KEPT);
     assert_eq!(replayed_lines.first().map(String::as_str), Some("line-350"));
     assert_eq!(replayed_lines.last().map(String::as_str), Some("line-2349"));
+
+    // Large lines (> 4 MiB total) and > 600 status events still replay all newest 2,000 log lines.
+    backend.set_run_behavior(RunBehavior::ChattyReady {
+        total_lines: RUN_LOG_LINES_KEPT + 100,
+        pad_bytes: 3 * 1024,
+        extra_statuses: 700,
+    });
+    let heavy_id = state
+        .start_plugin_run(account, existing_run_spec(session_name), Some(runtime))
+        .await
+        .unwrap();
+    assert_eq!(wait_run_finished(&state, heavy_id).await, RunPhase::Ready);
+
+    let heavy_run = state.plugin_run(heavy_id).expect("heavy run retained");
+    let mut heavy_events = heavy_run.subscribe();
+    let mut heavy_lines = Vec::new();
+    let mut heavy_finished = false;
+    while let Some(event) = heavy_events.next().await {
+        match event {
+            RunEvent::Progress { kind: "log", data } => {
+                if let Some(lines) = data.get("lines").and_then(Value::as_array) {
+                    heavy_lines.extend(
+                        lines
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(ToOwned::to_owned),
+                    );
+                }
+            }
+            RunEvent::Finished { error, .. } => {
+                assert!(error.is_none());
+                heavy_finished = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(heavy_finished);
+    assert_eq!(heavy_lines.len(), RUN_LOG_LINES_KEPT);
+    assert!(heavy_lines[0].starts_with("line-100:"));
+    assert!(
+        heavy_lines
+            .last()
+            .unwrap()
+            .starts_with(&format!("line-{}:", RUN_LOG_LINES_KEPT + 99))
+    );
 }
 
 #[tokio::test]
@@ -552,7 +653,11 @@ async fn run_summary_phase_tracks_running_ready_failed_and_cancelled() {
     let (account, runtime, session_name) = ready_context(&state).await;
 
     // Ready
-    backend.set_run_behavior(RunBehavior::ChattyReady { total_lines: 3 });
+    backend.set_run_behavior(RunBehavior::ChattyReady {
+        total_lines: 3,
+        pad_bytes: 0,
+        extra_statuses: 0,
+    });
     let ready_id = state
         .start_plugin_run(
             account.clone(),
@@ -729,8 +834,20 @@ async fn plugin_git_preview_cancel_aborts_clone_and_cleans_staging() {
             .expect("clone started");
     handle.abort();
     let _ = handle.await;
+    // Observe cleanup passively without calling `cancel_plugin_preview()`.
+    let is_inspect_running = || {
+        state.snapshot().operations.iter().any(|op| {
+            matches!(
+                &op.operation,
+                Operation::Domain {
+                    name: "inspect_plugin",
+                    ..
+                }
+            )
+        })
+    };
     tokio::time::timeout(Duration::from_secs(5), async {
-        while checkout_dir.exists() || state.cancel_plugin_preview() {
+        while checkout_dir.exists() || is_inspect_running() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
@@ -744,13 +861,41 @@ async fn gguf_listing_cache_reuses_per_repo_and_supports_explicit_refresh() {
     let calls = backend.hf_calls.clone();
     let state = WebState::start(backend.clone()).await.unwrap();
 
-    let first = state
-        .hf_gguf_listing("unsloth/Qwen3-0.6B-GGUF".into(), false)
+    // Concurrent misses for the same repo coalesce into one `hf_files()` call, even if
+    // the first requester aborts mid-flight.
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    *backend.hf_gate.lock().unwrap() = Some(HfGate {
+        started: started_tx,
+        release: Mutex::new(Some(release_rx)),
+    });
+    let first_state = state.clone();
+    let first_req = tokio::spawn(async move {
+        first_state
+            .hf_gguf_listing("unsloth/Qwen3-0.6B-GGUF".into(), false)
+            .await
+    });
+    tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(5)))
         .await
-        .unwrap();
+        .unwrap()
+        .expect("first hf_files started");
+
+    let second_state = state.clone();
+    let second_req = tokio::spawn(async move {
+        second_state
+            .hf_gguf_listing("  unsloth/Qwen3-0.6B-GGUF ".into(), false)
+            .await
+    });
+    // Let the second task subscribe to the in-flight lookup, then abort the first requester.
+    tokio::task::yield_now().await;
+    first_req.abort();
+    let _ = first_req.await;
+    let _ = release_tx.send(());
+
+    let first = second_req.await.unwrap().unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-    // Trimmed whitespace and repeated lookups for the same repo hit cache with zero backend calls.
+    // Subsequent lookups for the same repo hit cache with zero backend calls.
     let cached = state
         .hf_gguf_listing("  unsloth/Qwen3-0.6B-GGUF ".into(), false)
         .await
@@ -791,8 +936,39 @@ async fn gguf_listing_cache_reuses_per_repo_and_supports_explicit_refresh() {
         .unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 4);
 
-    // Clearing the cache (used when HF token changes) forces a fresh fetch.
-    state.clear_gguf_cache();
+    // Deleting the HF token invalidates the cache inside the background operation even if
+    // the caller drops the JoinHandle mid-flight.
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    *backend.secret_gate.lock().unwrap() = Some(HfGate {
+        started: started_tx,
+        release: Mutex::new(Some(release_rx)),
+    });
+    let Submission::Started { job, .. } = state.delete_hf_token().unwrap() else {
+        panic!("expected started delete_hf_token");
+    };
+    tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(5)))
+        .await
+        .unwrap()
+        .expect("delete_secret started");
+    drop(job);
+    let _ = release_tx.send(());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while state.snapshot().operations.iter().any(|op| {
+            matches!(
+                &op.operation,
+                Operation::Domain {
+                    name: "hf_token",
+                    ..
+                }
+            )
+        }) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("hf_token delete finished");
+
     state
         .hf_gguf_listing("unsloth/Qwen3-0.6B-GGUF".into(), false)
         .await

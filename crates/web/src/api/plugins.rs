@@ -8,7 +8,6 @@ use axum::{
     routing::{delete, get, post},
 };
 use colab_playground_core::{
-    Error,
     backend::{PluginRunSpec, RuntimeRef},
     hf::HfModel,
     plugins::{Capability, Manifest, PluginInfo, PluginOrigin},
@@ -17,7 +16,7 @@ use colab_playground_core::{
 };
 use colab_playground_shared::i18n::keys;
 use colab_playground_web::state::{
-    Access, AccountContext, Submission,
+    AccountContext, Submission,
     plugins::{RunEvent, RunPhase, RunSummary},
 };
 use futures_util::stream;
@@ -187,24 +186,7 @@ async fn save_token(
     payload: Result<Json<Token>, JsonRejection>,
 ) -> Result<Json<TokenStatus>, ApiError> {
     let Json(payload) = payload?;
-    if payload.token.trim().is_empty() {
-        return Err(Error::invalid("token", "empty token").into());
-    }
-    finish(state.web.start_operation(
-        "hf_token",
-        String::new(),
-        Access::Independent,
-        move |backend, cancel| {
-            cancel.commit()?;
-            backend.set_secret(
-                Capability::HfToken.secret_name(),
-                payload.token.trim(),
-                cancel,
-            )
-        },
-    )?)
-    .await?;
-    state.web.clear_gguf_cache();
+    finish(state.web.save_hf_token(payload.token)?).await?;
     Ok(Json(TokenStatus { saved: true }))
 }
 
@@ -213,17 +195,7 @@ async fn delete_token(
     payload: Result<Json<IgnoredAny>, JsonRejection>,
 ) -> Result<Json<TokenStatus>, ApiError> {
     let _ = payload?;
-    finish(state.web.start_operation(
-        "hf_token",
-        String::new(),
-        Access::Independent,
-        |backend, cancel| {
-            cancel.commit()?;
-            backend.delete_secret(Capability::HfToken.secret_name(), cancel)
-        },
-    )?)
-    .await?;
-    state.web.clear_gguf_cache();
+    finish(state.web.delete_hf_token()?).await?;
     Ok(Json(TokenStatus { saved: false }))
 }
 

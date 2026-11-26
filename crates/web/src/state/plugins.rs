@@ -8,8 +8,8 @@ use colab_playground_core::{
     accounts::nonce,
     backend::RunTarget,
     plugins::{
-        InputKind, InputValue, Manifest, PluginInfo, PluginOrigin, PluginPreview, discard_preview,
-        resolve_endpoints, resolve_inputs, validate_git_url,
+        Capability, InputKind, InputValue, Manifest, PluginInfo, PluginOrigin, PluginPreview,
+        discard_preview, resolve_endpoints, resolve_inputs, validate_git_url,
     },
     provision::ProvisionEvent,
     quant::GgufListing,
@@ -24,6 +24,7 @@ pub const RUN_LOG_LINES_KEPT: usize = 2_000;
 const PREVIEW_LIMIT: usize = 16;
 const FINISHED_RUN_LIMIT: usize = 8;
 const GGUF_CACHE_LIMIT: usize = 32;
+const REPLAY_LOG_CHUNK: usize = 256;
 // Reserve room above `RUN_LOG_LINES_KEPT` so lifecycle events do not evict kept log lines.
 const EVENT_LIMIT: usize = RUN_LOG_LINES_KEPT + 512;
 const EVENT_BYTES: usize = 4 * 1024 * 1024;
@@ -40,6 +41,12 @@ pub(super) struct Plugins {
 struct GgufCache {
     generation: u64,
     entries: VecDeque<(String, GgufListing)>,
+    inflight: BTreeMap<String, Arc<InflightGguf>>,
+}
+
+struct InflightGguf {
+    generation: u64,
+    result: watch::Sender<Option<Result<GgufListing>>>,
 }
 
 struct StagedPreview(PluginPreview);
@@ -124,6 +131,7 @@ struct JournalEntry {
     event: RunEvent,
     bytes: usize,
     log_lines: usize,
+    log_end: usize,
 }
 
 #[derive(Default)]
@@ -132,7 +140,11 @@ struct Journal {
     // Tracks an in-place trimmed front log batch so reconnects still emit `history_skipped`.
     trimmed_front: Option<usize>,
     bytes: usize,
-    log_lines: usize,
+    entries_log_lines: usize,
+    total_log_lines: usize,
+    // Retains the exact newest `RUN_LOG_LINES_KEPT` lines even if `entries` rolls over on
+    // byte or non-log event caps, matching desktop `RunLog`.
+    log_tail: VecDeque<String>,
     entries: VecDeque<JournalEntry>,
     checkpoints: BTreeMap<&'static str, (usize, RunEvent)>,
     phase: RunPhase,
@@ -160,17 +172,20 @@ impl PluginRun {
             let index = journal.first + journal.entries.len();
             journal.checkpoints.insert(kind, (index, event.clone()));
         }
-        let log_lines = event_log_lines(&event);
+        let log_lines = push_log_tail(&mut journal.log_tail, &event);
+        journal.total_log_lines += log_lines;
+        let log_end = journal.total_log_lines;
         journal.entries.push_back(JournalEntry {
             event,
             bytes: size,
             log_lines,
+            log_end,
         });
         journal.bytes += size;
-        journal.log_lines += log_lines;
+        journal.entries_log_lines += log_lines;
 
-        while journal.log_lines > RUN_LOG_LINES_KEPT {
-            let excess = journal.log_lines - RUN_LOG_LINES_KEPT;
+        while journal.entries_log_lines > RUN_LOG_LINES_KEPT {
+            let excess = journal.entries_log_lines - RUN_LOG_LINES_KEPT;
             let pop_whole = journal.entries.len() > 1
                 && journal
                     .entries
@@ -186,7 +201,7 @@ impl PluginRun {
                 }
                 let new_bytes = front.bytes;
                 journal.bytes = journal.bytes - old_bytes + new_bytes;
-                journal.log_lines -= removed;
+                journal.entries_log_lines -= removed;
                 journal.trimmed_front = Some(journal.first);
             } else {
                 break;
@@ -218,6 +233,7 @@ impl PluginRun {
             run: self.clone(),
             changes: self.changes.subscribe(),
             next: 0,
+            delivered_log_lines: 0,
             trimmed_reported: None,
             recovery: VecDeque::new(),
         }
@@ -228,6 +244,7 @@ pub struct RunEvents {
     run: Arc<PluginRun>,
     changes: watch::Receiver<()>,
     next: usize,
+    delivered_log_lines: usize,
     trimmed_reported: Option<usize>,
     recovery: VecDeque<RunEvent>,
 }
@@ -250,6 +267,29 @@ impl RunEvents {
                     checkpoints.sort_by_key(|(index, _)| *index);
                     self.recovery
                         .extend(checkpoints.into_iter().map(|(_, event)| event.clone()));
+
+                    let log_tail_start = journal.total_log_lines - journal.log_tail.len();
+                    let entries_log_start = journal.total_log_lines - journal.entries_log_lines;
+                    let recover_from = self.delivered_log_lines.max(log_tail_start);
+                    if recover_from < entries_log_start {
+                        let start = recover_from - log_tail_start;
+                        let end = entries_log_start - log_tail_start;
+                        let missing: Vec<&str> = journal
+                            .log_tail
+                            .range(start..end)
+                            .map(String::as_str)
+                            .collect();
+                        for chunk in missing.chunks(REPLAY_LOG_CHUNK) {
+                            self.recovery.push_back(RunEvent::Progress {
+                                kind: "log",
+                                data: serde_json::json!({
+                                    "event": "log",
+                                    "lines": chunk,
+                                }),
+                            });
+                        }
+                    }
+                    self.delivered_log_lines = self.delivered_log_lines.max(entries_log_start);
                     self.next = journal.first;
                     if journal.trimmed_front == Some(journal.first) {
                         self.trimmed_reported = Some(journal.first);
@@ -270,6 +310,9 @@ impl RunEvents {
                 }
                 if let Some(entry) = journal.entries.get(self.next - journal.first) {
                     self.next += 1;
+                    if entry.log_lines > 0 {
+                        self.delivered_log_lines = self.delivered_log_lines.max(entry.log_end);
+                    }
                     return Some(entry.event.clone());
                 }
                 if journal.phase != RunPhase::Running {
@@ -408,52 +451,132 @@ impl WebState {
 
     pub async fn hf_gguf_listing(&self, repo: String, refresh: bool) -> Result<GgufListing> {
         let repo = repo.trim().to_owned();
-        let generation = {
+        let (mut rx, start) = {
             let mut cache = lock(&self.0.plugins.gguf_cache);
-            if !refresh && let Some(index) = cache.entries.iter().position(|(key, _)| key == &repo)
-            {
-                let entry = cache.entries.remove(index).expect("cached gguf listing");
-                let listing = entry.1.clone();
-                cache.entries.push_back(entry);
-                return Ok(listing);
+            if !refresh {
+                if let Some(index) = cache.entries.iter().position(|(key, _)| key == &repo) {
+                    let entry = cache.entries.remove(index).expect("cached gguf listing");
+                    let listing = entry.1.clone();
+                    cache.entries.push_back(entry);
+                    return Ok(listing);
+                }
+                if let Some(inflight) = cache.inflight.get(&repo)
+                    && inflight.generation == cache.generation
+                {
+                    (inflight.result.subscribe(), None)
+                } else {
+                    let inflight = Arc::new(InflightGguf {
+                        generation: cache.generation,
+                        result: watch::channel(None).0,
+                    });
+                    let rx = inflight.result.subscribe();
+                    cache.inflight.insert(repo.clone(), inflight.clone());
+                    (rx, Some(inflight))
+                }
+            } else {
+                let inflight = Arc::new(InflightGguf {
+                    generation: cache.generation,
+                    result: watch::channel(None).0,
+                });
+                let rx = inflight.result.subscribe();
+                cache.inflight.insert(repo.clone(), inflight.clone());
+                (rx, Some(inflight))
             }
-            cache.generation
         };
-        let lookup_repo = repo.clone();
-        let result = self
-            .run_backend(move |backend, cancel| backend.hf_files(&lookup_repo, cancel))
-            .await;
-        match result {
-            Ok(listing) => {
-                let mut cache = lock(&self.0.plugins.gguf_cache);
-                if cache.generation == generation {
-                    if let Some(index) = cache.entries.iter().position(|(key, _)| key == &repo) {
-                        cache.entries.remove(index);
-                    } else if cache.entries.len() == GGUF_CACHE_LIMIT {
-                        cache.entries.pop_front();
-                    }
-                    cache.entries.push_back((repo, listing.clone()));
-                }
-                Ok(listing)
-            }
-            Err(error) => {
-                if refresh {
-                    let mut cache = lock(&self.0.plugins.gguf_cache);
-                    if cache.generation == generation
-                        && let Some(index) = cache.entries.iter().position(|(key, _)| key == &repo)
+
+        if let Some(flight) = start {
+            // Detached so aborting one HTTP requester lets concurrent waiters reuse the fetch.
+            let state = self.clone();
+            let generation = flight.generation;
+            tokio::spawn(async move {
+                let lookup_repo = repo.clone();
+                let result = state
+                    .run_backend(move |backend, cancel| backend.hf_files(&lookup_repo, cancel))
+                    .await;
+                {
+                    let mut cache = lock(&state.0.plugins.gguf_cache);
+                    if cache
+                        .inflight
+                        .get(&repo)
+                        .is_some_and(|current| Arc::ptr_eq(current, &flight))
                     {
-                        cache.entries.remove(index);
+                        cache.inflight.remove(&repo);
+                    }
+                    if cache.generation == generation {
+                        match &result {
+                            Ok(listing) => {
+                                if let Some(index) =
+                                    cache.entries.iter().position(|(key, _)| key == &repo)
+                                {
+                                    cache.entries.remove(index);
+                                } else if cache.entries.len() == GGUF_CACHE_LIMIT {
+                                    cache.entries.pop_front();
+                                }
+                                cache.entries.push_back((repo, listing.clone()));
+                            }
+                            Err(_) if refresh => {
+                                if let Some(index) =
+                                    cache.entries.iter().position(|(key, _)| key == &repo)
+                                {
+                                    cache.entries.remove(index);
+                                }
+                            }
+                            Err(_) => {}
+                        }
                     }
                 }
-                Err(error)
-            }
+                let _ = flight.result.send(Some(result));
+            });
         }
+
+        let outcome = rx
+            .wait_for(Option::is_some)
+            .await
+            .map_err(|_| Error::new(ErrorKind::Other))?;
+        outcome
+            .clone()
+            .unwrap_or_else(|| Err(Error::new(ErrorKind::Other)))
+    }
+
+    pub fn save_hf_token(&self, token: String) -> Result<Submission<()>> {
+        let token = token.trim().to_owned();
+        if token.is_empty() {
+            return Err(Error::invalid("token", "empty token"));
+        }
+        let state = self.clone();
+        self.start_operation(
+            "hf_token",
+            String::new(),
+            Access::Independent,
+            move |backend, cancel| {
+                cancel.commit()?;
+                backend.set_secret(Capability::HfToken.secret_name(), &token, cancel)?;
+                state.clear_gguf_cache();
+                Ok(())
+            },
+        )
+    }
+
+    pub fn delete_hf_token(&self) -> Result<Submission<()>> {
+        let state = self.clone();
+        self.start_operation(
+            "hf_token",
+            String::new(),
+            Access::Independent,
+            move |backend, cancel| {
+                cancel.commit()?;
+                backend.delete_secret(Capability::HfToken.secret_name(), cancel)?;
+                state.clear_gguf_cache();
+                Ok(())
+            },
+        )
     }
 
     pub fn clear_gguf_cache(&self) {
         let mut cache = lock(&self.0.plugins.gguf_cache);
         cache.generation += 1;
         cache.entries.clear();
+        cache.inflight.clear();
     }
 
     pub fn install_plugin(&self, id: String) -> Result<Submission<PluginInfo>> {
@@ -753,14 +876,23 @@ fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
     value.lock().unwrap_or_else(|error| error.into_inner())
 }
 
-fn event_log_lines(event: &RunEvent) -> usize {
-    match event {
-        RunEvent::Progress { kind: "log", data } => data
-            .get("lines")
-            .and_then(Value::as_array)
-            .map_or(0, Vec::len),
-        _ => 0,
+fn push_log_tail(log_tail: &mut VecDeque<String>, event: &RunEvent) -> usize {
+    let RunEvent::Progress { kind: "log", data } = event else {
+        return 0;
+    };
+    let Some(lines) = data.get("lines").and_then(Value::as_array) else {
+        return 0;
+    };
+    let mut added = 0;
+    for value in lines {
+        if let Some(line) = value.as_str() {
+            log_tail.push_back(line.to_owned());
+            added += 1;
+        }
     }
+    let extra = log_tail.len().saturating_sub(RUN_LOG_LINES_KEPT);
+    log_tail.drain(..extra);
+    added
 }
 
 fn pop_front(journal: &mut Journal) {
@@ -770,7 +902,7 @@ fn pop_front(journal: &mut Journal) {
     }
     journal.first += 1;
     journal.bytes -= entry.bytes;
-    journal.log_lines -= entry.log_lines;
+    journal.entries_log_lines -= entry.log_lines;
 }
 
 fn trim_log_entry(entry: &mut JournalEntry, drop_lines: usize) -> usize {
