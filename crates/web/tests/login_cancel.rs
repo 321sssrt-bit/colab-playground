@@ -30,7 +30,7 @@ use colab_playground_core::{
     tunnel::{TunnelEvent, TunnelId, TunnelInfo, TunnelSpec},
 };
 use colab_playground_web::state::{
-    CancelLoginOutcome, Snapshot, Submission, SubmitCancelOutcome, WebState,
+    Access, CancelLoginOutcome, Snapshot, Submission, SubmitCancelOutcome, WebState,
 };
 use sha2::{Digest as _, Sha256};
 use tokio::time::{sleep, timeout};
@@ -67,10 +67,13 @@ async fn wait_ready(state: &WebState) -> Arc<Snapshot> {
 
 type BeginHook =
     Box<dyn FnOnce(&MockBackend, &CancelToken) -> Result<Box<dyn LoginFlow>> + Send + 'static>;
+type RuntimesHook =
+    Box<dyn FnOnce(&MockBackend, &CancelToken) -> Result<RuntimesView> + Send + 'static>;
 
 struct ControlledBackend {
     inner: MockBackend,
     begin_hook: Mutex<Option<BeginHook>>,
+    runtimes_hook: Mutex<Option<RuntimesHook>>,
     accounts_calls: AtomicUsize,
     fail_accounts_once: AtomicBool,
 }
@@ -80,6 +83,7 @@ impl ControlledBackend {
         Arc::new(Self {
             inner,
             begin_hook: Mutex::new(None),
+            runtimes_hook: Mutex::new(None),
             accounts_calls: AtomicUsize::new(0),
             fail_accounts_once: AtomicBool::new(false),
         })
@@ -94,6 +98,13 @@ impl ControlledBackend {
 
     fn clear_begin_hook(&self) {
         *self.begin_hook.lock().unwrap() = None;
+    }
+
+    fn set_runtimes_hook(
+        &self,
+        hook: impl FnOnce(&MockBackend, &CancelToken) -> Result<RuntimesView> + Send + 'static,
+    ) {
+        *self.runtimes_hook.lock().unwrap() = Some(Box::new(hook));
     }
 }
 
@@ -165,6 +176,10 @@ impl Backend for ControlledBackend {
         self.inner.measured_rates()
     }
     fn runtimes(&self, cancel: &CancelToken) -> Result<RuntimesView> {
+        let hook = self.runtimes_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            return hook(&self.inner, cancel);
+        }
         self.inner.runtimes(cancel)
     }
     fn new_session_name(&self, prefix: Option<&str>) -> String {
@@ -342,7 +357,7 @@ async fn starting_cancel_interrupts_immediately_and_releases_lock() {
     entered_rx.recv_timeout(TEST_TIMEOUT).unwrap();
 
     // Cancel by id during starting must interrupt immediately and release the exclusive lock.
-    let outcome = timeout(Duration::from_secs(2), state.cancel_login_settled(Some(id)))
+    let outcome = timeout(Duration::from_secs(2), state.cancel_login_settled(id))
         .await
         .unwrap()
         .unwrap();
@@ -364,7 +379,7 @@ async fn starting_cancel_interrupts_immediately_and_releases_lock() {
     let (_, retry_begin) = started(state.begin_login(account.clone()).unwrap());
     let prompt = retry_begin.await.unwrap().unwrap();
     assert_eq!(
-        state.cancel_login_settled(Some(prompt.id)).await.unwrap(),
+        state.cancel_login_settled(prompt.id).await.unwrap(),
         CancelLoginOutcome::RolledBack
     );
     let (_, switch_job) = started(state.switch_account(account, other.clone()).unwrap());
@@ -373,13 +388,71 @@ async fn starting_cancel_interrupts_immediately_and_releases_lock() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn starting_cancel_without_id_and_abort_after_handoff_never_leak_pending_lock() {
+async fn starting_cancel_while_slow_poll_holds_poll_slot_releases_lock_immediately() {
     let backend = demo_backend();
     let state = WebState::start(backend.clone()).await.unwrap();
     let initial = wait_ready(&state).await;
     let account = initial.account.clone();
 
-    // Part 1: cancel active login with `id = None` during `starting`.
+    let (poll_entered_tx, poll_entered_rx) = mpsc::channel();
+    let (release_poll_tx, release_poll_rx) = mpsc::channel();
+    backend.set_runtimes_hook(move |mock, cancel| {
+        poll_entered_tx.send(()).unwrap();
+        release_poll_rx.recv_timeout(TEST_TIMEOUT).unwrap();
+        mock.runtimes(cancel)
+    });
+
+    // Trigger a real background `Slot::Poll` cycle (simulating a slow 120s helper call holding
+    // `poll_slot` while `Slot::Exclusive` is still allowed to start).
+    let (_, trigger) = started(
+        state
+            .start_operation(
+                "trigger_poll",
+                String::new(),
+                Access::Independent,
+                |_, _| Ok(()),
+            )
+            .unwrap(),
+    );
+    trigger.await.unwrap().unwrap();
+    poll_entered_rx.recv_timeout(TEST_TIMEOUT).unwrap();
+
+    // `begin_login` reserves Slot::Exclusive and waits on `poll_slot`; cancelling it must
+    // abort immediately without waiting for the slow background poll to finish.
+    let (id, begin_job) = started(state.begin_login(account.clone()).unwrap());
+    let outcome = timeout(Duration::from_secs(1), state.cancel_login_settled(id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome, CancelLoginOutcome::RolledBack);
+    assert!(matches!(
+        begin_job.await.unwrap(),
+        Err(error) if error.is(ErrorKind::Cancelled)
+    ));
+    assert!(state.snapshot().operations.is_empty());
+    assert!(state.snapshot().login_id.is_none());
+
+    // A follow-up login is accepted immediately (not Busy) even while the slow poll is still
+    // running, and completes cleanly once the poll finishes.
+    let (_, retry_begin) = started(state.begin_login(account).unwrap());
+    release_poll_tx.send(()).unwrap();
+    let prompt = retry_begin.await.unwrap().unwrap();
+    assert_eq!(
+        state.cancel_login_settled(prompt.id).await.unwrap(),
+        CancelLoginOutcome::RolledBack
+    );
+    assert!(state.shutdown(TEST_TIMEOUT).await.completed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn starting_cancel_handoff_race_and_stale_id_isolation() {
+    let backend = demo_backend();
+    let state = WebState::start(backend.clone()).await.unwrap();
+    let initial = wait_ready(&state).await;
+    let account = initial.account.clone();
+
+    // Part 1: cancel arrives right as `begin_add_account` returns a flow:
+    // WebState must roll back that flow via `flow.cancel()` instead of installing PendingLogin.
     let (entered_tx, entered_rx) = mpsc::channel();
     backend.set_begin_hook(move |mock, cancel| {
         entered_tx.send(()).unwrap();
@@ -387,14 +460,12 @@ async fn starting_cancel_without_id_and_abort_after_handoff_never_leak_pending_l
         while !cancel.is_cancelled() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
-        // Simulate cancel arriving right as `begin_add_account` returns a flow:
-        // WebState must roll back that flow via `flow.cancel()` instead of installing PendingLogin.
         mock.begin_add_account(&CancelToken::new())
     });
 
-    let (_, begin_job) = started(state.begin_login(account.clone()).unwrap());
+    let (first_id, begin_job) = started(state.begin_login(account.clone()).unwrap());
     entered_rx.recv_timeout(TEST_TIMEOUT).unwrap();
-    let outcome = timeout(Duration::from_secs(2), state.cancel_login_settled(None))
+    let outcome = timeout(Duration::from_secs(2), state.cancel_login_settled(first_id))
         .await
         .unwrap()
         .unwrap();
@@ -433,14 +504,20 @@ async fn starting_cancel_without_id_and_abort_after_handoff_never_leak_pending_l
         account.active
     );
 
-    // Immediate next login works cleanly.
+    // Part 3: a stale/retried cancel carrying an older login id NEVER cancels another tab's login.
     let (_, next_begin) = started(state.begin_login(account).unwrap());
     let next_prompt = next_begin.await.unwrap().unwrap();
-    assert_eq!(
+    assert_ne!(next_prompt.id, prompt.id);
+    assert!(
         state
-            .cancel_login_settled(Some(next_prompt.id))
+            .cancel_login_settled(prompt.id)
             .await
-            .unwrap(),
+            .unwrap_err()
+            .is(ErrorKind::LoginCancelled)
+    );
+    assert_eq!(state.snapshot().login_id, Some(next_prompt.id));
+    assert_eq!(
+        state.cancel_login_settled(next_prompt.id).await.unwrap(),
         CancelLoginOutcome::RolledBack
     );
     assert!(state.shutdown(TEST_TIMEOUT).await.completed);
@@ -497,12 +574,12 @@ async fn submitting_cancel_waits_for_rollback_and_returns_real_cancelled_state()
     // Two concurrent cancel requests during submitting must BOTH wait until rollback finishes.
     let cancel_a = {
         let state = state.clone();
-        tokio::spawn(async move { state.cancel_login_settled(Some(prompt.id)).await })
+        tokio::spawn(async move { state.cancel_login_settled(prompt.id).await })
     };
     cancel_seen_rx.recv_timeout(TEST_TIMEOUT).unwrap();
     let cancel_b = {
         let state = state.clone();
-        tokio::spawn(async move { state.cancel_login_settled(Some(prompt.id)).await })
+        tokio::spawn(async move { state.cancel_login_settled(prompt.id).await })
     };
 
     sleep(Duration::from_millis(80)).await;
@@ -531,8 +608,10 @@ async fn submitting_cancel_waits_for_rollback_and_returns_real_cancelled_state()
         };
         assert_eq!(settled.outcome, SubmitCancelOutcome::Cancelled);
         assert_eq!(settled.account_context.active, account.active);
-        assert_eq!(settled.accounts.active, account.active);
-        assert!(settled.accounts.has_token);
+        let accounts = settled.accounts.as_ref().unwrap();
+        assert_eq!(accounts.active, account.active);
+        assert!(accounts.has_token);
+        assert!(settled.accounts_error.is_none());
     }
     assert!(
         submit_job
@@ -554,6 +633,7 @@ async fn submitting_cancel_after_point_of_no_return_reports_completed_new_accoun
     let state = WebState::start(backend.clone()).await.unwrap();
     let initial = wait_ready(&state).await;
     let account = initial.account.clone();
+    let other = initial.accounts.as_ref().unwrap().accounts[1].id.clone();
 
     let (submitting_tx, submitting_rx) = mpsc::channel();
     let (release_commit_tx, release_commit_rx) = mpsc::channel();
@@ -585,19 +665,29 @@ async fn submitting_cancel_after_point_of_no_return_reports_completed_new_accoun
 
     let cancel_task = {
         let state = state.clone();
-        tokio::spawn(async move { state.cancel_login_settled(Some(prompt.id)).await })
+        tokio::spawn(async move { state.cancel_login_settled(prompt.id).await })
     };
     sleep(Duration::from_millis(60)).await;
     assert!(!cancel_task.is_finished());
 
     release_commit_tx.send(()).unwrap();
+    let submitted = submit_job.await.unwrap().unwrap().unwrap();
+
+    // Immediately switch to another account on a racing tab before inspecting the cancel result:
+    // the cancel settlement must still report the account state captured before Slot::Exclusive
+    // was released, never mixing Account A's `Completed` with Account B's active state.
+    let (_, switch_job) = started(
+        state
+            .switch_account(state.snapshot().account.clone(), other.clone())
+            .unwrap(),
+    );
+    assert_eq!(switch_job.await.unwrap().unwrap().active, Some(other));
+
     let settled = timeout(TEST_TIMEOUT, cancel_task)
         .await
         .unwrap()
         .unwrap()
         .unwrap();
-    let submitted = submit_job.await.unwrap().unwrap().unwrap();
-
     let CancelLoginOutcome::SubmittingSettled(settled) = settled else {
         panic!("expected SubmittingSettled, got {settled:?}");
     };
@@ -606,8 +696,12 @@ async fn submitting_cancel_after_point_of_no_return_reports_completed_new_accoun
         SubmitCancelOutcome::Completed(submitted.clone())
     );
     assert_eq!(settled.account_context.active, Some(submitted.id.clone()));
-    assert_eq!(settled.accounts.active, Some(submitted.id));
+    assert_eq!(
+        settled.accounts.as_ref().unwrap().active,
+        Some(submitted.id)
+    );
     assert_ne!(settled.account_context.active, account.active);
+    assert!(settled.accounts_error.is_none());
     assert!(state.shutdown(TEST_TIMEOUT).await.completed);
 }
 
@@ -649,7 +743,7 @@ async fn submitting_cancel_reports_failed_code_and_restored_active_account() {
 
     let cancel_task = {
         let state = state.clone();
-        tokio::spawn(async move { state.cancel_login_settled(Some(prompt.id)).await })
+        tokio::spawn(async move { state.cancel_login_settled(prompt.id).await })
     };
     sleep(Duration::from_millis(60)).await;
     assert!(!cancel_task.is_finished());
@@ -676,8 +770,130 @@ async fn submitting_cancel_reports_failed_code_and_restored_active_account() {
         other => panic!("expected Failed(LoginInvalidCode), got {other:?}"),
     }
     assert_eq!(settled.account_context.active, account.active);
-    assert_eq!(settled.accounts.active, account.active);
-    assert!(settled.accounts.has_token);
+    let accounts = settled.accounts.as_ref().unwrap();
+    assert_eq!(accounts.active, account.active);
+    assert!(accounts.has_token);
+    assert!(settled.accounts_error.is_none());
+    assert!(state.shutdown(TEST_TIMEOUT).await.completed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn submitting_completed_and_failed_outcomes_survive_post_submit_accounts_refresh_error() {
+    let backend = demo_backend();
+    let state = WebState::start(backend.clone()).await.unwrap();
+    let initial = wait_ready(&state).await;
+    let account = initial.account.clone();
+
+    // Case 1: submit commits a new account, then reading the account list fails.
+    // The cancel waiter must still receive `Completed(account)` plus `accounts_error`.
+    let (submitting_tx, submitting_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    let backend_ref = backend.clone();
+    backend.set_begin_hook(move |mock, cancel| {
+        let inner = mock.begin_add_account(cancel)?;
+        let release_rx = release_rx.clone();
+        Ok(GateLoginFlow::wrap(
+            inner,
+            move |inner, code, _cancel| {
+                submitting_tx.send(()).unwrap();
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(TEST_TIMEOUT)
+                    .unwrap();
+                let saved = inner.submit_code(code, &CancelToken::new())?;
+                backend_ref.fail_accounts_once.store(true, Ordering::SeqCst);
+                Ok(saved)
+            },
+            |inner| inner.cancel(),
+        ))
+    });
+
+    let (_, begin_job) = started(state.begin_login(account.clone()).unwrap());
+    let prompt = begin_job.await.unwrap().unwrap();
+    let (_, submit_job) = started(state.submit_login(prompt.id, "4/0A-ok".into()).unwrap());
+    submitting_rx.recv_timeout(TEST_TIMEOUT).unwrap();
+    let cancel_task = {
+        let state = state.clone();
+        tokio::spawn(async move { state.cancel_login_settled(prompt.id).await })
+    };
+    sleep(Duration::from_millis(40)).await;
+    release_tx.send(()).unwrap();
+
+    let saved = submit_job.await.unwrap().unwrap().unwrap();
+    let CancelLoginOutcome::SubmittingSettled(settled) = timeout(TEST_TIMEOUT, cancel_task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("expected SubmittingSettled");
+    };
+    assert_eq!(settled.outcome, SubmitCancelOutcome::Completed(saved));
+    assert_eq!(settled.accounts_error, Some(ErrorKind::KeyringUnavailable));
+
+    // Recover snapshot accounts before Case 2.
+    let refreshed = state.refresh_accounts().await.unwrap();
+    let current_ctx = refreshed.account.clone();
+
+    // Case 2: submit fails with `LoginInvalidCode`, then reading the account list also fails.
+    // The cancel waiter must preserve the original `LoginInvalidCode` error plus `accounts_error`.
+    let (submitting_tx, submitting_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    let backend_ref = backend.clone();
+    backend.set_begin_hook(move |mock, cancel| {
+        let inner = mock.begin_add_account(cancel)?;
+        let release_rx = release_rx.clone();
+        Ok(GateLoginFlow::wrap(
+            inner,
+            move |inner, _code, _cancel| {
+                submitting_tx.send(()).unwrap();
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(TEST_TIMEOUT)
+                    .unwrap();
+                drop(inner);
+                backend_ref.fail_accounts_once.store(true, Ordering::SeqCst);
+                Err(Error::new(ErrorKind::LoginInvalidCode))
+            },
+            |inner| inner.cancel(),
+        ))
+    });
+
+    let (_, begin_job) = started(state.begin_login(current_ctx).unwrap());
+    let prompt = begin_job.await.unwrap().unwrap();
+    let (_, submit_job) = started(state.submit_login(prompt.id, "bad".into()).unwrap());
+    submitting_rx.recv_timeout(TEST_TIMEOUT).unwrap();
+    let cancel_task = {
+        let state = state.clone();
+        tokio::spawn(async move { state.cancel_login_settled(prompt.id).await })
+    };
+    sleep(Duration::from_millis(40)).await;
+    release_tx.send(()).unwrap();
+
+    assert!(
+        submit_job
+            .await
+            .unwrap()
+            .unwrap_err()
+            .is(ErrorKind::LoginInvalidCode)
+    );
+    let CancelLoginOutcome::SubmittingSettled(settled) = timeout(TEST_TIMEOUT, cancel_task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("expected SubmittingSettled");
+    };
+    match settled.outcome {
+        SubmitCancelOutcome::Failed(error) => assert!(error.is(ErrorKind::LoginInvalidCode)),
+        other => panic!("expected Failed(LoginInvalidCode), got {other:?}"),
+    }
+    assert_eq!(settled.accounts_error, Some(ErrorKind::KeyringUnavailable));
     assert!(state.shutdown(TEST_TIMEOUT).await.completed);
 }
 
@@ -702,10 +918,7 @@ async fn rollback_and_post_cancel_account_verification_failures_surface_as_error
     });
     let (_, begin_job) = started(state.begin_login(account.clone()).unwrap());
     let prompt = begin_job.await.unwrap().unwrap();
-    let err = state
-        .cancel_login_settled(Some(prompt.id))
-        .await
-        .unwrap_err();
+    let err = state.cancel_login_settled(prompt.id).await.unwrap_err();
     assert!(err.is(ErrorKind::KeyringUnavailable));
     assert!(state.snapshot().login_id.is_none());
 
@@ -744,7 +957,7 @@ async fn rollback_and_post_cancel_account_verification_failures_surface_as_error
 
     let cancel_task = {
         let state = state.clone();
-        tokio::spawn(async move { state.cancel_login_settled(Some(prompt.id)).await })
+        tokio::spawn(async move { state.cancel_login_settled(prompt.id).await })
     };
     sleep(Duration::from_millis(40)).await;
     release_tx.send(()).unwrap();
@@ -940,8 +1153,8 @@ fn http_cancel_login_routes_and_dismiss_recovered_end_to_end() {
     );
     assert_eq!(st, StatusCode::NO_CONTENT);
 
-    // 2. Dropping the client connection mid-`POST /api/accounts/login` cancels the start and
-    //    leaves no 5-minute PendingLogin lock behind.
+    // 2. Dropping the client connection mid-`POST /api/accounts/login` cancels only that
+    //    request's own login start and leaves no 5-minute PendingLogin lock behind.
     {
         let body = serde_json::json!({ "account_context": ctx }).to_string();
         let mut stream = TcpStream::connect(&addr).unwrap();
@@ -960,10 +1173,8 @@ fn http_cancel_login_routes_and_dismiss_recovered_end_to_end() {
         stream.write_all(req.as_bytes()).unwrap();
         stream.flush().unwrap();
         std::thread::sleep(Duration::from_millis(50));
-        // Close socket immediately without reading response.
     }
 
-    // Retry opening login right after the aborted connection; the lock must clear rapidly.
     let mut prompt = None;
     for _ in 0..40 {
         let (st, body) = send(
@@ -982,9 +1193,19 @@ fn http_cancel_login_routes_and_dismiss_recovered_end_to_end() {
     let prompt = prompt.expect("aborted begin_login released the exclusive lock");
     let login_id = prompt["id"].as_u64().unwrap();
 
-    // 3. `DELETE /api/accounts/login` (without id) cancels the active login cleanly.
+    // 3. Unscoped `DELETE /api/accounts/login` is rejected so stale tabs cannot cancel another
+    //    tab's login; scoped `DELETE /api/accounts/login/{id}` cancels only its matching login.
     let (st, _) = send("DELETE", "/api/accounts/login", Some(&token), Some("{}"));
+    assert_eq!(st, StatusCode::METHOD_NOT_ALLOWED);
+
+    let (st, _) = send(
+        "DELETE",
+        &format!("/api/accounts/login/{login_id}"),
+        Some(&token),
+        Some("{}"),
+    );
     assert_eq!(st, StatusCode::NO_CONTENT);
+
     // Cancelling the already-cancelled id reports login_cancelled (409).
     let (st, err) = send(
         "DELETE",
@@ -1031,7 +1252,6 @@ fn http_cancel_login_routes_and_dismiss_recovered_end_to_end() {
         })
     };
 
-    // Wait briefly so submit_login enters the server's `submitting` phase.
     for _ in 0..40 {
         let (st, snap) = send("GET", "/api/snapshot", Some(&token), None);
         if st == StatusCode::OK {
@@ -1074,7 +1294,6 @@ fn http_cancel_login_routes_and_dismiss_recovered_end_to_end() {
             assert!(body["account"].is_object());
         }
     } else {
-        // Only possible if submit_login finished and released the slot before DELETE arrived.
         assert_eq!(cancel_st, StatusCode::CONFLICT);
     }
 }

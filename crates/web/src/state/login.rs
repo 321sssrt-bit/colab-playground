@@ -33,10 +33,35 @@ enum ActiveLoginPhase {
 }
 
 #[derive(Debug, Clone)]
+struct SettledAccounts {
+    account_context: AccountContext,
+    accounts: Option<AccountsView>,
+    accounts_error: Option<ErrorKind>,
+}
+
+impl SettledAccounts {
+    fn from_snapshot(snapshot: &Snapshot) -> Self {
+        Self {
+            account_context: snapshot.account.clone(),
+            accounts: snapshot.accounts.clone(),
+            accounts_error: snapshot.accounts_error,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 enum LoginSettled {
-    Cancelled,
-    Completed(Account),
-    Failed(Error),
+    Cancelled(SettledAccounts),
+    Completed {
+        account: Account,
+        state: SettledAccounts,
+    },
+    Failed {
+        error: Error,
+        state: SettledAccounts,
+    },
+    /// Cancellation completed or start/rollback failed and slot verification could not confirm state.
+    Error(Error),
 }
 
 type SettledReceiver = watch::Receiver<Option<LoginSettled>>;
@@ -70,7 +95,7 @@ impl SettleGuard {
 impl Drop for SettleGuard {
     fn drop(&mut self) {
         // Declared before the job guard so exclusive locks are released even on unwind.
-        self.send(LoginSettled::Failed(Error::new(ErrorKind::Other)));
+        self.send(LoginSettled::Error(Error::new(ErrorKind::Other)));
     }
 }
 
@@ -90,7 +115,8 @@ pub enum CancelLoginOutcome {
 pub struct SubmitCancelSettlement {
     pub outcome: SubmitCancelOutcome,
     pub account_context: AccountContext,
-    pub accounts: AccountsView,
+    pub accounts: Option<AccountsView>,
+    pub accounts_error: Option<ErrorKind>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -134,17 +160,35 @@ impl WebState {
             let mut settle = SettleGuard::new(settled_tx);
             let mut job = job;
             let state = job.state.clone();
-            let poll = state.lock_poll_slot();
+            let poll = match state.lock_poll_slot_cancellable(&job.cancel) {
+                Ok(poll) => poll,
+                Err(error) => {
+                    let cancelled = job.cancel.is_cancelled();
+                    let settled_accounts = SettledAccounts::from_snapshot(&state.snapshot());
+                    drop(job);
+                    settle.send(settled_from_start_error(
+                        &error,
+                        cancelled,
+                        settled_accounts,
+                    ));
+                    return Err(error);
+                }
+            };
 
             let precheck = job
                 .cancel
                 .check()
                 .and_then(|()| state.verify_account(&account, &job.cancel));
             if let Err(error) = precheck {
-                drop(poll);
                 let cancelled = job.cancel.is_cancelled();
+                let settled_accounts = SettledAccounts::from_snapshot(&state.snapshot());
+                drop(poll);
                 drop(job);
-                settle.send(settled_from_start_error(&error, cancelled));
+                settle.send(settled_from_start_error(
+                    &error,
+                    cancelled,
+                    settled_accounts,
+                ));
                 return Err(error);
             }
 
@@ -154,14 +198,13 @@ impl WebState {
                 Ok(flow) => flow,
                 Err(error) => {
                     let accounts_err = record_accounts_after_login(&state);
-                    drop(poll);
                     let cancelled = job.cancel.is_cancelled();
+                    let settled_accounts = SettledAccounts::from_snapshot(&state.snapshot());
+                    drop(poll);
                     drop(job);
                     let settled = match accounts_err {
-                        Some(err) if is_start_cancel(&error, cancelled) => {
-                            LoginSettled::Failed(err)
-                        }
-                        _ => settled_from_start_error(&error, cancelled),
+                        Some(err) if is_start_cancel(&error, cancelled) => LoginSettled::Error(err),
+                        _ => settled_from_start_error(&error, cancelled, settled_accounts),
                     };
                     settle.send(settled);
                     return Err(error);
@@ -174,12 +217,13 @@ impl WebState {
                 drop(control);
                 let cancel_result = flow.cancel();
                 let accounts_err = record_accounts_after_login(&state);
+                let settled_accounts = SettledAccounts::from_snapshot(&state.snapshot());
                 drop(poll);
                 drop(job);
                 let settled = match (&cancel_result, accounts_err) {
-                    (Err(error), _) => LoginSettled::Failed(error.clone()),
-                    (Ok(()), Some(error)) => LoginSettled::Failed(error),
-                    (Ok(()), None) => LoginSettled::Cancelled,
+                    (Err(error), _) => LoginSettled::Error(error.clone()),
+                    (Ok(()), Some(error)) => LoginSettled::Error(error),
+                    (Ok(()), None) => LoginSettled::Cancelled(settled_accounts),
                 };
                 settle.send(settled);
                 cancel_result?;
@@ -217,118 +261,135 @@ impl WebState {
 
     /// Cancels a starting or pending login when the HTTP client drops `begin_login` mid-flight.
     pub fn abort_login_start(&self, id: u64) {
-        let mut control = self.lock();
-        if control.shutting_down {
-            return;
-        }
-        if control.login.as_ref().is_some_and(|login| login.id == id) {
-            let _ = self.start_finish_login(&mut control, id, Finish::Cancel);
-            return;
-        }
-        if let Some(active) = control
-            .login_job
-            .as_ref()
-            .filter(|active| active.login_id == id && active.phase == ActiveLoginPhase::Starting)
-            && active.cancel.cancel()
-        {
-            self.publish_operations(&control);
+        let wake_poll = {
+            let mut control = self.lock();
+            if control.shutting_down {
+                return;
+            }
+            if control.login.as_ref().is_some_and(|login| login.id == id) {
+                let _ = self.start_finish_login(&mut control, id, Finish::Cancel);
+                false
+            } else if let Some(active) = control.login_job.as_ref().filter(|active| {
+                active.login_id == id && active.phase == ActiveLoginPhase::Starting
+            }) && active.cancel.cancel()
+            {
+                self.publish_operations(&control);
+                true
+            } else {
+                false
+            }
+        };
+        if wake_poll {
+            self.wake_poll_slot_waiters();
         }
     }
 
     /// Starts or joins cancellation of an active or pending login flow.
     pub fn cancel_login(&self, id: u64) -> Result<Option<Submission<Option<Account>>>> {
-        let mut control = self.lock();
-        if control.shutting_down {
-            return Err(Error::cancelled());
-        }
-        if control.login.as_ref().is_some_and(|login| login.id == id) {
-            return self
-                .start_finish_login(&mut control, id, Finish::Cancel)
-                .map(|(submission, _)| Some(submission));
-        }
-        if let Some(active) = control
-            .login_job
-            .as_ref()
-            .filter(|active| active.login_id == id)
-        {
-            if active.cancel.cancel() {
-                self.publish_operations(&control);
-            }
-            let job_id = active.job_id;
-            let mut rx = active.settled.clone();
-            drop(control);
-            let job = tokio::spawn(async move {
-                let settled = wait_settled(&mut rx).await?;
-                match settled {
-                    LoginSettled::Cancelled => Ok(None),
-                    LoginSettled::Completed(account) => Ok(Some(account)),
-                    LoginSettled::Failed(error) => Err(error),
-                }
-            });
-            return Ok(Some(Submission::Started { id: job_id, job }));
-        }
-        Err(Error::new(ErrorKind::LoginCancelled))
-    }
-
-    /// Cancels a matching login (or whichever login is active when `id` is `None`) and waits
-    /// until its submission or rollback finishes and releases the exclusive slot.
-    pub async fn cancel_login_settled(&self, id: Option<u64>) -> Result<CancelLoginOutcome> {
-        let (phase, mut rx) = {
+        let (job_id, mut rx, wake_poll) = {
             let mut control = self.lock();
             if control.shutting_down {
                 return Err(Error::cancelled());
             }
-            if let Some(pending_id) = control
-                .login
+            if control.login.as_ref().is_some_and(|login| login.id == id) {
+                return self
+                    .start_finish_login(&mut control, id, Finish::Cancel)
+                    .map(|(submission, _)| Some(submission));
+            }
+            let Some(active) = control
+                .login_job
                 .as_ref()
-                .map(|login| login.id)
-                .filter(|&pending_id| id.is_none_or(|target| target == pending_id))
-            {
-                let (_, rx) = self.start_finish_login(&mut control, pending_id, Finish::Cancel)?;
-                (ActiveLoginPhase::Cancelling, rx)
+                .filter(|active| active.login_id == id)
+            else {
+                return Err(Error::new(ErrorKind::LoginCancelled));
+            };
+            let wake_poll = if active.cancel.cancel() {
+                self.publish_operations(&control);
+                true
+            } else {
+                false
+            };
+            (active.job_id, active.settled.clone(), wake_poll)
+        };
+        if wake_poll {
+            self.wake_poll_slot_waiters();
+        }
+        let job = tokio::spawn(async move {
+            let settled = wait_settled(&mut rx).await?;
+            match settled {
+                LoginSettled::Cancelled(_) => Ok(None),
+                LoginSettled::Completed { account, .. } => Ok(Some(account)),
+                LoginSettled::Failed { error, .. } | LoginSettled::Error(error) => Err(error),
+            }
+        });
+        Ok(Some(Submission::Started { id: job_id, job }))
+    }
+
+    /// Cancels login `id` and waits until its submission or rollback finishes and releases the
+    /// exclusive slot.
+    pub async fn cancel_login_settled(&self, id: u64) -> Result<CancelLoginOutcome> {
+        let (phase, mut rx, wake_poll) = {
+            let mut control = self.lock();
+            if control.shutting_down {
+                return Err(Error::cancelled());
+            }
+            if control.login.as_ref().is_some_and(|login| login.id == id) {
+                let (_, rx) = self.start_finish_login(&mut control, id, Finish::Cancel)?;
+                (ActiveLoginPhase::Cancelling, rx, false)
             } else if let Some(active) = control
                 .login_job
                 .as_ref()
-                .filter(|active| id.is_none_or(|target| target == active.login_id))
+                .filter(|active| active.login_id == id)
             {
-                if active.cancel.cancel() {
+                let wake_poll = if active.cancel.cancel() {
                     self.publish_operations(&control);
-                }
-                (active.phase, active.settled.clone())
+                    true
+                } else {
+                    false
+                };
+                (active.phase, active.settled.clone(), wake_poll)
             } else {
                 return Err(Error::new(ErrorKind::LoginCancelled));
             }
         };
+        if wake_poll {
+            self.wake_poll_slot_waiters();
+        }
 
         let settled = wait_settled(&mut rx).await?;
         match phase {
             ActiveLoginPhase::Starting | ActiveLoginPhase::Cancelling => match settled {
-                LoginSettled::Cancelled => Ok(CancelLoginOutcome::RolledBack),
-                LoginSettled::Failed(error) => Err(error),
-                LoginSettled::Completed(_) => Err(Error::new(ErrorKind::Other)),
+                LoginSettled::Cancelled(_) => Ok(CancelLoginOutcome::RolledBack),
+                LoginSettled::Failed { error, .. } | LoginSettled::Error(error) => Err(error),
+                LoginSettled::Completed { .. } => Err(Error::new(ErrorKind::Other)),
             },
-            ActiveLoginPhase::Submitting => {
-                let snapshot = self.snapshot();
-                if let Some(error) = snapshot.accounts_error {
-                    return Err(Error::new(error));
-                }
-                let accounts = snapshot
-                    .accounts
-                    .clone()
-                    .ok_or_else(|| Error::new(ErrorKind::Other))?;
-                let outcome = match settled {
-                    LoginSettled::Cancelled => SubmitCancelOutcome::Cancelled,
-                    LoginSettled::Completed(account) => SubmitCancelOutcome::Completed(account),
-                    LoginSettled::Failed(error) => SubmitCancelOutcome::Failed(error),
-                };
-                Ok(CancelLoginOutcome::SubmittingSettled(Box::new(
-                    SubmitCancelSettlement {
-                        outcome,
-                        account_context: snapshot.account.clone(),
-                        accounts,
-                    },
-                )))
-            }
+            ActiveLoginPhase::Submitting => match settled {
+                LoginSettled::Cancelled(state) => Ok(CancelLoginOutcome::SubmittingSettled(
+                    Box::new(SubmitCancelSettlement {
+                        outcome: SubmitCancelOutcome::Cancelled,
+                        account_context: state.account_context,
+                        accounts: state.accounts,
+                        accounts_error: state.accounts_error,
+                    }),
+                )),
+                LoginSettled::Completed { account, state } => Ok(
+                    CancelLoginOutcome::SubmittingSettled(Box::new(SubmitCancelSettlement {
+                        outcome: SubmitCancelOutcome::Completed(account),
+                        account_context: state.account_context,
+                        accounts: state.accounts,
+                        accounts_error: state.accounts_error,
+                    })),
+                ),
+                LoginSettled::Failed { error, state } => Ok(CancelLoginOutcome::SubmittingSettled(
+                    Box::new(SubmitCancelSettlement {
+                        outcome: SubmitCancelOutcome::Failed(error),
+                        account_context: state.account_context,
+                        accounts: state.accounts,
+                        accounts_error: state.accounts_error,
+                    }),
+                )),
+                LoginSettled::Error(error) => Err(error),
+            },
         }
     }
 
@@ -384,17 +445,26 @@ impl WebState {
             let accounts_err = record_accounts_after_login(&state);
             let published =
                 result.map(|account| account.map(|account| state.published_account(account)));
+            // Capture the settled account snapshot before releasing Slot::Exclusive so a
+            // concurrent switch cannot mix another account's state into this response.
+            let settled_accounts = SettledAccounts::from_snapshot(&state.snapshot());
             let settled = match &published {
-                Ok(Some(account)) => LoginSettled::Completed(account.clone()),
+                Ok(Some(account)) => LoginSettled::Completed {
+                    account: account.clone(),
+                    state: settled_accounts,
+                },
                 Ok(None) => match accounts_err {
-                    Some(err) => LoginSettled::Failed(err),
-                    None => LoginSettled::Cancelled,
+                    Some(error) => LoginSettled::Error(error),
+                    None => LoginSettled::Cancelled(settled_accounts),
                 },
                 Err(error) if error.is(ErrorKind::Cancelled) => match accounts_err {
-                    Some(err) => LoginSettled::Failed(err),
-                    None => LoginSettled::Cancelled,
+                    Some(error) => LoginSettled::Error(error),
+                    None => LoginSettled::Cancelled(settled_accounts),
                 },
-                Err(error) => LoginSettled::Failed(error.clone()),
+                Err(error) => LoginSettled::Failed {
+                    error: error.clone(),
+                    state: settled_accounts,
+                },
             };
             // Release Slot::Exclusive before waking waiters so immediate follow-up writes succeed.
             drop(job);
@@ -422,15 +492,19 @@ fn is_start_cancel(error: &Error, cancelled: bool) -> bool {
     error.is(ErrorKind::Cancelled) || (cancelled && error.is(ErrorKind::LoginCancelled))
 }
 
-fn settled_from_start_error(error: &Error, cancelled: bool) -> LoginSettled {
+fn settled_from_start_error(
+    error: &Error,
+    cancelled: bool,
+    state: SettledAccounts,
+) -> LoginSettled {
     if is_start_cancel(error, cancelled) {
-        LoginSettled::Cancelled
+        LoginSettled::Cancelled(state)
     } else {
-        LoginSettled::Failed(error.clone())
+        LoginSettled::Error(error.clone())
     }
 }
 
-async fn wait_settled(rx: &mut watch::Receiver<Option<LoginSettled>>) -> Result<LoginSettled> {
+async fn wait_settled(rx: &mut SettledReceiver) -> Result<LoginSettled> {
     Ok(rx
         .wait_for(Option::is_some)
         .await

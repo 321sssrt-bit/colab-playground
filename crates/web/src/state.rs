@@ -8,7 +8,7 @@ mod shutdown;
 
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Condvar, Mutex, MutexGuard},
     time::Duration,
 };
 
@@ -110,7 +110,7 @@ pub struct WebState(Arc<Inner>);
 struct Inner {
     backend: Arc<dyn Backend>,
     control: Mutex<Control>,
-    poll_slot: Mutex<()>,
+    poll_slot: PollSlot,
     snapshots: watch::Sender<Arc<Snapshot>>,
     refresh: Notify,
     drained: Notify,
@@ -119,6 +119,54 @@ struct Inner {
     forwards: Mutex<forwards::ForwardUpdates>,
     plugins: plugins::Plugins,
     provisions: sessions::Provisions,
+}
+
+#[derive(Default)]
+struct PollSlot {
+    locked: Mutex<bool>,
+    changed: Condvar,
+}
+
+struct PollSlotGuard<'a>(&'a PollSlot);
+
+impl Drop for PollSlotGuard<'_> {
+    fn drop(&mut self) {
+        let mut locked = self.0.locked.lock().unwrap_or_else(|e| e.into_inner());
+        *locked = false;
+        self.0.changed.notify_all();
+    }
+}
+
+impl PollSlot {
+    fn lock(&self) -> PollSlotGuard<'_> {
+        let mut locked = self.locked.lock().unwrap_or_else(|e| e.into_inner());
+        while *locked {
+            locked = self.changed.wait(locked).unwrap_or_else(|e| e.into_inner());
+        }
+        *locked = true;
+        PollSlotGuard(self)
+    }
+
+    fn lock_cancellable(&self, cancel: &CancelToken) -> Result<PollSlotGuard<'_>> {
+        let mut locked = self.locked.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            cancel.check()?;
+            if !*locked {
+                *locked = true;
+                return Ok(PollSlotGuard(self));
+            }
+            let (guard, _) = self
+                .changed
+                .wait_timeout(locked, Duration::from_millis(20))
+                .unwrap_or_else(|e| e.into_inner());
+            locked = guard;
+        }
+    }
+
+    fn notify_waiters(&self) {
+        let _locked = self.locked.lock().unwrap_or_else(|e| e.into_inner());
+        self.changed.notify_all();
+    }
 }
 
 #[derive(Default)]
@@ -242,7 +290,7 @@ impl WebState {
         let state = Self(Arc::new(Inner {
             backend,
             control: Mutex::default(),
-            poll_slot: Mutex::default(),
+            poll_slot: PollSlot::default(),
             snapshots,
             refresh: Notify::new(),
             drained: Notify::new(),
@@ -371,13 +419,19 @@ impl WebState {
     }
 
     pub fn cancel(&self, id: u64) -> bool {
-        let control = self.lock();
-        let cancelled = control
-            .running
-            .get(&id)
-            .is_some_and(|running| running.operation.is_some() && running.cancel.cancel());
+        let cancelled = {
+            let control = self.lock();
+            let cancelled = control
+                .running
+                .get(&id)
+                .is_some_and(|running| running.operation.is_some() && running.cancel.cancel());
+            if cancelled {
+                self.publish_operations(&control);
+            }
+            cancelled
+        };
         if cancelled {
-            self.publish_operations(&control);
+            self.0.poll_slot.notify_waiters();
         }
         cancelled
     }
@@ -503,11 +557,16 @@ impl WebState {
         }
     }
 
-    fn lock_poll_slot(&self) -> MutexGuard<'_, ()> {
-        self.0
-            .poll_slot
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
+    fn lock_poll_slot(&self) -> PollSlotGuard<'_> {
+        self.0.poll_slot.lock()
+    }
+
+    fn lock_poll_slot_cancellable(&self, cancel: &CancelToken) -> Result<PollSlotGuard<'_>> {
+        self.0.poll_slot.lock_cancellable(cancel)
+    }
+
+    fn wake_poll_slot_waiters(&self) {
+        self.0.poll_slot.notify_waiters();
     }
 
     fn record_accounts(&self, result: Result<AccountsView>) {

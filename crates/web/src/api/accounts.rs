@@ -27,10 +27,7 @@ pub(super) fn routes() -> Router<StateData> {
         .route("/api/accounts/usage/refresh", post(refresh))
         .route("/api/accounts/recovered/dismiss", post(dismiss_recovered))
         .route("/api/accounts/adopt", post(adopt))
-        .route(
-            "/api/accounts/login",
-            post(begin_login).delete(cancel_active_login),
-        )
+        .route("/api/accounts/login", post(begin_login))
         .route(
             "/api/accounts/login/{id}",
             post(submit_login).delete(cancel_login),
@@ -163,7 +160,9 @@ async fn submit_login(
 struct CancelLoginResponse<'a> {
     outcome: &'static str,
     account_context: AccountContext,
-    accounts: AccountsView,
+    accounts: Option<AccountsView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    accounts_error: Option<ErrorKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
     account: Option<Account>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -189,6 +188,7 @@ fn cancel_login_response(outcome: CancelLoginOutcome) -> Response {
                     outcome,
                     account_context: settled.account_context,
                     accounts: settled.accounts,
+                    accounts_error: settled.accounts_error,
                     account,
                     error,
                 }),
@@ -204,16 +204,7 @@ async fn cancel_login(
     payload: Result<Json<Empty>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     let Json(_) = payload?;
-    let outcome = state.web.cancel_login_settled(Some(id)).await?;
-    Ok(cancel_login_response(outcome))
-}
-
-async fn cancel_active_login(
-    State(state): State<StateData>,
-    payload: Result<Json<Empty>, JsonRejection>,
-) -> Result<Response, ApiError> {
-    let Json(_) = payload?;
-    let outcome = state.web.cancel_login_settled(None).await?;
+    let outcome = state.web.cancel_login_settled(id).await?;
     Ok(cancel_login_response(outcome))
 }
 
