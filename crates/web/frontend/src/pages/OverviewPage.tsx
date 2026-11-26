@@ -202,18 +202,16 @@ export function OverviewPage({ snapshot, locale, t, navigate, pushToast }: PageP
     }
   }, [adopting, handleCheckAgain, overview, pushToast, snapshot, t]);
 
-  const loadPlugins = useCallback(async (signal?: AbortSignal) => {
+  const loadPlugins = useCallback(async (signal: AbortSignal) => {
     activePluginsControllerRef.current?.abort();
     const controller = new AbortController();
     activePluginsControllerRef.current = controller;
 
     const onExternalAbort = () => controller.abort();
-    if (signal) {
-      if (signal.aborted) {
-        controller.abort();
-      } else {
-        signal.addEventListener("abort", onExternalAbort, { once: true });
-      }
+    if (signal.aborted) {
+      controller.abort();
+    } else {
+      signal.addEventListener("abort", onExternalAbort, { once: true });
     }
 
     const seq = ++pluginsSeqRef.current;
@@ -226,7 +224,7 @@ export function OverviewPage({ snapshot, locale, t, navigate, pushToast }: PageP
     } catch {
       // Quick-deploy cards are secondary to the ready summary; hide quietly on failure.
     } finally {
-      signal?.removeEventListener("abort", onExternalAbort);
+      signal.removeEventListener("abort", onExternalAbort);
       if (activePluginsControllerRef.current === controller) {
         activePluginsControllerRef.current = null;
       }
