@@ -41,7 +41,7 @@ function renderToneIcon(tone: ToastTone) {
 export function ToastViewport({ toasts, t, inert = false, onDismiss }: ToastViewportProps) {
   return (
     <div
-      className="toast-viewport"
+      className={toasts.length > 0 ? "toast-viewport toast-viewport-active" : "toast-viewport"}
       aria-live="polite"
       aria-relevant="additions text"
       aria-hidden={inert ? "true" : undefined}

@@ -382,6 +382,132 @@ test("guardStore consumes Warn, Stopped, StopFailed persistently across pages an
   assert.equal(ackPayloads.length, 2);
 });
 
+test("guardStore deduplicates repeated stop_failed poll events and resets warn on Decision::Ok", async (t) => {
+  const sse = createSseControl();
+  const ackPayloads: unknown[] = [];
+
+  const client = createApiClient({
+    fetchImpl: async (input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/api/login") {
+        return jsonResponse({ token: "tok-dedupe", expires_in: 3600 });
+      }
+      if (url === "/api/events") {
+        return sse.response;
+      }
+      if (url === "/api/sessions/guard/ack") {
+        ackPayloads.push(JSON.parse(String(init?.body ?? "{}")));
+        return new Response(null, { status: 204 });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    },
+  });
+
+  const clock = createServerClock({
+    setIntervalFn: () => 0 as unknown as ReturnType<typeof setInterval>,
+    clearIntervalFn: () => {},
+  });
+  const store = createWebStore({ client, clock, ...noopTimers });
+  const toast = createToastStore(noopTimers);
+  const i18n = createFakeI18n();
+  const guard = createGuardStore({ client, store, toast, i18n });
+
+  t.after(() => {
+    guard.dispose();
+    store.dispose();
+    sse.close();
+    toast.dispose();
+    clock.dispose();
+  });
+
+  await store.signIn("secret-key");
+  const rt = makeRuntime();
+
+  // Two consecutive poll rounds emit distinct stop_failed event IDs (20 & 21) for the same runtime.
+  const fail1: GuardEvent = {
+    id: 20,
+    at: 1_700_000_020,
+    session: rt.id,
+    label: "a100-1",
+    email: "alice@example.com",
+    kind: "stop_failed",
+    concern: { kind: "limit", limit: "runtime", current: 7200, threshold: 7200, estimated: false },
+    error: { kind: "connection_lost", params: {}, detail: "drop", next_step: "try_again" },
+  };
+  const fail2: GuardEvent = {
+    ...fail1,
+    id: 21,
+    at: 1_700_000_050,
+    concern: { kind: "limit", limit: "runtime", current: 7230, threshold: 7200, estimated: false },
+  };
+  sse.sendFrame(
+    "snapshot",
+    makeSnapshot({ version: 2, runtimes: { runtimes: [rt], errors: [] }, guard_events: [fail1] }),
+    "2",
+  );
+  await flushAsync();
+  sse.sendFrame(
+    "snapshot",
+    makeSnapshot({
+      version: 3,
+      runtimes: { runtimes: [rt], errors: [] },
+      guard_events: [fail1, fail2],
+    }),
+    "3",
+  );
+  await flushAsync();
+
+  // Only ONE persistent danger toast is shown, and dismissing it acks BOTH event IDs [20, 21].
+  assert.equal(toast.getToasts().length, 1);
+  toast.dismiss(toast.getToasts()[0]!.id);
+  await flushAsync();
+  assert.deepEqual(ackPayloads[0], { ids: [20, 21] });
+
+  // Warn -> Decision::Ok -> Warn (same limit kind) raises a fresh warning toast.
+  const warn1: GuardEvent = {
+    id: 30,
+    at: 1_700_000_060,
+    session: rt.id,
+    label: "a100-1",
+    email: "alice@example.com",
+    kind: "warn",
+    concerns: [{ kind: "limit", limit: "runtime", current: 6600, threshold: 7200, estimated: false }],
+  };
+  sse.sendFrame(
+    "snapshot",
+    makeSnapshot({ version: 4, runtimes: { runtimes: [rt], errors: [] }, guard_events: [warn1] }),
+    "4",
+  );
+  await flushAsync();
+  assert.equal(toast.getToasts().length, 1);
+
+  sse.sendFrame(
+    "snapshot",
+    makeSnapshot({
+      version: 5,
+      runtimes: { runtimes: [rt], errors: [] },
+      guard: {
+        decisions: [{ session: rt.id, decision: { decision: "ok" }, stopped: false, error: null }],
+        vanished: [],
+        usage: [],
+      },
+      guard_events: [],
+    }),
+    "5",
+  );
+  await flushAsync();
+  assert.equal(toast.getToasts().length, 0);
+
+  const warn2: GuardEvent = { ...warn1, id: 31, at: 1_700_000_090 };
+  sse.sendFrame(
+    "snapshot",
+    makeSnapshot({ version: 6, runtimes: { runtimes: [rt], errors: [] }, guard_events: [warn2] }),
+    "6",
+  );
+  await flushAsync();
+  assert.equal(toast.getToasts().length, 1);
+});
+
 test("stopDialogsStore preserves unverified report across retries, blocks while loading, and falls back to toast if closed", async (t) => {
   const sse = createSseControl();
   let stopAllAttempt = 0;
@@ -530,15 +656,44 @@ test("stopDialogsStore preserves unverified report across retries, blocks while 
   assert.equal(stopDialogs.getState().stopAll.result?.remaining.length, 1);
   assert.notEqual(stopDialogs.getState().stopAll.submitError, null);
 
-  // Stop Runtime: open dialog receives inline error; if dialog is closed mid-request, falls back to danger toast.
-  stopDialogs.openStopRuntime({
-    target: unwatchedRt.id,
-    label: "NVIDIA T4",
-    email: "alice@example.com",
+  // While background sessions refresh is running after a failed retry, another retry is blocked.
+  const stopAllCallsBeforeRefresh = stopAllAttempt;
+  const blockedAppData = {
+    ...appData,
+    getState: () => ({ ...appData.getState(), sessionsRefreshing: true }),
+  };
+  const guardedStopDialogs = createStopDialogsStore({
+    client,
+    store,
+    appData: blockedAppData,
+    guard,
+    toast,
+    t: i18n.t,
   });
+  guardedStopDialogs.openStopAll();
+  await guardedStopDialogs.confirmStopAll();
+  assert.equal(stopAllAttempt, stopAllCallsBeforeRefresh);
+  guardedStopDialogs.dispose();
+
+  // Stop Runtime: open dialog receives inline error; callbacks fire on close.
+  let closeNotified = 0;
+  stopDialogs.openStopRuntime(
+    {
+      target: unwatchedRt.id,
+      label: "NVIDIA T4",
+      email: "alice@example.com",
+    },
+    {
+      onClose: () => {
+        closeNotified += 1;
+      },
+    },
+  );
   await stopDialogs.confirmStopRuntime();
   assert.notEqual(stopDialogs.getState().stopRuntime.submitError, null);
   assert.equal(toast.getToasts().length, 0);
+  stopDialogs.closeStopRuntime();
+  assert.equal(closeNotified, 1);
 });
 
 test("guardStore fallback report handles Warn deduplication and StopFailed without guard_events", async (t) => {
@@ -675,7 +830,18 @@ test("updatesStore shows banner and persistent sidebar badge, keeps badge after 
     },
   });
 
-  const updates = createUpdatesStore({ client, storage });
+  let intervalCallback: (() => void) | null = null;
+  const updates = createUpdatesStore({
+    client,
+    storage,
+    setIntervalFn: (cb) => {
+      intervalCallback = cb;
+      return 1 as unknown as ReturnType<typeof setInterval>;
+    },
+    clearIntervalFn: () => {
+      intervalCallback = null;
+    },
+  });
   t.after(() => {
     updates.dispose();
   });
@@ -687,6 +853,12 @@ test("updatesStore shows banner and persistent sidebar badge, keeps badge after 
   await client.login("secret-key");
   await Promise.all([updates.ensureChecked(), updates.ensureChecked()]);
   assert.equal(fetchCount, 1);
+  assert.notEqual(intervalCallback, null);
+
+  // Periodic background tick re-queries /api/updates while authenticated.
+  (intervalCallback as (() => void) | null)?.();
+  await flushAsync();
+  assert.equal(fetchCount, 2);
 
   assert.deepEqual(updates.getState().bannerUpdate, {
     version: "0.6.0",

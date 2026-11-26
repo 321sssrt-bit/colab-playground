@@ -62,13 +62,18 @@ export interface StopDialogsStoreOptions {
   readonly t?: TranslateFn;
 }
 
+export interface OpenStopRuntimeOptions {
+  readonly onStopped?: (target: GlobalStopRuntimeTarget) => void;
+  readonly onClose?: () => void;
+}
+
 export interface StopDialogsStore {
   getState(): StopDialogsState;
   subscribe(listener: () => void): () => void;
   openStopAll(): void;
   closeStopAll(): void;
   confirmStopAll(): Promise<void>;
-  openStopRuntime(target: GlobalStopRuntimeTarget): void;
+  openStopRuntime(target: GlobalStopRuntimeTarget, options?: OpenStopRuntimeOptions): number;
   closeStopRuntime(): void;
   confirmStopRuntime(): Promise<void>;
   dispose(): void;
@@ -185,6 +190,7 @@ export function createStopDialogsStore(
   let disposed = false;
   let seq = 0;
   let state: StopDialogsState = INITIAL_STATE;
+  let stopRuntimeCallbacks: OpenStopRuntimeOptions | null = null;
   const listeners = new Set<() => void>();
 
   const emit = (): void => {
@@ -207,7 +213,18 @@ export function createStopDialogsStore(
     emit();
   };
 
+  const notifyStopRuntimeClosed = (): void => {
+    const callbacks = stopRuntimeCallbacks;
+    stopRuntimeCallbacks = null;
+    try {
+      callbacks?.onClose?.();
+    } catch {
+      // Isolate caller close callback failures.
+    }
+  };
+
   const reset = (): void => {
+    stopRuntimeCallbacks = null;
     if (!state.stopAll.open && !state.stopRuntime.open && state.stopAll.result === null) {
       return;
     }
@@ -281,7 +298,7 @@ export function createStopDialogsStore(
       }
       const snapshot = store.getState().snapshot;
       const sessionsRefreshing = appData.getState().sessionsRefreshing;
-      if (state.stopAll.result === null && isStopAllRuntimesLoading(snapshot, sessionsRefreshing)) {
+      if (isStopAllRuntimesLoading(snapshot, sessionsRefreshing)) {
         return;
       }
 
@@ -382,14 +399,18 @@ export function createStopDialogsStore(
       }
     },
 
-    openStopRuntime(target: GlobalStopRuntimeTarget): void {
+    openStopRuntime(
+      target: GlobalStopRuntimeTarget,
+      openOptions?: OpenStopRuntimeOptions,
+    ): number {
       if (disposed) {
-        return;
+        return 0;
       }
       if (state.stopRuntime.open && state.stopRuntime.submitting) {
-        return;
+        return state.stopRuntime.openId;
       }
       seq += 1;
+      stopRuntimeCallbacks = openOptions ?? null;
       setStopRuntime({
         open: true,
         openId: seq,
@@ -397,6 +418,7 @@ export function createStopDialogsStore(
         submitting: false,
         submitError: null,
       });
+      return seq;
     },
 
     closeStopRuntime(): void {
@@ -404,6 +426,7 @@ export function createStopDialogsStore(
         return;
       }
       setStopRuntime({ open: false, target: null, submitError: null });
+      notifyStopRuntimeClosed();
     },
 
     async confirmStopRuntime(): Promise<void> {
@@ -441,12 +464,20 @@ export function createStopDialogsStore(
         });
         void store.refreshSnapshot().catch(() => {});
         if (state.stopRuntime.open && state.stopRuntime.openId === requestOpenId) {
+          const callbacks = stopRuntimeCallbacks;
+          stopRuntimeCallbacks = null;
           setStopRuntime({
             open: false,
             target: null,
             submitting: false,
             submitError: null,
           });
+          try {
+            callbacks?.onStopped?.(stopTarget);
+            callbacks?.onClose?.();
+          } catch {
+            // Isolate caller completion callback failures.
+          }
         }
       } catch (error) {
         if (error instanceof ApiError && error.isUnauthorized) {
@@ -456,6 +487,7 @@ export function createStopDialogsStore(
             submitting: false,
             submitError: null,
           });
+          notifyStopRuntimeClosed();
           return;
         }
         if (disposed || client.getSessionGeneration() !== sessionGeneration) {

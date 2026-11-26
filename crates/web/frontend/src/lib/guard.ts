@@ -110,6 +110,13 @@ export interface GuardStore {
   dispose(): void;
 }
 
+interface TrackedGuardToast {
+  readonly toastId: number;
+  readonly eventIds: Set<number>;
+  readonly kind: "warn" | "stopped" | "stop_failed";
+  readonly rtKey: string;
+}
+
 export function guardRuntimeKey(ref: RuntimeRef): string {
   return `${ref.account}/${ref.endpoint}`;
 }
@@ -202,9 +209,13 @@ export function createGuardStore(options: GuardStoreOptions = {}): GuardStore {
   let state: GuardState = INITIAL_STATE;
 
   let seenEventIds = new Set<number>();
-  let toastIdByEventId = new Map<number, number>();
-  let fallbackWarnings = new Map<string, readonly Concern[]>();
-  let fallbackStopFailures = new Set<string>();
+  let trackedToasts = new Set<TrackedGuardToast>();
+  let activeStopFailureToasts = new Map<string, TrackedGuardToast>();
+  let activeWarnToasts = new Map<string, TrackedGuardToast>();
+  // Mirrors upstream `SessionsState.warnings` and `stop_failures` per runtime so
+  // ongoing failures across poll rounds toast once rather than spamming every tick.
+  let activeWarnings = new Map<string, readonly Concern[]>();
+  let activeStopFailures = new Set<string>();
   let fallbackStoppedKeys = new Set<string>();
   let seenVanishedKeys = new Set<string>();
   let userStoppedKeys = new Set<string>();
@@ -250,7 +261,17 @@ export function createGuardStore(options: GuardStoreOptions = {}): GuardStore {
       });
   };
 
-  const recordEnded = (entry: EndedRuntime, options?: { fromBackend?: boolean }): void => {
+  const untrackToast = (tracked: TrackedGuardToast): void => {
+    trackedToasts.delete(tracked);
+    if (tracked.kind === "stop_failed" && activeStopFailureToasts.get(tracked.rtKey) === tracked) {
+      activeStopFailureToasts.delete(tracked.rtKey);
+    }
+    if (tracked.kind === "warn" && activeWarnToasts.get(tracked.rtKey) === tracked) {
+      activeWarnToasts.delete(tracked.rtKey);
+    }
+  };
+
+  const recordEnded = (entry: EndedRuntime, opts?: { fromBackend?: boolean }): void => {
     const key = guardRuntimeKey(entry.runtime);
     if (key) {
       deferredPendingKeys.delete(key);
@@ -259,10 +280,10 @@ export function createGuardStore(options: GuardStoreOptions = {}): GuardStore {
       userStoppedKeys.add(key);
       seenVanishedKeys.add(key);
     }
-    if (options?.fromBackend && key && clearedBackendEndedKeys.has(key)) {
+    if (opts?.fromBackend && key && clearedBackendEndedKeys.has(key)) {
       return;
     }
-    if (!options?.fromBackend && key) {
+    if (!opts?.fromBackend && key) {
       clearedBackendEndedKeys.delete(key);
     }
     const existing = state.ended.find((item) => guardRuntimeKey(item.runtime) === key);
@@ -307,6 +328,20 @@ export function createGuardStore(options: GuardStoreOptions = {}): GuardStore {
     };
   };
 
+  const syncOkDecisions = (snapshot: Snapshot): void => {
+    const decisions = snapshot.guard?.decisions;
+    if (!decisions) {
+      return;
+    }
+    for (const item of decisions) {
+      if (item.decision.decision === "ok") {
+        const rtKey = guardRuntimeKey(item.session);
+        activeWarnings.delete(rtKey);
+        activeStopFailures.delete(rtKey);
+      }
+    }
+  };
+
   const consumeGuardEvent = (
     event: GuardEvent,
     locale: Locale,
@@ -323,6 +358,8 @@ export function createGuardStore(options: GuardStoreOptions = {}): GuardStore {
         return;
       }
       handledRuntimeKeys.add(rtKey);
+      activeWarnings.delete(rtKey);
+      activeStopFailures.delete(rtKey);
       if (seenEventIds.has(event.id)) {
         return;
       }
@@ -356,29 +393,48 @@ export function createGuardStore(options: GuardStoreOptions = {}): GuardStore {
     seenEventIds.add(event.id);
 
     if (event.kind === "warn") {
-      // Upstream `apply_guard` only toasts when at least one `Limit` concern is active.
+      const previous = activeWarnings.get(rtKey) ?? [];
+      activeWarnings.set(rtKey, event.concerns);
+      // Upstream `apply_guard` only toasts when at least one `Limit` concern is active and changed.
       if (!hasLimitConcern(event.concerns)) {
         immediateAckIds.push(event.id);
         return;
       }
+      if (sameLimitKinds(event.concerns, previous)) {
+        const existingToast = activeWarnToasts.get(rtKey);
+        if (existingToast) {
+          existingToast.eventIds.add(event.id);
+        } else {
+          immediateAckIds.push(event.id);
+        }
+        return;
+      }
+      const eventIds = new Set<number>([event.id]);
+      let tracked: TrackedGuardToast | null = null;
       const toastId = toast.push({
         tone: "warning",
         title: t("app.b2.guard_warn_title", { name: label }),
         body: formatGuardConcerns(event.concerns, locale, t),
         durationMs: null,
         onDismiss: () => {
-          toastIdByEventId.delete(event.id);
-          ackEventIds([event.id]);
+          if (tracked) {
+            untrackToast(tracked);
+          }
+          ackEventIds(Array.from(eventIds));
         },
       });
       if (toastId > 0) {
-        toastIdByEventId.set(event.id, toastId);
+        tracked = { toastId, eventIds, kind: "warn", rtKey };
+        trackedToasts.add(tracked);
+        activeWarnToasts.set(rtKey, tracked);
       }
       return;
     }
 
     if (event.kind === "stopped") {
       handledRuntimeKeys.add(rtKey);
+      activeWarnings.delete(rtKey);
+      activeStopFailures.delete(rtKey);
       recordEnded({
         runtime: event.session,
         label,
@@ -386,36 +442,58 @@ export function createGuardStore(options: GuardStoreOptions = {}): GuardStore {
         reason: { kind: "guard", concern: event.concern },
         at: event.at,
       });
+      const eventIds = new Set<number>([event.id]);
+      let tracked: TrackedGuardToast | null = null;
       const toastId = toast.push({
         tone: "danger",
         title: t("app.b2.guard_stopped_title", { name: label }),
         body: formatGuardConcern(event.concern, locale, t),
         durationMs: null,
         onDismiss: () => {
-          toastIdByEventId.delete(event.id);
-          ackEventIds([event.id]);
+          if (tracked) {
+            untrackToast(tracked);
+          }
+          ackEventIds(Array.from(eventIds));
         },
       });
       if (toastId > 0) {
-        toastIdByEventId.set(event.id, toastId);
+        tracked = { toastId, eventIds, kind: "stopped", rtKey };
+        trackedToasts.add(tracked);
       }
       return;
     }
 
     if (event.kind === "stop_failed") {
+      // Upstream only raises one persistent toast per ongoing stop failure for a runtime.
+      if (activeStopFailures.has(rtKey)) {
+        const existingToast = activeStopFailureToasts.get(rtKey);
+        if (existingToast) {
+          existingToast.eventIds.add(event.id);
+        } else {
+          immediateAckIds.push(event.id);
+        }
+        return;
+      }
+      activeStopFailures.add(rtKey);
       const errorText = formatCoreErrorText(event.error, t);
+      const eventIds = new Set<number>([event.id]);
+      let tracked: TrackedGuardToast | null = null;
       const toastId = toast.push({
         tone: "danger",
         title: t("app.b2.guard_stop_failed_title", { name: label }),
         body: errorText || t("app.b2.guard_still_billing"),
         durationMs: null,
         onDismiss: () => {
-          toastIdByEventId.delete(event.id);
-          ackEventIds([event.id]);
+          if (tracked) {
+            untrackToast(tracked);
+          }
+          ackEventIds(Array.from(eventIds));
         },
       });
       if (toastId > 0) {
-        toastIdByEventId.set(event.id, toastId);
+        tracked = { toastId, eventIds, kind: "stop_failed", rtKey };
+        trackedToasts.add(tracked);
+        activeStopFailureToasts.set(rtKey, tracked);
       }
     }
   };
@@ -434,12 +512,13 @@ export function createGuardStore(options: GuardStoreOptions = {}): GuardStore {
       const rtKey = guardRuntimeKey(item.session);
       const info = lookupRuntimeInfo(item.session, snapshot);
       if (item.decision.decision === "ok") {
-        fallbackWarnings.delete(rtKey);
+        activeWarnings.delete(rtKey);
+        activeStopFailures.delete(rtKey);
         continue;
       }
       if (item.decision.decision === "warn") {
         const concerns = item.decision.concerns;
-        const previous = fallbackWarnings.get(rtKey) ?? [];
+        const previous = activeWarnings.get(rtKey) ?? [];
         if (hasLimitConcern(concerns) && !sameLimitKinds(concerns, previous)) {
           toast.push({
             tone: "warning",
@@ -448,15 +527,14 @@ export function createGuardStore(options: GuardStoreOptions = {}): GuardStore {
             durationMs: null,
           });
         }
-        fallbackWarnings.set(rtKey, concerns);
+        activeWarnings.set(rtKey, concerns);
         continue;
       }
-      // Decision::Stop
       const concern = item.decision.concerns;
       if (item.stopped) {
         handledRuntimeKeys.add(rtKey);
-        fallbackWarnings.delete(rtKey);
-        fallbackStopFailures.delete(rtKey);
+        activeWarnings.delete(rtKey);
+        activeStopFailures.delete(rtKey);
         const eventKey = `${rtKey}:${concern.kind}:${concern.limit}`;
         if (fallbackStoppedKeys.has(eventKey)) {
           continue;
@@ -475,8 +553,8 @@ export function createGuardStore(options: GuardStoreOptions = {}): GuardStore {
           body: formatGuardConcern(concern, locale, t),
           durationMs: null,
         });
-      } else if (!fallbackStopFailures.has(rtKey)) {
-        fallbackStopFailures.add(rtKey);
+      } else if (!activeStopFailures.has(rtKey)) {
+        activeStopFailures.add(rtKey);
         const body = item.error
           ? formatCoreErrorText(item.error, t)
           : t("app.b2.guard_still_billing");
@@ -496,6 +574,8 @@ export function createGuardStore(options: GuardStoreOptions = {}): GuardStore {
         continue;
       }
       handledRuntimeKeys.add(rtKey);
+      activeWarnings.delete(rtKey);
+      activeStopFailures.delete(rtKey);
       if (userStoppedKeys.has(rtKey) || seenVanishedKeys.has(rtKey)) {
         continue;
       }
@@ -542,16 +622,18 @@ export function createGuardStore(options: GuardStoreOptions = {}): GuardStore {
     }
 
     if (Array.isArray(snapshot.guard_events)) {
+      syncOkDecisions(snapshot);
       const liveEventIds = new Set<number>();
       for (const event of snapshot.guard_events) {
         liveEventIds.add(event.id);
         consumeGuardEvent(event, locale, t, immediateAckIds, handledRuntimeKeys);
       }
       // Keep multiple browser tabs synchronized when another tab dismisses & acks an event.
-      for (const [eventId, toastId] of Array.from(toastIdByEventId.entries())) {
-        if (!liveEventIds.has(eventId)) {
-          toastIdByEventId.delete(eventId);
-          toast.dismiss(toastId, { notify: false });
+      for (const tracked of Array.from(trackedToasts)) {
+        const anyStillLive = Array.from(tracked.eventIds).some((id) => liveEventIds.has(id));
+        if (!anyStillLive) {
+          untrackToast(tracked);
+          toast.dismiss(tracked.toastId, { notify: false });
         }
       }
       if (immediateAckIds.length > 0) {
@@ -575,14 +657,14 @@ export function createGuardStore(options: GuardStoreOptions = {}): GuardStore {
 
     if (snapshot.runtimes && snapshot.runtimes_error === null) {
       const liveKeysAll = new Set(nextRuntimes.map((rt) => guardRuntimeKey(rt.id)));
-      for (const key of Array.from(fallbackWarnings.keys())) {
+      for (const key of Array.from(activeWarnings.keys())) {
         if (!liveKeysAll.has(key)) {
-          fallbackWarnings.delete(key);
+          activeWarnings.delete(key);
         }
       }
-      for (const key of Array.from(fallbackStopFailures)) {
+      for (const key of Array.from(activeStopFailures)) {
         if (!liveKeysAll.has(key)) {
-          fallbackStopFailures.delete(key);
+          activeStopFailures.delete(key);
         }
       }
 
@@ -670,9 +752,11 @@ export function createGuardStore(options: GuardStoreOptions = {}): GuardStore {
 
   const reset = (): void => {
     seenEventIds = new Set<number>();
-    toastIdByEventId = new Map<number, number>();
-    fallbackWarnings = new Map<string, readonly Concern[]>();
-    fallbackStopFailures = new Set<string>();
+    trackedToasts = new Set<TrackedGuardToast>();
+    activeStopFailureToasts = new Map<string, TrackedGuardToast>();
+    activeWarnToasts = new Map<string, TrackedGuardToast>();
+    activeWarnings = new Map<string, readonly Concern[]>();
+    activeStopFailures = new Set<string>();
     fallbackStoppedKeys = new Set<string>();
     seenVanishedKeys = new Set<string>();
     userStoppedKeys = new Set<string>();

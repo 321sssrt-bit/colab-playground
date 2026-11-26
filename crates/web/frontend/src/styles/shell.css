@@ -412,10 +412,17 @@
   inset-inline-end: var(--space-6);
   z-index: var(--z-toast);
   width: min(var(--toast-width), calc(100vw - var(--space-8)));
+  max-height: calc(100dvh - var(--space-10));
+  overflow-y: auto;
+  overscroll-behavior: contain;
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
   pointer-events: none;
+}
+
+.toast-viewport-active {
+  pointer-events: auto;
 }
 
 .toast-card {
@@ -609,6 +616,7 @@
     inset-inline-start: var(--space-4);
     inset-inline-end: var(--space-4);
     width: auto;
+    max-height: calc(100dvh - var(--mobile-topbar-height) - var(--space-6));
   }
 }
 

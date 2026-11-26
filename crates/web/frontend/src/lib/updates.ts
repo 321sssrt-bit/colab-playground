@@ -13,6 +13,8 @@ import { apiClient, attachAbortSignal, type ApiClient } from "./api.ts";
 import type { UpdateNoticeResponse } from "./types.ts";
 
 export const UPDATE_DISMISSED_STORAGE_KEY = "cpg_update_dismissed_version";
+/** Matches backend `UPDATE_RETRY_INTERVAL` (1 hour); server enforces the 24h GitHub throttle. */
+export const UPDATE_POLL_INTERVAL_MS = 3_600_000;
 
 export interface BannerUpdate {
   readonly version: string;
@@ -30,6 +32,9 @@ export interface UpdatesState {
 export interface UpdatesStoreOptions {
   readonly client?: ApiClient;
   readonly storage?: Pick<Storage, "getItem" | "setItem"> | null;
+  readonly pollIntervalMs?: number;
+  readonly setIntervalFn?: (callback: () => void, delayMs: number) => ReturnType<typeof setInterval>;
+  readonly clearIntervalFn?: (id: ReturnType<typeof setInterval>) => void;
 }
 
 export interface UpdatesStore {
@@ -123,10 +128,14 @@ function deriveUpdateFields(
 export function createUpdatesStore(options: UpdatesStoreOptions = {}): UpdatesStore {
   const client = options.client ?? apiClient;
   const storage = options.storage !== undefined ? options.storage : resolveDefaultStorage();
+  const pollIntervalMs = options.pollIntervalMs ?? UPDATE_POLL_INTERVAL_MS;
+  const setIntervalFn = options.setIntervalFn ?? globalThis.setInterval.bind(globalThis);
+  const clearIntervalFn = options.clearIntervalFn ?? globalThis.clearInterval.bind(globalThis);
 
   let disposed = false;
   let checkedGeneration: number | null = null;
   let inFlight: InFlightUpdate | null = null;
+  let pollTimer: ReturnType<typeof setInterval> | null = null;
   let state: UpdatesState = {
     notice: null,
     loading: false,
@@ -136,6 +145,25 @@ export function createUpdatesStore(options: UpdatesStoreOptions = {}): UpdatesSt
   };
 
   const listeners = new Set<() => void>();
+
+  const stopPolling = (): void => {
+    if (pollTimer !== null) {
+      clearIntervalFn(pollTimer);
+      pollTimer = null;
+    }
+  };
+
+  const startPolling = (): void => {
+    stopPolling();
+    if (disposed || pollIntervalMs <= 0 || !client.isAuthenticated()) {
+      return;
+    }
+    pollTimer = setIntervalFn(() => {
+      if (!disposed && client.isAuthenticated()) {
+        void startFetch();
+      }
+    }, pollIntervalMs);
+  };
 
   const emit = (): void => {
     for (const listener of listeners) {
@@ -178,6 +206,7 @@ export function createUpdatesStore(options: UpdatesStoreOptions = {}): UpdatesSt
   };
 
   const resetSession = (): void => {
+    stopPolling();
     inFlight?.controller.abort();
     inFlight = null;
     checkedGeneration = null;
@@ -188,14 +217,17 @@ export function createUpdatesStore(options: UpdatesStoreOptions = {}): UpdatesSt
     if (disposed) {
       return;
     }
-    if (
-      event.type === "logged_out" ||
-      event.type === "unauthorized" ||
-      event.type === "authenticated"
-    ) {
+    if (event.type === "logged_out" || event.type === "unauthorized") {
       resetSession();
+    } else if (event.type === "authenticated") {
+      resetSession();
+      startPolling();
     }
   });
+
+  if (client.isAuthenticated()) {
+    startPolling();
+  }
 
   const startFetch = (signal?: AbortSignal): Promise<UpdateNoticeResponse | null> => {
     if (disposed || !client.isAuthenticated()) {
@@ -282,6 +314,7 @@ export function createUpdatesStore(options: UpdatesStoreOptions = {}): UpdatesSt
 
     dispose(): void {
       disposed = true;
+      stopPolling();
       unsubscribeAuth();
       inFlight?.controller.abort();
       inFlight = null;

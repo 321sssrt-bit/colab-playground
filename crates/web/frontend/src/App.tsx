@@ -85,11 +85,26 @@ export function App() {
     const controller = new AbortController();
     preferenceSync.syncSession(controller.signal);
     void updatesStore.ensureChecked(controller.signal);
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        void updatesStore.refresh();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
     return () => {
       controller.abort();
       preferenceSync.cancelPending();
+      document.removeEventListener("visibilitychange", onVisibilityChange);
     };
   }, [storeState.authStatus]);
+
+  // Sync global update notice after returning from Settings (where manual checks run).
+  useEffect(() => {
+    if (storeState.authStatus !== "authenticated") {
+      return;
+    }
+    void updatesStore.refresh();
+  }, [storeState.authStatus, route]);
 
   useEffect(() => {
     if (i18n.dict === null) {

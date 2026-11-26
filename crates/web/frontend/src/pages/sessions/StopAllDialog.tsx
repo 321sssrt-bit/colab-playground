@@ -354,6 +354,18 @@ export function StopAllDialog({
                   </div>
                 )}
 
+                {!submitting && runtimesLoading && (
+                  <div
+                    className="busy-line"
+                    role="status"
+                    aria-live="polite"
+                    data-stop-all-loading="true"
+                  >
+                    <span className="spinner" aria-hidden="true" />
+                    <span>{t("app.b9.quit_title_checking")}</span>
+                  </div>
+                )}
+
                 {formattedSubmitError && (
                   <div className="alert alert-danger" role="alert">
                     <span className="alert-icon icon-danger">
@@ -391,7 +403,7 @@ export function StopAllDialog({
                     type="button"
                     className="btn btn-danger"
                     data-stop-all-retry="true"
-                    disabled={submitting}
+                    disabled={submitting || runtimesLoading}
                     onClick={onConfirm}
                   >
                     {submitting ? <span className="spinner" aria-hidden="true" /> : <SquareIcon />}
