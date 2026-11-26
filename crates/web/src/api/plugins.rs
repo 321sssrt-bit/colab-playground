@@ -8,7 +8,7 @@ use axum::{
     routing::{delete, get, post},
 };
 use colab_playground_core::{
-    Error, ErrorKind,
+    Error,
     backend::{PluginRunSpec, RuntimeRef},
     hf::HfModel,
     plugins::{Capability, Manifest, PluginInfo, PluginOrigin},
@@ -17,8 +17,8 @@ use colab_playground_core::{
 };
 use colab_playground_shared::i18n::keys;
 use colab_playground_web::state::{
-    Access, AccountContext,
-    plugins::{RunEvent, RunSummary},
+    Access, AccountContext, Submission,
+    plugins::{RunEvent, RunPhase, RunSummary},
 };
 use futures_util::stream;
 use serde::{Deserialize, Serialize, de::IgnoredAny};
@@ -37,6 +37,7 @@ pub(super) fn routes() -> Router<StateData> {
     Router::new()
         .route("/api/plugins", get(list))
         .route("/api/plugins/previews", post(preview))
+        .route("/api/plugins/previews/cancel", post(cancel_preview))
         .route("/api/plugins/previews/{id}", post(install).delete(discard))
         .route("/api/plugins/{id}", delete(remove).patch(enable))
         .route("/api/plugins/{id}/template", get(template))
@@ -86,7 +87,10 @@ async fn preview(
     payload: Result<Json<PluginOrigin>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Preview>), ApiError> {
     let Json(origin) = payload?;
-    let staged = state.web.preview_plugin(origin).await?;
+    let staged = match state.web.start_plugin_preview(origin)? {
+        Submission::Started { id, job } => state.web.finish_plugin_preview(id, job).await?,
+        Submission::AlreadyRunning { id } => return Err(ApiError::busy(id)),
+    };
     Ok((
         StatusCode::CREATED,
         Json(Preview {
@@ -97,6 +101,18 @@ async fn preview(
             warning_key: keys::PLUGIN_RUNS_ON_RUNTIME,
         }),
     ))
+}
+
+async fn cancel_preview(
+    State(state): State<StateData>,
+    payload: Result<Json<IgnoredAny>, JsonRejection>,
+) -> Result<StatusCode, ApiError> {
+    let _ = payload?;
+    if state.web.cancel_plugin_preview() {
+        Ok(StatusCode::ACCEPTED)
+    } else {
+        Ok(StatusCode::NO_CONTENT)
+    }
 }
 
 async fn install(
@@ -188,6 +204,7 @@ async fn save_token(
         },
     )?)
     .await?;
+    state.web.clear_gguf_cache();
     Ok(Json(TokenStatus { saved: true }))
 }
 
@@ -206,6 +223,7 @@ async fn delete_token(
         },
     )?)
     .await?;
+    state.web.clear_gguf_cache();
     Ok(Json(TokenStatus { saved: false }))
 }
 
@@ -238,6 +256,8 @@ struct Gguf {
     #[serde(default)]
     fit: FitOptions,
     quant: Option<String>,
+    #[serde(default)]
+    refresh: bool,
 }
 
 #[derive(Default, Deserialize)]
@@ -258,7 +278,7 @@ async fn gguf(
     let Json(payload) = payload?;
     let listing = state
         .web
-        .run_backend(move |backend, cancel| backend.hf_files(payload.repo.trim(), cancel))
+        .hf_gguf_listing(payload.repo, payload.refresh)
         .await?;
     let sizes = match (payload.fit.vram_mib, payload.accelerator) {
         (Some(vram_mib), _) => vec![vram_mib],
@@ -373,11 +393,7 @@ async fn events(
                         .map(|info| super::forwards::ForwardView::new(info.clone(), &host, Some(&endpoint.endpoint)));
                     json!({ "endpoint": endpoint.endpoint, "error": endpoint.error.as_ref().map(ErrorMessage::from), "forward": forward })
                 }).collect();
-                    let phase = match error.as_ref().map(|error| error.kind) {
-                        None => "ready",
-                        Some(ErrorKind::Cancelled) => "cancelled",
-                        Some(_) => "failed",
-                    };
+                    let phase = RunPhase::from_error(error.as_ref());
                     Event::default().event("finished").json_data(json!({
                         "phase": phase,
                         "run": run.metadata(),
