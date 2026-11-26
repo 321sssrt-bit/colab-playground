@@ -1,12 +1,14 @@
 /**
- * Overview route: four-step environment readiness checklist with streaming
- * Colab CLI installer when setup is incomplete, transitioning to the active
- * account compute-unit summary, unmanaged runtime warning, and enabled-plugin
- * quick-deploy cards once ready.
+ * Overview route: upstream three-step environment readiness checklist with
+ * persistent streaming/replaying Colab CLI installer when setup is incomplete,
+ * transitioning to the active account compute-unit summary and bundled-plugin
+ * quick-deploy cards once ready, while surfacing unmanaged billing runtime
+ * warnings in both states.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo } from "react";
 
+import { ApiError } from "../lib/api.ts";
 import {
   appDataStore,
   isAccountChangeBlocked,
@@ -15,40 +17,39 @@ import {
 } from "../lib/appCache.ts";
 import { useUsageClockSecs } from "../lib/format.ts";
 import { webStore } from "../lib/store.ts";
+import type { ErrorKind } from "../lib/types.ts";
 import { formatApiError } from "./accounts/model.ts";
-import { deriveChecklist, findRunningInstallOp } from "./overview/api.ts";
+import {
+  buildOverviewUnmanagedWarning,
+  deriveChecklist,
+  findRunningInstallOp,
+} from "./overview/api.ts";
 import { ChecklistCard } from "./overview/ChecklistCard.tsx";
+import { cliInstallStore, useCliInstallStore } from "./overview/installStore.ts";
 import { QuickDeploySection } from "./overview/QuickDeploySection.tsx";
 import { SummaryCard } from "./overview/SummaryCard.tsx";
-import { listPlugins } from "./plugins/api.ts";
+import { UnmanagedWarningAlert } from "./overview/UnmanagedWarningAlert.tsx";
+import "./overview/overview.css";
+import { pluginCacheStore, usePluginCacheStore } from "./plugins/pluginCache.ts";
 import { openPluginDeployForm } from "./plugins/runStore.ts";
-import type { PluginInfo } from "./plugins/types.ts";
 import type { PageProps } from "./types.ts";
 
 export function OverviewPage({ snapshot, locale, t, navigate, pushToast }: PageProps) {
   const nowSecs = useUsageClockSecs();
   const appData = useAppDataStore();
-
-  const [plugins, setPlugins] = useState<readonly PluginInfo[]>([]);
-
-  const pluginsSeqRef = useRef(0);
-  const mountedRef = useRef(true);
-  const activePluginsControllerRef = useRef<AbortController | null>(null);
-
-  useEffect(() => {
-    mountedRef.current = true;
-    return () => {
-      mountedRef.current = false;
-      activePluginsControllerRef.current?.abort();
-      activePluginsControllerRef.current = null;
-    };
-  }, []);
+  const installState = useCliInstallStore();
+  const pluginCache = usePluginCacheStore();
 
   // Ensure the host probe runs once per session; cached results survive route switches
-  // and live SSE snapshots update accounts, usage, and keyring state without re-probing.
+  // and live SSE snapshots update accounts, usage, and CLI install state without re-probing.
   useEffect(() => {
     void appDataStore.ensureOverview().catch(() => {});
+    cliInstallStore.syncWithServer();
   }, []);
+
+  useEffect(() => {
+    cliInstallStore.hydrateFromOverview(appData.overview?.cli_install);
+  }, [appData.overview?.cli_install]);
 
   const handleCheckAgain = useCallback(async () => {
     try {
@@ -63,10 +64,6 @@ export function OverviewPage({ snapshot, locale, t, navigate, pushToast }: PageP
     }
   }, []);
 
-  const handleInstallSucceeded = useCallback(async () => {
-    await handleCheckAgain();
-  }, [handleCheckAgain]);
-
   const handleRefreshUsage = useCallback(async () => {
     try {
       await appDataStore.refreshUsage();
@@ -80,35 +77,6 @@ export function OverviewPage({ snapshot, locale, t, navigate, pushToast }: PageP
       await appDataStore.adoptAccount();
     } catch {
       // Failure state is captured in `appDataStore.adoptError`.
-    }
-  }, []);
-
-  const loadPlugins = useCallback(async (signal: AbortSignal) => {
-    activePluginsControllerRef.current?.abort();
-    const controller = new AbortController();
-    activePluginsControllerRef.current = controller;
-
-    const onExternalAbort = () => controller.abort();
-    if (signal.aborted) {
-      controller.abort();
-    } else {
-      signal.addEventListener("abort", onExternalAbort, { once: true });
-    }
-
-    const seq = ++pluginsSeqRef.current;
-    try {
-      const items = await listPlugins(controller.signal);
-      if (!mountedRef.current || seq !== pluginsSeqRef.current) {
-        return;
-      }
-      setPlugins(items);
-    } catch {
-      // Quick-deploy cards are secondary to the ready summary; hide quietly on failure.
-    } finally {
-      signal.removeEventListener("abort", onExternalAbort);
-      if (activePluginsControllerRef.current === controller) {
-        activePluginsControllerRef.current = null;
-      }
     }
   }, []);
 
@@ -128,6 +96,8 @@ export function OverviewPage({ snapshot, locale, t, navigate, pushToast }: PageP
     () => (appData.overviewError !== null ? formatApiError(appData.overviewError, t) : null),
     [appData.overviewError, t],
   );
+  const probeErrorKind: ErrorKind | null =
+    appData.overviewError instanceof ApiError ? (appData.overviewError.kind as ErrorKind) : null;
   const usageRefreshError = useMemo(
     () =>
       appData.usageRefreshError !== null ? formatApiError(appData.usageRefreshError, t) : null,
@@ -142,34 +112,44 @@ export function OverviewPage({ snapshot, locale, t, navigate, pushToast }: PageP
   const adopting = appData.adopting;
 
   const runningInstallOp = useMemo(() => findRunningInstallOp(snapshot), [snapshot]);
+  const installActive =
+    installState.phase === "running" ||
+    installState.phase === "checking" ||
+    runningInstallOp !== null;
   const checklist = useMemo(
-    () => deriveChecklist(overview, probeError, probing, runningInstallOp !== null),
-    [overview, probeError, probing, runningInstallOp],
+    () =>
+      deriveChecklist(overview, probeError, probing, {
+        probeErrorKind,
+        installing: installActive,
+      }),
+    [installActive, overview, probeError, probeErrorKind, probing],
   );
   const ready = checklist.complete && overview !== null;
-  const snapshotVersion = snapshot?.version ?? -1;
   const accountChangeBlocked = isAccountChangeBlocked(snapshot, appData);
   const shuttingDown = snapshot?.shutting_down === true;
 
-  // Reload plugins when entering ready state and whenever the monotonic snapshot version
-  // advances (including cross-tab plugin catalog changes and SSE reconnect convergence).
   useEffect(() => {
     if (!ready) {
-      activePluginsControllerRef.current?.abort();
-      activePluginsControllerRef.current = null;
-      pluginsSeqRef.current += 1;
-      setPlugins([]);
       return;
     }
-    const controller = new AbortController();
-    void loadPlugins(controller.signal);
-    return () => {
-      controller.abort();
-    };
-  }, [loadPlugins, ready, snapshotVersion]);
+    void pluginCacheStore.ensurePlugins().catch(() => {});
+  }, [ready]);
+
+  const effectiveAccounts = overview?.accounts ?? snapshot?.accounts ?? null;
+  const unmanagedWarning = useMemo(
+    () =>
+      buildOverviewUnmanagedWarning(
+        effectiveAccounts,
+        snapshot,
+        overview?.unmanaged_runtimes ?? null,
+        nowSecs,
+        t,
+      ),
+    [effectiveAccounts, nowSecs, overview?.unmanaged_runtimes, snapshot, t],
+  );
 
   const initialLoading =
-    overview === null && probeError === null && probing && runningInstallOp === null;
+    overview === null && probeError === null && probing && !installActive;
 
   return (
     <>
@@ -179,6 +159,10 @@ export function OverviewPage({ snapshot, locale, t, navigate, pushToast }: PageP
       </header>
 
       <div className="page-sections">
+        {!ready && unmanagedWarning !== null && (
+          <UnmanagedWarningAlert warning={unmanagedWarning} t={t} navigate={navigate} />
+        )}
+
         {initialLoading ? (
           <section className="card">
             <div className="busy-line" role="status" aria-live="polite">
@@ -197,11 +181,13 @@ export function OverviewPage({ snapshot, locale, t, navigate, pushToast }: PageP
               usageRefreshError={usageRefreshError}
               shuttingDown={shuttingDown}
               t={t}
-              navigate={navigate}
               onRefreshUsage={handleRefreshUsage}
             />
+            {unmanagedWarning !== null && (
+              <UnmanagedWarningAlert warning={unmanagedWarning} t={t} navigate={navigate} />
+            )}
             <QuickDeploySection
-              plugins={plugins}
+              plugins={pluginCache.plugins ?? []}
               locale={locale}
               shuttingDown={shuttingDown}
               t={t}
@@ -213,6 +199,7 @@ export function OverviewPage({ snapshot, locale, t, navigate, pushToast }: PageP
             overview={overview}
             checklist={checklist}
             probeError={probeError}
+            probeErrorKind={probeErrorKind}
             probing={probing}
             runningInstallOp={runningInstallOp}
             adopting={adopting}
@@ -224,7 +211,6 @@ export function OverviewPage({ snapshot, locale, t, navigate, pushToast }: PageP
             pushToast={pushToast}
             onCheckAgain={handleCheckAgain}
             onAdoptAccount={handleAdoptAccount}
-            onInstallSucceeded={handleInstallSucceeded}
           />
         )}
       </div>

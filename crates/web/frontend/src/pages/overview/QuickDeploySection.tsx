@@ -1,5 +1,5 @@
 /**
- * Ready-state Overview quick-deploy cards for enabled plugins.
+ * Ready-state Overview quick-deploy cards for enabled bundled plugins only.
  */
 
 import type { TranslateFn } from "../../lib/i18n.ts";
@@ -7,6 +7,7 @@ import type { Locale } from "../../lib/types.ts";
 import { resolveLocalizedText } from "../plugins/api.ts";
 import { RocketIcon } from "../plugins/PluginDeployForm.tsx";
 import type { PluginInfo } from "../plugins/types.ts";
+import { selectQuickDeployPlugins } from "./api.ts";
 
 export interface QuickDeploySectionProps {
   readonly plugins: readonly PluginInfo[];
@@ -23,8 +24,8 @@ export function QuickDeploySection({
   t,
   onDeploy,
 }: QuickDeploySectionProps) {
-  const enabledPlugins = plugins.filter((plugin) => plugin.enabled);
-  if (enabledPlugins.length === 0) {
+  const bundledPlugins = selectQuickDeployPlugins(plugins);
+  if (bundledPlugins.length === 0) {
     return null;
   }
 
@@ -36,7 +37,7 @@ export function QuickDeploySection({
       </div>
 
       <div className="deploy-list">
-        {enabledPlugins.map((plugin) => {
+        {bundledPlugins.map((plugin) => {
           const id = plugin.manifest.id;
           const name = resolveLocalizedText(plugin.manifest.name, locale, id);
           const description = resolveLocalizedText(plugin.manifest.description, locale, "");

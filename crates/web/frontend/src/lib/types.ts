@@ -411,6 +411,7 @@ export interface Snapshot {
   guard_events?: GuardEvent[];
   guard_error: ErrorKind | null;
   ended?: EndedRuntime[];
+  cli_install?: CliInstallSummary;
   settings_notice?: SettingsNotice | null;
   operations: PendingOperation[];
   login_id: number | null;
@@ -418,6 +419,42 @@ export interface Snapshot {
 }
 
 export type InstallMethod = "uv" | "install_uv_then_cli" | "pip_user";
+
+export type CliInstallPhase =
+  | "idle"
+  | "running"
+  | "checking"
+  | "succeeded"
+  | "not_found"
+  | "probe_failed"
+  | "cancelled"
+  | "failed";
+
+export interface CliInstallLine {
+  readonly stream: "stdout" | "stderr";
+  readonly text: string;
+}
+
+export interface CliInstallSummary {
+  readonly id: number | null;
+  readonly method: InstallMethod | null;
+  readonly phase: CliInstallPhase;
+  readonly cancelling: boolean;
+  readonly line_count: number;
+  readonly error_kind: ErrorKind | null;
+}
+
+export interface CliInstallView {
+  readonly id: number | null;
+  readonly method: InstallMethod | null;
+  readonly phase: CliInstallPhase;
+  readonly cli_installed: boolean;
+  readonly cancelling: boolean;
+  readonly lines: readonly CliInstallLine[];
+  readonly warning_title_key: string | null;
+  readonly warning_body_key: string | null;
+  readonly error: ApiErrorPayload | null;
+}
 
 export interface ProbeReport {
   readonly wsl_installed: boolean;
@@ -441,6 +478,7 @@ export interface HostCheck {
   readonly kind: "wsl" | "shell_tools";
   readonly ready: boolean;
   readonly hint_key: string | null;
+  readonly wsl_distro?: string | null;
 }
 
 export interface KeyringCheck {
@@ -474,6 +512,7 @@ export interface OverviewResponse {
   readonly sampled_at?: UnixSecs;
   readonly unmanaged_runtimes: UnmanagedRuntimes;
   readonly install_methods: readonly InstallMethod[];
+  readonly cli_install?: CliInstallView;
 }
 
 export interface ForwardAddresses {

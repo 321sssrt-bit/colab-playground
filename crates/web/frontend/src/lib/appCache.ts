@@ -301,6 +301,7 @@ export function createAppDataStore(options: AppDataStoreOptions = {}): AppDataSt
   let state: AppDataState = INITIAL_STATE;
   let disposed = false;
   let settingsSeq = 0;
+  let prevRebuildingBackend = false;
 
   let overviewInFlight: InFlightRequest<OverviewResponse> | null = null;
   let sessionsInFlight: InFlightRequest<SessionsListResponse> | null = null;
@@ -358,6 +359,7 @@ export function createAppDataStore(options: AppDataStoreOptions = {}): AppDataSt
 
   const reset = (): void => {
     abortAllInFlight();
+    prevRebuildingBackend = false;
     setState(INITIAL_STATE);
   };
 
@@ -378,16 +380,28 @@ export function createAppDataStore(options: AppDataStoreOptions = {}): AppDataSt
     if (!snapshot) {
       return;
     }
+    const rebuildingBackend = snapshot.operations.some(
+      ({ operation }) => operation.kind === "domain" && operation.name === "rebuild_backend",
+    );
+    const rebuildFinished = prevRebuildingBackend && !rebuildingBackend;
+    prevRebuildingBackend = rebuildingBackend;
+
     const clearSessionsErrors =
       state.sessionsAccountErrors !== null &&
       snapshot.runtimes !== null &&
       !accountErrorsMatch(state.sessionsAccountErrors, snapshot.runtimes.errors);
     const clearAdoptError =
       state.adoptError !== null && snapshot.accounts !== null && !snapshot.accounts.unadopted;
-    if (clearSessionsErrors || clearAdoptError) {
+    if (clearSessionsErrors || clearAdoptError || rebuildFinished) {
+      if (rebuildFinished && overviewInFlight !== null) {
+        overviewInFlight.controller.abort();
+        overviewInFlight = null;
+      }
       setState({
         ...(clearSessionsErrors ? { sessionsAccountErrors: null } : {}),
         ...(clearAdoptError ? { adoptError: null } : {}),
+        // Host/WSL/CLI-path rebuild invalidates the cached probe so Overview re-probes the new backend.
+        ...(rebuildFinished ? { overview: null, overviewLoading: false, overviewError: null } : {}),
       });
     }
   });

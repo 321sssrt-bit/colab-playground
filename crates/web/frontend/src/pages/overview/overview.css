@@ -1,0 +1,17 @@
+/* Overview-specific adjustments matching upstream crates/app/src/ui/pages/overview.rs. */
+
+.checklist-item[data-overview-step-status="waiting"] .checklist-title {
+  color: var(--color-fg-muted);
+}
+
+.checklist-body > .alert {
+  margin-top: var(--space-1);
+}
+
+.checklist-body > .install-log {
+  margin-top: var(--space-2);
+}
+
+.overview-unmanaged-alert .alert-body {
+  white-space: pre-line;
+}

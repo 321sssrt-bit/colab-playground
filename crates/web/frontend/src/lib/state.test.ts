@@ -38,6 +38,13 @@ import type {
 } from "./types.ts";
 import { createUpdatesStore } from "./updates.ts";
 import { CORE_DEFAULTS } from "./constants.ts";
+import {
+  buildOverviewUnmanagedWarning,
+  deriveChecklist,
+  selectQuickDeployPlugins,
+} from "../pages/overview/api.ts";
+import { createCliInstallStore } from "../pages/overview/installStore.ts";
+import type { PluginInfo } from "../pages/plugins/types.ts";
 import { createSettingsDraftStore } from "../pages/settings/draftStore.ts";
 import { createSettingsNoticeStore } from "../pages/settings/noticeStore.ts";
 
@@ -1517,4 +1524,327 @@ test("settingsNoticeStore displays once globally, survives background null updat
   await notices.dismissPart("reset");
   assert.equal(dismissCalls, 2);
   assert.equal(notices.getState().notice, null);
+});
+
+test("deriveChecklist follows upstream 3-step flow and routes NotInstalled probe error to CLI step", () => {
+  const err = { message: "err", hint: null };
+  assert.deepEqual(
+    deriveChecklist(null, err, false, { probeErrorKind: "not_installed" }),
+    {
+      complete: false,
+      hostStatus: "done",
+      cliStatus: "todo",
+      signinStatus: "waiting",
+    },
+  );
+  assert.deepEqual(deriveChecklist(null, err, false, { probeErrorKind: "io" }), {
+    complete: false,
+    hostStatus: "failed",
+    cliStatus: "waiting",
+    signinStatus: "waiting",
+  });
+
+  const keyringFailed = makeOverview({
+    accounts: null,
+    accounts_error: "keyring_unavailable",
+    keyring: { status: "unavailable", hint_key: "app.ns.unlock_keyring" },
+  });
+  assert.deepEqual(deriveChecklist(keyringFailed, null, false), {
+    complete: false,
+    hostStatus: "done",
+    cliStatus: "done",
+    signinStatus: "failed",
+  });
+
+  const signedOut = makeOverview({
+    accounts: {
+      accounts: [],
+      active: null,
+      has_token: false,
+      unadopted: false,
+      active_email: null,
+      recovered_pending_add: false,
+    },
+  });
+  assert.deepEqual(deriveChecklist(signedOut, null, false), {
+    complete: false,
+    hostStatus: "done",
+    cliStatus: "done",
+    signinStatus: "todo",
+  });
+
+  assert.deepEqual(deriveChecklist(makeOverview(), null, false), {
+    complete: true,
+    hostStatus: "done",
+    cliStatus: "done",
+    signinStatus: "done",
+  });
+});
+
+test("cliInstallStore streams, replays without duplicates, strips ANSI, handles fa25d8c not_found, and resets on host change", async (t) => {
+  const installSse = createSseControl();
+  const replaySse = createSseControl();
+  const eventsSse = createSseControl();
+  const calls: string[] = [];
+  let overviewRefreshes = 0;
+
+  const client = createApiClient({
+    fetchImpl: async (input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const method = init?.method ?? "GET";
+      calls.push(`${method} ${url}`);
+      if (url === "/api/login") {
+        return jsonResponse({ token: "tok-install", expires_in: 3600 });
+      }
+      if (url === "/api/events") {
+        return eventsSse.response;
+      }
+      if (url === "/api/overview/cli/install" && method === "POST") {
+        return installSse.response;
+      }
+      if (url === "/api/overview/cli/install/7/events" && method === "POST") {
+        return replaySse.response;
+      }
+      if (url === "/api/overview/cli/install" && method === "GET") {
+        return jsonResponse({
+          id: 7,
+          method: "uv",
+          phase: "not_found",
+          cli_installed: false,
+          cancelling: false,
+          lines: [{ stream: "stdout", text: "\u001B[32minstalled to ~/.local/bin\u001B[0m" }],
+          warning_title_key: "app.install.not_found.title",
+          warning_body_key: "app.install.not_found.body",
+          error: null,
+        });
+      }
+      if (url === "/api/snapshot") {
+        return jsonResponse(makeSnapshot({ version: 99 }));
+      }
+      throw new Error(`unexpected fetch: ${method} ${url}`);
+    },
+  });
+
+  const clock = createServerClock({
+    setIntervalFn: () => 0 as unknown as ReturnType<typeof setInterval>,
+    clearIntervalFn: () => {},
+  });
+  const store = createWebStore({ client, clock, ...noopTimers });
+  const installStore = createCliInstallStore({
+    client,
+    store,
+    appData: {
+      refreshOverview: async () => {
+        overviewRefreshes += 1;
+        return makeOverview();
+      },
+    },
+  });
+  t.after(() => {
+    installStore.dispose();
+    store.dispose();
+    installSse.close();
+    replaySse.close();
+    eventsSse.close();
+    clock.dispose();
+  });
+
+  await store.signIn("secret-key");
+
+  // Start install -> ANSI codes stripped -> phase transitions to checking -> finished with phase=not_found.
+  const startPromise = installStore.startInstall("uv");
+  installSse.sendFrame("started", { id: 7, method: "uv" });
+  installSse.sendFrame("line", { stream: "stdout", text: "\u001B[32minstalled to ~/.local/bin\u001B[0m" });
+  await flushAsync();
+  assert.equal(installStore.getState().id, 7);
+  assert.equal(installStore.getState().phase, "running");
+  assert.deepEqual(installStore.getState().lines, [
+    { stream: "stdout", text: "installed to ~/.local/bin" },
+  ]);
+
+  // Backend moves into post-install probe -> UI shows checking immediately.
+  eventsSse.sendFrame(
+    "snapshot",
+    makeSnapshot({
+      version: 2,
+      cli_install: {
+        id: 7,
+        method: "uv",
+        phase: "checking",
+        cancelling: false,
+        line_count: 1,
+        error_kind: null,
+      },
+    }),
+    "2",
+  );
+  await flushAsync();
+  assert.equal(installStore.getState().phase, "checking");
+
+  // SSE finished frame carries legacy `status: "failed"` + `error`, but `phase: "not_found"` must win.
+  installSse.sendFrame("finished", {
+    status: "failed",
+    phase: "not_found",
+    cli_installed: false,
+    warning_title_key: "app.install.not_found.title",
+    warning_body_key: "app.install.not_found.body",
+    error: {
+      kind: "not_installed",
+      message_key: "app.install.not_found.title",
+      args: {},
+      hint_key: "app.install.not_found.body",
+      action_key: null,
+      operation_id: null,
+    },
+  });
+  installSse.close();
+  await startPromise;
+
+  assert.equal(installStore.getState().phase, "not_found");
+  assert.equal(installStore.getState().error, null);
+  assert.equal(installStore.getState().warningTitleKey, "app.install.not_found.title");
+  assert.equal(installStore.getState().warningBodyKey, "app.install.not_found.body");
+  assert.equal(overviewRefreshes, 0);
+
+  // Changing host settings clears cli_install back to idle on backend -> store resets cleanly.
+  eventsSse.sendFrame(
+    "snapshot",
+    makeSnapshot({
+      version: 3,
+      cli_install: {
+        id: null,
+        method: null,
+        phase: "idle",
+        cancelling: false,
+        line_count: 0,
+        error_kind: null,
+      },
+    }),
+    "3",
+  );
+  await flushAsync();
+  assert.equal(installStore.getState().phase, "idle");
+  assert.equal(installStore.getState().lines.length, 0);
+
+  // Hydrate an already-running session from overview (simulating reload/tab attach): replays without duplicating lines.
+  installStore.hydrateFromOverview({
+    id: 7,
+    method: "uv",
+    phase: "running",
+    cli_installed: false,
+    cancelling: false,
+    lines: [{ stream: "stdout", text: "\u001B[36mline-1\u001B[0m" }],
+    warning_title_key: null,
+    warning_body_key: null,
+    error: null,
+  });
+  await flushAsync();
+  assert.ok(calls.includes("POST /api/overview/cli/install/7/events"));
+  replaySse.sendFrame("started", { id: 7, method: "uv" });
+  replaySse.sendFrame("line", { stream: "stdout", text: "\u001B[36mline-1\u001B[0m" });
+  replaySse.sendFrame("line", { stream: "stderr", text: "\u001B[31mline-2\u001B[0m" });
+  replaySse.sendFrame("finished", {
+    status: "succeeded",
+    phase: "succeeded",
+    cli_installed: true,
+    warning_title_key: null,
+    warning_body_key: null,
+    error: null,
+  });
+  replaySse.close();
+  await flushAsync();
+
+  assert.deepEqual(installStore.getState().lines, [
+    { stream: "stdout", text: "line-1" },
+    { stream: "stderr", text: "line-2" },
+  ]);
+  assert.equal(installStore.getState().phase, "succeeded");
+  assert.equal(overviewRefreshes, 1);
+});
+
+test("buildOverviewUnmanagedWarning surfaces billing risks in checklist state and selectQuickDeployPlugins keeps bundled only", () => {
+  const t = (key: string, params?: Record<string, string | number>) =>
+    params ? `${key}:${JSON.stringify(params)}` : key;
+
+  const signedOutAccounts = {
+    accounts: [],
+    active: null,
+    has_token: false,
+    unadopted: false,
+    active_email: null,
+    recovered_pending_add: false,
+  };
+
+  // Checklist state with runtimes-fail surfaces unknown ownership warning.
+  const runtimesFailSnap = makeSnapshot({
+    accounts: signedOutAccounts,
+    runtimes: null,
+    runtimes_error: "io",
+    usage: [],
+  });
+  const failWarning = buildOverviewUnmanagedWarning(
+    signedOutAccounts,
+    runtimesFailSnap,
+    {
+      count: null,
+      incomplete: true,
+      unverified_accounts: [],
+      warning_key: "web.runtimes.unmanaged_unknown",
+    },
+    1_700_000_000,
+    t,
+  );
+  assert.deepEqual(failWarning, {
+    title: "app.unmanaged.unknown_title",
+    body: "web.runtimes.unmanaged_unknown",
+  });
+
+  // Checklist state with unmanaged runtime in live snapshot (and empty usage) still warns.
+  const unmanagedSnap = makeSnapshot({
+    accounts: signedOutAccounts,
+    runtimes: {
+      runtimes: [makeRuntime({ managed: false, account_email: "alice@example.com" })],
+      errors: [],
+    },
+    runtimes_error: null,
+    usage: [],
+  });
+  const liveWarning = buildOverviewUnmanagedWarning(
+    signedOutAccounts,
+    unmanagedSnap,
+    null,
+    1_700_000_000,
+    t,
+  );
+  assert.deepEqual(liveWarning, {
+    title: "app.unmanaged.title",
+    body: 'app.unmanaged.one:{"email":"alice@example.com"}',
+  });
+
+  // Quick-deploy filters strictly to enabled bundled plugins.
+  const makePlugin = (id: string, source: PluginInfo["source"], enabled: boolean): PluginInfo => ({
+    manifest: {
+      api: 1,
+      id,
+      version: "0.1.0",
+      name: { "en-US": id },
+      description: {},
+      inputs: [],
+      run: { script: "run.sh" },
+      stages: [],
+      endpoints: [],
+      needs: [],
+    },
+    source,
+    enabled,
+  });
+  const filtered = selectQuickDeployPlugins([
+    makePlugin("llama-cpp", { kind: "bundled" }, true),
+    makePlugin("bundled-off", { kind: "bundled" }, false),
+    makePlugin("third-party", { kind: "user" }, true),
+  ]);
+  assert.deepEqual(
+    filtered.map((item) => item.manifest.id),
+    ["llama-cpp"],
+  );
 });

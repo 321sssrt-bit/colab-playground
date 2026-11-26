@@ -1,5 +1,5 @@
 /**
- * Ready-state Overview compute-unit summary card and unmanaged runtime warning.
+ * Ready-state Overview compute-unit summary card.
  */
 
 import { AlertIcon } from "../../components/Icons.tsx";
@@ -10,18 +10,13 @@ import {
   resolveActiveAccount,
 } from "../../lib/format.ts";
 import type { TranslateFn } from "../../lib/i18n.ts";
-import type { RouteId } from "../../lib/router.ts";
 import type { Locale, Snapshot } from "../../lib/types.ts";
 import {
   formatAccountTimeLeft,
   formatCoreError,
   type FormattedApiError,
 } from "../accounts/model.ts";
-import {
-  buildOverviewUnmanagedWarning,
-  summarizeCrossAccountRuntimes,
-  type OverviewResponse,
-} from "./api.ts";
+import { summarizeCrossAccountRuntimes, type OverviewResponse } from "./api.ts";
 import { RefreshIcon } from "./Icons.tsx";
 
 export interface SummaryCardProps {
@@ -33,7 +28,6 @@ export interface SummaryCardProps {
   readonly usageRefreshError: FormattedApiError | null;
   readonly shuttingDown: boolean;
   readonly t: TranslateFn;
-  readonly navigate: (route: RouteId) => void;
   readonly onRefreshUsage: () => Promise<void>;
 }
 
@@ -46,7 +40,6 @@ export function SummaryCard({
   usageRefreshError,
   shuttingDown,
   t,
-  navigate,
   onRefreshUsage,
 }: SummaryCardProps) {
   const effectiveSnapshot: Snapshot | null =
@@ -99,133 +92,103 @@ export function SummaryCard({
       : null;
 
   const activeUsageError =
-    usageRefreshError === null && active.usage?.last_error !== null && active.usage?.last_error !== undefined
+    usageRefreshError === null &&
+    active.usage?.last_error !== null &&
+    active.usage?.last_error !== undefined
       ? active.usage.last_error
       : null;
 
-  const unmanagedWarning = buildOverviewUnmanagedWarning(
-    effectiveAccounts,
-    effectiveSnapshot,
-    overview.unmanaged_runtimes,
-    nowSecs,
-    t,
-  );
-
   return (
-    <>
-      <section className="card" data-overview-summary="true">
-        <div className="card-header">
-          <div className="card-heading">
-            <h2 className="card-title">{t("app.summary.title")}</h2>
-            <p className="card-desc">{t("app.summary.active", { email: active.label })}</p>
-          </div>
-          <div className="card-actions">
-            {freshness?.outdated && (
-              <span className="badge badge-warning">{t("app.usage.outdated")}</span>
+    <section className="card" data-overview-summary="true">
+      <div className="card-header">
+        <div className="card-heading">
+          <h2 className="card-title">{t("app.summary.title")}</h2>
+          <p className="card-desc">{t("app.summary.active", { email: active.label })}</p>
+        </div>
+        <div className="card-actions">
+          {freshness?.outdated && (
+            <span className="badge badge-warning">{t("app.usage.outdated")}</span>
+          )}
+          <button
+            type="button"
+            className="btn btn-ghost btn-icon"
+            data-overview-refresh-usage="true"
+            aria-label={t("app.usage.refresh")}
+            title={t("app.usage.refresh")}
+            disabled={refreshingUsage || shuttingDown}
+            onClick={() => {
+              void onRefreshUsage();
+            }}
+          >
+            {refreshingUsage ? (
+              <span className="spinner" aria-hidden="true" />
+            ) : (
+              <RefreshIcon />
             )}
-            <button
-              type="button"
-              className="btn btn-ghost btn-icon"
-              data-overview-refresh-usage="true"
-              aria-label={t("app.usage.refresh")}
-              title={t("app.usage.refresh")}
-              disabled={refreshingUsage || shuttingDown}
-              onClick={() => {
-                void onRefreshUsage();
-              }}
-            >
-              {refreshingUsage ? (
-                <span className="spinner" aria-hidden="true" />
-              ) : (
-                <RefreshIcon />
-              )}
-            </button>
+          </button>
+        </div>
+      </div>
+
+      <div className="kpi-grid">
+        <div className="kpi-tile">
+          <span className="kpi-label">{t("app.summary.balance")}</span>
+          <div className="kpi-value-row">
+            <span className="kpi-value">{balanceText}</span>
           </div>
         </div>
 
-        <div className="kpi-grid">
-          <div className="kpi-tile">
-            <span className="kpi-label">{t("app.summary.balance")}</span>
-            <div className="kpi-value-row">
-              <span className="kpi-value">{balanceText}</span>
-            </div>
-          </div>
-
-          <div className="kpi-tile">
-            <span className="kpi-label">{t("app.summary.rate")}</span>
-            <div className="kpi-value-row">
-              <span className="kpi-value">{rateText}</span>
-            </div>
-          </div>
-
-          <div className="kpi-tile">
-            <span className="kpi-label">{t("app.summary.time_left")}</span>
-            <div className="kpi-value-row">
-              <span className="kpi-value">{timeLeftText}</span>
-            </div>
-          </div>
-
-          <div className="kpi-tile">
-            <span className="kpi-label">{t("app.summary.runtimes")}</span>
-            <div className="kpi-value-row">
-              <span className="kpi-value">{runtimesText}</span>
-              {runtimesSummary.incomplete && (
-                <span className="badge badge-warning">{t("app.b10.summary_incomplete")}</span>
-              )}
-            </div>
-            <span className="kpi-note">
-              {runtimesSummary.incomplete && runtimesSummary.uncountedNote !== null
-                ? runtimesSummary.uncountedNote
-                : t("app.summary.runtimes_all")}
-            </span>
+        <div className="kpi-tile">
+          <span className="kpi-label">{t("app.summary.rate")}</span>
+          <div className="kpi-value-row">
+            <span className="kpi-value">{rateText}</span>
           </div>
         </div>
 
-        {staleNote !== null && (
-          <div className="inline-msg inline-msg-warning" role="status">
-            <AlertIcon />
-            <span className="inline-msg-text">{staleNote}</span>
+        <div className="kpi-tile">
+          <span className="kpi-label">{t("app.summary.time_left")}</span>
+          <div className="kpi-value-row">
+            <span className="kpi-value">{timeLeftText}</span>
           </div>
-        )}
+        </div>
 
-        {usageRefreshError !== null && (
-          <div className="inline-msg inline-msg-warning" role="status">
-            <AlertIcon />
-            <span className="inline-msg-text">{usageRefreshError.message}</span>
+        <div className="kpi-tile">
+          <span className="kpi-label">{t("app.summary.runtimes")}</span>
+          <div className="kpi-value-row">
+            <span className="kpi-value">{runtimesText}</span>
+            {runtimesSummary.incomplete && (
+              <span className="badge badge-warning">{t("app.b10.summary_incomplete")}</span>
+            )}
           </div>
-        )}
-
-        {activeUsageError !== null && (
-          <div className="inline-msg inline-msg-warning" role="status">
-            <AlertIcon />
-            <span className="inline-msg-text">
-              {`${t("app.accounts.usage_failed")} ${formatCoreError(activeUsageError, t)}`}
-            </span>
-          </div>
-        )}
-      </section>
-
-      {unmanagedWarning !== null && (
-        <div className="alert alert-warning" role="alert" data-overview-unmanaged="true">
-          <span className="alert-icon icon-warning">
-            <AlertIcon />
+          <span className="kpi-note">
+            {runtimesSummary.incomplete && runtimesSummary.uncountedNote !== null
+              ? runtimesSummary.uncountedNote
+              : t("app.summary.runtimes_all")}
           </span>
-          <div className="alert-text">
-            <p className="alert-title">{unmanagedWarning.title}</p>
-            <p className="alert-body">{unmanagedWarning.body}</p>
-            <div className="alert-actions">
-              <button
-                type="button"
-                className="btn btn-sm"
-                data-overview-view-sessions="true"
-                onClick={() => navigate("sessions")}
-              >
-                {t("app.action.view_sessions")}
-              </button>
-            </div>
-          </div>
+        </div>
+      </div>
+
+      {staleNote !== null && (
+        <div className="inline-msg inline-msg-warning" role="status">
+          <AlertIcon />
+          <span className="inline-msg-text">{staleNote}</span>
         </div>
       )}
-    </>
+
+      {usageRefreshError !== null && (
+        <div className="inline-msg inline-msg-warning" role="status">
+          <AlertIcon />
+          <span className="inline-msg-text">{usageRefreshError.message}</span>
+        </div>
+      )}
+
+      {activeUsageError !== null && (
+        <div className="inline-msg inline-msg-warning" role="status">
+          <AlertIcon />
+          <span className="inline-msg-text">
+            {`${t("app.accounts.usage_failed")} ${formatCoreError(activeUsageError, t)}`}
+          </span>
+        </div>
+      )}
+    </section>
   );
 }

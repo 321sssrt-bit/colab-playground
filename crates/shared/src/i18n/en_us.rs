@@ -190,7 +190,6 @@ pub(super) const MESSAGES: Messages = &[
     (INSTALL_START, "Install"),
     (INSTALL_RUNNING, "Installing the Colab CLI…"),
     (INSTALL_CANCELLING, "Cancelling…"),
-    (INSTALL_DONE, "The Colab CLI is installed."),
     (INSTALL_FAILED, "Installation failed"),
     (INSTALL_CANCELLED, "Installation was cancelled."),
     (

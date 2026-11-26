@@ -214,7 +214,6 @@ pub(super) const MESSAGES: Messages = &[
     (INSTALL_START, "インストール"),
     (INSTALL_RUNNING, "Colab CLI をインストールしています…"),
     (INSTALL_CANCELLING, "キャンセルしています…"),
-    (INSTALL_DONE, "Colab CLI がインストールされました。"),
     (INSTALL_FAILED, "インストールに失敗しました"),
     (INSTALL_CANCELLED, "インストールはキャンセルされました。"),
     (
