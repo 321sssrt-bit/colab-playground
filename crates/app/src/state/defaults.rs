@@ -7,8 +7,8 @@
 use colab_playground_core::Defaults;
 use gpui::{AppContext, Context};
 
-use super::{AppState, Op};
-use crate::backend;
+use super::{AppState, InstallPhase, Op, SettingsFocus};
+use crate::{backend, route::Route};
 
 pub use colab_playground_shared::defaults::{MIN_DURATION, sanitize};
 
@@ -99,6 +99,13 @@ impl AppState {
         self.toast(toast, cx);
     }
 
+    /// Opens Settings with where the CLI lives at the top.
+    pub fn open_host_setting(&mut self, cx: &mut Context<Self>) {
+        self.navigate(Route::Settings, cx);
+        self.settings_focus = Some(SettingsFocus::Host);
+        cx.notify();
+    }
+
     /// Whether host changes can be applied now (nothing else is running).
     pub fn can_change_host(&self) -> bool {
         !self.ops.any()
@@ -133,6 +140,9 @@ impl AppState {
                 state.backend = built;
                 state.probe = super::Load::Idle;
                 state.accounts = super::Load::Idle;
+                // How the last install ended, and its log, belong to the host it ran on.
+                state.install.phase = InstallPhase::Idle;
+                state.install.lines = Default::default();
                 state.check_environment(cx);
             })
             .ok();

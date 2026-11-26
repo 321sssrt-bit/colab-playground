@@ -138,6 +138,8 @@ catalog_keys! {
     INSTALL_DONE => "app.install.done",
     INSTALL_FAILED => "app.install.failed",
     INSTALL_CANCELLED => "app.install.cancelled",
+    INSTALL_NOT_FOUND_TITLE => "app.install.not_found.title",
+    INSTALL_NOT_FOUND_BODY => "app.install.not_found.body",
     SUMMARY_TITLE => "app.summary.title",
     SUMMARY_ACTIVE => "app.summary.active",
     SUMMARY_BALANCE => "app.summary.balance",

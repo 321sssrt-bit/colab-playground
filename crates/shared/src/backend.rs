@@ -110,6 +110,7 @@ const SCENARIOS: &[(&str, StartWorld)] = &[
 const FAILURES: &[(&str, Inject)] = &[
     ("cli-missing", |f| f.cli_missing = true),
     ("install-fails", |f| f.install_fails = true),
+    ("install-off-path", |f| f.install_off_path = true),
     ("keyring", |f| f.keyring_unavailable = true),
     ("usage-fails", |f| f.usage_fetch_fails = true),
     ("login-invalid-code", |f| {
@@ -351,6 +352,10 @@ mod tests {
         assert!(check_args(&["--real"]).is_ok());
         let flags = MockFlags::parse(&["--mock", "--mock-fail", "watchdog-restart-fails"]).unwrap();
         assert!(flags.failures.watchdog_restart_fails);
+        let flags =
+            MockFlags::parse(&["--mock", "--mock-fail=cli-missing,install-off-path"]).unwrap();
+        assert!(flags.failures.cli_missing && flags.failures.install_off_path);
+        assert!(super::usage().contains("install-off-path"));
         let flags =
             MockFlags::parse(&["--mock", "--mock-fail=update-available,update-check-fails"])
                 .unwrap();
