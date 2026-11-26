@@ -188,8 +188,14 @@ async fn host_settings_hot_rebuild_clears_install_state_and_validates_interprete
             assert!(initial["colab_python"].is_null());
             assert_eq!(initial["uses_wsl"], crate::platform::uses_wsl());
 
-            // Off-path install settles to phase `not_found` (never installed), while keeping wire
-            // `status: "succeeded"` so legacy SSE parsers do not report connection lost.
+            // Off-path install settles to phase `not_found` (never installed), emitting legacy
+            // `status: "failed"` + localized `not_found` error on SSE `finished` so unedited
+            // frontends neither drop the frame nor show "installed", while `GET /api/overview/cli/install`
+            // keeps domain `error: null`.
+            let dictionary = client.get("/api/i18n/en-US");
+            assert!(dictionary[keys::INSTALL_NOT_FOUND_TITLE].is_string());
+            assert!(dictionary[keys::INSTALL_NOT_FOUND_BODY].is_string());
+
             let mut reader = client.install();
             let id = event(&mut reader, "started")["id"].as_u64().unwrap();
             for _ in 0..5 {
@@ -204,17 +210,24 @@ async fn host_settings_hot_rebuild_clears_install_state_and_validates_interprete
                     .contains("not on your PATH")
             );
             let finished = event(&mut reader, "finished");
-            assert_eq!(finished["status"], "succeeded");
+            assert_eq!(finished["status"], "failed");
             assert_eq!(finished["phase"], "not_found");
             assert_eq!(finished["cli_installed"], false);
             assert_eq!(finished["warning_title_key"], keys::INSTALL_NOT_FOUND_TITLE);
             assert_eq!(finished["warning_body_key"], keys::INSTALL_NOT_FOUND_BODY);
-            assert!(finished["error"].is_null());
+            assert_eq!(finished["error"]["kind"], "not_installed");
+            assert_eq!(
+                finished["error"]["message_key"],
+                keys::INSTALL_NOT_FOUND_TITLE
+            );
+            assert_eq!(finished["error"]["hint_key"], keys::INSTALL_NOT_FOUND_BODY);
 
             let overview = client.get("/api/overview");
             assert_eq!(overview["cli_installed"], false);
             assert_eq!(overview["cli_install"]["id"], id);
             assert_eq!(overview["cli_install"]["phase"], "not_found");
+            assert_eq!(overview["cli_install"]["cli_installed"], false);
+            assert!(overview["cli_install"]["error"].is_null());
             assert_eq!(overview["cli_install"]["lines"].as_array().unwrap().len(), 6);
             assert_eq!(
                 overview["cli_install"]["warning_title_key"],
@@ -459,6 +472,31 @@ script = "run.py"
                     .status(),
                 StatusCode::NOT_FOUND
             );
+
+            // On unix (non-root), an existing unreadable settings.json must fail before save/builder
+            // and never be treated as Missing or deleted.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+
+                let file = store.file().unwrap();
+                fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
+                let still_readable = fs::read(&file).is_ok();
+                if !still_readable {
+                    let calls_before = build_calls.load(Ordering::SeqCst);
+                    let err = json(
+                        client.request("PATCH", "/api/settings", r#"{"colab_path":"/opt/colab"}"#),
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                    );
+                    assert_eq!(err["error"]["kind"], "io");
+                    assert_eq!(build_calls.load(Ordering::SeqCst), calls_before);
+                    assert!(
+                        file.exists(),
+                        "unreadable settings.json must not be deleted"
+                    );
+                }
+                fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+            }
         },
     )
     .await;
@@ -503,11 +541,21 @@ async fn cli_install_sse_replays_after_disconnect_and_resolves_after_check_again
         assert_eq!(lines[0], first);
         assert_eq!(lines[5]["stream"], "stderr");
         let finished = event(&mut replay, "finished");
-        assert_eq!(finished["status"], "succeeded");
+        assert_eq!(finished["status"], "failed");
         assert_eq!(finished["phase"], "not_found");
         assert_eq!(finished["cli_installed"], false);
         assert_eq!(finished["warning_title_key"], keys::INSTALL_NOT_FOUND_TITLE);
         assert_eq!(finished["warning_body_key"], keys::INSTALL_NOT_FOUND_BODY);
+        assert_eq!(
+            finished["error"]["message_key"],
+            keys::INSTALL_NOT_FOUND_TITLE
+        );
+        assert_eq!(finished["error"]["hint_key"], keys::INSTALL_NOT_FOUND_BODY);
+
+        let install_status = client.get("/api/overview/cli/install");
+        assert_eq!(install_status["phase"], "not_found");
+        assert_eq!(install_status["cli_installed"], false);
+        assert!(install_status["error"].is_null());
 
         // Reconnect after finish via latest endpoint: replays full log and terminal status.
         let response = client.request("POST", &format!("{INSTALL}/events"), "{}");
@@ -518,7 +566,7 @@ async fn cli_install_sse_replays_after_disconnect_and_resolves_after_check_again
             assert_eq!(&event(&mut late, "line"), expected);
         }
         let late_finished = event(&mut late, "finished");
-        assert_eq!(late_finished["status"], "succeeded");
+        assert_eq!(late_finished["status"], "failed");
         assert_eq!(late_finished["phase"], "not_found");
         assert_eq!(
             client

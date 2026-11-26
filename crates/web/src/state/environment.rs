@@ -41,11 +41,14 @@ impl CliInstallPhase {
     /// Legacy SSE `finished.status` value (`succeeded | cancelled | failed`) for wire compatibility.
     pub fn wire_status(self) -> &'static str {
         match self {
-            Self::Succeeded | Self::NotFound => "succeeded",
+            Self::Succeeded => "succeeded",
             Self::Cancelled => "cancelled",
-            Self::Failed | Self::ProbeFailed | Self::Idle | Self::Running | Self::Checking => {
-                "failed"
-            }
+            Self::NotFound
+            | Self::Failed
+            | Self::ProbeFailed
+            | Self::Idle
+            | Self::Running
+            | Self::Checking => "failed",
         }
     }
 }

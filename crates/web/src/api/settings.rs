@@ -1,5 +1,5 @@
 use std::{
-    fs,
+    fs, io,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
 };
@@ -238,17 +238,35 @@ fn save_outcome(store: &SettingsStore) -> LoadOutcome {
     }
 }
 
-fn restore_settings_file(file: Option<&Path>, previous_bytes: Option<&[u8]>) {
+enum PreviousSettingsFile {
+    NoFile,
+    Missing,
+    Bytes(Vec<u8>),
+}
+
+fn snapshot_settings_file(file: Option<&Path>) -> CoreResult<PreviousSettingsFile> {
     let Some(file) = file else {
-        return;
+        return Ok(PreviousSettingsFile::NoFile);
     };
-    match previous_bytes {
-        Some(bytes) => {
-            let _ = write_atomic(file, bytes);
-        }
-        None => {
-            let _ = fs::remove_file(file);
-        }
+    match fs::read(file) {
+        Ok(bytes) => Ok(PreviousSettingsFile::Bytes(bytes)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(PreviousSettingsFile::Missing),
+        Err(error) => Err(Error::new(ErrorKind::Io).detail(error.to_string())),
+    }
+}
+
+fn restore_settings_file(file: Option<&Path>, previous: &PreviousSettingsFile) -> io::Result<()> {
+    let Some(file) = file else {
+        return Ok(());
+    };
+    match previous {
+        PreviousSettingsFile::NoFile => Ok(()),
+        PreviousSettingsFile::Bytes(bytes) => write_atomic(file, bytes),
+        PreviousSettingsFile::Missing => match fs::remove_file(file) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        },
     }
 }
 
@@ -347,9 +365,7 @@ pub(super) async fn patch(
             cancel.commit()?;
 
             let settings_file = settings.store.file();
-            let previous_bytes = settings_file
-                .as_deref()
-                .and_then(|path| fs::read(path).ok());
+            let previous = snapshot_settings_file(settings_file.as_deref())?;
             // Save before invoking the backend builder so a write failure never cleans up staged
             // plugin previews on disk.
             settings
@@ -363,10 +379,13 @@ pub(super) async fn patch(
                     match builder(&updated) {
                         Ok(backend) => Some(backend),
                         Err(error) => {
-                            restore_settings_file(
-                                settings_file.as_deref(),
-                                previous_bytes.as_deref(),
-                            );
+                            if let Err(rollback_err) =
+                                restore_settings_file(settings_file.as_deref(), &previous)
+                            {
+                                let detail =
+                                    format!("{error}; settings rollback failed: {rollback_err}");
+                                return Err(error.detail(detail));
+                            }
                             return Err(error);
                         }
                     }
@@ -393,4 +412,62 @@ pub(super) async fn patch(
         })
         .await?;
     Ok(Json(response))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_settings_file_distinguishes_missing_from_io_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("settings.json");
+        assert!(matches!(
+            snapshot_settings_file(Some(&missing)).unwrap(),
+            PreviousSettingsFile::Missing
+        ));
+        assert!(matches!(
+            snapshot_settings_file(None).unwrap(),
+            PreviousSettingsFile::NoFile
+        ));
+
+        // Reading a directory (or any non-NotFound error such as PermissionDenied) must fail
+        // instead of being treated as Missing.
+        fs::create_dir(&missing).unwrap();
+        let err = snapshot_settings_file(Some(&missing))
+            .err()
+            .expect("directory read must return Io error");
+        assert_eq!(err.kind, ErrorKind::Io);
+        fs::remove_dir(&missing).unwrap();
+
+        fs::write(&missing, br#"{"appearance":"dark"}"#).unwrap();
+        match snapshot_settings_file(Some(&missing)).unwrap() {
+            PreviousSettingsFile::Bytes(bytes) => {
+                assert_eq!(bytes, br#"{"appearance":"dark"}"#);
+            }
+            _ => panic!("expected file bytes"),
+        }
+    }
+
+    #[test]
+    fn restore_settings_file_surfaces_rollback_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("settings.json");
+
+        // Replacing settings.json with a directory forces both remove_file and write_atomic to fail.
+        fs::create_dir(&target).unwrap();
+        assert!(restore_settings_file(Some(&target), &PreviousSettingsFile::Missing).is_err());
+        assert!(
+            restore_settings_file(
+                Some(&target),
+                &PreviousSettingsFile::Bytes(br#"{"appearance":"dark"}"#.to_vec())
+            )
+            .is_err()
+        );
+        fs::remove_dir(&target).unwrap();
+
+        fs::write(&target, b"temporary").unwrap();
+        restore_settings_file(Some(&target), &PreviousSettingsFile::Missing).unwrap();
+        assert!(!target.exists());
+    }
 }

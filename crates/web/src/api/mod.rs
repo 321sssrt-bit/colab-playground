@@ -84,6 +84,23 @@ pub(super) struct ErrorMessage<'a> {
     operation_id: Option<u64>,
 }
 
+impl ErrorMessage<'static> {
+    pub(super) fn localized(
+        kind: &'static str,
+        message_key: &'static str,
+        hint_key: Option<&'static str>,
+    ) -> Self {
+        Self {
+            kind,
+            message_key,
+            args: BTreeMap::new(),
+            hint_key,
+            action_key: None,
+            operation_id: None,
+        }
+    }
+}
+
 impl<'a> From<&'a Error> for ErrorMessage<'a> {
     fn from(error: &'a Error) -> Self {
         let message = errors::message(error, true);

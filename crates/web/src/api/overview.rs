@@ -151,6 +151,7 @@ pub(super) struct CliInstallView {
     id: Option<u64>,
     method: Option<InstallMethod>,
     phase: CliInstallPhase,
+    cli_installed: bool,
     cancelling: bool,
     lines: Vec<Line>,
     warning_title_key: Option<&'static str>,
@@ -168,6 +169,7 @@ impl From<CliInstallSnapshot> for CliInstallView {
             id: snapshot.id,
             method: snapshot.method,
             phase: snapshot.phase,
+            cli_installed: snapshot.phase == CliInstallPhase::Succeeded,
             cancelling: snapshot.cancelling,
             lines: snapshot.lines,
             warning_title_key: not_found.then_some(keys::INSTALL_NOT_FOUND_TITLE),
@@ -289,13 +291,25 @@ fn stream_cli_install(state: StateData, session: Session, events: CliInstallEven
             CliInstallEvent::Line(line) => Event::default().event("line").json_data(line),
             CliInstallEvent::Finished(outcome) => {
                 let not_found = outcome.phase == CliInstallPhase::NotFound;
+                let error = if not_found {
+                    // Legacy SSE clients only understand `succeeded | cancelled | failed`; emit
+                    // the localized not-found warning so they neither show "installed" nor drop
+                    // the frame before UI #87 switches to `phase === "not_found"`.
+                    Some(ErrorMessage::localized(
+                        ErrorKind::NotInstalled.as_str(),
+                        keys::INSTALL_NOT_FOUND_TITLE,
+                        Some(keys::INSTALL_NOT_FOUND_BODY),
+                    ))
+                } else {
+                    outcome.error.as_ref().map(ErrorMessage::from)
+                };
                 Event::default().event("finished").json_data(Finished {
                     status: outcome.phase.wire_status(),
                     phase: outcome.phase,
                     cli_installed: outcome.cli_installed,
                     warning_title_key: not_found.then_some(keys::INSTALL_NOT_FOUND_TITLE),
                     warning_body_key: not_found.then_some(keys::INSTALL_NOT_FOUND_BODY),
-                    error: outcome.error.as_ref().map(ErrorMessage::from),
+                    error,
                 })
             }
         };
