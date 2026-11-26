@@ -625,17 +625,304 @@ fn parse_wsl_distros(stdout: &str) -> Vec<String> {
         .collect()
 }
 
-/// Shell function for the scripts below: prints the interpreter that runs the entry script
-/// `$1`, read from its shebang, or the `python` next to it for the `#!/bin/sh` launcher that
-/// `uv` and pip write. Prints nothing when the script names none.
-const SHEBANG_PYTHON: &str = r#"shebang_python() {
-  l1=$(head -n 1 -- "$1" 2>/dev/null)
-  l2=$(sed -n 2p -- "$1" 2>/dev/null)
-  case "$l1" in
-    '#!/bin/sh'*|'#!/usr/bin/env sh'*) case "$l2" in *exec*) printf %s "$(dirname -- "$1")/python" ;; esac ;;
-    '#!'*) set -- ${l1#??}; case "$1" in */env) command -v "$2" 2>/dev/null ;; *) printf %s "$1" ;; esac ;;
-  esac
-}
+/// Shell function for the scripts below: prints the Python interpreter that runs the entry script
+/// `$1`, read from its shebang, following shell wrapper `exec` targets (bounded depth, cycle-safe)
+/// and the `uv` / pip `#!/bin/sh` sibling-`python` launcher. Never returns a shell interpreter;
+/// prints nothing when no Python interpreter can be resolved.
+const SHEBANG_PYTHON: &str = r#"shebang_python() (
+  set -f
+  IFS=$(printf ' \t\n')
+  cr=$(printf '\r')
+  tab=$(printf '\t')
+  nl='
+'
+  seen="$nl"
+  total=0
+
+  _cpg_is_python() {
+    case "$1" in
+      *.sh) return 1 ;;
+      python|python[0-9]*) return 0 ;;
+      *) return 1 ;;
+    esac
+  }
+
+  _cpg_is_shell() {
+    case "$1" in
+      sh|bash|bash[0-9]*|dash|zsh|ash|ksh|ksh[0-9]*|mksh|pdksh|yash) return 0 ;;
+      *) return 1 ;;
+    esac
+  }
+
+  _cpg_is_env_assign() {
+    case "$1" in
+      *=*)
+        local k=${1%%=*}
+        case "$k" in
+          ""|[0-9]*|*[!A-Za-z0-9_]*) return 1 ;;
+          *) return 0 ;;
+        esac
+        ;;
+      *) return 1 ;;
+    esac
+  }
+
+  _cpg_next_tok() {
+    local ws ch
+    tok=""
+    tok_quoted=0
+    ws=${rest%%[! $tab]*}
+    rest=${rest#"$ws"}
+    case "$rest" in
+      ""|'#'*|';'*|'&'*|'|'*) return 1 ;;
+    esac
+    while [ -n "$rest" ]; do
+      ch=${rest%"${rest#?}"}
+      case "$ch" in
+        ' '|"$tab"|';'|'|') break ;;
+        '&')
+          case "$tok" in
+            *'>'|*'<')
+              tok="${tok}${ch}"
+              rest=${rest#?}
+              ;;
+            *) break ;;
+          esac
+          ;;
+        "'")
+          tok_quoted=1
+          rest=${rest#?}
+          case "$rest" in
+            *\'*)
+              tok="${tok}${rest%%\'*}"
+              rest=${rest#*\'}
+              ;;
+            *) return 1 ;;
+          esac
+          ;;
+        '"')
+          tok_quoted=1
+          rest=${rest#?}
+          while [ -n "$rest" ]; do
+            ch=${rest%"${rest#?}"}
+            case "$ch" in
+              '"') rest=${rest#?}; break ;;
+              '\')
+                rest=${rest#?}
+                [ -n "$rest" ] || break
+                ch=${rest%"${rest#?}"}
+                case "$ch" in
+                  '"'|'\') tok="${tok}${ch}" ;;
+                  *) tok="${tok}\\${ch}" ;;
+                esac
+                rest=${rest#?}
+                ;;
+              *)
+                tok="${tok}${ch}"
+                rest=${rest#?}
+                ;;
+            esac
+          done
+          ;;
+        '\')
+          rest=${rest#?}
+          [ -n "$rest" ] || break
+          ch=${rest%"${rest#?}"}
+          tok="${tok}${ch}"
+          rest=${rest#?}
+          ;;
+        *)
+          tok="${tok}${ch}"
+          rest=${rest#?}
+          ;;
+      esac
+    done
+    return 0
+  }
+
+  _cpg_resolve() {
+    local cur=$1 depth=$2
+    local l1 sb interp base line ws rest tok tok_quoted polyglot dir fallback_py="" lines=0
+    [ "$depth" -lt 8 ] || return 1
+    [ "$total" -lt 32 ] || return 1
+    total=$((total + 1))
+
+    cur=$(readlink -f -- "$cur" 2>/dev/null || printf %s "$cur")
+    [ -f "$cur" ] || return 1
+    case "$seen" in
+      *"$nl$cur$nl"*) return 1 ;;
+    esac
+    seen="${seen}${cur}${nl}"
+
+    l1=""
+    IFS= read -r l1 < "$cur" 2>/dev/null || [ -n "$l1" ] || return 1
+    l1=${l1%$cr}
+    case "$l1" in
+      '#!'*) ;;
+      *) return 1 ;;
+    esac
+
+    sb=${l1#??}
+    set -- $sb
+    interp=${1-}
+    [ -n "$interp" ] || return 1
+    case "$interp" in
+      env|*/env)
+        shift
+        while [ "$#" -gt 0 ]; do
+          case "$1" in
+            --) shift; break ;;
+            -u|--unset|-C|--chdir) shift; [ "$#" -gt 0 ] && shift ;;
+            -*) shift ;;
+            *=*) shift ;;
+            *) break ;;
+          esac
+        done
+        interp=${1-}
+        [ -n "$interp" ] || return 1
+        case "$interp" in
+          */*) ;;
+          *) interp=$(command -v -- "$interp" 2>/dev/null) ;;
+        esac
+        ;;
+    esac
+    [ -n "$interp" ] || return 1
+
+    base=${interp##*/}
+    if _cpg_is_python "$base"; then
+      printf %s "$interp"
+      return 0
+    fi
+    _cpg_is_shell "$base" || return 1
+
+    while IFS= read -r line || [ -n "$line" ]; do
+      lines=$((lines + 1))
+      [ "$lines" -eq 1 ] && continue
+      [ "$lines" -gt 200 ] && break
+      line=${line%$cr}
+      ws=${line%%[! $tab]*}
+      rest=${line#"$ws"}
+      case "$rest" in
+        ""|'#'*) continue ;;
+        *exec*) ;;
+        *) continue ;;
+      esac
+
+      polyglot=0
+      case "$rest" in
+        "'''exec'"*) polyglot=1 ;;
+      esac
+
+      while _cpg_next_tok; do
+        if [ "$tok" = "exec" ]; then
+          break
+        fi
+        if _cpg_is_env_assign "$tok"; then
+          continue
+        fi
+        tok=""
+        break
+      done
+      [ "$tok" = "exec" ] || continue
+
+      if [ "$lines" -eq 2 ] && [ "$base" = "sh" ]; then
+        dir=$(dirname -- "$cur")
+        if [ -x "$dir/python" ]; then
+          printf %s "$dir/python"
+          return 0
+        fi
+      fi
+
+      while _cpg_next_tok; do
+        if [ "$tok_quoted" = 0 ]; then
+          case "$tok" in
+            --) _cpg_next_tok || tok=""; break ;;
+            -a) _cpg_next_tok || { tok=""; break; } ;;
+            -*) ;;
+            *'<'*|*'>'*)
+              case "$tok" in
+                *'<'|*'>') _cpg_next_tok || { tok=""; break; } ;;
+              esac
+              ;;
+            *) break ;;
+          esac
+        else
+          break
+        fi
+      done
+      [ -n "$tok" ] || continue
+
+      case "$tok" in
+        env|*/env)
+          while _cpg_next_tok; do
+            case "$tok" in
+              --) _cpg_next_tok || tok=""; break ;;
+              -u|--unset|-C|--chdir) _cpg_next_tok || { tok=""; break; } ;;
+              -*) [ "$tok_quoted" = 0 ] || break ;;
+              *=*) _cpg_is_env_assign "$tok" || break ;;
+              *) break ;;
+            esac
+          done
+          ;;
+      esac
+      [ -n "$tok" ] || continue
+
+      if [ -n "${HOME-}" ]; then
+        if [ "$tok_quoted" = 0 ]; then
+          case "$tok" in '~/'*) tok="$HOME/${tok#\~/}" ;; esac
+        fi
+        case "$tok" in
+          '$HOME/'*) tok="$HOME/${tok#\$HOME/}" ;;
+          '${HOME}/'*) tok="$HOME/${tok#\$\{HOME\}/}" ;;
+        esac
+      fi
+
+      case "$tok" in
+        *'$'*|*'`'*)
+          case "$polyglot:$line" in
+            1:*|*:*/python*)
+              dir=$(dirname -- "$cur")
+              if [ -x "$dir/python" ]; then
+                printf %s "$dir/python"
+                return 0
+              fi
+              ;;
+          esac
+          continue
+          ;;
+      esac
+
+      case "$tok" in
+        */*) ;;
+        *)
+          tok=$(command -v -- "$tok" 2>/dev/null) || continue
+          case "$tok" in */*) ;; *) continue ;; esac
+          ;;
+      esac
+
+      if _cpg_is_python "${tok##*/}"; then
+        if [ -x "$tok" ]; then
+          printf %s "$tok"
+          return 0
+        fi
+        [ -z "$fallback_py" ] && fallback_py=$tok
+        continue
+      fi
+
+      if _cpg_resolve "$tok" $((depth + 1)); then
+        return 0
+      fi
+    done < "$cur"
+
+    if [ -n "$fallback_py" ]; then
+      printf %s "$fallback_py"
+      return 0
+    fi
+    return 1
+  }
+
+  _cpg_resolve "$1" 0 || true
+)
 "#;
 
 fn with_shebang_python(script: &str) -> String {
@@ -1730,5 +2017,355 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.is(ErrorKind::Timeout));
+    }
+
+    #[cfg(unix)]
+    fn write_exec(path: &std::path::Path, content: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, content).unwrap();
+        make_executable(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn run_shebang_python(
+        script_path: &std::path::Path,
+        path_prefix: Option<&std::path::Path>,
+    ) -> String {
+        let body = match path_prefix {
+            Some(_) => format!(
+                "PATH=\"$2:$PATH\"\n{}",
+                with_shebang_python("shebang_python \"$1\"")
+            ),
+            None => with_shebang_python("shebang_python \"$1\""),
+        };
+        let mut req = ScriptRequest::new(body)
+            .arg(script_path.to_string_lossy().to_string())
+            .timeout(Duration::from_secs(20));
+        if let Some(prefix) = path_prefix {
+            req = req.arg(prefix.to_string_lossy().to_string());
+        }
+        Host::Local
+            .run_quiet(req, &CancelToken::new())
+            .unwrap()
+            .stdout
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shebang_python_follows_multiline_bash_wrappers_and_probe_checks_keyring() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+
+        let venv_python = root.join("venv/bin/python3");
+        write_exec(
+            &venv_python,
+            "#!/bin/sh\nif [ \"$1\" = \"-c\" ] && [ \"$2\" = \"import keyring\" ]; then exit 0; fi\necho 'Version: 0.8.0-fake'\n",
+        );
+        let venv_colab = root.join("venv/bin/colab");
+        write_exec(&venv_colab, &format!("#!{}\n", venv_python.display()));
+
+        // Multi-line `#!/usr/bin/env bash` wrapper with umask, export, comments, and FD redirect.
+        let wrapper_bin = root.join("bin");
+        let env_bash_wrapper = wrapper_bin.join("colab");
+        write_exec(
+            &env_bash_wrapper,
+            &format!(
+                "#!/usr/bin/env bash\n\
+                 set -euo pipefail\n\
+                 umask 077\n\
+                 # exec /wrong/comment\n\
+                 export COLAB_NOTE=\"exec /wrong/export\"\n\
+                 exec 2>&1\n\
+                 exec {} \"$@\"\n",
+                venv_colab.display()
+            ),
+        );
+
+        let expected = venv_python.to_string_lossy().to_string();
+        assert_eq!(run_shebang_python(&env_bash_wrapper, None), expected);
+
+        let resolved = Toolchain::from_colab_path(env_bash_wrapper.to_string_lossy().to_string())
+            .resolve(&Host::Local, &[], &CancelToken::new())
+            .unwrap();
+        assert_eq!(resolved.helper_python, expected);
+
+        // Run PROBE_SCRIPT with isolated PATH and HOME so no host `colab` is touched.
+        let fake_home = root.join("home");
+        std::fs::create_dir_all(&fake_home).unwrap();
+        let probe_req = ScriptRequest::new(format!(
+            "PATH=\"$1:$PATH\"\n{}",
+            with_shebang_python(PROBE_SCRIPT)
+        ))
+        .arg(wrapper_bin.to_string_lossy().to_string())
+        .env("HOME", fake_home.to_string_lossy().to_string())
+        .timeout(Duration::from_secs(20));
+        let out = Host::Local
+            .run_quiet(probe_req, &CancelToken::new())
+            .unwrap();
+        let mut report = ProbeReport::default();
+        report.apply_probe_output(&out.stdout);
+        assert_eq!(report.helper_python.as_deref(), Some(expected.as_str()));
+        assert!(report.keyring_ok);
+        assert_eq!(report.colab_version.as_deref(), Some("0.8.0-fake"));
+
+        // Quoted paths with spaces, exec flags, env prefix, multi-hop chain, and direct python exec.
+        let spaced_colab = root.join("dir with spaces/venv/bin/colab");
+        write_exec(&spaced_colab, &format!("#!{}\n", venv_python.display()));
+
+        let double_quoted = root.join("wrap_dq");
+        write_exec(
+            &double_quoted,
+            &format!(
+                "#!/bin/bash\nexport FOO=1\nexec \"{}\" \"$@\"",
+                spaced_colab.display()
+            ),
+        );
+        assert_eq!(run_shebang_python(&double_quoted, None), expected);
+
+        let single_quoted = root.join("wrap_sq");
+        write_exec(
+            &single_quoted,
+            &format!(
+                "#!/bin/bash\nexec -a colab -- '{}' \"$@\"\n",
+                spaced_colab.display()
+            ),
+        );
+        assert_eq!(run_shebang_python(&single_quoted, None), expected);
+
+        let via_env = root.join("wrap_env");
+        write_exec(
+            &via_env,
+            &format!(
+                "#!/usr/bin/env bash\nFOO=\"a b\" exec /usr/bin/env BAR=\"c d\" \"{}\" \"$@\"\n",
+                spaced_colab.display()
+            ),
+        );
+        assert_eq!(run_shebang_python(&via_env, None), expected);
+
+        let hop1 = root.join("hop1");
+        write_exec(
+            &hop1,
+            &format!("#!/bin/sh\nexec {} \"$@\"\n", double_quoted.display()),
+        );
+        assert_eq!(run_shebang_python(&hop1, None), expected);
+
+        let direct_py_exec = root.join("wrap_direct_py");
+        write_exec(
+            &direct_py_exec,
+            &format!(
+                "#!/usr/bin/env bash\numask 077\nexec {} -m colab_cli \"$@\"\n",
+                venv_python.display()
+            ),
+        );
+        assert_eq!(run_shebang_python(&direct_py_exec, None), expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shebang_python_preserves_direct_python_and_uv_pip_launchers() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+
+        let py_dir = root.join("pybin");
+        let fake_py3 = py_dir.join("python3");
+        write_exec(&fake_py3, "#!/bin/sh\nexit 0\n");
+
+        let direct_abs = root.join("direct_abs");
+        write_exec(&direct_abs, &format!("#!{}\n", fake_py3.display()));
+        assert_eq!(
+            run_shebang_python(&direct_abs, None),
+            fake_py3.to_string_lossy()
+        );
+
+        let direct_env = root.join("direct_env");
+        write_exec(&direct_env, "#!/usr/bin/env python3\n");
+        assert_eq!(
+            run_shebang_python(&direct_env, Some(&py_dir)),
+            fake_py3.to_string_lossy()
+        );
+
+        let direct_env_s = root.join("direct_env_s");
+        write_exec(&direct_env_s, "#!/usr/bin/env -S python3 -u\n");
+        assert_eq!(
+            run_shebang_python(&direct_env_s, Some(&py_dir)),
+            fake_py3.to_string_lossy()
+        );
+
+        // Relocatable uv/pip `#!/bin/sh` launcher with sibling `python`.
+        let uv_dir = root.join("uv_venv/bin");
+        let uv_py = uv_dir.join("python");
+        write_exec(&uv_py, "#!/bin/sh\nexit 0\n");
+        let uv_colab = uv_dir.join("colab");
+        write_exec(
+            &uv_colab,
+            "#!/bin/sh\n'''exec' \"$(dirname -- \"$(realpath -- \"$0\")\")/python\" \"$0\" \"$@\"\n' '''\n",
+        );
+        assert_eq!(run_shebang_python(&uv_colab, None), uv_py.to_string_lossy());
+
+        // `#!/usr/bin/env sh` launcher with sibling `python`.
+        let env_sh_colab = uv_dir.join("colab_env_sh");
+        write_exec(
+            &env_sh_colab,
+            "#!/usr/bin/env sh\nexec \"$(dirname -- \"$0\")/python\" \"$0\" \"$@\"\n",
+        );
+        assert_eq!(
+            run_shebang_python(&env_sh_colab, None),
+            uv_py.to_string_lossy()
+        );
+
+        // Literal-path pip/uv launcher pointing to a path with spaces.
+        let spaced_py = root.join("my venv/bin/python3");
+        write_exec(&spaced_py, "#!/bin/sh\nexit 0\n");
+        let pip_literal = root.join("pip_literal");
+        write_exec(
+            &pip_literal,
+            &format!(
+                "#!/bin/sh\n'''exec' '{}' \"$0\" \"$@\"\n' '''\n",
+                spaced_py.display()
+            ),
+        );
+        assert_eq!(
+            run_shebang_python(&pip_literal, None),
+            spaced_py.to_string_lossy()
+        );
+
+        // Bash wrapper forwarding to a uv/pip `#!/bin/sh` launcher.
+        let bash_to_uv = root.join("bash_to_uv");
+        write_exec(
+            &bash_to_uv,
+            &format!("#!/usr/bin/env bash\nexec {} \"$@\"\n", uv_colab.display()),
+        );
+        assert_eq!(
+            run_shebang_python(&bash_to_uv, None),
+            uv_py.to_string_lossy()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shebang_python_rejects_non_python_shell_wrappers_and_cycles() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+
+        // Wrapper with no exec must return empty (never bash/sh).
+        let no_exec_dir = root.join("no_exec_bin");
+        let no_exec = no_exec_dir.join("colab");
+        write_exec(&no_exec, "#!/usr/bin/env bash\necho 'Version: 0.0.0'\n");
+        assert_eq!(run_shebang_python(&no_exec, None), "");
+
+        let err = Toolchain::from_colab_path(no_exec.to_string_lossy().to_string())
+            .resolve(&Host::Local, &[], &CancelToken::new())
+            .unwrap_err();
+        assert_eq!(err.param("reason"), Some("no_python_shebang"));
+
+        // PROBE_SCRIPT must report helper_python = None and keyring_ok = false.
+        let fake_home = root.join("home");
+        std::fs::create_dir_all(&fake_home).unwrap();
+        let probe_req = ScriptRequest::new(format!(
+            "PATH=\"$1:$PATH\"\n{}",
+            with_shebang_python(PROBE_SCRIPT)
+        ))
+        .arg(no_exec_dir.to_string_lossy().to_string())
+        .env("HOME", fake_home.to_string_lossy().to_string())
+        .timeout(Duration::from_secs(20));
+        let out = Host::Local
+            .run_quiet(probe_req, &CancelToken::new())
+            .unwrap();
+        let mut report = ProbeReport::default();
+        report.apply_probe_output(&out.stdout);
+        assert_eq!(report.helper_python, None);
+        assert!(!report.keyring_ok);
+
+        // Bash wrapper exec'ing a non-Python script must return empty, even if sibling python exists.
+        let mixed_dir = root.join("mixed");
+        write_exec(&mixed_dir.join("python"), "#!/bin/sh\nexit 0\n");
+        let non_py_target = root.join("tool");
+        write_exec(&non_py_target, "#!/usr/bin/env node\n");
+        let exec_non_py = mixed_dir.join("colab");
+        write_exec(
+            &exec_non_py,
+            &format!("#!/bin/bash\nexec {} \"$@\"\n", non_py_target.display()),
+        );
+        assert_eq!(run_shebang_python(&exec_non_py, None), "");
+
+        // `#!/bin/sh` wrapper exec'ing a non-Python script (no sibling python) must return empty.
+        let sh_non_py = root.join("sh_non_py/colab");
+        write_exec(
+            &sh_non_py,
+            &format!("#!/bin/sh\nexec {} \"$@\"\n", non_py_target.display()),
+        );
+        assert_eq!(run_shebang_python(&sh_non_py, None), "");
+
+        // Dynamic uv/pip launcher without sibling `python` returns empty.
+        let orphan_uv = root.join("orphan_uv/colab");
+        write_exec(
+            &orphan_uv,
+            "#!/bin/sh\n'''exec' \"$(dirname -- \"$0\")/python\" \"$0\" \"$@\"\n' '''\n",
+        );
+        assert_eq!(run_shebang_python(&orphan_uv, None), "");
+
+        // Self-loop wrapper must terminate and return empty.
+        let self_loop = root.join("self_loop");
+        write_exec(
+            &self_loop,
+            &format!("#!/usr/bin/env bash\nexec {} \"$@\"\n", self_loop.display()),
+        );
+        assert_eq!(run_shebang_python(&self_loop, None), "");
+        let err = Toolchain::from_colab_path(self_loop.to_string_lossy().to_string())
+            .resolve(&Host::Local, &[], &CancelToken::new())
+            .unwrap_err();
+        assert_eq!(err.param("reason"), Some("no_python_shebang"));
+
+        // Two-hop cycle must terminate and return empty.
+        let cyc_a = root.join("cyc_a");
+        let cyc_b = root.join("cyc_b");
+        write_exec(
+            &cyc_a,
+            &format!("#!/bin/bash\nexec {} \"$@\"\n", cyc_b.display()),
+        );
+        write_exec(
+            &cyc_b,
+            &format!("#!/bin/bash\nexec {} \"$@\"\n", cyc_a.display()),
+        );
+        assert_eq!(run_shebang_python(&cyc_a, None), "");
+
+        // Chain exceeding hop depth limit (8) stops and returns empty.
+        let deep_py = root.join("deep/python3");
+        write_exec(&deep_py, "#!/bin/sh\nexit 0\n");
+        let deep_target = root.join("deep/colab");
+        write_exec(&deep_target, &format!("#!{}\n", deep_py.display()));
+        let mut next = deep_target;
+        for i in (0..10).rev() {
+            let link = root.join(format!("deep/w{i}"));
+            write_exec(
+                &link,
+                &format!("#!/bin/bash\nexec {} \"$@\"\n", next.display()),
+            );
+            next = link;
+        }
+        assert_eq!(run_shebang_python(&next, None), "");
+
+        // Wrapper pointing to a Python script with a missing interpreter reports `interpreter_missing`.
+        let missing_py = root.join("gone/python3");
+        let broken_entry = root.join("broken_entry");
+        write_exec(&broken_entry, &format!("#!{}\n", missing_py.display()));
+        let wrap_broken = root.join("wrap_broken");
+        write_exec(
+            &wrap_broken,
+            &format!(
+                "#!/usr/bin/env bash\nexec {} \"$@\"\n",
+                broken_entry.display()
+            ),
+        );
+        let err = Toolchain::from_colab_path(wrap_broken.to_string_lossy().to_string())
+            .resolve(&Host::Local, &[], &CancelToken::new())
+            .unwrap_err();
+        assert_eq!(err.param("reason"), Some("interpreter_missing"));
+        assert_eq!(
+            err.param("interpreter"),
+            Some(missing_py.to_string_lossy().as_ref())
+        );
     }
 }
