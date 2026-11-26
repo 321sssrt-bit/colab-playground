@@ -25,19 +25,6 @@ pub enum CliInstallPhase {
 }
 
 impl CliInstallPhase {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Idle => "idle",
-            Self::Running => "running",
-            Self::Checking => "checking",
-            Self::Succeeded => "succeeded",
-            Self::NotFound => "not_found",
-            Self::ProbeFailed => "probe_failed",
-            Self::Cancelled => "cancelled",
-            Self::Failed => "failed",
-        }
-    }
-
     /// Legacy SSE `finished.status` value (`succeeded | cancelled | failed`) for wire compatibility.
     pub fn wire_status(self) -> &'static str {
         match self {
