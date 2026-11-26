@@ -32,7 +32,7 @@ use tokio::{
 
 pub use accounts::{AccountSwitchApproval, AccountSwitchPreview};
 pub use forwards::ForwardPolicy;
-pub use login::LoginPrompt;
+pub use login::{CancelLoginOutcome, LoginPrompt, SubmitCancelOutcome, SubmitCancelSettlement};
 pub use shutdown::{Billing, ShutdownReport};
 
 const LOGIN_INACTIVITY: Duration = Duration::from_secs(5 * 60);
@@ -80,6 +80,8 @@ pub struct Snapshot {
     pub account: AccountContext,
     pub accounts: Option<AccountsView>,
     pub accounts_error: Option<ErrorKind>,
+    #[serde(skip)]
+    recovered_pending_add_latched: bool,
     pub runtimes: Option<RuntimesView>,
     pub runtimes_error: Option<ErrorKind>,
     pub tunnels: Vec<TunnelInfo>,
@@ -124,6 +126,7 @@ struct Control {
     next_id: u64,
     running: BTreeMap<u64, Running>,
     login: Option<login::PendingLogin>,
+    login_job: Option<login::ActiveLoginJob>,
     shutting_down: bool,
     uncertain_cleanup: bool,
 }
@@ -152,17 +155,42 @@ struct Job {
     state: WebState,
     id: u64,
     cancel: CancelToken,
+    finished: bool,
 }
 
-impl Drop for Job {
-    fn drop(&mut self) {
-        let mut control = self.state.lock();
+impl Job {
+    fn finish_locked(&mut self, control: &mut Control) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.release_locked(control);
+    }
+
+    fn release_locked(&self, control: &mut Control) {
         let running = control.running.remove(&self.id).expect("reserved job");
-        self.state.publish_operations(&control);
+        if control
+            .login_job
+            .as_ref()
+            .is_some_and(|active| active.job_id == self.id)
+        {
+            control.login_job = None;
+        }
+        self.state.publish_operations(control);
         if running.operation.is_some() {
             self.state.0.refresh.notify_one();
         }
         self.state.0.drained.notify_waiters();
+    }
+}
+
+impl Drop for Job {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let mut control = self.state.lock();
+        self.release_locked(&mut control);
     }
 }
 
@@ -199,6 +227,7 @@ impl WebState {
             },
             accounts: None,
             accounts_error: None,
+            recovered_pending_add_latched: false,
             runtimes: None,
             runtimes_error: None,
             tunnels: Vec::new(),
@@ -485,6 +514,10 @@ impl WebState {
         let now = self.0.backend.now();
         self.update(|snapshot| match result {
             Ok(mut view) => {
+                if view.recovered_pending_add {
+                    snapshot.recovered_pending_add_latched = true;
+                }
+                view.recovered_pending_add = snapshot.recovered_pending_add_latched;
                 let usage = view
                     .accounts
                     .iter_mut()
@@ -561,6 +594,7 @@ impl WebState {
             state: self.clone(),
             id,
             cancel,
+            finished: false,
         }
     }
 

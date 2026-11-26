@@ -36,6 +36,19 @@ impl WebState {
         self.snapshot()
     }
 
+    pub fn dismiss_recovered_pending_add(&self) {
+        self.update(|snapshot| {
+            if !snapshot.recovered_pending_add_latched {
+                return false;
+            }
+            snapshot.recovered_pending_add_latched = false;
+            if let Some(accounts) = &mut snapshot.accounts {
+                accounts.recovered_pending_add = false;
+            }
+            true
+        });
+    }
+
     pub async fn refresh_accounts(&self) -> Result<Arc<Snapshot>> {
         let state = self.clone();
         self.backend_job(Slot::Shared, move |backend, cancel| {
