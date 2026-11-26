@@ -51,9 +51,9 @@ export function ProvisioningCard({
 
   const events =
     trackedProvision && trackedProvision.operationId === operationId ? trackedProvision.events : [];
-  const waitingSinceMs =
+  const waitingSinceSecs =
     trackedProvision && trackedProvision.operationId === operationId
-      ? trackedProvision.waitingSinceMs
+      ? trackedProvision.waitingSinceSecs
       : null;
   const reconnecting =
     trackedProvision !== null &&
@@ -91,7 +91,7 @@ export function ProvisioningCard({
       <ProvisionProgress
         events={events}
         live={true}
-        waitingSinceMs={waitingSinceMs}
+        waitingSinceSecs={waitingSinceSecs}
         locale={locale}
         t={t}
       />

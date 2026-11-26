@@ -1,159 +1,45 @@
 /**
- * Reusable provisioning progress parser, formatter, and step list renderer,
- * shared by `NewSessionDialog`, `ProvisioningCard`, and future plugin new-session runs.
+ * Reusable provisioning progress renderer, backed by pure formatting and
+ * server-clock timing helpers in `provision.ts`.
  */
 
-import { useEffect, useState } from "react";
-
 import { CheckCircleIcon } from "../../components/Icons.tsx";
+import { useServerClockSecs } from "../../lib/clock.ts";
 import { formatDuration } from "../../lib/format.ts";
 import type { TranslateFn } from "../../lib/i18n.ts";
-import type { Locale } from "../../lib/types.ts";
-import type { ProvisionFinishedEvent, ProvisionProgressEvent } from "./api.ts";
-import { formatErrorMessage, formatHardware, formatShortWait, formatVram } from "./format.ts";
+import type { Locale, UnixSecs } from "../../lib/types.ts";
+import type { ProvisionProgressEvent } from "./api.ts";
 import { AlertTriangleIcon, CircleXIcon, DotIcon, SmallInfoIcon } from "./Icons.tsx";
+import {
+  computeUnansweredForSecs,
+  formatProvisionHeadline,
+  formatProvisionSentence,
+  hasProvisionLines,
+  parseFinishedEvent,
+  parseProvisionEvent,
+  SLOW_ANSWER_SECS,
+  type ProvisionSentence,
+} from "./provision.ts";
 
-const SLOW_ANSWER_MS = 60_000;
+export {
+  computeUnansweredForSecs,
+  formatProvisionHeadline,
+  formatProvisionSentence,
+  hasProvisionLines,
+  parseFinishedEvent,
+  parseProvisionEvent,
+  SLOW_ANSWER_SECS,
+  type ProvisionSentence,
+};
+
 const SLOW_ANSWER_POLL_MS = 15_000;
 const MS_PER_SECOND = 1000;
-
-export interface ProvisionSentence {
-  readonly text: string;
-  readonly tone: "busy" | "good" | "warn" | "bad" | "neutral";
-}
-
-export function parseProvisionEvent(raw: string): ProvisionProgressEvent | null {
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    if (typeof parsed === "object" && parsed !== null && "event" in parsed) {
-      return parsed as ProvisionProgressEvent;
-    }
-  } catch {
-    // Ignore malformed SSE event frames.
-  }
-  return null;
-}
-
-export function parseFinishedEvent(raw: string): ProvisionFinishedEvent | null {
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    if (typeof parsed === "object" && parsed !== null && "phase" in parsed) {
-      return parsed as ProvisionFinishedEvent;
-    }
-  } catch {
-    // Ignore malformed SSE finished frames.
-  }
-  return null;
-}
-
-export function formatProvisionSentence(
-  ev: ProvisionProgressEvent,
-  completed: boolean,
-  locale: Locale,
-  t: TranslateFn,
-): ProvisionSentence | null {
-  const hw = (gpu: string | null, vramMib: number | null) =>
-    formatHardware(gpu, vramMib, locale, t) ?? t("app.b2.prov_no_gpu");
-
-  switch (ev.event) {
-    case "allocating":
-      return {
-        text: t(completed ? "app.b3.prov_allocated" : "app.b2.prov_allocating", {
-          n: ev.attempt,
-          of: ev.max_attempts,
-        }),
-        tone: "busy",
-      };
-    case "allocated":
-    case "failed":
-      return null;
-    case "allocation_failed":
-      return {
-        text: t("app.b2.prov_allocation_failed", {
-          why: formatErrorMessage(ev.error, t).message,
-        }),
-        tone: "warn",
-      };
-    case "probed":
-      return {
-        text: t("app.b2.prov_probed", { hardware: hw(ev.gpu, ev.vram_mib) }),
-        tone: "neutral",
-      };
-    case "rejected":
-      return {
-        text: t("app.b2.prov_rejected", {
-          got: ev.vram_mib !== null ? formatVram(ev.vram_mib, locale, t) : t("app.summary.unknown"),
-          min: formatVram(ev.min_vram_mib, locale, t),
-        }),
-        tone: "warn",
-      };
-    case "releasing":
-      return {
-        text: t(completed ? "app.b3.prov_released" : "app.b2.prov_releasing"),
-        tone: "busy",
-      };
-    case "reconciling":
-      return {
-        text: t(completed ? "app.b11.prov_reconciled" : "app.b11.prov_reconciling"),
-        tone: "busy",
-      };
-    case "orphan_detected":
-      return ev.released
-        ? { text: t("app.b2.prov_orphan_released"), tone: "neutral" }
-        : { text: t("app.b2.prov_orphan_left"), tone: "bad" };
-    case "retrying":
-      return {
-        text: t(completed ? "app.b3.prov_retried" : "app.b2.prov_retrying", {
-          time: formatShortWait(ev.delay_secs, t),
-        }),
-        tone: "busy",
-      };
-    case "watchdog_started":
-      return {
-        text: t(ev.deadline !== null ? "app.b2.prov_watchdog" : "app.b2.prov_watchdog_no_deadline"),
-        tone: "good",
-      };
-    case "watchdog_failed":
-      return { text: t("app.b2.prov_watchdog_failed"), tone: "bad" };
-    case "ready":
-      return {
-        text: t(ev.below_spec ? "app.b2.prov_ready_below" : "app.b2.prov_ready", {
-          hardware: hw(ev.gpu, ev.vram_mib),
-        }),
-        tone: ev.below_spec ? "warn" : "good",
-      };
-    default:
-      return null;
-  }
-}
-
-export function formatProvisionHeadline(
-  events: readonly ProvisionProgressEvent[],
-  t: TranslateFn,
-): string {
-  for (let i = events.length - 1; i >= 0; i -= 1) {
-    const ev = events[i];
-    if (ev.event === "allocating") {
-      return t("app.b2.prov_attempt", { n: ev.attempt, of: ev.max_attempts });
-    }
-    if (ev.event === "reconciling") {
-      return t("app.b11.prov_reconciling");
-    }
-  }
-  return t("app.b2.prov_starting");
-}
-
-export function hasProvisionLines(
-  events: readonly ProvisionProgressEvent[],
-  locale: Locale,
-  t: TranslateFn,
-): boolean {
-  return events.some((ev) => formatProvisionSentence(ev, true, locale, t) !== null);
-}
 
 export interface ProvisionProgressProps {
   readonly events: readonly ProvisionProgressEvent[];
   readonly live: boolean;
+  readonly waitingSinceSecs?: UnixSecs | null;
+  /** Legacy fallback for callers not yet passing server-anchored seconds. */
   readonly waitingSinceMs?: number | null;
   readonly locale: Locale;
   readonly t: TranslateFn;
@@ -162,36 +48,31 @@ export interface ProvisionProgressProps {
 export function ProvisionProgress({
   events,
   live,
+  waitingSinceSecs = null,
   waitingSinceMs = null,
   locale,
   t,
 }: ProvisionProgressProps) {
-  const [nowMs, setNowMs] = useState<number>(() => Date.now());
+  const nowSecs = useServerClockSecs(SLOW_ANSWER_POLL_MS);
 
   const lastEvent = events.length > 0 ? events[events.length - 1] : null;
-  const isAllocating = live && lastEvent?.event === "allocating" && waitingSinceMs !== null;
-
-  useEffect(() => {
-    if (!isAllocating) {
-      return;
-    }
-    setNowMs(Date.now());
-    const timer = window.setInterval(() => {
-      setNowMs(Date.now());
-    }, SLOW_ANSWER_POLL_MS);
-    return () => {
-      window.clearInterval(timer);
-    };
-  }, [isAllocating, waitingSinceMs]);
+  const effectiveSinceSecs =
+    waitingSinceSecs !== null
+      ? waitingSinceSecs
+      : waitingSinceMs !== null && Number.isFinite(waitingSinceMs)
+        ? Math.floor(waitingSinceMs / MS_PER_SECOND)
+        : null;
+  const unansweredSecs = live
+    ? computeUnansweredForSecs(events, effectiveSinceSecs, nowSecs)
+    : null;
 
   const visibleEvents = events.filter(
     (ev) => formatProvisionSentence(ev, true, locale, t) !== null,
   );
   // Server emits `allocated` once Colab answers `allocating`, so only a trailing `allocating` is waiting.
   const allocatingAnswered = lastEvent !== null && lastEvent.event === "allocated";
-  const waitedMs = isAllocating && waitingSinceMs !== null ? Math.max(0, nowMs - waitingSinceMs) : 0;
 
-  if (visibleEvents.length === 0 && !(isAllocating && waitedMs >= SLOW_ANSWER_MS)) {
+  if (visibleEvents.length === 0 && unansweredSecs === null) {
     return null;
   }
 
@@ -245,12 +126,12 @@ export function ProvisionProgress({
         </div>
       )}
 
-      {isAllocating && waitedMs >= SLOW_ANSWER_MS && (
+      {unansweredSecs !== null && (
         <div className="inline-msg inline-msg-info" role="status" data-provision-no-answer="true">
           <SmallInfoIcon className="icon-xs icon-info" />
           <span className="inline-msg-text">
             {t("app.b11.prov_no_answer", {
-              time: formatDuration(Math.floor(waitedMs / MS_PER_SECOND), t),
+              time: formatDuration(unansweredSecs, t),
             })}
           </span>
         </div>

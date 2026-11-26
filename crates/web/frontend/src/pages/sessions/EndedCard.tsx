@@ -3,10 +3,9 @@
  */
 
 import type { TranslateFn } from "../../lib/i18n.ts";
-import type { Locale } from "../../lib/types.ts";
-import { formatConcern, formatEmail, runtimeKey } from "./format.ts";
+import type { EndedRuntime, Locale } from "../../lib/types.ts";
+import { endedRuntimeRowKey, formatConcern, formatEmail } from "./format.ts";
 import { CircleStopIcon, ShieldIcon, SquareIcon } from "./Icons.tsx";
-import type { EndedRuntime } from "./store.ts";
 
 export interface EndedCardProps {
   readonly items: readonly EndedRuntime[];
@@ -35,7 +34,7 @@ export function EndedCard({ items, locale, t, onClear }: EndedCardProps) {
       </div>
 
       <div className="ended-list">
-        {items.map((item) => {
+        {items.map((item, index) => {
           const email = formatEmail(item.email, t);
           const why =
             item.reason.kind === "guard"
@@ -45,7 +44,7 @@ export function EndedCard({ items, locale, t, onClear }: EndedCardProps) {
                 : t("app.b2.ended_user");
 
           return (
-            <div className="ended-row" key={`${runtimeKey(item.runtime)}-${item.label}`}>
+            <div className="ended-row" key={endedRuntimeRowKey(item, index)}>
               <span className="ended-icon">
                 {item.reason.kind === "guard" ? (
                   <ShieldIcon className="icon-danger" />

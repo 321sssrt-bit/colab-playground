@@ -3,17 +3,20 @@
  */
 
 import { ApiError } from "../../lib/api.ts";
+import { isCliInstalledFromSnapshot } from "../../lib/appCache.ts";
 import { formatCu, formatDuration } from "../../lib/format.ts";
 import type { I18nParams, TranslateFn } from "../../lib/i18n.ts";
 import type {
   ApiErrorPayload,
   Concern,
   CoreError,
+  EndedRuntime,
   ErrorKind,
   Limit,
   Locale,
   Runtime,
   RuntimeRef,
+  Snapshot,
 } from "../../lib/types.ts";
 
 const MIB_PER_GIB = 1024;
@@ -106,6 +109,140 @@ export function runtimeKey(ref: RuntimeRef | null | undefined): string {
     return "";
   }
   return `${ref.account}/${ref.endpoint || ""}`;
+}
+
+/**
+ * Mirrors upstream `AppState::cli_installed() && AppState::has_saved_accounts()`:
+ * returns false whenever the snapshot is missing, CLI is absent, the OS keyring is
+ * unavailable, accounts have not loaded (`accounts === null`), or zero accounts exist.
+ */
+export function isSessionsEnvironmentReady(
+  snapshot: Snapshot | null,
+  overviewCliInstalled: boolean | null = null,
+): boolean {
+  if (snapshot === null) {
+    return false;
+  }
+  const liveCli = isCliInstalledFromSnapshot(snapshot);
+  const cliReady =
+    liveCli !== null
+      ? liveCli
+      : overviewCliInstalled !== null
+        ? overviewCliInstalled
+        : true;
+  if (!cliReady) {
+    return false;
+  }
+  if (snapshot.accounts_error === "keyring_unavailable" || snapshot.accounts === null) {
+    return false;
+  }
+  return snapshot.accounts.accounts.length > 0;
+}
+
+const ENDED_DISPLAY_LIMIT = 20;
+
+/**
+ * Mirrors backend `same_runtime` (`crates/web/src/state/sessions.rs`): uses non-empty
+ * `endpoint` first, falls back to session `name` when `endpoint` is empty, and finally
+ * falls back to `label` + timestamp so empty-endpoint records never collapse onto each other.
+ */
+export function endedRuntimeIdentityKey(item: EndedRuntime): string {
+  const { account, endpoint, name } = item.runtime;
+  if (endpoint.length > 0) {
+    return `${account}/ep:${endpoint}`;
+  }
+  if (name && name.length > 0) {
+    return `${account}/name:${name}`;
+  }
+  const timestamp = item.at !== null ? String(item.at) : "na";
+  return `${account}/label:${item.label}/${timestamp}`;
+}
+
+export function endedRuntimeClearedSignature(item: EndedRuntime): string {
+  const identity = endedRuntimeIdentityKey(item);
+  const at = item.at !== null ? String(item.at) : "na";
+  return `${identity}@${item.reason.kind}@${at}`;
+}
+
+/**
+ * Merges authoritative `snapshot.ended` entries with local `guardStore.ended` entries
+ * using `endedRuntimeIdentityKey` so records with empty `endpoint` and distinct `name`
+ * survive intact even when upstream `guardRuntimeKey` collapses them or the 20-entry cap
+ * is reached. Entries are ordered newest-first (fresh local stops with `at === null`
+ * ahead of timestamped entries, then descending `at`, preserving backend order on ties).
+ */
+export function mergeEndedRuntimes(
+  snapshotEnded: readonly EndedRuntime[] | null | undefined,
+  guardEnded: readonly EndedRuntime[],
+  clearedSignatures: ReadonlySet<string>,
+): readonly EndedRuntime[] {
+  interface RankedEnded {
+    readonly item: EndedRuntime;
+    readonly fromSnapshot: boolean;
+    readonly order: number;
+  }
+
+  const ranked: RankedEnded[] = [];
+  const seen = new Set<string>();
+  let order = 0;
+
+  if (snapshotEnded && snapshotEnded.length > 0) {
+    for (const item of snapshotEnded) {
+      if (clearedSignatures.has(endedRuntimeClearedSignature(item))) {
+        continue;
+      }
+      const key = endedRuntimeIdentityKey(item);
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      ranked.push({ item, fromSnapshot: true, order: order++ });
+    }
+  }
+
+  for (const item of guardEnded) {
+    const key = endedRuntimeIdentityKey(item);
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    ranked.push({ item, fromSnapshot: false, order: order++ });
+  }
+
+  ranked.sort((a, b) => {
+    const aLocalPending = !a.fromSnapshot && a.item.at === null;
+    const bLocalPending = !b.fromSnapshot && b.item.at === null;
+    if (aLocalPending !== bLocalPending) {
+      return aLocalPending ? -1 : 1;
+    }
+    const aAt = a.item.at;
+    const bAt = b.item.at;
+    if (aAt !== null && bAt !== null && aAt !== bAt) {
+      return bAt - aAt;
+    }
+    if (aAt !== null && bAt === null) {
+      return -1;
+    }
+    if (aAt === null && bAt !== null) {
+      return 1;
+    }
+    if (a.fromSnapshot !== b.fromSnapshot) {
+      return a.fromSnapshot ? -1 : 1;
+    }
+    return a.order - b.order;
+  });
+
+  return ranked.slice(0, ENDED_DISPLAY_LIMIT).map((entry) => entry.item);
+}
+
+/**
+ * Builds a collision-free key for an `EndedCard` entry even when `runtime.endpoint`
+ * is empty or multiple entries share the same account and fallback label.
+ */
+export function endedRuntimeRowKey(item: EndedRuntime, index: number): string {
+  const identity = endedRuntimeIdentityKey(item);
+  const timestamp = item.at !== null ? String(item.at) : "na";
+  return `${identity}/${timestamp}/${index}`;
 }
 
 export function formatRuntimeCardLabel(runtime: Runtime): string {
