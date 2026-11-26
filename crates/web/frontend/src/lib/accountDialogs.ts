@@ -129,6 +129,7 @@ function isTransportUnknownError(error: unknown): boolean {
 interface PendingSubmitRecovery {
   readonly seq: number;
   readonly loginId: number;
+  readonly minVersion: number;
   readonly preAccountIds: ReadonlySet<string>;
   readonly preActive: string | null;
   readonly error: unknown;
@@ -376,10 +377,12 @@ export function createAccountDialogsStore(
     }
   };
 
-  const reconcilePendingSubmit = (snapshot: Snapshot): void => {
+  const reconcilePendingSubmit = (): void => {
     const pending = pendingSubmitRecovery;
+    const snapshot = store.getState().snapshot;
     if (
       pending === null ||
+      snapshot === null ||
       pending.seq !== loginSeq ||
       !state.add.open ||
       state.add.phase.kind !== "submitting" ||
@@ -387,7 +390,11 @@ export function createAccountDialogsStore(
     ) {
       return;
     }
-    if (isLoginOpRunningFor(snapshot, pending.loginId) || snapshot.login_id === pending.loginId) {
+    if (
+      snapshot.version < pending.minVersion ||
+      isLoginOpRunningFor(snapshot, pending.loginId) ||
+      snapshot.login_id === pending.loginId
+    ) {
       return;
     }
     pendingSubmitRecovery = null;
@@ -425,9 +432,9 @@ export function createAccountDialogsStore(
         const generation = client.getSessionGeneration();
         void store
           .refreshSnapshot()
-          .then((latest) => {
+          .then(() => {
             if (!disposed && generation === client.getSessionGeneration() && pendingSeq === loginSeq) {
-              reconcilePendingSubmit(latest);
+              reconcilePendingSubmit();
             }
           })
           .catch(() => {});
@@ -471,7 +478,7 @@ export function createAccountDialogsStore(
 
     const phase = state.add.phase;
     if (phase.kind === "submitting") {
-      reconcilePendingSubmit(snapshot);
+      reconcilePendingSubmit();
       return;
     }
 
@@ -641,12 +648,23 @@ export function createAccountDialogsStore(
         return;
       }
       if (error instanceof ApiError && (error.kind === "add_in_progress" || error.kind === "busy")) {
-        let latestSnapshot = store.getState().snapshot;
-        if (findActiveServerLoginId(latestSnapshot) === null) {
+        if (findActiveServerLoginId(store.getState().snapshot) === null) {
+          const beforeVersion = store.getState().snapshot?.version ?? 0;
           try {
-            latestSnapshot = await store.refreshSnapshot();
+            const fetched = await store.refreshSnapshot();
+            if (
+              !disposed &&
+              generation === client.getSessionGeneration() &&
+              seq === loginSeq &&
+              state.add.open &&
+              fetched.version <= beforeVersion &&
+              findActiveServerLoginId(store.getState().snapshot) === null
+            ) {
+              // Retry once if the first refresh joined a pre-existing in-flight snapshot request.
+              await store.refreshSnapshot();
+            }
           } catch {
-            latestSnapshot = store.getState().snapshot;
+            // Fall back to the monotonically converged store snapshot below.
           }
           if (
             disposed ||
@@ -657,7 +675,7 @@ export function createAccountDialogsStore(
             return;
           }
         }
-        const activeServerLoginId = findActiveServerLoginId(latestSnapshot);
+        const activeServerLoginId = findActiveServerLoginId(store.getState().snapshot);
         if (activeServerLoginId !== null) {
           setAddPhase({ kind: "other_active", loginId: activeServerLoginId });
           return;
@@ -737,15 +755,21 @@ export function createAccountDialogsStore(
         return;
       }
       if (isTransportUnknownError(error)) {
+        const minVersion = Math.max(
+          postBeginVersion ?? 0,
+          preSnapshot?.version ?? 0,
+          store.getState().snapshot?.version ?? 0,
+        );
         pendingSubmitRecovery = {
           seq,
           loginId,
+          minVersion,
           preAccountIds,
           preActive,
           error,
         };
         try {
-          const latest = await store.refreshSnapshot();
+          const fetched = await store.refreshSnapshot();
           if (
             disposed ||
             generation !== client.getSessionGeneration() ||
@@ -754,7 +778,18 @@ export function createAccountDialogsStore(
           ) {
             return;
           }
-          reconcilePendingSubmit(latest);
+          if (fetched.version < minVersion) {
+            await store.refreshSnapshot();
+            if (
+              disposed ||
+              generation !== client.getSessionGeneration() ||
+              seq !== loginSeq ||
+              !state.add.open
+            ) {
+              return;
+            }
+          }
+          reconcilePendingSubmit();
         } catch {
           // Stay locked in submitting until connectivity returns and SSE/snapshot reconciles.
         }

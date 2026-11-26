@@ -463,9 +463,46 @@ test("409 busy conflict before SSE snapshot transitions to other_active without 
   harness.dialogStore.dispose();
 });
 
-test("submitting transport drop stays locked until backend settles and never falsely claims rollback", async () => {
-  const harness = createHarness();
+test("409 busy ignores a stale deduplicated refreshSnapshot return value once SSE delivers active login", async () => {
+  const staleV1 = makeSnapshot({ version: 1, login_id: null, operations: [] });
+  const harness = createHarness(staleV1);
+  const refreshDeferred = createDeferred<Snapshot>();
+
+  harness.setRequestHandler(async (path, options) => {
+    if (path === "/api/accounts/login" && options.method === "POST") {
+      throw new ApiError({
+        status: 409,
+        kind: "busy",
+        messageKey: "app.err.busy",
+        message: "busy",
+      });
+    }
+    return undefined;
+  });
+  harness.setRefreshHandler(() => refreshDeferred.promise);
+
+  harness.dialogStore.openAddAccount();
+  const startPromise = harness.dialogStore.startAddLogin();
+  await Promise.resolve();
+
+  // SSE delivers the other tab's active login (v2) before the older deduplicated snapshot (v1) resolves.
+  harness.pushSnapshot(makeSnapshot({ version: 2, login_id: 89 }));
+  refreshDeferred.resolve(staleV1);
+  await startPromise;
+
+  assert.deepEqual(harness.dialogStore.getState().add.phase, {
+    kind: "other_active",
+    loginId: 89,
+  });
+
+  harness.dialogStore.dispose();
+});
+
+test("submitting transport drop stays locked even when deduplicated refreshSnapshot returns an older pre-login snapshot", async () => {
+  const staleV1 = makeSnapshot({ version: 1, login_id: null, operations: [] });
+  const harness = createHarness(staleV1);
   const submitDeferred = createDeferred<Account>();
+  let refreshCalls = 0;
 
   harness.setRequestHandler((path, options) => {
     if (path === "/api/accounts/login" && options.method === "POST") {
@@ -482,14 +519,18 @@ test("submitting transport drop stays locked until backend settles and never fal
   await harness.dialogStore.startAddLogin();
   const submitPromise = harness.dialogStore.submitAddLoginCode("auth-code-drop");
 
-  // Server still has the submitting login operation running when the HTTP response drops.
+  // SSE already moved the store to v3 with the running login operation, while an older
+  // deduplicated refreshSnapshot call resolves with stale v1 (no login_id / no operations).
   const inFlightSubmitSnapshot = makeSnapshot({
     version: 3,
     login_id: null,
     operations: [{ id: 101, operation: { kind: "login", login_id: 95 }, cancelling: false }],
   });
   harness.pushSnapshot(inFlightSubmitSnapshot);
-  harness.setRefreshHandler(async () => inFlightSubmitSnapshot);
+  harness.setRefreshHandler(async () => {
+    refreshCalls += 1;
+    return refreshCalls === 1 ? staleV1 : inFlightSubmitSnapshot;
+  });
 
   submitDeferred.reject(
     new ApiError({
@@ -500,7 +541,8 @@ test("submitting transport drop stays locked until backend settles and never fal
   );
   await submitPromise;
 
-  // Dialog MUST remain locked in submitting while server login op is still running.
+  // Dialog MUST remain locked in submitting despite stale v1 returning first from refreshSnapshot.
+  assert.equal(refreshCalls, 2);
   assert.equal(harness.dialogStore.getState().add.open, true);
   assert.equal(harness.dialogStore.getState().add.phase.kind, "submitting");
   harness.dialogStore.cancelOrCloseAddAccount();
