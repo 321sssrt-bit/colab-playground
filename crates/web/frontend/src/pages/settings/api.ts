@@ -1,5 +1,5 @@
 /**
- * Settings and read-only update check API helpers bound to `/api/settings` and `/api/updates`.
+ * Settings API helpers bound to `/api/settings` and `/api/settings/notice/dismiss`.
  */
 
 import { apiClient, ApiError } from "../../lib/api.ts";
@@ -11,20 +11,36 @@ import {
   type RuntimeDefaults,
 } from "../../lib/constants.ts";
 import type { TranslateFn } from "../../lib/i18n.ts";
-import type { Accelerator, SettingsView } from "../../lib/types.ts";
+import type {
+  Accelerator,
+  ApiErrorPayload,
+  DismissSettingsNoticeResponse,
+  SettingsNotice,
+  SettingsPatch,
+  SettingsView,
+} from "../../lib/types.ts";
 
 export interface LoadedSettings {
   readonly defaults: RuntimeDefaults;
+  readonly checkUpdates: boolean;
+  readonly wslDistro: string | null;
+  readonly colabPath: string | null;
+  readonly colabPython: string | null;
+  readonly usesWsl: boolean;
   readonly configDir: string | null;
+  readonly settingsFile: string | null;
   readonly loadStatus: SettingsView["load_status"];
   readonly corruptBackup: string | null;
   readonly resetDefaults: readonly string[];
+  readonly settingsNotice: SettingsNotice | null;
 }
 
-export interface UpdateNotice {
-  readonly current_version: string;
-  readonly update_available: boolean;
-  readonly releases_url: string;
+export type RuntimeDefaultsPatch = Partial<RuntimeDefaults>;
+
+export interface HostSettingsPatch {
+  readonly wsl_distro?: string | null;
+  readonly colab_path?: string | null;
+  readonly colab_python?: string | null;
 }
 
 const ACCELERATOR_SET: ReadonlySet<string> = new Set<string>(ACCELERATOR_OPTIONS);
@@ -55,6 +71,14 @@ function readNonNegInt(value: unknown, fallback: number): number {
     return Math.round(value);
   }
   return fallback;
+}
+
+function readOptionalString(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
 }
 
 function readAccelerator(value: unknown): Accelerator {
@@ -91,15 +115,39 @@ function normalizeRuntimeDefaults(raw: Record<string, unknown>): RuntimeDefaults
   };
 }
 
+export function normalizeSettingsNotice(
+  raw: SettingsNotice | null | undefined,
+): SettingsNotice | null {
+  if (!raw) {
+    return null;
+  }
+  const corrupt = raw.corrupt === true;
+  const corrupt_backup = typeof raw.corrupt_backup === "string" ? raw.corrupt_backup : null;
+  const reset_defaults = Array.isArray(raw.reset_defaults)
+    ? raw.reset_defaults.filter((item): item is string => typeof item === "string")
+    : [];
+  if (!corrupt && reset_defaults.length === 0) {
+    return null;
+  }
+  return { corrupt, corrupt_backup, reset_defaults };
+}
+
 function toLoadedSettings(view: SettingsView): LoadedSettings {
   return {
     defaults: normalizeRuntimeDefaults(view.defaults),
+    checkUpdates: typeof view.check_updates === "boolean" ? view.check_updates : true,
+    wslDistro: readOptionalString(view.wsl_distro),
+    colabPath: readOptionalString(view.colab_path),
+    colabPython: readOptionalString(view.colab_python),
+    usesWsl: view.uses_wsl === true,
     configDir: typeof view.config_dir === "string" ? view.config_dir : null,
+    settingsFile: typeof view.settings_file === "string" ? view.settings_file : null,
     loadStatus: view.load_status,
     corruptBackup: typeof view.corrupt_backup === "string" ? view.corrupt_backup : null,
     resetDefaults: Array.isArray(view.reset_defaults)
       ? view.reset_defaults.filter((item): item is string => typeof item === "string")
       : [],
+    settingsNotice: normalizeSettingsNotice(view.settings_notice),
   };
 }
 
@@ -111,23 +159,42 @@ export async function fetchSettings(signal?: AbortSignal): Promise<LoadedSetting
   return toLoadedSettings(view);
 }
 
-export type RuntimeDefaultsPatch = Partial<RuntimeDefaults>;
-
-export async function patchDefaults(
-  defaults: RuntimeDefaultsPatch,
-  signal?: AbortSignal,
-): Promise<LoadedSettings> {
+async function patchSettings(patch: SettingsPatch, signal?: AbortSignal): Promise<LoadedSettings> {
   const view = await apiClient.request<SettingsView>("/api/settings", {
     method: "PATCH",
-    body: { defaults },
+    body: patch,
     signal,
   });
   return toLoadedSettings(view);
 }
 
-export async function fetchUpdates(signal?: AbortSignal): Promise<UpdateNotice> {
-  return apiClient.request<UpdateNotice>("/api/updates", {
-    method: "GET",
+export async function patchDefaults(
+  defaults: RuntimeDefaultsPatch,
+  signal?: AbortSignal,
+): Promise<LoadedSettings> {
+  return patchSettings({ defaults }, signal);
+}
+
+export async function patchHostSettings(
+  patch: HostSettingsPatch,
+  signal?: AbortSignal,
+): Promise<LoadedSettings> {
+  return patchSettings(patch, signal);
+}
+
+export async function patchCheckUpdates(
+  checkUpdates: boolean,
+  signal?: AbortSignal,
+): Promise<LoadedSettings> {
+  return patchSettings({ check_updates: checkUpdates }, signal);
+}
+
+export async function dismissSettingsNotice(
+  signal?: AbortSignal,
+): Promise<DismissSettingsNoticeResponse> {
+  return apiClient.request<DismissSettingsNoticeResponse>("/api/settings/notice/dismiss", {
+    method: "POST",
+    body: {},
     signal,
   });
 }
@@ -136,13 +203,30 @@ export function isAbortError(error: unknown): boolean {
   return error instanceof ApiError && error.isAbort;
 }
 
-export function isSafeHttpUrl(rawUrl: string): boolean {
-  try {
-    const parsed = new URL(rawUrl);
-    return parsed.protocol === "https:" || parsed.protocol === "http:";
-  } catch {
-    return false;
+export function isHostInterpreterAloneError(error: unknown): boolean {
+  return error instanceof ApiError && error.messageKey === "app.host.interpreter_alone";
+}
+
+export function formatApiErrorPayload(
+  payload: ApiErrorPayload | null | undefined,
+  t: TranslateFn,
+): string {
+  if (!payload) {
+    return t("app.err.other");
   }
+  if (payload.message_key) {
+    const primary = t(payload.message_key, payload.args);
+    if (primary) {
+      if (payload.hint_key) {
+        const hint = t(payload.hint_key, payload.args);
+        if (hint) {
+          return `${primary} ${hint}`;
+        }
+      }
+      return primary;
+    }
+  }
+  return t("app.err.other");
 }
 
 export function formatSettingsError(error: unknown, t: TranslateFn): string {

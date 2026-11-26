@@ -11,20 +11,41 @@ export type LanguagePref = "system" | Locale;
 
 export type AppearancePref = "system" | "light" | "dark";
 
+export interface SettingsNotice {
+  readonly corrupt: boolean;
+  readonly corrupt_backup: string | null;
+  readonly reset_defaults: readonly string[];
+}
+
+export interface DismissSettingsNoticeResponse {
+  readonly notice: SettingsNotice | null;
+}
+
 export interface SettingsView {
   language: LanguagePref;
   appearance: AppearancePref;
   defaults: Record<string, unknown>;
+  check_updates?: boolean;
+  wsl_distro?: string | null;
+  colab_path?: string | null;
+  colab_python?: string | null;
+  uses_wsl?: boolean;
   config_dir: string | null;
+  settings_file?: string | null;
   load_status: "no_config_dir" | "missing" | "loaded" | "corrupt";
   corrupt_backup: string | null;
   reset_defaults: string[];
+  settings_notice?: SettingsNotice | null;
 }
 
 export interface SettingsPatch {
   language?: LanguagePref;
   appearance?: AppearancePref;
   defaults?: Record<string, unknown>;
+  check_updates?: boolean;
+  wsl_distro?: string | null;
+  colab_path?: string | null;
+  colab_python?: string | null;
 }
 
 export type AccountId = string;
@@ -390,6 +411,7 @@ export interface Snapshot {
   guard_events?: GuardEvent[];
   guard_error: ErrorKind | null;
   ended?: EndedRuntime[];
+  settings_notice?: SettingsNotice | null;
   operations: PendingOperation[];
   login_id: number | null;
   shutting_down: boolean;

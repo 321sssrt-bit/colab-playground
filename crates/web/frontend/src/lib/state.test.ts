@@ -11,8 +11,16 @@ import {
 import { createServerClock } from "./clock.ts";
 import { evaluateUsageSampleFreshness, USAGE_STALE_AFTER_SECS } from "./format.ts";
 import { createForwardsStore } from "./forwards.ts";
-import { i18nStore } from "./i18n.ts";
+import { createI18nStore, i18nStore } from "./i18n.ts";
+import { createPreferenceSync } from "./preferences.ts";
+import {
+  createRouterStore,
+  parseHashRoute,
+  parseSettingsFocus,
+  routeToHash,
+} from "./router.ts";
 import { createWebStore } from "./store.ts";
+import { createThemeStore } from "./theme.ts";
 import { createToastStore } from "./toast.ts";
 import type {
   Account,
@@ -25,8 +33,13 @@ import type {
   SettingsView,
   Snapshot,
   TunnelInfo,
+  UpdateNoticeResponse,
   UsageSnapshot,
 } from "./types.ts";
+import { createUpdatesStore } from "./updates.ts";
+import { CORE_DEFAULTS } from "./constants.ts";
+import { createSettingsDraftStore } from "../pages/settings/draftStore.ts";
+import { createSettingsNoticeStore } from "../pages/settings/noticeStore.ts";
 
 // Stop the module-level i18n singleton's cold-start retry loop in headless Node test runs.
 after(() => {
@@ -1108,4 +1121,340 @@ test("appDataStore discards stale in-flight GET /api/settings after Settings sav
   assert.equal(resolved.rearmDurationSecs, 7200);
   assert.equal(appData.getState().rearmDurationSecs, 7200);
   assert.equal(appData.getState().maxConcurrentSessions, 3);
+});
+
+test("routerStore supports SettingsFocus pinning, canonicalization, and clearing on navigation", () => {
+  assert.deepEqual(parseHashRoute("#/settings"), { route: "settings", canonical: true });
+  assert.deepEqual(parseHashRoute("#/settings?focus=host"), { route: "settings", canonical: true });
+  assert.deepEqual(parseHashRoute("#/settings?focus=limit"), { route: "settings", canonical: true });
+  assert.deepEqual(parseHashRoute("#/settings?focus=unknown"), { route: "settings", canonical: false });
+  assert.deepEqual(parseHashRoute("#/overview?focus=host"), { route: "overview", canonical: false });
+  assert.equal(parseSettingsFocus("#/settings?focus=host"), "host");
+  assert.equal(parseSettingsFocus("#/settings?focus=limit"), "limit");
+  assert.equal(parseSettingsFocus("#/settings?focus=unknown"), null);
+  assert.equal(parseSettingsFocus("#/overview?focus=host"), null);
+  assert.equal(routeToHash("settings", "limit"), "#/settings?focus=limit");
+  assert.equal(routeToHash("settings", "host"), "#/settings?focus=host");
+  assert.equal(routeToHash("overview", "host"), "#/overview");
+
+  const hashListeners = new Set<() => void>();
+  const fakeWin = {
+    location: {
+      pathname: "/",
+      search: "",
+      hash: "#/overview",
+    },
+    history: {
+      replaceState(_state: unknown, _unused: string, url?: string | URL | null) {
+        if (typeof url === "string") {
+          const idx = url.indexOf("#");
+          fakeWin.location.hash = idx >= 0 ? url.slice(idx) : "";
+        }
+      },
+    },
+    addEventListener(type: string, listener: EventListenerOrEventListenerObject) {
+      if (type === "hashchange" && typeof listener === "function") {
+        hashListeners.add(listener as () => void);
+      }
+    },
+    removeEventListener(type: string, listener: EventListenerOrEventListenerObject) {
+      if (type === "hashchange" && typeof listener === "function") {
+        hashListeners.delete(listener as () => void);
+      }
+    },
+  };
+
+  const router = createRouterStore({ win: fakeWin as unknown as Window });
+  assert.equal(router.getRoute(), "overview");
+  assert.equal(router.getSettingsFocus(), null);
+
+  router.navigate("settings", { settingsFocus: "limit" });
+  assert.equal(router.getRoute(), "settings");
+  assert.equal(router.getSettingsFocus(), "limit");
+  assert.equal(fakeWin.location.hash, "#/settings?focus=limit");
+
+  router.navigate("settings", { settingsFocus: "host" });
+  assert.equal(router.getSettingsFocus(), "host");
+  assert.equal(fakeWin.location.hash, "#/settings?focus=host");
+
+  // Plain Settings navigation clears focus.
+  router.navigate("settings");
+  assert.equal(router.getRoute(), "settings");
+  assert.equal(router.getSettingsFocus(), null);
+  assert.equal(fakeWin.location.hash, "#/settings");
+
+  // Hashchange into invalid focus normalizes cleanly.
+  fakeWin.location.hash = "#/settings?focus=bogus";
+  for (const fn of hashListeners) {
+    fn();
+  }
+  assert.equal(router.getRoute(), "settings");
+  assert.equal(router.getSettingsFocus(), null);
+  assert.equal(fakeWin.location.hash, "#/settings");
+
+  router.navigate("settings", { settingsFocus: "limit" });
+  router.navigate("sessions");
+  assert.equal(router.getRoute(), "sessions");
+  assert.equal(router.getSettingsFocus(), null);
+  assert.equal(fakeWin.location.hash, "#/sessions");
+  router.dispose();
+});
+
+test("preferenceSync surfaces language/appearance save failures and clears after retry succeeds", async (t) => {
+  let failPatch = true;
+  const patchBodies: unknown[] = [];
+  const client = createApiClient({
+    fetchImpl: async (input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const method = init?.method ?? "GET";
+      if (url === "/api/login") {
+        return jsonResponse({ token: "tok-pref", expires_in: 3600 });
+      }
+      if (url === "/api/settings" && method === "PATCH") {
+        patchBodies.push(JSON.parse(String(init?.body ?? "{}")));
+        if (failPatch) {
+          return jsonResponse(
+            {
+              error: {
+                kind: "io",
+                message_key: "app.err.io",
+                args: {},
+                hint_key: null,
+                action_key: null,
+                operation_id: null,
+              },
+            },
+            500,
+          );
+        }
+        return jsonResponse({
+          language: "zh-CN",
+          appearance: "dark",
+          defaults: { ...CORE_DEFAULTS },
+          check_updates: true,
+          wsl_distro: null,
+          colab_path: null,
+          colab_python: null,
+          uses_wsl: false,
+          config_dir: "/tmp/cfg",
+          settings_file: "/tmp/cfg/settings.json",
+          load_status: "loaded",
+          corrupt_backup: null,
+          reset_defaults: [],
+          settings_notice: null,
+        } satisfies SettingsView);
+      }
+      throw new Error(`unexpected fetch: ${method} ${url}`);
+    },
+  });
+
+  const i18n = createI18nStore({
+    storage: null,
+    fetchImpl: async () => jsonResponse({}),
+  });
+  const theme = createThemeStore({ storage: null, doc: null });
+  const sync = createPreferenceSync(client, i18n, theme);
+  t.after(() => {
+    sync.cancelPending();
+    i18n.dispose();
+    theme.dispose();
+  });
+
+  await client.login("secret-key");
+  sync.setLanguage("zh-CN");
+  sync.setAppearance("dark");
+  await flushAsync(6);
+
+  assert.equal(patchBodies.length, 1);
+  assert.deepEqual(patchBodies[0], { language: "zh-CN", appearance: "dark" });
+  const failedState = sync.getState();
+  assert.ok(failedState.lastError !== null);
+  assert.deepEqual(failedState.lastError.fields, ["language", "appearance"]);
+  assert.equal(failedState.lastError.error instanceof ApiError, true);
+  assert.equal((failedState.lastError.error as ApiError).messageKey, "app.err.io");
+
+  // Retry succeeds and clears lastError.
+  failPatch = false;
+  sync.retryLastFailed();
+  await flushAsync(6);
+  assert.equal(patchBodies.length, 2);
+  assert.equal(sync.getState().lastError, null);
+});
+
+test("updatesStore checkNow preserves current_version on offline failure and supersedes slower GET", async (t) => {
+  const slowGet = createDeferred<Response>();
+  let failManualTransport = false;
+  const baseNotice: UpdateNoticeResponse = {
+    current_version: "0.5.0",
+    update_available: false,
+    releases_url: "https://github.com/321sssrt-bit/colab-playground/releases",
+    release_url: null,
+    latest_version: null,
+    status: "failed",
+    checked_at: null,
+    check_updates: true,
+    error: {
+      kind: "http",
+      message_key: "app.err.http",
+      args: {},
+      hint_key: "app.ns.check_network",
+      action_key: null,
+      operation_id: null,
+    },
+    persist_error: null,
+  };
+
+  const client = createApiClient({
+    fetchImpl: async (input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const method = init?.method ?? "GET";
+      if (url === "/api/login") {
+        return jsonResponse({ token: "tok-upd", expires_in: 3600 });
+      }
+      if (url === "/api/updates" && method === "GET") {
+        return slowGet.promise;
+      }
+      if (url === "/api/updates/check" && method === "POST") {
+        if (failManualTransport) {
+          throw new TypeError("network down");
+        }
+        return jsonResponse(baseNotice);
+      }
+      throw new Error(`unexpected fetch: ${method} ${url}`);
+    },
+  });
+
+  const updates = createUpdatesStore({
+    client,
+    storage: null,
+    pollIntervalMs: 0,
+  });
+  t.after(() => {
+    updates.dispose();
+  });
+
+  await client.login("secret-key");
+  const autoPromise = updates.ensureChecked();
+  const manualResult = await updates.checkNow();
+  assert.equal(manualResult.current_version, "0.5.0");
+  assert.equal(manualResult.status, "failed");
+  assert.equal(updates.getState().notice?.current_version, "0.5.0");
+
+  // Slower GET returning idle must NOT overwrite the newer manual POST result.
+  slowGet.resolve(
+    jsonResponse({
+      ...baseNotice,
+      status: "idle",
+      error: null,
+    } satisfies UpdateNoticeResponse),
+  );
+  await autoPromise;
+  assert.equal(updates.getState().notice?.status, "failed");
+
+  // Toggling auto-check updates the cached notice immediately.
+  updates.setCheckUpdates(false);
+  assert.equal(updates.getState().notice?.check_updates, false);
+
+  // Even a transport error on manual check keeps the last known current_version intact.
+  failManualTransport = true;
+  await assert.rejects(() => updates.checkNow());
+  assert.equal(updates.getState().notice?.current_version, "0.5.0");
+  assert.ok(updates.getState().manualError !== null);
+});
+
+test("settingsDraftStore persists unsaved drafts across route changes, merges limit saves, and clears on sign-out", async (t) => {
+  const client = createApiClient({
+    fetchImpl: async (input) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/api/login") {
+        return jsonResponse({ token: "tok-draft", expires_in: 3600 });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    },
+  });
+  const drafts = createSettingsDraftStore(client);
+  t.after(() => {
+    drafts.dispose();
+  });
+
+  await client.login("secret-key");
+  const initial = drafts.resolveDefaultsDraft(CORE_DEFAULTS);
+  drafts.saveDefaultsDraft(
+    CORE_DEFAULTS,
+    { ...initial.draft, max_attempts: "5", max_concurrent_sessions: "4" },
+    initial.forceInclude,
+  );
+  drafts.saveHostDraft(null, null, "/usr/local/bin/colab", "/usr/bin/python3");
+
+  // Re-entering Settings with identical server values restores unsaved drafts.
+  const restoredDefaults = drafts.resolveDefaultsDraft({ ...CORE_DEFAULTS });
+  assert.equal(restoredDefaults.draft.max_attempts, "5");
+  assert.equal(restoredDefaults.draft.max_concurrent_sessions, "4");
+  const restoredHost = drafts.resolveHostDraft(null, null);
+  assert.equal(restoredHost.colabPath, "/usr/local/bin/colab");
+  assert.equal(restoredHost.colabPython, "/usr/bin/python3");
+
+  // Saving concurrent limit from LimitFocusCard updates limit while keeping other unsaved Defaults fields.
+  const serverAfterLimit = { ...CORE_DEFAULTS, max_concurrent_sessions: 4 };
+  drafts.reconcileSavedConcurrentLimit(serverAfterLimit);
+  const afterMerge = drafts.resolveDefaultsDraft(serverAfterLimit);
+  assert.equal(afterMerge.draft.max_concurrent_sessions, "4");
+  assert.equal(afterMerge.draft.max_attempts, "5");
+
+  // Sign-out wipes all unsaved drafts immediately.
+  client.logout();
+  const afterLogout = drafts.resolveDefaultsDraft(CORE_DEFAULTS);
+  assert.equal(afterLogout.draft.max_attempts, String(CORE_DEFAULTS.max_attempts));
+  assert.deepEqual(drafts.resolveHostDraft(null, null), { colabPath: "", colabPython: "" });
+});
+
+test("settingsNoticeStore displays once globally, calls dismiss endpoint, and suppresses stale re-observations", async (t) => {
+  let dismissCalls = 0;
+  const client = createApiClient({
+    fetchImpl: async (input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const method = init?.method ?? "GET";
+      if (url === "/api/login") {
+        return jsonResponse({ token: "tok-notice", expires_in: 3600 });
+      }
+      if (url === "/api/settings/notice/dismiss" && method === "POST") {
+        dismissCalls += 1;
+        return jsonResponse({ notice: null });
+      }
+      throw new Error(`unexpected fetch: ${method} ${url}`);
+    },
+  });
+  const notices = createSettingsNoticeStore(client);
+  t.after(() => {
+    notices.dispose();
+  });
+
+  await client.login("secret-key");
+  const corruptNotice = {
+    corrupt: true,
+    corrupt_backup: "/tmp/cfg/settings.json.corrupt",
+    reset_defaults: [],
+  };
+
+  notices.observe(corruptNotice);
+  assert.equal(notices.getState().showCorrupt, true);
+  assert.equal(notices.getState().showReset, false);
+
+  await notices.dismissPart("corrupt");
+  assert.equal(dismissCalls, 1);
+  assert.equal(notices.getState().notice, null);
+
+  // Stale GET /api/settings re-observing the same notice does not re-open it.
+  notices.observe(corruptNotice);
+  assert.equal(notices.getState().notice, null);
+
+  // A distinct reset_defaults notice displays and clears authoritatively after PATCH /api/settings.
+  notices.observe({
+    corrupt: false,
+    corrupt_backup: null,
+    reset_defaults: ["max_runtime"],
+  });
+  assert.equal(notices.getState().showReset, true);
+  notices.observe(null, { authoritativeClear: true });
+  assert.equal(notices.getState().notice, null);
 });

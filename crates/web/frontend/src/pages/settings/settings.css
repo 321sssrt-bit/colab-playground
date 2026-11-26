@@ -1,0 +1,87 @@
+/* Settings-specific layout and focus styles (mirrors crates/app/src/ui/pages/{settings,defaults}.rs). */
+
+.settings-global-notices {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin-block-end: var(--space-4);
+}
+
+.settings-focus-card {
+  border-color: var(--color-accent);
+  box-shadow: 0 0 0 1px var(--color-accent);
+}
+
+.settings-focus-heading:focus:not(:focus-visible) {
+  outline: none;
+}
+
+.settings-limit-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.settings-limit-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.settings-path-control {
+  width: min(100%, 24rem);
+  flex: 0 1 24rem;
+}
+
+.settings-path-input {
+  width: 100%;
+  font-family: var(--font-mono);
+}
+
+.settings-host-feedback {
+  padding-top: var(--space-2);
+}
+
+.settings-file-box {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  max-width: min(100%, 36rem);
+}
+
+.settings-file-path {
+  display: inline-block;
+  max-width: 100%;
+  padding: var(--space-0p5) var(--space-1p5);
+  border-radius: var(--radius-sm);
+  background-color: var(--color-sunken);
+  color: var(--color-fg);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.settings-inline-alert {
+  margin-top: var(--space-1);
+}
+
+@media (max-width: 640px) {
+  .settings-path-control {
+    width: 100%;
+    flex: 1 1 100%;
+  }
+
+  .settings-file-box {
+    justify-content: flex-start;
+    max-width: 100%;
+  }
+
+  .settings-limit-controls {
+    align-items: stretch;
+  }
+}

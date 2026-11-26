@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   AppShell,
@@ -16,8 +16,14 @@ import { useAppDataStore } from "./lib/appCache.ts";
 // Ensure the global Cost Guard observer is initialized at application scope across all routes.
 import "./lib/guard.ts";
 import { useI18n } from "./lib/i18n.ts";
-import { preferenceSync } from "./lib/preferences.ts";
-import { formatDocumentTitle, routerStore, useRouter, type RouteId } from "./lib/router.ts";
+import { preferenceSync, usePreferenceSync } from "./lib/preferences.ts";
+import {
+  formatDocumentTitle,
+  routerStore,
+  useRouter,
+  type RouteId,
+  type SettingsFocus,
+} from "./lib/router.ts";
 import { stopDialogsStore, useStopDialogsStore } from "./lib/stopDialogs.ts";
 import { useWebStore, webStore } from "./lib/store.ts";
 import { useTheme } from "./lib/theme.ts";
@@ -37,12 +43,21 @@ import { SessionsPage } from "./pages/SessionsPage.tsx";
 import { StopAllDialog } from "./pages/sessions/StopAllDialog.tsx";
 import { StopRuntimeDialog } from "./pages/sessions/StopRuntimeDialog.tsx";
 import { SettingsPage } from "./pages/SettingsPage.tsx";
+import { formatSettingsError } from "./pages/settings/api.ts";
+import {
+  settingsNoticeStore,
+  useSettingsNoticeStore,
+  type NoticePart,
+} from "./pages/settings/noticeStore.ts";
+import { SettingsNoticeBanner } from "./pages/settings/SettingsNoticeBanner.tsx";
+import "./pages/settings/settings.css";
 import type { PageProps } from "./pages/types.ts";
 
 type AccountDialogCallbacks = Pick<AccountsPageProps, "onRequestSwitchAccount">;
 
 function renderRoutePage(
   route: RouteId,
+  settingsFocus: SettingsFocus | null,
   pageProps: PageProps,
   accountCallbacks: AccountDialogCallbacks,
 ) {
@@ -56,7 +71,7 @@ function renderRoutePage(
     case "accounts":
       return <AccountsPage {...pageProps} {...accountCallbacks} />;
     case "settings":
-      return <SettingsPage {...pageProps} />;
+      return <SettingsPage {...pageProps} settingsFocus={settingsFocus} />;
   }
 }
 
@@ -64,19 +79,23 @@ export function App() {
   const storeState = useWebStore();
   const appData = useAppDataStore();
   const updatesState = useUpdatesStore();
+  const preferenceState = usePreferenceSync();
+  const settingsNoticeState = useSettingsNoticeStore();
   const stopDialogsState = useStopDialogsStore();
   const accountDialogsState = useAccountDialogsStore();
   const i18n = useI18n();
   const theme = useTheme();
-  const { route, navigate } = useRouter();
+  const { route, settingsFocus, navigate } = useRouter();
   const toasts = useToasts();
   const [modalDrawerOpen, setModalDrawerOpen] = useState(false);
   const [switchTarget, setSwitchTarget] = useState<SwitchTarget | null>(null);
+  const lastPrefErrorIdRef = useRef(0);
   const { t } = i18n;
 
   useEffect(() => {
     if (storeState.authStatus !== "authenticated") {
       preferenceSync.cancelPending();
+      lastPrefErrorIdRef.current = 0;
       toastStore.clear();
       setModalDrawerOpen(false);
       setSwitchTarget(null);
@@ -85,7 +104,11 @@ export function App() {
 
     routerStore.ensureCanonicalHash();
     const controller = new AbortController();
-    preferenceSync.syncSession(controller.signal);
+    preferenceSync.syncSession(controller.signal, {
+      onSettingsLoaded: (view) => {
+        settingsNoticeStore.observe(view.settings_notice, { authoritativeClear: true });
+      },
+    });
     void updatesStore.ensureChecked(controller.signal);
     const onVisibilityChange = () => {
       if (document.visibilityState === "visible") {
@@ -100,12 +123,38 @@ export function App() {
     };
   }, [storeState.authStatus]);
 
-  // Sync global update notice after returning from Settings (where manual checks run).
+  useEffect(() => {
+    if (storeState.authStatus !== "authenticated" || storeState.snapshot === null) {
+      return;
+    }
+    if (storeState.snapshot.settings_notice !== undefined) {
+      settingsNoticeStore.observe(storeState.snapshot.settings_notice, {
+        authoritativeClear: true,
+      });
+    }
+  }, [storeState.authStatus, storeState.snapshot]);
+
+  useEffect(() => {
+    const err = preferenceState.lastError;
+    if (storeState.authStatus !== "authenticated" || err === null) {
+      return;
+    }
+    if (err.id === lastPrefErrorIdRef.current) {
+      return;
+    }
+    lastPrefErrorIdRef.current = err.id;
+    pushToast({
+      tone: "danger",
+      title: t("app.toast.save_failed.title"),
+      body: formatSettingsError(err.error, t),
+    });
+  }, [storeState.authStatus, preferenceState.lastError, t]);
+
   useEffect(() => {
     if (storeState.authStatus !== "authenticated") {
       return;
     }
-    void updatesStore.refresh();
+    void updatesStore.ensureChecked();
   }, [storeState.authStatus, route]);
 
   useEffect(() => {
@@ -199,6 +248,10 @@ export function App() {
     updatesStore.dismiss(version);
   }, []);
 
+  const handleDismissSettingsNotice = useCallback((part: NoticePart) => {
+    void settingsNoticeStore.dismissPart(part);
+  }, []);
+
   const handleCloseStopAll = useCallback(() => {
     stopDialogsStore.closeStopAll();
   }, []);
@@ -288,7 +341,12 @@ export function App() {
         onModalDrawerChange={setModalDrawerOpen}
         renderAccountSlot={renderAccountSlot}
       >
-        {renderRoutePage(route, pageProps, accountCallbacks)}
+        <SettingsNoticeBanner
+          state={settingsNoticeState}
+          t={t}
+          onDismiss={handleDismissSettingsNotice}
+        />
+        {renderRoutePage(route, settingsFocus, pageProps, accountCallbacks)}
       </AppShell>
       {storeState.snapshot !== null && (
         <SwitchAccountDialog

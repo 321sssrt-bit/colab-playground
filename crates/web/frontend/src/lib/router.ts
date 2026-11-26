@@ -11,6 +11,9 @@ import type { TranslateFn } from "./i18n.ts";
 
 export type RouteId = "overview" | "sessions" | "plugins" | "accounts" | "settings";
 
+/** Section pinned to the top of Settings when another page links there directly. */
+export type SettingsFocus = "limit" | "host";
+
 export const ROUTES: readonly RouteId[] = [
   "overview",
   "sessions",
@@ -22,6 +25,7 @@ export const ROUTES: readonly RouteId[] = [
 export const DEFAULT_ROUTE: RouteId = "overview";
 
 const ROUTE_SET: ReadonlySet<string> = new Set<string>(ROUTES);
+const SETTINGS_FOCUS_SET: ReadonlySet<string> = new Set<string>(["limit", "host"]);
 
 const ROUTE_TITLE_KEYS = {
   overview: "app.nav.overview",
@@ -38,6 +42,12 @@ export interface ParsedHashRoute {
 
 export interface NavigateOptions {
   readonly replace?: boolean;
+  readonly settingsFocus?: SettingsFocus | null;
+}
+
+export interface RouterSnapshot {
+  readonly route: RouteId;
+  readonly settingsFocus: SettingsFocus | null;
 }
 
 export interface RouterStoreOptions {
@@ -49,6 +59,8 @@ export interface RouterStoreOptions {
 
 export interface RouterStore {
   getRoute(): RouteId;
+  getSettingsFocus(): SettingsFocus | null;
+  getState(): RouterSnapshot;
   subscribe(listener: () => void): () => void;
   navigate(route: RouteId, options?: NavigateOptions): void;
   ensureCanonicalHash(): void;
@@ -59,8 +71,31 @@ export function isRouteId(value: string): value is RouteId {
   return ROUTE_SET.has(value);
 }
 
-export function routeToHash(route: RouteId): string {
+export function isSettingsFocus(value: string): value is SettingsFocus {
+  return SETTINGS_FOCUS_SET.has(value);
+}
+
+export function routeToHash(route: RouteId, settingsFocus?: SettingsFocus | null): string {
+  if (route === "settings" && settingsFocus && isSettingsFocus(settingsFocus)) {
+    return `#/settings?focus=${settingsFocus}`;
+  }
   return `#/${route}`;
+}
+
+export function parseSettingsFocus(rawHash: string): SettingsFocus | null {
+  const withoutHash = rawHash.startsWith("#") ? rawHash.slice(1) : rawHash;
+  const withoutLeadingSlash = withoutHash.startsWith("/") ? withoutHash.slice(1) : withoutHash;
+  const queryIndex = withoutLeadingSlash.indexOf("?");
+  if (queryIndex < 0) {
+    return null;
+  }
+  const segment = withoutLeadingSlash.slice(0, queryIndex).split("/", 1)[0]?.toLowerCase() ?? "";
+  if (segment !== "settings") {
+    return null;
+  }
+  const params = new URLSearchParams(withoutLeadingSlash.slice(queryIndex + 1));
+  const focus = params.get("focus")?.toLowerCase() ?? "";
+  return isSettingsFocus(focus) ? focus : null;
 }
 
 export function parseHashRoute(rawHash: string): ParsedHashRoute {
@@ -69,7 +104,8 @@ export function parseHashRoute(rawHash: string): ParsedHashRoute {
   const segment = withoutLeadingSlash.split(/[/?]/, 1)[0]?.toLowerCase() ?? "";
 
   if (isRouteId(segment)) {
-    const canonicalHash = routeToHash(segment);
+    const focus = segment === "settings" ? parseSettingsFocus(rawHash) : null;
+    const canonicalHash = routeToHash(segment, focus);
     return {
       route: segment,
       canonical: rawHash === canonicalHash,
@@ -106,7 +142,14 @@ export function createRouterStore(options: RouterStoreOptions = {}): RouterStore
         ? window
         : null;
 
-  let currentRoute: RouteId = win ? parseHashRoute(win.location.hash).route : DEFAULT_ROUTE;
+  const initialRoute = win ? parseHashRoute(win.location.hash).route : DEFAULT_ROUTE;
+  const initialFocus =
+    win && initialRoute === "settings" ? parseSettingsFocus(win.location.hash) : null;
+
+  let snapshot: RouterSnapshot = {
+    route: initialRoute,
+    settingsFocus: initialFocus,
+  };
   let disposed = false;
   const listeners = new Set<() => void>();
 
@@ -120,11 +163,11 @@ export function createRouterStore(options: RouterStoreOptions = {}): RouterStore
     }
   };
 
-  const replaceHashInPlace = (route: RouteId): void => {
+  const replaceHashInPlace = (route: RouteId, focus: SettingsFocus | null): void => {
     if (!win) {
       return;
     }
-    const targetHash = routeToHash(route);
+    const targetHash = routeToHash(route, focus);
     if (win.location.hash === targetHash) {
       return;
     }
@@ -141,11 +184,12 @@ export function createRouterStore(options: RouterStoreOptions = {}): RouterStore
       return;
     }
     const parsed = parseHashRoute(win.location.hash);
+    const nextFocus = parsed.route === "settings" ? parseSettingsFocus(win.location.hash) : null;
     if (normalizeInvalid && !parsed.canonical) {
-      replaceHashInPlace(parsed.route);
+      replaceHashInPlace(parsed.route, nextFocus);
     }
-    if (parsed.route !== currentRoute) {
-      currentRoute = parsed.route;
+    if (parsed.route !== snapshot.route || nextFocus !== snapshot.settingsFocus) {
+      snapshot = { route: parsed.route, settingsFocus: nextFocus };
       emit();
     }
   };
@@ -158,7 +202,15 @@ export function createRouterStore(options: RouterStoreOptions = {}): RouterStore
 
   return {
     getRoute(): RouteId {
-      return currentRoute;
+      return snapshot.route;
+    },
+
+    getSettingsFocus(): SettingsFocus | null {
+      return snapshot.settingsFocus;
+    },
+
+    getState(): RouterSnapshot {
+      return snapshot;
     },
 
     subscribe(listener: () => void): () => void {
@@ -172,16 +224,20 @@ export function createRouterStore(options: RouterStoreOptions = {}): RouterStore
       if (disposed) {
         return;
       }
-      const targetHash = routeToHash(route);
+      const nextFocus =
+        route === "settings" && navOptions.settingsFocus && isSettingsFocus(navOptions.settingsFocus)
+          ? navOptions.settingsFocus
+          : null;
+      const targetHash = routeToHash(route, nextFocus);
       if (win) {
         if (navOptions.replace) {
-          replaceHashInPlace(route);
+          replaceHashInPlace(route, nextFocus);
         } else if (win.location.hash !== targetHash) {
           win.location.hash = targetHash;
         }
       }
-      if (route !== currentRoute) {
-        currentRoute = route;
+      if (route !== snapshot.route || nextFocus !== snapshot.settingsFocus) {
+        snapshot = { route, settingsFocus: nextFocus };
         emit();
       }
     },
@@ -202,12 +258,17 @@ export function createRouterStore(options: RouterStoreOptions = {}): RouterStore
 export const routerStore: RouterStore = createRouterStore();
 
 /**
- * React hook returning the active hash route and navigation helper.
+ * React hook returning the active hash route, optional Settings focus, and navigation helper.
  */
 export function useRouter(store: RouterStore = routerStore): {
   readonly route: RouteId;
+  readonly settingsFocus: SettingsFocus | null;
   readonly navigate: (route: RouteId, options?: NavigateOptions) => void;
 } {
-  const route = useSyncExternalStore(store.subscribe, store.getRoute, store.getRoute);
-  return { route, navigate: store.navigate };
+  const state = useSyncExternalStore(store.subscribe, store.getState, store.getState);
+  return {
+    route: state.route,
+    settingsFocus: state.settingsFocus,
+    navigate: store.navigate,
+  };
 }

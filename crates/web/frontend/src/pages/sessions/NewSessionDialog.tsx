@@ -13,7 +13,7 @@ import { serverClock } from "../../lib/clock.ts";
 import { CORE_DEFAULTS } from "../../lib/constants.ts";
 import { resolveActiveAccount } from "../../lib/format.ts";
 import type { TranslateFn } from "../../lib/i18n.ts";
-import type { RouteId } from "../../lib/router.ts";
+import type { NavigateOptions, RouteId } from "../../lib/router.ts";
 import type { ToastInput } from "../../lib/toast.ts";
 import type {
   AccountContext,
@@ -83,7 +83,7 @@ export interface NewSessionDialogProps {
   readonly trackedProvision: TrackedProvision | null;
   readonly locale: Locale;
   readonly t: TranslateFn;
-  readonly navigate: (route: RouteId) => void;
+  readonly navigate: (route: RouteId, options?: NavigateOptions) => void;
   readonly pushToast: (toast: ToastInput) => number;
   readonly onClose: () => void;
   readonly onTrackingOperation: (operationId: number | null) => void;
@@ -817,7 +817,7 @@ export function NewSessionDialog({
                   autoFocus
                   onClick={() => {
                     dismissAndClose();
-                    navigate("settings");
+                    navigate("settings", { settingsFocus: "limit" });
                   }}
                 >
                   {t("app.b3.new_open_settings")}

@@ -1,10 +1,11 @@
 /**
  * General settings card: immediate language and appearance preferences persisted
- * via `preferenceSync` to `/api/settings`.
+ * via `preferenceSync` to `/api/settings`, with explicit save error feedback.
  */
 
 import { memo, useId } from "react";
 
+import { AlertIcon, CloseIcon } from "../../components/Icons.tsx";
 import { SUPPORTED_LOCALES, type Dictionary, type TranslateFn } from "../../lib/i18n.ts";
 import { APPEARANCE_OPTIONS } from "../../lib/theme.ts";
 import type { AppearancePref, LanguagePref, Locale } from "../../lib/types.ts";
@@ -28,25 +29,33 @@ export interface GeneralSectionProps {
   readonly browserLocale: Locale;
   readonly dict: Dictionary | null;
   readonly appearance: AppearancePref;
+  readonly saving: boolean;
+  readonly saveError: string | null;
   readonly t: TranslateFn;
   readonly onLanguageChange: (pref: LanguagePref) => void;
   readonly onAppearanceChange: (pref: AppearancePref) => void;
+  readonly onRetrySave: () => void;
+  readonly onDismissError: () => void;
 }
 
 export const GeneralSection = memo(function GeneralSection({
   language,
   browserLocale,
   appearance,
+  saving,
+  saveError,
   t,
   onLanguageChange,
   onAppearanceChange,
+  onRetrySave,
+  onDismissError,
 }: GeneralSectionProps) {
   const languageId = useId();
   const appearanceLabelId = useId();
   const appearanceGroup = useId();
 
   return (
-    <section className="card settings-section">
+    <section className="card settings-section" data-settings-general="true">
       <div className="card-heading">
         <h2 className="card-title">{t("app.settings.general.title")}</h2>
         <p className="card-desc">{t("app.settings.general.description")}</p>
@@ -117,6 +126,42 @@ export const GeneralSection = memo(function GeneralSection({
           </div>
         </div>
       </div>
+
+      {saveError !== null && (
+        <div
+          className="alert alert-danger settings-inline-alert"
+          role="alert"
+          data-settings-general-error="true"
+        >
+          <span className="alert-icon icon-danger">
+            <AlertIcon />
+          </span>
+          <div className="alert-text">
+            <p className="alert-title">{t("app.toast.save_failed.title")}</p>
+            <p className="alert-body">{saveError}</p>
+            <div className="alert-actions">
+              <button
+                type="button"
+                className="btn btn-sm"
+                disabled={saving}
+                data-settings-general-retry="true"
+                onClick={onRetrySave}
+              >
+                {saving && <span className="spinner" aria-hidden="true" />}
+                <span>{t("app.action.retry")}</span>
+              </button>
+            </div>
+          </div>
+          <button
+            type="button"
+            className="btn btn-sm btn-ghost btn-icon alert-dismiss"
+            aria-label={t("app.action.dismiss")}
+            onClick={onDismissError}
+          >
+            <CloseIcon />
+          </button>
+        </div>
+      )}
     </section>
   );
 });

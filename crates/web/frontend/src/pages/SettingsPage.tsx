@@ -1,58 +1,62 @@
 /**
- * Settings route: immediate persisted language & appearance controls, isolated
- * Defaults form protected from SSE snapshot re-renders, corrupt/reset notices,
- * and read-only About card.
+ * Settings route: focused limit/host jump cards, persisted language & appearance
+ * controls with save-error feedback, isolated Defaults form with cross-route
+ * draft preservation, Host/WSL/CLI path settings, and complete About section.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { AlertIcon, CloseIcon } from "../components/Icons.tsx";
-import { appDataStore } from "../lib/appCache.ts";
+import { AlertIcon } from "../components/Icons.tsx";
+import { appDataStore, useAppDataStore } from "../lib/appCache.ts";
 import { useI18n } from "../lib/i18n.ts";
-import { preferenceSync } from "../lib/preferences.ts";
+import { preferenceSync, usePreferenceSync } from "../lib/preferences.ts";
+import type { SettingsFocus } from "../lib/router.ts";
 import { useTheme } from "../lib/theme.ts";
 import type { AppearancePref, LanguagePref } from "../lib/types.ts";
+import { updatesStore, useUpdatesStore } from "../lib/updates.ts";
 import { AboutSection } from "./settings/AboutSection.tsx";
 import {
   fetchSettings,
-  fetchUpdates,
+  formatApiErrorPayload,
   formatSettingsError,
   isAbortError,
+  isHostInterpreterAloneError,
+  patchCheckUpdates,
   patchDefaults,
+  patchHostSettings,
   type LoadedSettings,
   type RuntimeDefaultsPatch,
-  type UpdateNotice,
 } from "./settings/api.ts";
 import { DefaultsSection } from "./settings/DefaultsSection.tsx";
+import { settingsDraftStore, useSettingsDraftStore } from "./settings/draftStore.ts";
 import { GeneralSection } from "./settings/GeneralSection.tsx";
+import { HostSection, type HostSaveError } from "./settings/HostSection.tsx";
+import { LimitFocusCard } from "./settings/LimitFocusCard.tsx";
+import { settingsNoticeStore } from "./settings/noticeStore.ts";
+import "./settings/settings.css";
 import type { PageProps } from "./types.ts";
 
-const RESET_FIELD_LABEL_KEYS = {
-  max_runtime: "app.def.max_runtime",
-  max_spend_cu: "app.def.max_spend",
-  min_balance_cu: "app.def.min_balance",
-  idle_timeout: "app.def.idle",
-  max_concurrent_sessions: "app.def.concurrent",
-  max_attempts: "app.def.attempts",
-  retry_delay: "app.def.retry_delay",
-  on_exhausted: "app.def.on_exhausted",
-  usage_poll_active: "app.def.poll_active",
-  usage_poll_idle: "app.def.poll_idle",
-  accelerator: "app.def.accelerator",
-  high_mem: "app.def.high_mem",
-  min_vram_mib: "app.def.min_vram",
-  winddown_grace: "app.def.winddown",
-} as const;
-
-type KnownResetField = keyof typeof RESET_FIELD_LABEL_KEYS;
-
-function isKnownResetField(name: string): name is KnownResetField {
-  return Object.prototype.hasOwnProperty.call(RESET_FIELD_LABEL_KEYS, name);
+export interface SettingsPageProps extends PageProps {
+  readonly settingsFocus?: SettingsFocus | null;
 }
 
-export function SettingsPage({ snapshot, t, pushToast }: PageProps) {
+function normalizePathInput(raw: string): string | null {
+  const trimmed = raw.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+export function SettingsPage({
+  snapshot,
+  t,
+  pushToast,
+  settingsFocus = null,
+}: SettingsPageProps) {
   const i18n = useI18n();
   const theme = useTheme();
+  const appData = useAppDataStore();
+  const updatesState = useUpdatesStore();
+  const preferenceState = usePreferenceSync();
+  useSettingsDraftStore();
 
   const [settings, setSettings] = useState<LoadedSettings | null>(null);
   const [loadingSettings, setLoadingSettings] = useState(true);
@@ -62,16 +66,23 @@ export function SettingsPage({ snapshot, t, pushToast }: PageProps) {
   const [saveError, setSaveError] = useState<unknown>(null);
   const [savedNotice, setSavedNotice] = useState(false);
 
-  const [corruptDismissed, setCorruptDismissed] = useState(false);
-  const [resetDismissed, setResetDismissed] = useState(false);
+  const [savingLimit, setSavingLimit] = useState(false);
+  const [limitSaveError, setLimitSaveError] = useState<unknown>(null);
+  const [limitSavedNotice, setLimitSavedNotice] = useState(false);
 
-  const [updateNotice, setUpdateNotice] = useState<UpdateNotice | null>(null);
-  const [checkingUpdates, setCheckingUpdates] = useState(false);
-  const [updateError, setUpdateError] = useState<unknown>(null);
+  const [savingHost, setSavingHost] = useState(false);
+  const [hostError, setHostError] = useState<HostSaveError | null>(null);
+  const [hostSavedNotice, setHostSavedNotice] = useState(false);
+
+  const [savingCheckUpdates, setSavingCheckUpdates] = useState(false);
+  const [checkUpdatesError, setCheckUpdatesError] = useState<unknown>(null);
 
   const loadAbortRef = useRef<AbortController | null>(null);
   const saveAbortRef = useRef<AbortController | null>(null);
-  const updateAbortRef = useRef<AbortController | null>(null);
+  const limitAbortRef = useRef<AbortController | null>(null);
+  const hostAbortRef = useRef<AbortController | null>(null);
+  const checkUpdatesAbortRef = useRef<AbortController | null>(null);
+  const updateCheckAbortRef = useRef<AbortController | null>(null);
 
   const loadSettings = useCallback(() => {
     loadAbortRef.current?.abort();
@@ -87,8 +98,8 @@ export function SettingsPage({ snapshot, t, pushToast }: PageProps) {
           return;
         }
         setSettings(loaded);
-        setCorruptDismissed(false);
-        setResetDismissed(false);
+        settingsNoticeStore.observe(loaded.settingsNotice, { authoritativeClear: true });
+        updatesStore.setCheckUpdates(loaded.checkUpdates);
       })
       .catch((error: unknown) => {
         if (controller.signal.aborted || isAbortError(error)) {
@@ -106,46 +117,32 @@ export function SettingsPage({ snapshot, t, pushToast }: PageProps) {
       });
   }, []);
 
-  const checkUpdates = useCallback(() => {
-    updateAbortRef.current?.abort();
-    const controller = new AbortController();
-    updateAbortRef.current = controller;
-
-    setCheckingUpdates(true);
-    setUpdateError(null);
-
-    void fetchUpdates(controller.signal)
-      .then((notice) => {
-        if (controller.signal.aborted) {
-          return;
-        }
-        setUpdateNotice(notice);
-      })
-      .catch((error: unknown) => {
-        if (controller.signal.aborted || isAbortError(error)) {
-          return;
-        }
-        setUpdateError(error);
-      })
-      .finally(() => {
-        if (updateAbortRef.current === controller) {
-          updateAbortRef.current = null;
-        }
-        if (!controller.signal.aborted) {
-          setCheckingUpdates(false);
-        }
-      });
-  }, []);
-
   useEffect(() => {
     loadSettings();
-    checkUpdates();
+    const updatesController = new AbortController();
+    void updatesStore.ensureChecked(updatesController.signal);
     return () => {
+      updatesController.abort();
       loadAbortRef.current?.abort();
       saveAbortRef.current?.abort();
-      updateAbortRef.current?.abort();
+      limitAbortRef.current?.abort();
+      hostAbortRef.current?.abort();
+      checkUpdatesAbortRef.current?.abort();
+      updateCheckAbortRef.current?.abort();
     };
-  }, [loadSettings, checkUpdates]);
+  }, [loadSettings]);
+
+  // Populate WSL distributions on Windows/WSL when Overview has not loaded yet.
+  useEffect(() => {
+    if (!settings?.usesWsl || appData.overview !== null) {
+      return;
+    }
+    const controller = new AbortController();
+    void appDataStore.ensureOverview(controller.signal).catch(() => {});
+    return () => {
+      controller.abort();
+    };
+  }, [settings?.usesWsl, appData.overview]);
 
   const handleLanguageChange = useCallback((pref: LanguagePref) => {
     preferenceSync.setLanguage(pref);
@@ -155,9 +152,22 @@ export function SettingsPage({ snapshot, t, pushToast }: PageProps) {
     preferenceSync.setAppearance(pref);
   }, []);
 
-  const handleClearFeedback = useCallback(() => {
+  const handleRetryPreferenceSave = useCallback(() => {
+    preferenceSync.retryLastFailed();
+  }, []);
+
+  const handleDismissPreferenceError = useCallback(() => {
+    preferenceSync.clearError();
+  }, []);
+
+  const handleClearDefaultsFeedback = useCallback(() => {
     setSaveError(null);
     setSavedNotice(false);
+  }, []);
+
+  const handleClearLimitFeedback = useCallback(() => {
+    setLimitSaveError(null);
+    setLimitSavedNotice(false);
   }, []);
 
   const handleSaveDefaults = useCallback(
@@ -176,6 +186,7 @@ export function SettingsPage({ snapshot, t, pushToast }: PageProps) {
           return false;
         }
         setSettings(updated);
+        settingsNoticeStore.observe(updated.settingsNotice, { authoritativeClear: true });
         appDataStore.applySessionDefaults(updated.defaults);
         setSavedNotice(true);
         pushToast({ tone: "success", body: t("web.settings.saved") });
@@ -203,21 +214,318 @@ export function SettingsPage({ snapshot, t, pushToast }: PageProps) {
     [pushToast, t],
   );
 
-  const showCorruptAlert = settings !== null && settings.loadStatus === "corrupt" && !corruptDismissed;
-  const showResetAlert =
-    settings !== null && settings.resetDefaults.length > 0 && !resetDismissed;
+  const handleSaveLimitFocus = useCallback(
+    async (limit: number): Promise<boolean> => {
+      limitAbortRef.current?.abort();
+      const controller = new AbortController();
+      limitAbortRef.current = controller;
 
-  const resetFieldNames = showResetAlert
-    ? settings.resetDefaults
-        .map((field) => (isKnownResetField(field) ? t(RESET_FIELD_LABEL_KEYS[field]) : field))
-        .join(t("app.fmt.list_separator"))
-    : "";
+      setSavingLimit(true);
+      setLimitSaveError(null);
+      setLimitSavedNotice(false);
+
+      try {
+        const updated = await patchDefaults({ max_concurrent_sessions: limit }, controller.signal);
+        if (controller.signal.aborted) {
+          return false;
+        }
+        setSettings(updated);
+        settingsDraftStore.reconcileSavedConcurrentLimit(updated.defaults);
+        settingsNoticeStore.observe(updated.settingsNotice, { authoritativeClear: true });
+        appDataStore.applySessionDefaults(updated.defaults);
+        setLimitSavedNotice(true);
+        pushToast({ tone: "success", body: t("web.settings.saved") });
+        return true;
+      } catch (error: unknown) {
+        if (controller.signal.aborted || isAbortError(error)) {
+          return false;
+        }
+        setLimitSaveError(error);
+        pushToast({
+          tone: "danger",
+          title: t("app.toast.save_failed.title"),
+          body: formatSettingsError(error, t),
+        });
+        return false;
+      } finally {
+        if (limitAbortRef.current === controller) {
+          limitAbortRef.current = null;
+        }
+        if (!controller.signal.aborted) {
+          setSavingLimit(false);
+        }
+      }
+    },
+    [pushToast, t],
+  );
+
+  const handleHostDraftChange = useCallback(
+    (colabPath: string, colabPython: string) => {
+      settingsDraftStore.saveHostDraft(
+        settings?.colabPath ?? null,
+        settings?.colabPython ?? null,
+        colabPath,
+        colabPython,
+      );
+      if (hostError !== null) {
+        setHostError(null);
+      }
+      if (hostSavedNotice) {
+        setHostSavedNotice(false);
+      }
+    },
+    [hostError, hostSavedNotice, settings?.colabPath, settings?.colabPython],
+  );
+
+  const handleWslDistroChange = useCallback(
+    (distro: string | null) => {
+      if (!settings || settings.wslDistro === distro) {
+        return;
+      }
+      hostAbortRef.current?.abort();
+      const controller = new AbortController();
+      hostAbortRef.current = controller;
+
+      setSavingHost(true);
+      setHostError(null);
+      setHostSavedNotice(false);
+
+      void patchHostSettings({ wsl_distro: distro }, controller.signal)
+        .then((updated) => {
+          if (controller.signal.aborted) {
+            return;
+          }
+          setSettings(updated);
+          settingsNoticeStore.observe(updated.settingsNotice, { authoritativeClear: true });
+          setHostSavedNotice(true);
+          pushToast({ tone: "success", body: t("web.settings.saved") });
+          if (snapshot?.backend === "real") {
+            void appDataStore.refreshOverview().catch(() => {});
+          }
+        })
+        .catch((error: unknown) => {
+          if (controller.signal.aborted || isAbortError(error)) {
+            return;
+          }
+          const message = formatSettingsError(error, t);
+          setHostError({ message, interpreterAlone: false });
+          pushToast({
+            tone: "danger",
+            title: t("app.toast.save_failed.title"),
+            body: message,
+          });
+        })
+        .finally(() => {
+          if (hostAbortRef.current === controller) {
+            hostAbortRef.current = null;
+          }
+          if (!controller.signal.aborted) {
+            setSavingHost(false);
+          }
+        });
+    },
+    [pushToast, settings, snapshot?.backend, t],
+  );
+
+  const handleApplyHostPaths = useCallback(
+    async (colabPathRaw: string, colabPythonRaw: string): Promise<boolean> => {
+      if (!settings) {
+        return false;
+      }
+      const nextColab = normalizePathInput(colabPathRaw);
+      const nextPython = normalizePathInput(colabPythonRaw);
+      if (nextColab === settings.colabPath && nextPython === settings.colabPython) {
+        settingsDraftStore.clearHostDraft();
+        setHostError(null);
+        return true;
+      }
+
+      hostAbortRef.current?.abort();
+      const controller = new AbortController();
+      hostAbortRef.current = controller;
+
+      setSavingHost(true);
+      setHostError(null);
+      setHostSavedNotice(false);
+
+      try {
+        const updated = await patchHostSettings(
+          { colab_path: nextColab, colab_python: nextPython },
+          controller.signal,
+        );
+        if (controller.signal.aborted) {
+          return false;
+        }
+        setSettings(updated);
+        settingsDraftStore.clearHostDraft();
+        settingsNoticeStore.observe(updated.settingsNotice, { authoritativeClear: true });
+        setHostSavedNotice(true);
+        pushToast({ tone: "success", body: t("web.settings.saved") });
+        if (snapshot?.backend === "real") {
+          void appDataStore.refreshOverview().catch(() => {});
+        }
+        return true;
+      } catch (error: unknown) {
+        if (controller.signal.aborted || isAbortError(error)) {
+          return false;
+        }
+        const interpreterAlone = isHostInterpreterAloneError(error);
+        const message = formatSettingsError(error, t);
+        setHostError({ message, interpreterAlone });
+        if (interpreterAlone) {
+          pushToast({ tone: "warning", body: message });
+        } else {
+          pushToast({
+            tone: "danger",
+            title: t("app.toast.save_failed.title"),
+            body: message,
+          });
+        }
+        return false;
+      } finally {
+        if (hostAbortRef.current === controller) {
+          hostAbortRef.current = null;
+        }
+        if (!controller.signal.aborted) {
+          setSavingHost(false);
+        }
+      }
+    },
+    [pushToast, settings, snapshot?.backend, t],
+  );
+
+  const handleCheckUpdatesNow = useCallback(() => {
+    updateCheckAbortRef.current?.abort();
+    const controller = new AbortController();
+    updateCheckAbortRef.current = controller;
+
+    void updatesStore
+      .checkNow(controller.signal)
+      .then((notice) => {
+        if (controller.signal.aborted) {
+          return;
+        }
+        if (notice.status === "failed") {
+          pushToast({
+            tone: "warning",
+            title: t("app.b7.update_failed_title"),
+            body: formatApiErrorPayload(notice.error, t),
+          });
+        }
+      })
+      .catch((error: unknown) => {
+        if (controller.signal.aborted || isAbortError(error)) {
+          return;
+        }
+        pushToast({
+          tone: "warning",
+          title: t("app.b7.update_failed_title"),
+          body: formatSettingsError(error, t),
+        });
+      })
+      .finally(() => {
+        if (updateCheckAbortRef.current === controller) {
+          updateCheckAbortRef.current = null;
+        }
+      });
+  }, [pushToast, t]);
+
+  const handleToggleCheckUpdates = useCallback(
+    (enabled: boolean) => {
+      checkUpdatesAbortRef.current?.abort();
+      const controller = new AbortController();
+      checkUpdatesAbortRef.current = controller;
+
+      setSavingCheckUpdates(true);
+      setCheckUpdatesError(null);
+
+      void patchCheckUpdates(enabled, controller.signal)
+        .then((updated) => {
+          if (controller.signal.aborted) {
+            return;
+          }
+          setSettings(updated);
+          settingsNoticeStore.observe(updated.settingsNotice, { authoritativeClear: true });
+          updatesStore.setCheckUpdates(updated.checkUpdates);
+        })
+        .catch((error: unknown) => {
+          if (controller.signal.aborted || isAbortError(error)) {
+            return;
+          }
+          setCheckUpdatesError(error);
+          pushToast({
+            tone: "danger",
+            title: t("app.toast.save_failed.title"),
+            body: formatSettingsError(error, t),
+          });
+        })
+        .finally(() => {
+          if (checkUpdatesAbortRef.current === controller) {
+            checkUpdatesAbortRef.current = null;
+          }
+          if (!controller.signal.aborted) {
+            setSavingCheckUpdates(false);
+          }
+        });
+    },
+    [pushToast, t],
+  );
 
   const loadErrorText = loadError !== null ? formatSettingsError(loadError, t) : null;
   const saveErrorText = saveError !== null ? formatSettingsError(saveError, t) : null;
-  const updateErrorText = updateError !== null ? formatSettingsError(updateError, t) : null;
+  const limitSaveErrorText =
+    limitSaveError !== null ? formatSettingsError(limitSaveError, t) : null;
+  const generalSaveErrorText =
+    preferenceState.lastError !== null
+      ? formatSettingsError(preferenceState.lastError.error, t)
+      : null;
+  const updateErrorText =
+    updatesState.manualError !== null ? formatSettingsError(updatesState.manualError, t) : null;
+  const checkUpdatesErrorText =
+    checkUpdatesError !== null ? formatSettingsError(checkUpdatesError, t) : null;
 
   const backendKind = snapshot?.backend ?? null;
+  const simulated = backendKind === "mock";
+  const hostBusy = Boolean(
+    snapshot?.shutting_down ||
+      snapshot?.login_id !== null ||
+      (snapshot?.operations.length ?? 0) > 0,
+  );
+  const wslDistros = appData.overview?.environment.wsl_distros ?? [];
+  const hostFirst = settingsFocus === "host";
+  const limitFirst = settingsFocus === "limit";
+
+  const resolvedDefaultsDraft = settings
+    ? settingsDraftStore.resolveDefaultsDraft(settings.defaults)
+    : null;
+  const resolvedHostDraft = settings
+    ? settingsDraftStore.resolveHostDraft(settings.colabPath, settings.colabPython)
+    : null;
+
+  const hostSectionNode =
+    settings !== null && resolvedHostDraft !== null ? (
+      <HostSection
+        usesWsl={settings.usesWsl}
+        wslDistro={settings.wslDistro}
+        wslDistros={wslDistros}
+        colabPathDraft={resolvedHostDraft.colabPath}
+        colabPythonDraft={resolvedHostDraft.colabPython}
+        simulated={simulated}
+        busy={hostBusy}
+        saving={savingHost}
+        focused={hostFirst}
+        hostError={hostError}
+        savedNotice={hostSavedNotice}
+        dict={i18n.dict}
+        t={t}
+        onWslDistroChange={handleWslDistroChange}
+        onDraftChange={handleHostDraftChange}
+        onApplyPaths={handleApplyHostPaths}
+      />
+    ) : null;
+
+  const effectiveCheckUpdates =
+    settings?.checkUpdates ?? updatesState.notice?.check_updates ?? true;
 
   return (
     <>
@@ -227,60 +535,37 @@ export function SettingsPage({ snapshot, t, pushToast }: PageProps) {
       </header>
 
       <div className="page-sections">
-        {showCorruptAlert && (
-          <div className="alert alert-warning" role="status">
-            <span className="alert-icon icon-warning">
-              <AlertIcon />
-            </span>
-            <div className="alert-text">
-              <p className="alert-title">{t("app.toast.settings_reset.title")}</p>
-              <p className="alert-body">
-                {settings.corruptBackup !== null
-                  ? t("app.toast.settings_reset.body", { file: settings.corruptBackup })
-                  : t("app.toast.settings_reset.body_lost")}
-              </p>
-            </div>
-            <button
-              type="button"
-              className="btn btn-sm btn-ghost btn-icon alert-dismiss"
-              aria-label={t("app.action.dismiss")}
-              onClick={() => setCorruptDismissed(true)}
-            >
-              <CloseIcon />
-            </button>
-          </div>
+        {limitFirst && settings !== null && resolvedDefaultsDraft !== null && (
+          <LimitFocusCard
+            serverDefaults={settings.defaults}
+            draftValue={resolvedDefaultsDraft.draft.max_concurrent_sessions}
+            dict={i18n.dict}
+            saving={savingLimit}
+            saveError={limitSaveErrorText}
+            savedNotice={limitSavedNotice}
+            t={t}
+            onChange={(value) => {
+              settingsDraftStore.updateConcurrentLimitDraft(settings.defaults, value);
+            }}
+            onSave={handleSaveLimitFocus}
+            onClearFeedback={handleClearLimitFeedback}
+          />
         )}
 
-        {showResetAlert && (
-          <div className="alert alert-warning" role="status">
-            <span className="alert-icon icon-warning">
-              <AlertIcon />
-            </span>
-            <div className="alert-text">
-              <p className="alert-title">{t("app.toast.defaults_reset.title")}</p>
-              <p className="alert-body">
-                {t("app.toast.defaults_reset.body", { fields: resetFieldNames })}
-              </p>
-            </div>
-            <button
-              type="button"
-              className="btn btn-sm btn-ghost btn-icon alert-dismiss"
-              aria-label={t("app.action.dismiss")}
-              onClick={() => setResetDismissed(true)}
-            >
-              <CloseIcon />
-            </button>
-          </div>
-        )}
+        {hostFirst && hostSectionNode}
 
         <GeneralSection
           language={i18n.preference}
           browserLocale={i18n.browserLocale}
           dict={i18n.dict}
           appearance={theme.preference}
+          saving={preferenceState.saving}
+          saveError={generalSaveErrorText}
           t={t}
           onLanguageChange={handleLanguageChange}
           onAppearanceChange={handleAppearanceChange}
+          onRetrySave={handleRetryPreferenceSave}
+          onDismissError={handleDismissPreferenceError}
         />
 
         {settings !== null ? (
@@ -292,7 +577,7 @@ export function SettingsPage({ snapshot, t, pushToast }: PageProps) {
             saveError={saveErrorText}
             savedNotice={savedNotice}
             onSave={handleSaveDefaults}
-            onClearFeedback={handleClearFeedback}
+            onClearFeedback={handleClearDefaultsFeedback}
           />
         ) : loadingSettings ? (
           <section className="card">
@@ -317,15 +602,22 @@ export function SettingsPage({ snapshot, t, pushToast }: PageProps) {
           </div>
         ) : null}
 
+        {!hostFirst && hostSectionNode}
+
         <AboutSection
           backendKind={backendKind}
+          settingsFile={settings?.settingsFile ?? null}
           configDir={settings?.configDir ?? null}
-          updateNotice={updateNotice}
-          checkingUpdates={checkingUpdates}
+          checkUpdates={effectiveCheckUpdates}
+          savingCheckUpdates={savingCheckUpdates}
+          checkUpdatesError={checkUpdatesErrorText}
+          updateNotice={updatesState.notice}
+          checkingUpdates={updatesState.checkingManual}
           updateError={updateErrorText}
           dict={i18n.dict}
           t={t}
-          onCheckUpdates={checkUpdates}
+          onCheckUpdates={handleCheckUpdatesNow}
+          onToggleCheckUpdates={handleToggleCheckUpdates}
           pushToast={pushToast}
         />
       </div>
