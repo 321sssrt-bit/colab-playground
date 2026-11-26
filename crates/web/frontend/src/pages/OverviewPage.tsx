@@ -40,12 +40,23 @@ export function OverviewPage({ snapshot, locale, t, navigate, pushToast }: PageP
   const installState = useCliInstallStore();
   const pluginCache = usePluginCacheStore();
 
-  // Ensure the host probe runs once per session; cached results survive route switches
-  // and live SSE snapshots update accounts, usage, and CLI install state without re-probing.
+  // Ensure the host probe runs once per session and automatically re-probes if a cross-tab
+  // backend rebuild clears the cached overview while Overview stays mounted.
   useEffect(() => {
-    void appDataStore.ensureOverview().catch(() => {});
     cliInstallStore.syncWithServer();
   }, []);
+
+  useEffect(() => {
+    if (appData.overview === null && appData.overviewError === null && !appData.overviewLoading) {
+      void appDataStore.ensureOverview().catch(() => {});
+    }
+  }, [appData.overview, appData.overviewError, appData.overviewLoading]);
+
+  useEffect(() => {
+    if (appData.overview === null && appData.overviewError !== null && appData.usesWsl === null) {
+      void appDataStore.refreshSessionDefaults().catch(() => {});
+    }
+  }, [appData.overview, appData.overviewError, appData.usesWsl]);
 
   useEffect(() => {
     cliInstallStore.hydrateFromOverview(appData.overview?.cli_install);
@@ -200,6 +211,7 @@ export function OverviewPage({ snapshot, locale, t, navigate, pushToast }: PageP
             checklist={checklist}
             probeError={probeError}
             probeErrorKind={probeErrorKind}
+            usesWsl={appData.usesWsl}
             probing={probing}
             runningInstallOp={runningInstallOp}
             adopting={adopting}

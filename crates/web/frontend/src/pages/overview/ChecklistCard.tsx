@@ -44,6 +44,7 @@ export interface ChecklistCardProps {
   readonly checklist: ChecklistModel;
   readonly probeError: FormattedApiError | null;
   readonly probeErrorKind: ErrorKind | null;
+  readonly usesWsl: boolean | null;
   readonly probing: boolean;
   readonly runningInstallOp: PendingOperation | null;
   readonly adopting: boolean;
@@ -85,6 +86,7 @@ export function ChecklistCard({
   checklist,
   probeError,
   probeErrorKind,
+  usesWsl,
   probing,
   runningInstallOp,
   adopting,
@@ -152,7 +154,8 @@ export function ChecklistCard({
     }
   }, [pushToast, t]);
 
-  const hostIsWsl = overview?.host.kind === "wsl";
+  const hostIsWsl =
+    overview !== null ? overview.host.kind === "wsl" : (usesWsl ?? probeErrorKind === "wsl_unavailable");
   const hostTitle = t(hostIsWsl ? "app.step.wsl.title" : "app.step.shell.title");
 
   let hostDescription: string | null = null;
@@ -258,31 +261,6 @@ export function ChecklistCard({
           <p className="card-desc">{t("app.checklist.description")}</p>
         </div>
       </div>
-
-      {overview !== null && probeError !== null && probeErrorKind !== "not_installed" && (
-        <div className="alert alert-danger" role="alert">
-          <span className="alert-icon icon-danger">
-            <AlertIcon />
-          </span>
-          <div className="alert-text">
-            <p className="alert-title">{probeError.message}</p>
-            {probeError.hint !== null && <p className="alert-body">{probeError.hint}</p>}
-            <div className="alert-actions">
-              <button
-                type="button"
-                className="btn btn-sm"
-                data-overview-check-again="true"
-                disabled={probing || installing || shuttingDown}
-                onClick={() => {
-                  void onCheckAgain();
-                }}
-              >
-                {t("app.action.check_again")}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
 
       <ol className="checklist" role="list">
         <li

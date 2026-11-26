@@ -109,6 +109,7 @@ export function createCliInstallStore(options: CliInstallStoreOptions = {}): Cli
   let startingLocal = false;
   let totalLinesSeen = 0;
   let hydratedTerminalKey: string | null = null;
+  let lastHydratedOverviewView: CliInstallView | null = null;
   let refreshedSucceededId: number | null = null;
   let statusFetchInFlight: {
     readonly generation: number;
@@ -171,6 +172,9 @@ export function createCliInstallStore(options: CliInstallStoreOptions = {}): Cli
     abortStatusFetch();
     totalLinesSeen = 0;
     hydratedTerminalKey = null;
+    if (!keepPreferredMethod) {
+      lastHydratedOverviewView = null;
+    }
     refreshedSucceededId = null;
     setState({
       ...INITIAL_STATE,
@@ -201,16 +205,15 @@ export function createCliInstallStore(options: CliInstallStoreOptions = {}): Cli
 
   const applyView = (view: CliInstallView): void => {
     const sameSession = view.id !== null && view.id === state.id;
-    const incomingLines = sanitizeInstallLines(view.lines);
-    // Preserve already-streamed lines if the polled snapshot happens to lag behind an active stream.
-    const keepCurrentLines =
-      sameSession && activeStream !== null && view.lines.length < totalLinesSeen;
+    // Never regress an already-captured log buffer when a stale GET lags behind the live stream.
+    const keepCurrentLines = sameSession && view.lines.length < totalLinesSeen;
+    const incomingLines = keepCurrentLines ? state.lines : sanitizeInstallLines(view.lines);
     if (!keepCurrentLines) {
       totalLinesSeen = view.lines.length;
     }
     const notFound = view.phase === "not_found";
     if (isTerminalPhase(view.phase)) {
-      hydratedTerminalKey = `${view.id ?? "none"}:${view.phase}:${view.lines.length}`;
+      hydratedTerminalKey = `${view.id ?? "none"}:${view.phase}:${totalLinesSeen}`;
     } else {
       hydratedTerminalKey = null;
     }
@@ -220,7 +223,7 @@ export function createCliInstallStore(options: CliInstallStoreOptions = {}): Cli
       phase: view.phase,
       cliInstalled: view.cli_installed,
       cancelling: view.cancelling,
-      lines: keepCurrentLines ? state.lines : incomingLines,
+      lines: incomingLines,
       warningTitleKey: notFound ? (view.warning_title_key ?? "app.install.not_found.title") : null,
       warningBodyKey: notFound ? (view.warning_body_key ?? "app.install.not_found.body") : null,
       error: notFound ? null : view.error,
@@ -500,6 +503,7 @@ export function createCliInstallStore(options: CliInstallStoreOptions = {}): Cli
 
     if (summary.phase === "checking") {
       const sameSession = summary.id !== null && summary.id === state.id;
+      hydratedTerminalKey = null;
       setState({
         id: summary.id,
         method: summary.method ?? state.method,
@@ -521,6 +525,23 @@ export function createCliInstallStore(options: CliInstallStoreOptions = {}): Cli
     }
     if (activeStream !== null && activeStream.id === summary.id) {
       // Live SSE `finished` frame is immediately behind this snapshot notification.
+      return;
+    }
+    if (
+      summary.id !== null &&
+      summary.id === state.id &&
+      summary.phase === "not_found" &&
+      totalLinesSeen >= summary.line_count &&
+      state.warningTitleKey !== null
+    ) {
+      hydratedTerminalKey = terminalKey;
+      setState({
+        phase: "not_found",
+        cliInstalled: false,
+        cancelling: false,
+        error: null,
+        streamError: null,
+      });
       return;
     }
     void fetchInstallStatus();
@@ -733,12 +754,27 @@ export function createCliInstallStore(options: CliInstallStoreOptions = {}): Cli
       if (disposed || view === null || view === undefined) {
         return;
       }
+      // Route-switch remounts pass the same cached `overview.cli_install` object; never re-apply it.
+      if (view === lastHydratedOverviewView) {
+        return;
+      }
+      lastHydratedOverviewView = view;
+      if (startingLocal) {
+        return;
+      }
+      if (view.phase === "idle" && view.id === null && (activeStream !== null || state.id !== null)) {
+        return;
+      }
+      if (state.id !== null && view.id !== null && view.id < state.id) {
+        return;
+      }
       if (
         activeStream !== null &&
         (view.phase === "running" || view.phase === "checking") &&
         (activeStream.id === null || activeStream.id === view.id)
       ) {
         if (view.phase === "checking" && state.phase !== "checking") {
+          hydratedTerminalKey = null;
           setState({ phase: "checking", cancelling: false });
         } else if (view.cancelling && !state.cancelling) {
           setState({ cancelling: true });

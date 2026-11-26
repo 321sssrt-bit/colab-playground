@@ -222,6 +222,7 @@ export interface AppDataState {
   readonly overview: OverviewResponse | null;
   readonly overviewLoading: boolean;
   readonly overviewError: unknown | null;
+  readonly usesWsl: boolean | null;
   readonly sessionsRefreshing: boolean;
   readonly sessionsError: unknown | null;
   readonly sessionsAccountErrors: readonly AccountFailureResponse[] | null;
@@ -277,6 +278,7 @@ const INITIAL_STATE: AppDataState = {
   overview: null,
   overviewLoading: false,
   overviewError: null,
+  usesWsl: null,
   sessionsRefreshing: false,
   sessionsError: null,
   sessionsAccountErrors: null,
@@ -327,6 +329,7 @@ export function createAppDataStore(options: AppDataStoreOptions = {}): AppDataSt
       next.overview === state.overview &&
       next.overviewLoading === state.overviewLoading &&
       next.overviewError === state.overviewError &&
+      next.usesWsl === state.usesWsl &&
       next.sessionsRefreshing === state.sessionsRefreshing &&
       next.sessionsError === state.sessionsError &&
       next.sessionsAccountErrors === state.sessionsAccountErrors &&
@@ -427,6 +430,7 @@ export function createAppDataStore(options: AppDataStoreOptions = {}): AppDataSt
             overview: data,
             overviewLoading: false,
             overviewError: null,
+            usesWsl: data.host.kind === "wsl",
           });
         }
         return data;
@@ -644,7 +648,10 @@ export function createAppDataStore(options: AppDataStoreOptions = {}): AppDataSt
       .then((settings) => {
         if (!disposed && client.getSessionGeneration() === generation && seq === settingsSeq) {
           const summary = extractSessionSettings(settings.defaults);
-          setState(summary);
+          setState({
+            ...summary,
+            ...(typeof settings.uses_wsl === "boolean" ? { usesWsl: settings.uses_wsl } : {}),
+          });
           return summary;
         }
         return {

@@ -346,15 +346,24 @@ export function deriveChecklist(
   const probeErrorKind = options.probeErrorKind ?? null;
   const installing = options.installing === true;
 
+  if (probeErrorKind === "not_installed") {
+    return {
+      complete: false,
+      hostStatus: "done",
+      cliStatus: "todo",
+      signinStatus: "waiting",
+    };
+  }
+  if (probeError !== null) {
+    return {
+      complete: false,
+      hostStatus: "failed",
+      cliStatus: "waiting",
+      signinStatus: "waiting",
+    };
+  }
+
   if (overview === null) {
-    if (probeErrorKind === "not_installed") {
-      return {
-        complete: false,
-        hostStatus: "done",
-        cliStatus: "todo",
-        signinStatus: "waiting",
-      };
-    }
     if (installing) {
       return {
         complete: false,
@@ -365,16 +374,15 @@ export function deriveChecklist(
     }
     return {
       complete: false,
-      hostStatus: probeError !== null ? "failed" : "checking",
+      hostStatus: "checking",
       cliStatus: "waiting",
       signinStatus: "waiting",
     };
   }
 
   const hostStatus: ChecklistStepStatus = overview.host.ready ? "done" : "todo";
-  const cliInstalled = probeErrorKind === "not_installed" ? false : overview.cli_installed;
   const cliStatus: ChecklistStepStatus =
-    hostStatus !== "done" ? "waiting" : cliInstalled ? "done" : "todo";
+    hostStatus !== "done" ? "waiting" : overview.cli_installed ? "done" : "todo";
 
   let signinStatus: ChecklistStepStatus;
   if (cliStatus !== "done") {
@@ -505,6 +513,29 @@ function buildUnmanagedWarningFromRuntimes(
   };
 }
 
+function isEnvironmentBlockedError(kind: ErrorKind | null): boolean {
+  return kind === "not_installed" || kind === "keyring_unavailable" || kind === "wsl_unavailable";
+}
+
+function buildOverviewFallbackWarning(
+  overviewUnmanaged: UnmanagedRuntimes | null,
+  t: TranslateFn,
+): UnmanagedWarningView | null {
+  if (overviewUnmanaged === null || overviewUnmanaged.warning_key === null) {
+    return null;
+  }
+  const body =
+    overviewUnmanaged.count !== null
+      ? t(overviewUnmanaged.warning_key, { count: overviewUnmanaged.count })
+      : t(overviewUnmanaged.warning_key);
+  if (!body) {
+    return null;
+  }
+  const title =
+    overviewUnmanaged.count === null ? t("app.unmanaged.unknown_title") : t("app.unmanaged.title");
+  return { title, body };
+}
+
 /**
  * Builds the unmanaged-runtime warning for both ready and checklist states from
  * live SSE snapshot data once available, falling back to `/api/overview`'s
@@ -527,10 +558,30 @@ export function buildOverviewUnmanagedWarning(
     if (primary === null && snapshot.runtimes !== null) {
       primary = buildUnmanagedWarningFromRuntimes(snapshot, accountsView, t);
     }
+    if (
+      primary === null &&
+      snapshot.runtimes === null &&
+      overviewUnmanaged !== null &&
+      overviewUnmanaged.count !== null &&
+      overviewUnmanaged.count > 0
+    ) {
+      primary = buildOverviewFallbackWarning(overviewUnmanaged, t);
+    }
 
+    // Backend mirrors environment-blocked errors (`keyring_unavailable`, `not_installed`,
+    // `wsl_unavailable`) onto `runtimes_error`; those mean setup is incomplete, not billing risk.
+    const envBlocked =
+      isEnvironmentBlockedError(snapshot.accounts_error) ||
+      isEnvironmentBlockedError(snapshot.runtimes_error);
+    const hasAccountContext =
+      (accountsView !== null && accountsView.accounts.length > 0) ||
+      overviewUnmanaged?.warning_key !== null;
     const liveIncomplete =
-      snapshot.runtimes_error !== null ||
-      (snapshot.runtimes !== null && snapshot.runtimes.errors.length > 0);
+      !envBlocked &&
+      snapshot.accounts_error === null &&
+      hasAccountContext &&
+      (snapshot.runtimes_error !== null ||
+        (snapshot.runtimes !== null && snapshot.runtimes.errors.length > 0));
 
     if (primary !== null) {
       if (liveIncomplete) {
@@ -552,23 +603,10 @@ export function buildOverviewUnmanagedWarning(
       };
     }
 
-    if (snapshot.runtimes !== null) {
+    if (envBlocked || snapshot.runtimes !== null) {
       return null;
     }
   }
 
-  if (overviewUnmanaged === null || overviewUnmanaged.warning_key === null) {
-    return null;
-  }
-
-  const body =
-    overviewUnmanaged.count !== null
-      ? t(overviewUnmanaged.warning_key, { count: overviewUnmanaged.count })
-      : t(overviewUnmanaged.warning_key);
-  if (!body) {
-    return null;
-  }
-  const title =
-    overviewUnmanaged.count === null ? t("app.unmanaged.unknown_title") : t("app.unmanaged.title");
-  return { title, body };
+  return buildOverviewFallbackWarning(overviewUnmanaged, t);
 }

@@ -1526,7 +1526,7 @@ test("settingsNoticeStore displays once globally, survives background null updat
   assert.equal(notices.getState().notice, null);
 });
 
-test("deriveChecklist follows upstream 3-step flow and routes NotInstalled probe error to CLI step", () => {
+test("deriveChecklist follows upstream 3-step flow and routes NotInstalled and re-probe failures accurately", () => {
   const err = { message: "err", hint: null };
   assert.deepEqual(
     deriveChecklist(null, err, false, { probeErrorKind: "not_installed" }),
@@ -1543,6 +1543,31 @@ test("deriveChecklist follows upstream 3-step flow and routes NotInstalled probe
     cliStatus: "waiting",
     signinStatus: "waiting",
   });
+
+  // Re-probe failure with cached overview must still mark host failed and wait CLI.
+  const staleNotReadyHost = makeOverview({
+    host: { kind: "shell_tools", ready: false, hint_key: null },
+    cli_installed: false,
+  });
+  assert.deepEqual(
+    deriveChecklist(staleNotReadyHost, err, false, { probeErrorKind: "io" }),
+    {
+      complete: false,
+      hostStatus: "failed",
+      cliStatus: "waiting",
+      signinStatus: "waiting",
+    },
+  );
+  // New NotInstalled error overrides a stale host.ready=false cached report so Install is shown.
+  assert.deepEqual(
+    deriveChecklist(staleNotReadyHost, err, false, { probeErrorKind: "not_installed" }),
+    {
+      complete: false,
+      hostStatus: "done",
+      cliStatus: "todo",
+      signinStatus: "waiting",
+    },
+  );
 
   const keyringFailed = makeOverview({
     accounts: null,
@@ -1581,7 +1606,7 @@ test("deriveChecklist follows upstream 3-step flow and routes NotInstalled probe
   });
 });
 
-test("cliInstallStore streams, replays without duplicates, strips ANSI, handles fa25d8c not_found, and resets on host change", async (t) => {
+test("cliInstallStore survives route-switch remount, recheck cycle with identical line_count, and >5000-line replay", async (t) => {
   const installSse = createSseControl();
   const replaySse = createSseControl();
   const eventsSse = createSseControl();
@@ -1651,11 +1676,27 @@ test("cliInstallStore streams, replays without duplicates, strips ANSI, handles 
 
   await store.signIn("secret-key");
 
-  // Start install -> ANSI codes stripped -> phase transitions to checking -> finished with phase=not_found.
+  // Initial overview hydrate before install starts.
+  const cachedIdleView = {
+    id: null,
+    method: null,
+    phase: "idle" as const,
+    cli_installed: false,
+    cancelling: false,
+    lines: [],
+    warning_title_key: null,
+    warning_body_key: null,
+    error: null,
+  };
+  installStore.hydrateFromOverview(cachedIdleView);
+
+  // Start install -> ANSI codes stripped -> remounting Overview with stale cached idle view must NOT wipe live logs.
   const startPromise = installStore.startInstall("uv");
   installSse.sendFrame("started", { id: 7, method: "uv" });
   installSse.sendFrame("line", { stream: "stdout", text: "\u001B[32minstalled to ~/.local/bin\u001B[0m" });
   await flushAsync();
+  installStore.hydrateFromOverview(cachedIdleView);
+  installStore.hydrateFromOverview({ ...cachedIdleView });
   assert.equal(installStore.getState().id, 7);
   assert.equal(installStore.getState().phase, "running");
   assert.deepEqual(installStore.getState().lines, [
@@ -1706,11 +1747,49 @@ test("cliInstallStore streams, replays without duplicates, strips ANSI, handles 
   assert.equal(installStore.getState().warningBodyKey, "app.install.not_found.body");
   assert.equal(overviewRefreshes, 0);
 
-  // Changing host settings clears cli_install back to idle on backend -> store resets cleanly.
+  // Recheck cycle: clicking Check again transitions not_found -> checking -> not_found with identical line_count=1.
   eventsSse.sendFrame(
     "snapshot",
     makeSnapshot({
       version: 3,
+      cli_install: {
+        id: 7,
+        method: "uv",
+        phase: "checking",
+        cancelling: false,
+        line_count: 1,
+        error_kind: null,
+      },
+    }),
+    "3",
+  );
+  await flushAsync();
+  assert.equal(installStore.getState().phase, "checking");
+
+  eventsSse.sendFrame(
+    "snapshot",
+    makeSnapshot({
+      version: 4,
+      cli_install: {
+        id: 7,
+        method: "uv",
+        phase: "not_found",
+        cancelling: false,
+        line_count: 1,
+        error_kind: null,
+      },
+    }),
+    "4",
+  );
+  await flushAsync();
+  assert.equal(installStore.getState().phase, "not_found");
+  assert.equal(installStore.getState().lines.length, 1);
+
+  // Changing host settings clears cli_install back to idle on backend -> store resets cleanly.
+  eventsSse.sendFrame(
+    "snapshot",
+    makeSnapshot({
+      version: 5,
       cli_install: {
         id: null,
         method: null,
@@ -1720,29 +1799,38 @@ test("cliInstallStore streams, replays without duplicates, strips ANSI, handles 
         error_kind: null,
       },
     }),
-    "3",
+    "5",
   );
   await flushAsync();
   assert.equal(installStore.getState().phase, "idle");
   assert.equal(installStore.getState().lines.length, 0);
 
-  // Hydrate an already-running session from overview (simulating reload/tab attach): replays without duplicating lines.
+  // Hydrate an already-running session with >5000 lines, then replay stream without losing or duplicating lines.
+  const manyLines = Array.from({ length: 5002 }, (_, i) => ({
+    stream: "stdout" as const,
+    text: `line-${i}`,
+  }));
   installStore.hydrateFromOverview({
     id: 7,
     method: "uv",
     phase: "running",
     cli_installed: false,
     cancelling: false,
-    lines: [{ stream: "stdout", text: "\u001B[36mline-1\u001B[0m" }],
+    lines: manyLines,
     warning_title_key: null,
     warning_body_key: null,
     error: null,
   });
   await flushAsync();
   assert.ok(calls.includes("POST /api/overview/cli/install/7/events"));
+  assert.equal(installStore.getState().lines.length, 5000);
+  assert.equal(installStore.getState().lines[0]?.text, "line-2");
+
   replaySse.sendFrame("started", { id: 7, method: "uv" });
-  replaySse.sendFrame("line", { stream: "stdout", text: "\u001B[36mline-1\u001B[0m" });
-  replaySse.sendFrame("line", { stream: "stderr", text: "\u001B[31mline-2\u001B[0m" });
+  for (let i = 0; i < 5002; i += 1) {
+    replaySse.sendFrame("line", { stream: "stdout", text: `line-${i}` });
+  }
+  replaySse.sendFrame("line", { stream: "stderr", text: "\u001B[31mline-5002\u001B[0m" });
   replaySse.sendFrame("finished", {
     status: "succeeded",
     phase: "succeeded",
@@ -1754,17 +1842,63 @@ test("cliInstallStore streams, replays without duplicates, strips ANSI, handles 
   replaySse.close();
   await flushAsync();
 
-  assert.deepEqual(installStore.getState().lines, [
-    { stream: "stdout", text: "line-1" },
-    { stream: "stderr", text: "line-2" },
-  ]);
+  assert.equal(installStore.getState().lines.length, 5000);
+  assert.equal(installStore.getState().lines[0]?.text, "line-3");
+  assert.deepEqual(installStore.getState().lines.at(-1), {
+    stream: "stderr",
+    text: "line-5002",
+  });
   assert.equal(installStore.getState().phase, "succeeded");
   assert.equal(overviewRefreshes, 1);
 });
 
-test("buildOverviewUnmanagedWarning surfaces billing risks in checklist state and selectQuickDeployPlugins keeps bundled only", () => {
+test("buildOverviewUnmanagedWarning ignores first-run env errors, preserves count warnings, and selectQuickDeployPlugins keeps bundled only", () => {
   const t = (key: string, params?: Record<string, string | number>) =>
     params ? `${key}:${JSON.stringify(params)}` : key;
+
+  // First-run keyring_unavailable sets runtimes_error too -> must NOT emit false billing warning.
+  const lockedKeyringSnap = makeSnapshot({
+    accounts: null,
+    accounts_error: "keyring_unavailable",
+    runtimes: null,
+    runtimes_error: "keyring_unavailable",
+    usage: [],
+  });
+  assert.equal(
+    buildOverviewUnmanagedWarning(
+      null,
+      lockedKeyringSnap,
+      { count: null, incomplete: false, unverified_accounts: [], warning_key: null },
+      1_700_000_000,
+      t,
+    ),
+    null,
+  );
+
+  // Known overview unmanaged count is NOT downgraded to generic unknown when snapshot has runtimes_error and no accounts.
+  const ioErrorSnap = makeSnapshot({
+    accounts: null,
+    accounts_error: null,
+    runtimes: null,
+    runtimes_error: "io",
+    usage: [],
+  });
+  const preservedCount = buildOverviewUnmanagedWarning(
+    null,
+    ioErrorSnap,
+    {
+      count: 1,
+      incomplete: false,
+      unverified_accounts: [],
+      warning_key: "app.b2.quit_unwatched_one",
+    },
+    1_700_000_000,
+    t,
+  );
+  assert.deepEqual(preservedCount, {
+    title: "app.unmanaged.title",
+    body: 'app.b2.quit_unwatched_one:{"count":1}\nweb.runtimes.unmanaged_unknown',
+  });
 
   const signedOutAccounts = {
     accounts: [],
@@ -1775,7 +1909,7 @@ test("buildOverviewUnmanagedWarning surfaces billing risks in checklist state an
     recovered_pending_add: false,
   };
 
-  // Checklist state with runtimes-fail surfaces unknown ownership warning.
+  // Checklist state with runtimes_error + overview warning_key surfaces unknown ownership warning.
   const runtimesFailSnap = makeSnapshot({
     accounts: signedOutAccounts,
     runtimes: null,
@@ -1847,4 +1981,83 @@ test("buildOverviewUnmanagedWarning surfaces billing risks in checklist state an
     filtered.map((item) => item.manifest.id),
     ["llama-cpp"],
   );
+});
+
+test("appDataStore captures usesWsl from settings and clears cached overview when rebuild_backend finishes", async (t) => {
+  const sse = createSseControl();
+  let overviewCalls = 0;
+  const client = createApiClient({
+    fetchImpl: async (input) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/api/login") {
+        return jsonResponse({ token: "tok-rebuild", expires_in: 3600 });
+      }
+      if (url === "/api/events") {
+        return sse.response;
+      }
+      if (url === "/api/overview") {
+        overviewCalls += 1;
+        return jsonResponse(
+          makeOverview({
+            host: { kind: "wsl", ready: true, hint_key: null, wsl_distro: "Debian" },
+          }),
+        );
+      }
+      if (url === "/api/settings") {
+        return jsonResponse({
+          language: "system",
+          appearance: "system",
+          defaults: { ...CORE_DEFAULTS },
+          uses_wsl: true,
+          config_dir: null,
+          load_status: "loaded",
+          corrupt_backup: null,
+          reset_defaults: [],
+        } satisfies SettingsView);
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    },
+  });
+  const clock = createServerClock({
+    setIntervalFn: () => 0 as unknown as ReturnType<typeof setInterval>,
+    clearIntervalFn: () => {},
+  });
+  const store = createWebStore({ client, clock, ...noopTimers });
+  const toast = createToastStore(noopTimers);
+  const appData = createAppDataStore({ client, store, clock, toast, t: (k) => k });
+  t.after(() => {
+    appData.dispose();
+    store.dispose();
+    sse.close();
+    toast.dispose();
+    clock.dispose();
+  });
+
+  await store.signIn("secret-key");
+  await appData.refreshSessionDefaults();
+  assert.equal(appData.getState().usesWsl, true);
+
+  await appData.ensureOverview();
+  assert.equal(overviewCalls, 1);
+  assert.equal(appData.getState().overview?.host.wsl_distro, "Debian");
+
+  // Simulate cross-tab host change: rebuild_backend starts then completes.
+  sse.sendFrame(
+    "snapshot",
+    makeSnapshot({
+      version: 2,
+      operations: [{ id: 12, operation: { kind: "domain", name: "rebuild_backend", key: "" }, cancelling: false }],
+    }),
+    "2",
+  );
+  await flushAsync();
+  assert.ok(appData.getState().overview !== null);
+
+  sse.sendFrame("snapshot", makeSnapshot({ version: 3, operations: [] }), "3");
+  await flushAsync();
+  assert.equal(appData.getState().overview, null);
+  assert.equal(appData.getState().usesWsl, true);
+
+  await appData.ensureOverview();
+  assert.equal(overviewCalls, 2);
 });
