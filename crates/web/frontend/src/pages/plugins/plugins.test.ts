@@ -1092,7 +1092,7 @@ test("volatile deploy secret stash survives React ref-detach-before-cleanup unmo
   runsStore.openPluginDeployForm("llama-cpp");
   const openSeq = runsStore.getState().formOpenSeq;
 
-  // Simulate uncontrolled <input type="password"> receiving user input (`onInput`),
+  // Simulate an uncontrolled masked <input> receiving user input (`onInput`),
   // then React detaching `ref(null)` BEFORE `useEffect` cleanup on unmount.
   const domRefs = new Map<string, { value: string }>();
   const mount1Input = { value: "" };

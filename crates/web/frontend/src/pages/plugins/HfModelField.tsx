@@ -26,7 +26,7 @@ import type {
   PluginInputSpec,
 } from "./types.ts";
 
-export { buildGgufFitKey, type HfGgufFitParams };
+export type { HfGgufFitParams };
 
 const SEARCH_DEBOUNCE_MS = 300;
 const REPO_DEBOUNCE_MS = 350;
