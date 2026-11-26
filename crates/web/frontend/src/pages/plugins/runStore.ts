@@ -129,12 +129,13 @@ export interface PluginRunsStore {
   ): void;
   latchDeployOriginAccountContext(snapshotAccount: AccountContext | null): void;
   reconcileDeployTarget(snapshot: Snapshot | null): void;
-  stashDeploySecrets(
+  setStashedDeploySecret(
     pluginId: string,
     openSeq: number,
-    entries: readonly (readonly [string, string])[],
+    inputId: string,
+    value: string,
   ): void;
-  takeStashedDeploySecrets(
+  getStashedDeploySecrets(
     pluginId: string,
     openSeq: number,
   ): ReadonlyMap<string, string> | null;
@@ -1551,26 +1552,32 @@ export function createPluginRunsStore(options: PluginRunsStoreOptions = {}): Plu
     latchDeployOriginAccountContext,
     reconcileDeployTarget,
 
-    stashDeploySecrets(
+    setStashedDeploySecret(
       pluginId: string,
       openSeq: number,
-      entries: readonly (readonly [string, string])[],
+      inputId: string,
+      value: string,
     ): void {
       const current = state.deployDraft;
       if (!current || current.pluginId !== pluginId || current.openSeq !== openSeq) {
         stashedDeploySecrets = null;
         return;
       }
-      const values = new Map<string, string>();
-      for (const [id, raw] of entries) {
-        if (raw.length > 0) {
-          values.set(id, raw);
-        }
+      const existing =
+        stashedDeploySecrets &&
+        stashedDeploySecrets.pluginId === pluginId &&
+        stashedDeploySecrets.openSeq === openSeq
+          ? stashedDeploySecrets.values
+          : new Map<string, string>();
+      if (value.length > 0) {
+        existing.set(inputId, value);
+      } else {
+        existing.delete(inputId);
       }
-      stashedDeploySecrets = values.size > 0 ? { pluginId, openSeq, values } : null;
+      stashedDeploySecrets = existing.size > 0 ? { pluginId, openSeq, values: existing } : null;
     },
 
-    takeStashedDeploySecrets(
+    getStashedDeploySecrets(
       pluginId: string,
       openSeq: number,
     ): ReadonlyMap<string, string> | null {
@@ -1578,8 +1585,7 @@ export function createPluginRunsStore(options: PluginRunsStoreOptions = {}): Plu
       if (!current || current.pluginId !== pluginId || current.openSeq !== openSeq) {
         return null;
       }
-      stashedDeploySecrets = null;
-      return current.values;
+      return new Map(current.values);
     },
 
     clearStashedDeploySecrets(): void {
@@ -1727,25 +1733,26 @@ export function reconcilePluginDeployTarget(snapshot: Snapshot | null): void {
 }
 
 /**
- * Temporarily stashes non-empty masked secret inputs in volatile memory across a route unmount
- * while the same deploy draft stays open (never enters React state or `deployDraft`).
+ * Synchronously updates a single volatile masked secret input in memory while the same
+ * deploy draft stays open (never enters React state or `deployDraft`).
  */
-export function stashPluginDeploySecrets(
+export function setStashedPluginDeploySecret(
   pluginId: string,
   openSeq: number,
-  entries: readonly (readonly [string, string])[],
+  inputId: string,
+  value: string,
 ): void {
-  pluginRunsStore.stashDeploySecrets(pluginId, openSeq, entries);
+  pluginRunsStore.setStashedDeploySecret(pluginId, openSeq, inputId, value);
 }
 
 /**
- * Restores and clears volatile stashed secret inputs for the active deploy draft upon remount.
+ * Reads volatile stashed secret inputs for the active deploy draft upon remount.
  */
-export function takeStashedPluginDeploySecrets(
+export function getStashedPluginDeploySecrets(
   pluginId: string,
   openSeq: number,
 ): ReadonlyMap<string, string> | null {
-  return pluginRunsStore.takeStashedDeploySecrets(pluginId, openSeq);
+  return pluginRunsStore.getStashedDeploySecrets(pluginId, openSeq);
 }
 
 /**

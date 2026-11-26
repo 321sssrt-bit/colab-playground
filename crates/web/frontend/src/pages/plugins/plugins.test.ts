@@ -1075,7 +1075,7 @@ test("fast submitted run still emits Ready toast once even if /api/plugins/runs 
   toast.dispose();
 });
 
-test("volatile deploy secret stash survives route unmount for same draft and wipes on close or logout", () => {
+test("volatile deploy secret stash survives React ref-detach-before-cleanup unmount and StrictMode remount, and wipes on close or logout", () => {
   const web = createFakeWebStore(makeSnapshot());
   const harness = createFakeClient(async () => []);
   const pluginCache = createPluginCacheStore({ client: harness.client, store: web.store });
@@ -1091,30 +1091,60 @@ test("volatile deploy secret stash survives route unmount for same draft and wip
 
   runsStore.openPluginDeployForm("llama-cpp");
   const openSeq = runsStore.getState().formOpenSeq;
-  runsStore.stashDeploySecrets("llama-cpp", openSeq, [["api_key", "sk-route-secret"]]);
+
+  // Simulate uncontrolled <input type="password"> receiving user input (`onInput`),
+  // then React detaching `ref(null)` BEFORE `useEffect` cleanup on unmount.
+  const domRefs = new Map<string, { value: string }>();
+  const mount1Input = { value: "" };
+  domRefs.set("api_key", mount1Input);
+  mount1Input.value = "sk-route-secret";
+  runsStore.setStashedDeploySecret("llama-cpp", openSeq, "api_key", mount1Input.value);
 
   // Secrets must never appear in serialized store state / deployDraft.
   assert.equal(JSON.stringify(runsStore.getState()).includes("sk-route-secret"), false);
 
-  // Single-use restore hands secret back to DOM input and clears stash.
-  const restored = runsStore.takeStashedDeploySecrets("llama-cpp", openSeq);
-  assert.equal(restored?.get("api_key"), "sk-route-secret");
-  assert.equal(runsStore.takeStashedDeploySecrets("llama-cpp", openSeq), null);
+  // React unmount order: ref(null) deletes from Map before cleanup runs.
+  domRefs.delete("api_key");
+  assert.equal(domRefs.size, 0);
 
-  // Closing the form wipes any stashed secret.
-  runsStore.stashDeploySecrets("llama-cpp", openSeq, [["api_key", "sk-wiped"]]);
+  // StrictMode double-mount / route return both restore the secret into the fresh DOM input.
+  const firstRestore = runsStore.getStashedDeploySecrets("llama-cpp", openSeq);
+  const secondRestore = runsStore.getStashedDeploySecrets("llama-cpp", openSeq);
+  assert.equal(firstRestore?.get("api_key"), "sk-route-secret");
+  assert.equal(secondRestore?.get("api_key"), "sk-route-secret");
+
+  // Clearing input to empty removes it from stash; closing or logout wipes it unconditionally.
+  runsStore.setStashedDeploySecret("llama-cpp", openSeq, "api_key", "");
+  assert.equal(runsStore.getStashedDeploySecrets("llama-cpp", openSeq), null);
+
+  runsStore.setStashedDeploySecret("llama-cpp", openSeq, "api_key", "sk-wiped");
   runsStore.closePluginDeployForm();
-  assert.equal(runsStore.takeStashedDeploySecrets("llama-cpp", openSeq), null);
+  assert.equal(runsStore.getStashedDeploySecrets("llama-cpp", openSeq), null);
+
+  runsStore.openPluginDeployForm("llama-cpp");
+  const openSeq2 = runsStore.getState().formOpenSeq;
+  runsStore.setStashedDeploySecret("llama-cpp", openSeq2, "api_key", "sk-logout");
+  harness.emitAuth({ type: "logged_out", generation: 2 });
+  assert.equal(runsStore.getStashedDeploySecrets("llama-cpp", openSeq2), null);
 
   runsStore.dispose();
   pluginCache.dispose();
 });
 
-test("pluginCacheStore refreshes catalog when cross-tab plugin mutation op completes and preview cancel respects op ownership", async () => {
+test("pluginCacheStore refreshes catalog after in-flight GET /api/plugins when cross-tab mutation completes mid-flight, and preview cancel respects op ownership", async () => {
   const web = createFakeWebStore(makeSnapshot({ version: 1 }));
   let enabledOnServer = true;
+  let pluginListCalls = 0;
+  let releaseMidFlightList: ((items: PluginInfo[]) => void) | null = null;
+
   const harness = createFakeClient(async (_method, path) => {
     if (path === "/api/plugins") {
+      pluginListCalls += 1;
+      if (pluginListCalls === 2) {
+        return new Promise<PluginInfo[]>((resolve) => {
+          releaseMidFlightList = resolve;
+        });
+      }
       return [makePlugin("llama-cpp", enabledOnServer)];
     }
     return [];
@@ -1124,7 +1154,11 @@ test("pluginCacheStore refreshes catalog when cross-tab plugin mutation op compl
   await pluginCache.ensurePlugins();
   assert.equal(pluginCache.getPluginById("llama-cpp")?.enabled, true);
 
-  // Another tab starts and completes `set_plugin_enabled` on `llama-cpp`.
+  // Start an in-flight refresh BEFORE the cross-tab mutation completes.
+  const staleInFlight = pluginCache.refreshPlugins();
+  assert.equal(pluginListCalls, 2);
+
+  // While that older GET /api/plugins is still in flight, another tab disables `llama-cpp`.
   web.setSnapshot(
     makeSnapshot({
       version: 2,
@@ -1139,8 +1173,14 @@ test("pluginCacheStore refreshes catalog when cross-tab plugin mutation op compl
   );
   enabledOnServer = false;
   web.setSnapshot(makeSnapshot({ version: 3, operations: [] }));
+
+  // Stale in-flight response resolves with `enabled: true`, triggering queued follow-up refresh.
+  assert.ok(releaseMidFlightList);
+  (releaseMidFlightList as (items: PluginInfo[]) => void)([makePlugin("llama-cpp", true)]);
+  await staleInFlight;
   await new Promise((resolve) => setTimeout(resolve, 0));
 
+  assert.equal(pluginListCalls, 3, "must issue follow-up refresh after stale in-flight settles");
   assert.equal(pluginCache.getPluginById("llama-cpp")?.enabled, false);
 
   // Preview cancel guard: Tab B observing Tab A's pre-existing `inspect_plugin` op must not send global cancel.

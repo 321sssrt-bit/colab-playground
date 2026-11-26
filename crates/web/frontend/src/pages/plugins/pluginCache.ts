@@ -121,6 +121,7 @@ export function createPluginCacheStore(
   );
 
   let pluginsInFlight: InFlight<readonly PluginInfo[]> | null = null;
+  let pluginsRefreshPending = false;
   let tokenCheckInFlight: InFlight<HfTokenState> | null = null;
 
   const listeners = new Set<() => void>();
@@ -152,6 +153,7 @@ export function createPluginCacheStore(
   const abortAllInFlight = (): void => {
     pluginsInFlight?.controller.abort();
     pluginsInFlight = null;
+    pluginsRefreshPending = false;
     tokenCheckInFlight?.controller.abort();
     tokenCheckInFlight = null;
     pluginsSeq += 1;
@@ -214,6 +216,10 @@ export function createPluginCacheStore(
       .finally(() => {
         if (pluginsInFlight?.promise === promise) {
           pluginsInFlight = null;
+          if (!disposed && pluginsRefreshPending && client.getSessionGeneration() === generation) {
+            pluginsRefreshPending = false;
+            void refreshPlugins().catch(() => {});
+          }
         }
       });
     pluginsInFlight = { generation, controller, promise };
@@ -286,7 +292,14 @@ export function createPluginCacheStore(
       const nextSet = new Set(nextCatalogOpIds ? nextCatalogOpIds.split(",") : []);
       const anyCompleted = prevCatalogIds.split(",").some((id) => !nextSet.has(id));
       if (anyCompleted) {
-        void refreshPlugins().catch(() => {});
+        if (
+          pluginsInFlight !== null &&
+          pluginsInFlight.generation === client.getSessionGeneration()
+        ) {
+          pluginsRefreshPending = true;
+        } else {
+          void refreshPlugins().catch(() => {});
+        }
       }
     }
   });
