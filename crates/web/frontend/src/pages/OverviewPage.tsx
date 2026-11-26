@@ -1,7 +1,8 @@
 /**
  * Overview route: four-step environment readiness checklist with streaming
  * Colab CLI installer when setup is incomplete, transitioning to the active
- * account compute-unit summary and unmanaged runtime warning once ready.
+ * account compute-unit summary, unmanaged runtime warning, and enabled-plugin
+ * quick-deploy cards once ready.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -23,13 +24,18 @@ import {
   type OverviewResponse,
 } from "./overview/api.ts";
 import { ChecklistCard } from "./overview/ChecklistCard.tsx";
+import { QuickDeploySection } from "./overview/QuickDeploySection.tsx";
 import { SummaryCard } from "./overview/SummaryCard.tsx";
+import { listPlugins } from "./plugins/api.ts";
+import { openPluginDeployForm } from "./plugins/runStore.ts";
+import type { PluginInfo } from "./plugins/types.ts";
 import type { PageProps } from "./types.ts";
 
 export function OverviewPage({ snapshot, locale, t, navigate, pushToast }: PageProps) {
   const nowSecs = useUsageClockSecs();
 
   const [overview, setOverview] = useState<OverviewResponse | null>(null);
+  const [plugins, setPlugins] = useState<readonly PluginInfo[]>([]);
   const [probing, setProbing] = useState(true);
   const [probeError, setProbeError] = useState<FormattedApiError | null>(null);
   const [refreshingUsage, setRefreshingUsage] = useState(false);
@@ -38,8 +44,10 @@ export function OverviewPage({ snapshot, locale, t, navigate, pushToast }: PageP
   const [adoptError, setAdoptError] = useState<FormattedApiError | null>(null);
 
   const probeSeqRef = useRef(0);
+  const pluginsSeqRef = useRef(0);
   const mountedRef = useRef(true);
   const activeProbeControllerRef = useRef<AbortController | null>(null);
+  const activePluginsControllerRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -47,6 +55,8 @@ export function OverviewPage({ snapshot, locale, t, navigate, pushToast }: PageP
       mountedRef.current = false;
       activeProbeControllerRef.current?.abort();
       activeProbeControllerRef.current = null;
+      activePluginsControllerRef.current?.abort();
+      activePluginsControllerRef.current = null;
     };
   }, []);
 
@@ -192,13 +202,69 @@ export function OverviewPage({ snapshot, locale, t, navigate, pushToast }: PageP
     }
   }, [adopting, handleCheckAgain, overview, pushToast, snapshot, t]);
 
+  const loadPlugins = useCallback(async (signal: AbortSignal) => {
+    activePluginsControllerRef.current?.abort();
+    const controller = new AbortController();
+    activePluginsControllerRef.current = controller;
+
+    const onExternalAbort = () => controller.abort();
+    if (signal.aborted) {
+      controller.abort();
+    } else {
+      signal.addEventListener("abort", onExternalAbort, { once: true });
+    }
+
+    const seq = ++pluginsSeqRef.current;
+    try {
+      const items = await listPlugins(controller.signal);
+      if (!mountedRef.current || seq !== pluginsSeqRef.current) {
+        return;
+      }
+      setPlugins(items);
+    } catch {
+      // Quick-deploy cards are secondary to the ready summary; hide quietly on failure.
+    } finally {
+      signal.removeEventListener("abort", onExternalAbort);
+      if (activePluginsControllerRef.current === controller) {
+        activePluginsControllerRef.current = null;
+      }
+    }
+  }, []);
+
+  const handleQuickDeploy = useCallback(
+    (pluginId: string) => {
+      openPluginDeployForm(pluginId);
+      navigate("plugins");
+    },
+    [navigate],
+  );
+
   const runningInstallOp = useMemo(() => findRunningInstallOp(snapshot), [snapshot]);
   const checklist = useMemo(
     () => deriveChecklist(overview, probeError, probing, runningInstallOp !== null),
     [overview, probeError, probing, runningInstallOp],
   );
+  const ready = checklist.complete && overview !== null;
+  const snapshotVersion = snapshot?.version ?? -1;
   const accountChangeBlocked = isAccountChangeBlocked(snapshot);
   const shuttingDown = snapshot?.shutting_down === true;
+
+  // Reload plugins when entering ready state and whenever the monotonic snapshot version
+  // advances (including cross-tab plugin catalog changes and SSE reconnect convergence).
+  useEffect(() => {
+    if (!ready) {
+      activePluginsControllerRef.current?.abort();
+      activePluginsControllerRef.current = null;
+      pluginsSeqRef.current += 1;
+      setPlugins([]);
+      return;
+    }
+    const controller = new AbortController();
+    void loadPlugins(controller.signal);
+    return () => {
+      controller.abort();
+    };
+  }, [loadPlugins, ready, snapshotVersion]);
 
   const initialLoading =
     overview === null && probeError === null && probing && runningInstallOp === null;
@@ -218,19 +284,28 @@ export function OverviewPage({ snapshot, locale, t, navigate, pushToast }: PageP
               <span>{t("web.overview.loading")}</span>
             </div>
           </section>
-        ) : checklist.complete && overview !== null ? (
-          <SummaryCard
-            overview={overview}
-            snapshot={snapshot}
-            nowSecs={nowSecs}
-            locale={locale}
-            refreshingUsage={refreshingUsage}
-            usageRefreshError={usageRefreshError}
-            shuttingDown={shuttingDown}
-            t={t}
-            navigate={navigate}
-            onRefreshUsage={handleRefreshUsage}
-          />
+        ) : ready ? (
+          <>
+            <SummaryCard
+              overview={overview}
+              snapshot={snapshot}
+              nowSecs={nowSecs}
+              locale={locale}
+              refreshingUsage={refreshingUsage}
+              usageRefreshError={usageRefreshError}
+              shuttingDown={shuttingDown}
+              t={t}
+              navigate={navigate}
+              onRefreshUsage={handleRefreshUsage}
+            />
+            <QuickDeploySection
+              plugins={plugins}
+              locale={locale}
+              shuttingDown={shuttingDown}
+              t={t}
+              onDeploy={handleQuickDeploy}
+            />
+          </>
         ) : (
           <ChecklistCard
             overview={overview}

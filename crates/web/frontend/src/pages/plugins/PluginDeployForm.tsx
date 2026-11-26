@@ -116,10 +116,10 @@ function ArrowLeftIcon() {
   );
 }
 
-export function RocketIcon() {
+export function RocketIcon({ className }: { readonly className?: string } = {}) {
   return (
     <svg
-      className="icon"
+      className={className ? `icon ${className}` : "icon"}
       viewBox="0 0 24 24"
       fill="none"
       stroke="currentColor"

@@ -10,6 +10,7 @@
 import { useSyncExternalStore } from "react";
 
 import { apiClient, ApiError } from "../../lib/api.ts";
+import { routerStore } from "../../lib/router.ts";
 import type { SseFrame } from "../../lib/sse.ts";
 import { webStore } from "../../lib/store.ts";
 import type { ApiErrorPayload, TunnelEvent } from "../../lib/types.ts";
@@ -125,6 +126,14 @@ function resetStore(): void {
 apiClient.subscribeAuth((event) => {
   if (event.type === "logged_out" || event.type === "unauthorized") {
     resetStore();
+  }
+});
+
+// Clear an open deploy form when leaving `#/plugins` so returning via the sidebar
+// lands on the plugin list instead of reopening a discarded form.
+routerStore.subscribe(() => {
+  if (routerStore.getRoute() !== "plugins" && state.selectedFormPluginId !== null) {
+    closePluginDeployForm();
   }
 });
 
@@ -591,7 +600,7 @@ function attachRun(summary: PluginRunSummary): void {
 export function refreshPluginRuns(options?: {
   readonly autoAttach?: boolean;
 }): Promise<PluginRunSummary[]> {
-  const autoAttach = options?.autoAttach ?? true;
+  const autoAttach = (options?.autoAttach ?? true) && state.selectedFormPluginId === null;
   pendingAutoAttach = pendingAutoAttach || autoAttach;
   if (runsListInFlight) {
     return runsListInFlight;
@@ -678,6 +687,7 @@ export function openPluginRun(id: number, fallbackSummary?: PluginRunSummary): v
 export function openPluginDeployForm(pluginId: string): void {
   const latestId = state.runs[0]?.id ?? state.selectedRunId ?? 0;
   dismissedAutoRunId = Math.max(dismissedAutoRunId, latestId);
+  pendingAutoAttach = false;
   stopStream();
   setState({
     selectedRunId: null,
@@ -693,6 +703,9 @@ export function closePluginDeployForm(): void {
   if (state.selectedFormPluginId === null) {
     return;
   }
+  const latestId = state.runs[0]?.id ?? state.selectedRunId ?? 0;
+  dismissedAutoRunId = Math.max(dismissedAutoRunId, latestId);
+  pendingAutoAttach = false;
   setState({ selectedFormPluginId: null });
 }
 
