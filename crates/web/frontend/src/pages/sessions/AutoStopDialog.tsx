@@ -145,13 +145,11 @@ export function AutoStopDialog({
         time: durationText,
       });
       const armed = Boolean(result.watchdog_armed);
-      const warningBody = result.warning_key
-        ? t(result.warning_key)
-        : t("app.b2.prov_watchdog_failed");
       pushToast({
         tone: armed ? "success" : "warning",
         title: toastTitle,
-        body: armed ? t("app.b2.prov_watchdog") : warningBody,
+        body: armed ? t("app.b2.prov_watchdog") : t("app.b2.prov_watchdog_failed"),
+        ...(armed ? {} : { durationMs: null }),
       });
       setSubmitting(false);
       onCompleted();

@@ -276,6 +276,10 @@
   color: var(--color-fg-subtle);
 }
 
+.nav-update-badge {
+  flex: none;
+}
+
 .sidebar-spacer {
   flex: 1;
 }
@@ -426,6 +430,16 @@
   color: var(--color-fg);
   box-shadow: var(--shadow-floating);
   font-size: var(--text-base);
+}
+
+.toast-card-persistent.toast-card-warning {
+  border-color: var(--color-warning);
+  background-color: var(--color-warning-subtle);
+}
+
+.toast-card-persistent.toast-card-danger {
+  border-color: var(--color-danger);
+  background-color: var(--color-danger-subtle);
 }
 
 .toast-body {

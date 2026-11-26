@@ -14,8 +14,9 @@ import {
   useAppDataStore,
 } from "../lib/appCache.ts";
 import { forwardsStore, selectRuntimeForwards, useForwardsStore } from "../lib/forwards.ts";
+import { stopDialogsStore } from "../lib/stopDialogs.ts";
 import { webStore } from "../lib/store.ts";
-import type { GuardDecision, Runtime, Snapshot } from "../lib/types.ts";
+import type { GuardDecision, Runtime } from "../lib/types.ts";
 import {
   AutoStopDialog,
   type AutoStopDialogMode,
@@ -41,16 +42,10 @@ import {
 } from "./sessions/NewSessionDialog.tsx";
 import { ProvisioningCard } from "./sessions/ProvisioningCard.tsx";
 import { RuntimeCard } from "./sessions/RuntimeCard.tsx";
-import { StopAllDialog } from "./sessions/StopAllDialog.tsx";
-import {
-  StopRuntimeDialog,
-  stopTargetFromRuntime,
-  type StopRuntimeDialogRequest,
-} from "./sessions/StopRuntimeDialog.tsx";
+import { stopTargetFromRuntime } from "./sessions/StopRuntimeDialog.tsx";
 import {
   claimProvisionHandled,
   clearEndedRuntimes,
-  observeSnapshotTransitions,
   refreshRearmDuration,
   trackProvision,
   useSessionsLocalState,
@@ -64,10 +59,7 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
   const [autoStopDialog, setAutoStopDialog] = useState<AutoStopDialogRequest | null>(null);
   const [forwardDialog, setForwardDialog] = useState<ForwardDialogRequest | null>(null);
   const [newSessionDialog, setNewSessionDialog] = useState<NewSessionDialogRequest | null>(null);
-  const [stopRuntimeDialog, setStopRuntimeDialog] = useState<StopRuntimeDialogRequest | null>(null);
-  const [stopAllDialogId, setStopAllDialogId] = useState<number | null>(null);
 
-  const prevSnapshotRef = useRef<Snapshot | null>(null);
   const dialogSeqRef = useRef(0);
   const dialogTrackingOpIdRef = useRef<number | null>(null);
   const tRef = useRef(t);
@@ -121,14 +113,6 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
     }
   }, [needsInitialSessions]);
 
-  useEffect(() => {
-    if (!snapshot) {
-      return;
-    }
-    observeSnapshotTransitions(prevSnapshotRef.current, snapshot, locale, t, pushToast);
-    prevSnapshotRef.current = snapshot;
-  }, [snapshot, localState.reconcileSeq, locale, t, pushToast]);
-
   const runtimesView = snapshot?.runtimes ?? null;
   const runtimesError = snapshot?.runtimes_error ?? null;
   const operations = snapshot?.operations ?? [];
@@ -181,16 +165,11 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
   );
 
   const openStopRuntimeModal = useCallback((runtime: Runtime) => {
-    dialogSeqRef.current += 1;
-    setStopRuntimeDialog({
-      id: dialogSeqRef.current,
-      ...stopTargetFromRuntime(runtime),
-    });
+    stopDialogsStore.openStopRuntime(stopTargetFromRuntime(runtime));
   }, []);
 
   const openStopAllModal = useCallback(() => {
-    dialogSeqRef.current += 1;
-    setStopAllDialogId(dialogSeqRef.current);
+    stopDialogsStore.openStopAll();
   }, []);
 
   const trackedProvision = localState.trackedProvision;
@@ -685,14 +664,6 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
         onRetryForwardPolicy={handleRetryForwardPolicy}
       />
 
-      <StopRuntimeDialog
-        request={stopRuntimeDialog}
-        t={t}
-        pushToast={pushToast}
-        onClose={() => setStopRuntimeDialog(null)}
-        onStopped={handleRuntimeMutationCompleted}
-      />
-
       <NewSessionDialog
         request={newSessionDialog}
         snapshot={snapshot}
@@ -705,15 +676,6 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
         pushToast={pushToast}
         onClose={() => setNewSessionDialog(null)}
         onTrackingOperation={handleDialogTrackingOperation}
-      />
-
-      <StopAllDialog
-        openId={stopAllDialogId}
-        snapshot={snapshot}
-        t={t}
-        pushToast={pushToast}
-        onClose={() => setStopAllDialogId(null)}
-        onCompleted={handleRuntimeMutationCompleted}
       />
     </>
   );

@@ -16,15 +16,18 @@ import {
 } from "react";
 
 import { buildUsageBadge, resolveActiveAccount, useUsageClockSecs } from "../lib/format.ts";
+import { isKeyringLockedOrAccountsMissing } from "../lib/guard.ts";
 import type { TranslateFn } from "../lib/i18n.ts";
 import { getRouteTitle, ROUTES, routeToHash, type RouteId } from "../lib/router.ts";
 import type { ConnectionStatus } from "../lib/store.ts";
 import type { Locale, Snapshot } from "../lib/types.ts";
+import type { BannerUpdate } from "../lib/updates.ts";
 import {
   AccountsIcon,
   AlertIcon,
   BrandIcon,
   CloseIcon,
+  InfoIcon,
   LogOutIcon,
   MenuIcon,
   OverviewIcon,
@@ -92,6 +95,11 @@ export interface AppShellProps {
   readonly t: TranslateFn;
   readonly onNavigate: (route: RouteId) => void;
   readonly onSignOut: () => void;
+  /** Global read-only release update notice banner (hidden after dismissing that version). */
+  readonly updateBanner?: BannerUpdate | null;
+  /** Persistent sidebar Settings update badge (remains visible even after dismissing the banner). */
+  readonly updateBadge?: boolean;
+  readonly onDismissUpdate?: (version: string) => void;
   /** Optional hook notified when the mobile modal drawer opens or closes. */
   readonly onModalDrawerChange?: (open: boolean) => void;
   /** Optional renderer replacing the account area in both sidebar and mobile topbar. */
@@ -111,6 +119,9 @@ export function AppShell({
   t,
   onNavigate,
   onSignOut,
+  updateBanner = null,
+  updateBadge = false,
+  onDismissUpdate,
   onModalDrawerChange,
   renderAccountSlot,
   children,
@@ -268,7 +279,11 @@ export function AppShell({
     mainRef.current?.focus();
   }, []);
 
-  const activeAccount = resolveActiveAccount(snapshot, t);
+  const accountsUnavailable = isKeyringLockedOrAccountsMissing(snapshot);
+  const keyringLocked = snapshot?.accounts_error === "keyring_unavailable";
+  // When keyring locks or accounts are missing, collapse account identity and usage badge immediately.
+  const effectiveSnapshot = accountsUnavailable ? null : snapshot;
+  const activeAccount = resolveActiveAccount(effectiveSnapshot, t);
   const usageBadge = buildUsageBadge(activeAccount, nowSecs, locale, t);
   const isMock = snapshot?.backend === "mock";
   const isShuttingDown = snapshot?.shutting_down === true;
@@ -287,6 +302,7 @@ export function AppShell({
       href={routeToHash("accounts")}
       className="sidebar-account"
       title={accountTitle}
+      data-keyring-locked={keyringLocked ? "true" : undefined}
       onClick={handleLinkClick("accounts")}
     >
       <UserIcon />
@@ -299,6 +315,7 @@ export function AppShell({
       href={routeToHash("accounts")}
       className="topbar-account"
       title={accountTitle}
+      data-keyring-locked={keyringLocked ? "true" : undefined}
       onClick={handleLinkClick("accounts")}
     >
       <UserIcon />
@@ -353,7 +370,7 @@ export function AppShell({
 
           <div className="sidebar-body">
             <div className="sidebar-account-wrap">
-              {renderAccountSlot
+              {!accountsUnavailable && renderAccountSlot
                 ? renderAccountSlot("sidebar", {
                     drawerOpen: modalDrawerOpen,
                     closeDrawer: closeDrawerForSlot,
@@ -377,6 +394,14 @@ export function AppShell({
                         <span className="nav-label">{getRouteTitle(item, t)}</span>
                         {item === "sessions" && runtimeCount > 0 && (
                           <span className="nav-count">{runtimeCount}</span>
+                        )}
+                        {item === "settings" && updateBadge && (
+                          <span
+                            className="badge badge-info nav-update-badge"
+                            data-sidebar-update="true"
+                          >
+                            {t("app.b7.update_badge")}
+                          </span>
                         )}
                       </a>
                     </li>
@@ -465,7 +490,7 @@ export function AppShell({
 
             <div className="topbar-meta">
               <div className="topbar-account-wrap">
-                {renderAccountSlot
+                {!accountsUnavailable && renderAccountSlot
                   ? renderAccountSlot("topbar", {
                       drawerOpen: modalDrawerOpen,
                       closeDrawer: closeDrawerForSlot,
@@ -481,7 +506,7 @@ export function AppShell({
             </div>
           </header>
 
-          {(isShuttingDown || isReconnecting) && (
+          {(isShuttingDown || isReconnecting || updateBanner !== null) && (
             <div className="status-banner">
               {isShuttingDown && (
                 <div className="alert alert-warning" role="alert">
@@ -501,6 +526,43 @@ export function AppShell({
                   </span>
                   <div className="alert-text">
                     <p className="alert-body">{t("web.shell.reconnecting")}</p>
+                  </div>
+                </div>
+              )}
+
+              {updateBanner !== null && (
+                <div
+                  className="alert alert-info"
+                  role="status"
+                  aria-live="polite"
+                  data-update-notice="true"
+                >
+                  <span className="alert-icon icon-info">
+                    <InfoIcon />
+                  </span>
+                  <div className="alert-text">
+                    <p className="alert-title">
+                      {t("app.b7.update_notice_title", { version: updateBanner.version })}
+                    </p>
+                    <div className="alert-actions">
+                      <a
+                        className="btn btn-primary btn-sm"
+                        href={updateBanner.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        data-update-notice-open="true"
+                      >
+                        {t("app.b7.update_open_page")}
+                      </a>
+                      <button
+                        type="button"
+                        className="btn btn-ghost btn-sm"
+                        data-update-notice-dismiss="true"
+                        onClick={() => onDismissUpdate?.(updateBanner.version)}
+                      >
+                        {t("app.b7.update_dismiss")}
+                      </button>
+                    </div>
                   </div>
                 </div>
               )}

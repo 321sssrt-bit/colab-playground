@@ -20,6 +20,8 @@ import type {
   HardwareRate,
   RuntimeRef,
   SessionsListResponse,
+  StopAllRemainingItem,
+  StopAllResponse,
   UnixSecs,
   WatchdogInfo,
 } from "../../lib/types.ts";
@@ -30,6 +32,8 @@ export type {
   ForwardPolicyView,
   ForwardView,
   SessionsListResponse,
+  StopAllRemainingItem,
+  StopAllResponse,
 };
 
 export interface SessionTemplateResponse extends ProvisionSpec {
@@ -62,17 +66,6 @@ interface AutoStopResponse {
   readonly watchdog_armed: boolean;
   readonly watchdog: WatchdogInfo | null;
   readonly warning_key: string | null;
-}
-
-interface StopAllRemainingItem {
-  readonly target: RuntimeRef;
-  readonly error: ApiErrorPayload | null;
-}
-
-export interface StopAllResponse {
-  readonly verified: boolean;
-  readonly remaining: readonly StopAllRemainingItem[];
-  readonly account_errors: readonly AccountFailureResponse[];
 }
 
 export type ProvisionProgressEvent =
@@ -189,6 +182,16 @@ export function stopAllRuntimes(): Promise<StopAllResponse> {
     body: {
       confirmed: true,
     },
+  });
+}
+
+export function ackGuardEvents(payload: {
+  readonly up_to_id?: number;
+  readonly ids?: readonly number[];
+}): Promise<void> {
+  return apiClient.request<void>("/api/sessions/guard/ack", {
+    method: "POST",
+    body: payload,
   });
 }
 

@@ -12,6 +12,13 @@ export interface ToastInput {
   readonly body: string;
   /** Auto-dismiss timeout in ms; pass `null` to keep until dismissed by the user. */
   readonly durationMs?: number | null;
+  /** Invoked only when the user explicitly dismisses this toast (not on sign-out clear). */
+  readonly onDismiss?: () => void;
+}
+
+export interface DismissToastOptions {
+  /** Whether to invoke `onDismiss` callback. Defaults to `true`. */
+  readonly notify?: boolean;
 }
 
 export interface ToastItem {
@@ -32,7 +39,7 @@ export interface ToastStore {
   getToasts(): readonly ToastItem[];
   subscribe(listener: () => void): () => void;
   push(input: ToastInput): number;
-  dismiss(id: number): void;
+  dismiss(id: number, options?: DismissToastOptions): void;
   clear(): void;
   dispose(): void;
 }
@@ -66,6 +73,7 @@ export function createToastStore(options: ToastStoreOptions = {}): ToastStore {
   let disposed = false;
 
   const timers = new Map<number, ReturnType<typeof setTimeout>>();
+  const dismissCallbacks = new Map<number, () => void>();
   const listeners = new Set<() => void>();
 
   const emit = (): void => {
@@ -86,13 +94,22 @@ export function createToastStore(options: ToastStoreOptions = {}): ToastStore {
     }
   };
 
-  const dismiss = (id: number): void => {
+  const dismiss = (id: number, dismissOptions: DismissToastOptions = {}): void => {
     cancelTimer(id);
+    const callback = dismissCallbacks.get(id);
+    dismissCallbacks.delete(id);
     const filtered = items.filter((item) => item.id !== id);
     if (filtered.length === items.length) {
       return;
     }
     items = filtered;
+    if (dismissOptions.notify !== false && callback) {
+      try {
+        callback();
+      } catch {
+        // Isolate dismiss callback failures so UI updates still settle.
+      }
+    }
     emit();
   };
 
@@ -122,20 +139,33 @@ export function createToastStore(options: ToastStoreOptions = {}): ToastStore {
         body: input.body,
         durationMs,
       };
+      if (input.onDismiss) {
+        dismissCallbacks.set(id, input.onDismiss);
+      }
 
       const nextList = [...items, nextItem];
+      // Evict oldest transient toasts first so persistent billing/guard alerts stay visible.
       while (nextList.length > maxItems) {
-        const evicted = nextList.shift();
-        if (evicted) {
-          cancelTimer(evicted.id);
+        const transientIndex = nextList.findIndex(
+          (item) => item.id !== id && item.durationMs !== null,
+        );
+        if (transientIndex !== -1) {
+          const [evicted] = nextList.splice(transientIndex, 1);
+          if (evicted) {
+            cancelTimer(evicted.id);
+            dismissCallbacks.delete(evicted.id);
+          }
+          continue;
         }
+        // Keep persistent alerts intact rather than dropping a still-billing warning.
+        break;
       }
       items = nextList;
 
       if (durationMs !== null) {
         const timer = setTimer(() => {
           timers.delete(id);
-          dismiss(id);
+          dismiss(id, { notify: false });
         }, durationMs);
         timers.set(id, timer);
       }
@@ -151,6 +181,7 @@ export function createToastStore(options: ToastStoreOptions = {}): ToastStore {
         clearTimer(timer);
       }
       timers.clear();
+      dismissCallbacks.clear();
       if (items.length === 0) {
         return;
       }
@@ -173,8 +204,8 @@ export function pushToast(input: ToastInput): number {
   return toastStore.push(input);
 }
 
-export function dismissToast(id: number): void {
-  toastStore.dismiss(id);
+export function dismissToast(id: number, options?: DismissToastOptions): void {
+  toastStore.dismiss(id, options);
 }
 
 /**

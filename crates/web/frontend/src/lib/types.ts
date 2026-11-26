@@ -489,3 +489,29 @@ export interface AccountsApiResponse {
   readonly login_id: number | null;
   readonly sampled_at?: UnixSecs;
 }
+
+export interface StopAllRemainingItem {
+  readonly target: RuntimeRef;
+  readonly error: ApiErrorPayload | null;
+}
+
+export interface StopAllResponse {
+  readonly verified: boolean;
+  readonly remaining: readonly StopAllRemainingItem[];
+  readonly account_errors: readonly AccountFailureResponse[];
+}
+
+export type UpdateCheckStatus = "idle" | "up_to_date" | "available" | "failed";
+
+export interface UpdateNoticeResponse {
+  readonly current_version: string;
+  readonly update_available: boolean;
+  readonly releases_url: string;
+  readonly release_url: string | null;
+  readonly latest_version: string | null;
+  readonly status: UpdateCheckStatus;
+  readonly checked_at: UnixSecs | null;
+  readonly check_updates: boolean;
+  readonly error: ApiErrorPayload | null;
+  readonly persist_error: ApiErrorPayload | null;
+}

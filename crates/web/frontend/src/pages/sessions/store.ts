@@ -1,7 +1,6 @@
 /**
- * Session-scoped client state for Recently ended history, server-validated
- * Forward addresses (merged onto authoritative live `snapshot.tunnels`), and
- * the default rearm duration from Settings.
+ * Session-scoped client state for Provision progress streaming and thin
+ * delegates to the global `guardStore`, `forwardsStore`, and `appDataStore`.
  *
  * Resets automatically when the Bearer auth session ends or rotates.
  */
@@ -11,28 +10,22 @@ import { useSyncExternalStore } from "react";
 import { apiClient, ApiError } from "../../lib/api.ts";
 import { appDataStore, type SessionSettingsSummary } from "../../lib/appCache.ts";
 import { forwardsStore } from "../../lib/forwards.ts";
-import type { TranslateFn } from "../../lib/i18n.ts";
-import type { ToastInput } from "../../lib/toast.ts";
+import { guardStore } from "../../lib/guard.ts";
 import type {
   AccountContext,
-  AccountId,
   ApiErrorPayload,
   Concern,
+  EndedRuntime as GlobalEndedRuntime,
   ForwardView,
-  Locale,
-  Runtime,
   RuntimeRef,
-  Snapshot,
 } from "../../lib/types.ts";
 import {
   openProvisionEventStream,
   type ProvisionOutcome,
   type ProvisionProgressEvent,
 } from "./api.ts";
-import { formatConcern, formatRuntimeCardLabel, runtimeKey } from "./format.ts";
 import { parseFinishedEvent, parseProvisionEvent } from "./ProvisionProgress.tsx";
 
-const ENDED_LIMIT = 20;
 const PROVISION_RECONNECT_BASE_MS = 1000;
 const PROVISION_RECONNECT_MAX_MS = 5000;
 const PROVISION_RECONNECT_MAX_EXP = 3;
@@ -65,31 +58,38 @@ export interface EndedRuntime {
 }
 
 interface SessionsLocalState {
-  readonly ended: readonly EndedRuntime[];
+  readonly ended: readonly GlobalEndedRuntime[];
   readonly reconcileSeq: number;
   readonly trackedProvision: TrackedProvision | null;
 }
 
-const INITIAL_STATE: SessionsLocalState = {
-  ended: [],
-  reconcileSeq: 0,
+let trackedProvision: TrackedProvision | null = null;
+let cachedSnapshot: SessionsLocalState = {
+  ended: guardStore.getState().ended,
+  reconcileSeq: guardStore.getState().reconcileSeq,
   trackedProvision: null,
 };
 
-let state: SessionsLocalState = INITIAL_STATE;
-let seenGuardStoppedKeys = new Set<string>();
-let seenVanishedKeys = new Set<string>();
-let pendingUserStopCounts = new Map<string, number>();
-let pendingStopAllCount = 0;
-let deferredPendingKeys = new Set<string>();
-let lastKnownRuntimesByAccount = new Map<AccountId, readonly Runtime[]>();
 let provisionStreamController: AbortController | null = null;
 let provisionReconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let provisionStreamSeq = 0;
 let handledProvisionIds = new Set<number>();
 const listeners = new Set<() => void>();
 
-function emit(): void {
+function refreshSnapshot(): void {
+  const guardState = guardStore.getState();
+  if (
+    cachedSnapshot.ended === guardState.ended &&
+    cachedSnapshot.reconcileSeq === guardState.reconcileSeq &&
+    cachedSnapshot.trackedProvision === trackedProvision
+  ) {
+    return;
+  }
+  cachedSnapshot = {
+    ended: guardState.ended,
+    reconcileSeq: guardState.reconcileSeq,
+    trackedProvision,
+  };
   for (const listener of listeners) {
     try {
       listener();
@@ -99,9 +99,13 @@ function emit(): void {
   }
 }
 
-function setState(patch: Partial<SessionsLocalState>): void {
-  state = { ...state, ...patch };
-  emit();
+guardStore.subscribe(() => {
+  refreshSnapshot();
+});
+
+function setTrackedProvision(next: TrackedProvision | null): void {
+  trackedProvision = next;
+  refreshSnapshot();
 }
 
 function stopProvisionStream(): void {
@@ -119,14 +123,7 @@ function stopProvisionStream(): void {
 function resetLocalState(): void {
   stopProvisionStream();
   handledProvisionIds = new Set<number>();
-  seenGuardStoppedKeys = new Set<string>();
-  seenVanishedKeys = new Set<string>();
-  pendingUserStopCounts = new Map<string, number>();
-  pendingStopAllCount = 0;
-  deferredPendingKeys = new Set<string>();
-  lastKnownRuntimesByAccount = new Map<AccountId, readonly Runtime[]>();
-  state = INITIAL_STATE;
-  emit();
+  setTrackedProvision(null);
 }
 
 function connectProvisionStream(
@@ -138,8 +135,8 @@ function connectProvisionStream(
   const isCurrent = (): boolean =>
     seq === provisionStreamSeq &&
     apiClient.getSessionGeneration() === gen &&
-    state.trackedProvision?.operationId === operationId &&
-    state.trackedProvision.phase === "running";
+    trackedProvision?.operationId === operationId &&
+    trackedProvision.phase === "running";
 
   if (!isCurrent()) {
     return;
@@ -154,9 +151,9 @@ function connectProvisionStream(
     if (!isCurrent()) {
       return;
     }
-    const cur = state.trackedProvision;
+    const cur = trackedProvision;
     if (cur) {
-      setState({ trackedProvision: { ...cur, reconnecting: true } });
+      setTrackedProvision({ ...cur, reconnecting: true });
     }
     const delayMs = Math.min(
       PROVISION_RECONNECT_MAX_MS,
@@ -174,16 +171,16 @@ function connectProvisionStream(
       if (!isCurrent()) {
         return;
       }
-      const cur = state.trackedProvision;
+      const cur = trackedProvision;
       if (cur?.reconnecting) {
-        setState({ trackedProvision: { ...cur, reconnecting: false } });
+        setTrackedProvision({ ...cur, reconnecting: false });
       }
     },
     onFrame: (frame) => {
       if (!isCurrent()) {
         return;
       }
-      const cur = state.trackedProvision;
+      const cur = trackedProvision;
       if (!cur) {
         return;
       }
@@ -207,14 +204,12 @@ function connectProvisionStream(
           waitingAttempt = null;
           waitingSinceMs = null;
         }
-        setState({
-          trackedProvision: {
-            ...cur,
-            events: nextEvents,
-            waitingAttempt,
-            waitingSinceMs,
-            reconnecting: false,
-          },
+        setTrackedProvision({
+          ...cur,
+          events: nextEvents,
+          waitingAttempt,
+          waitingSinceMs,
+          reconnecting: false,
         });
       } else if (frame.event === "finished") {
         const finished = parseFinishedEvent(frame.data);
@@ -238,17 +233,15 @@ function connectProvisionStream(
         if (provisionStreamController === controller) {
           provisionStreamController = null;
         }
-        setState({
-          trackedProvision: {
-            ...cur,
-            events: baseEvents,
-            waitingAttempt: null,
-            waitingSinceMs: null,
-            phase: finished.phase,
-            outcome: finished.outcome ?? null,
-            finishedError: finished.error ?? null,
-            reconnecting: false,
-          },
+        setTrackedProvision({
+          ...cur,
+          events: baseEvents,
+          waitingAttempt: null,
+          waitingSinceMs: null,
+          phase: finished.phase,
+          outcome: finished.outcome ?? null,
+          finishedError: finished.error ?? null,
+          reconnecting: false,
         });
       }
     },
@@ -272,24 +265,22 @@ function connectProvisionStream(
         return;
       }
       if (error instanceof ApiError && error.kind === "provision_not_found") {
-        const cur = state.trackedProvision;
+        const cur = trackedProvision;
         if (cur) {
-          setState({
-            trackedProvision: {
-              ...cur,
-              waitingAttempt: null,
-              waitingSinceMs: null,
-              phase: "failed",
-              finishedError: {
-                kind: error.kind,
-                message_key: error.messageKey ?? "app.err.other",
-                args: error.args,
-                hint_key: error.hintKey,
-                action_key: error.actionKey,
-                operation_id: null,
-              },
-              reconnecting: false,
+          setTrackedProvision({
+            ...cur,
+            waitingAttempt: null,
+            waitingSinceMs: null,
+            phase: "failed",
+            finishedError: {
+              kind: error.kind,
+              message_key: error.messageKey ?? "app.err.other",
+              args: error.args,
+              hint_key: error.hintKey,
+              action_key: error.actionKey,
+              operation_id: null,
             },
+            reconnecting: false,
           });
         }
         return;
@@ -308,18 +299,17 @@ export function trackProvision(
   sessionName: string,
   accountContext?: AccountContext | null,
 ): void {
-  const existing = state.trackedProvision;
+  const existing = trackedProvision;
   if (existing && existing.operationId === operationId) {
-    const nextName = sessionName && existing.sessionName !== sessionName ? sessionName : existing.sessionName;
+    const nextName =
+      sessionName && existing.sessionName !== sessionName ? sessionName : existing.sessionName;
     const nextAccountContext =
       existing.accountContext === null && accountContext ? accountContext : existing.accountContext;
     if (nextName !== existing.sessionName || nextAccountContext !== existing.accountContext) {
-      setState({
-        trackedProvision: {
-          ...existing,
-          sessionName: nextName,
-          accountContext: nextAccountContext,
-        },
+      setTrackedProvision({
+        ...existing,
+        sessionName: nextName,
+        accountContext: nextAccountContext,
       });
     }
     return;
@@ -327,19 +317,17 @@ export function trackProvision(
   stopProvisionStream();
   const seq = provisionStreamSeq;
   const gen = apiClient.getSessionGeneration();
-  setState({
-    trackedProvision: {
-      operationId,
-      sessionName,
-      accountContext: accountContext ?? null,
-      events: [],
-      waitingAttempt: null,
-      waitingSinceMs: null,
-      phase: "running",
-      outcome: null,
-      finishedError: null,
-      reconnecting: false,
-    },
+  setTrackedProvision({
+    operationId,
+    sessionName,
+    accountContext: accountContext ?? null,
+    events: [],
+    waitingAttempt: null,
+    waitingSinceMs: null,
+    phase: "running",
+    outcome: null,
+    finishedError: null,
+    reconnecting: false,
   });
   connectProvisionStream(operationId, seq, gen, 0);
 }
@@ -362,273 +350,28 @@ apiClient.subscribeAuth((event) => {
   }
 });
 
-function isStopPending(key: string): boolean {
-  return pendingStopAllCount > 0 || pendingUserStopCounts.has(key);
-}
-
-function flushReleasedDeferredKeys(): void {
-  let hasUnblocked = false;
-  for (const key of deferredPendingKeys) {
-    if (!isStopPending(key)) {
-      deferredPendingKeys.delete(key);
-      hasUnblocked = true;
-    }
-  }
-  if (hasUnblocked) {
-    setState({ reconcileSeq: state.reconcileSeq + 1 });
-  }
-}
-
-/**
- * Suppresses generic "vanished" notifications while a user-initiated stop for `target`
- * is in flight, since SSE broadcasts the updated runtime list before the HTTP response returns.
- */
 export function beginUserStop(target: RuntimeRef): () => void {
-  const key = runtimeKey(target);
-  const gen = apiClient.getSessionGeneration();
-  let released = false;
-  if (key) {
-    pendingUserStopCounts.set(key, (pendingUserStopCounts.get(key) ?? 0) + 1);
-  }
-  return () => {
-    if (released || !key || apiClient.getSessionGeneration() !== gen) {
-      return;
-    }
-    released = true;
-    const remaining = (pendingUserStopCounts.get(key) ?? 0) - 1;
-    if (remaining <= 0) {
-      pendingUserStopCounts.delete(key);
-    } else {
-      pendingUserStopCounts.set(key, remaining);
-    }
-    flushReleasedDeferredKeys();
-  };
+  return guardStore.beginUserStop(target);
 }
 
-/**
- * Suppresses generic "vanished" notifications while a user-initiated Stop all is in flight.
- */
 export function beginStopAll(): () => void {
-  const gen = apiClient.getSessionGeneration();
-  let released = false;
-  pendingStopAllCount += 1;
-  return () => {
-    if (released || apiClient.getSessionGeneration() !== gen) {
-      return;
-    }
-    released = true;
-    pendingStopAllCount = Math.max(0, pendingStopAllCount - 1);
-    flushReleasedDeferredKeys();
-  };
+  return guardStore.beginStopAll();
 }
 
 export function recordEndedRuntime(entry: EndedRuntime): void {
-  const key = runtimeKey(entry.runtime);
-  if (key) {
-    deferredPendingKeys.delete(key);
-  }
-  if (entry.reason.kind === "user" && key) {
-    // Prevent later SSE/Guard vanished checks from replaying a vanished toast for a user stop.
-    seenVanishedKeys.add(key);
-  }
-  const existing = state.ended.find((item) => runtimeKey(item.runtime) === key);
-  // Keep a specific guard reason intact, and keep user/guard reasons over later generic vanished checks.
-  if (existing && existing.reason.kind === "guard" && entry.reason.kind !== "guard") {
-    return;
-  }
-  if (existing && entry.reason.kind === "vanished" && existing.reason.kind !== "vanished") {
-    return;
-  }
-  const filtered = state.ended.filter((item) => runtimeKey(item.runtime) !== key);
-  setState({ ended: [entry, ...filtered].slice(0, ENDED_LIMIT) });
+  guardStore.recordEndedRuntime(entry);
 }
 
 export function clearEndedRuntimes(): void {
-  if (state.ended.length === 0) {
-    return;
-  }
-  setState({ ended: [] });
+  guardStore.clearEndedRuntimes();
 }
 
-/**
- * Caches server-validated addresses immediately from a `POST /api/forwards` response
- * in the global `forwardsStore`.
- */
 export function recordForwardAddresses(view: ForwardView): void {
   forwardsStore.recordForward(view);
 }
 
 export function refreshRearmDuration(signal?: AbortSignal): Promise<SessionSettingsSummary> {
   return appDataStore.refreshSessionDefaults(signal);
-}
-
-/**
- * Observes Guard reports and runtime list removals across snapshots, deduplicating
- * per runtime event so new events never replay earlier notifications and manual
- * refreshes that reconcile the ledger ahead of a Guard round still record vanished
- * runtimes into Recently ended.
- */
-export function observeSnapshotTransitions(
-  prevSnapshot: Snapshot | null,
-  nextSnapshot: Snapshot | null,
-  locale: Locale,
-  t: TranslateFn,
-  pushToast: (toast: ToastInput) => number,
-): void {
-  if (!nextSnapshot) {
-    return;
-  }
-
-  const prevRuntimes = prevSnapshot?.runtimes?.runtimes ?? [];
-  const nextRuntimes = nextSnapshot.runtimes?.runtimes ?? [];
-  const accounts = nextSnapshot.accounts?.accounts ?? prevSnapshot?.accounts?.accounts ?? [];
-  const lookupInfo = (ref: RuntimeRef): { label: string; email: string | null } => {
-    const key = runtimeKey(ref);
-    let matched = prevRuntimes.find((rt) => runtimeKey(rt.id) === key);
-    if (!matched) {
-      const baseline = lastKnownRuntimesByAccount.get(ref.account);
-      matched = baseline?.find((rt) => runtimeKey(rt.id) === key);
-    }
-    const acct = accounts.find((a) => a.id === ref.account);
-    return {
-      label: matched ? formatRuntimeCardLabel(matched) : (ref.name ?? ref.endpoint),
-      email: matched?.account_email ?? acct?.email ?? null,
-    };
-  };
-
-  const guardHandledRuntimeKeys = new Set<string>();
-  const report = nextSnapshot.guard;
-  if (report) {
-    for (const item of report.decisions) {
-      if (item.decision.decision !== "stop" || !item.stopped) {
-        continue;
-      }
-      const rtKey = runtimeKey(item.session);
-      guardHandledRuntimeKeys.add(rtKey);
-      const concern = item.decision.concerns;
-      const eventKey = `${rtKey}:${concern.kind}:${concern.limit}`;
-      if (seenGuardStoppedKeys.has(eventKey)) {
-        continue;
-      }
-      seenGuardStoppedKeys.add(eventKey);
-      const info = lookupInfo(item.session);
-      recordEndedRuntime({
-        runtime: item.session,
-        label: info.label,
-        email: info.email,
-        reason: { kind: "guard", concern },
-      });
-      pushToast({
-        tone: "danger",
-        title: t("app.b2.guard_stopped_title", { name: info.label }),
-        body: formatConcern(concern, locale, t),
-      });
-    }
-
-    for (const ref of report.vanished) {
-      const rtKey = runtimeKey(ref);
-      if (isStopPending(rtKey)) {
-        deferredPendingKeys.add(rtKey);
-        continue;
-      }
-      guardHandledRuntimeKeys.add(rtKey);
-      if (seenVanishedKeys.has(rtKey)) {
-        continue;
-      }
-      seenVanishedKeys.add(rtKey);
-      const info = lookupInfo(ref);
-      recordEndedRuntime({
-        runtime: ref,
-        label: info.label,
-        email: info.email,
-        reason: { kind: "vanished" },
-      });
-      pushToast({
-        tone: "info",
-        title: t("app.b2.vanished_title", { name: info.label }),
-        body: t("app.b2.ended_vanished"),
-      });
-    }
-  }
-
-  // Keep each account's last successful runtime list so a transient per-account
-  // listing error does not drop the baseline needed to detect vanished runtimes
-  // when a subsequent manual refresh reconciles the ledger ahead of a Guard round.
-  const hasAccountsList = nextSnapshot.accounts !== null;
-  const savedAccounts = new Set(accounts.map((a) => a.id));
-  if (hasAccountsList) {
-    for (const accountId of lastKnownRuntimesByAccount.keys()) {
-      if (!savedAccounts.has(accountId)) {
-        lastKnownRuntimesByAccount.delete(accountId);
-      }
-    }
-  }
-
-  if (nextSnapshot.runtimes && nextSnapshot.runtimes_error === null) {
-    const erroredAccounts = new Set(nextSnapshot.runtimes.errors.map((e) => e.account));
-    const nextByAccount = new Map<AccountId, Runtime[]>();
-    for (const rt of nextRuntimes) {
-      const list = nextByAccount.get(rt.id.account);
-      if (list) {
-        list.push(rt);
-      } else {
-        nextByAccount.set(rt.id.account, [rt]);
-      }
-    }
-
-    const accountsToCompare = new Set<AccountId>([
-      ...savedAccounts,
-      ...nextByAccount.keys(),
-    ]);
-    for (const accountId of accountsToCompare) {
-      if (erroredAccounts.has(accountId)) {
-        continue;
-      }
-      const nextList = nextByAccount.get(accountId) ?? [];
-      const prevList = lastKnownRuntimesByAccount.get(accountId);
-      const retainedForAccount: Runtime[] = [];
-      if (prevList !== undefined) {
-        const liveKeys = new Set(nextList.map((rt) => runtimeKey(rt.id)));
-        for (const prevRt of prevList) {
-          const rtKey = runtimeKey(prevRt.id);
-          if (
-            liveKeys.has(rtKey) ||
-            guardHandledRuntimeKeys.has(rtKey) ||
-            seenVanishedKeys.has(rtKey)
-          ) {
-            continue;
-          }
-          if (isStopPending(rtKey)) {
-            // Keep the baseline intact until the in-flight stop settles so a failed or dropped
-            // response still reconciles any already-stopped runtime into Recently ended.
-            deferredPendingKeys.add(rtKey);
-            retainedForAccount.push(prevRt);
-            continue;
-          }
-          seenVanishedKeys.add(rtKey);
-          const label = formatRuntimeCardLabel(prevRt);
-          recordEndedRuntime({
-            runtime: prevRt.id,
-            label,
-            email:
-              prevRt.account_email ??
-              accounts.find((a) => a.id === prevRt.id.account)?.email ??
-              null,
-            reason: { kind: "vanished" },
-          });
-          pushToast({
-            tone: "info",
-            title: t("app.b2.vanished_title", { name: label }),
-            body: t("app.b2.ended_vanished"),
-          });
-        }
-      }
-      lastKnownRuntimesByAccount.set(
-        accountId,
-        retainedForAccount.length > 0 ? [...nextList, ...retainedForAccount] : nextList,
-      );
-    }
-  }
 }
 
 function subscribe(listener: () => void): () => void {
@@ -639,7 +382,7 @@ function subscribe(listener: () => void): () => void {
 }
 
 function getSnapshot(): SessionsLocalState {
-  return state;
+  return cachedSnapshot;
 }
 
 export function useSessionsLocalState(): SessionsLocalState {

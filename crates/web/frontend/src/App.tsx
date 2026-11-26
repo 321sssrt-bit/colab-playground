@@ -7,13 +7,18 @@ import {
 } from "./components/AppShell.tsx";
 import { BrandIcon } from "./components/Icons.tsx";
 import { ToastViewport } from "./components/ToastViewport.tsx";
+import { useAppDataStore } from "./lib/appCache.ts";
+// Ensure the global Cost Guard observer is initialized at application scope across all routes.
+import "./lib/guard.ts";
 import { useI18n } from "./lib/i18n.ts";
 import { preferenceSync } from "./lib/preferences.ts";
 import { formatDocumentTitle, routerStore, useRouter, type RouteId } from "./lib/router.ts";
+import { stopDialogsStore, useStopDialogsStore } from "./lib/stopDialogs.ts";
 import { useWebStore, webStore } from "./lib/store.ts";
 import { useTheme } from "./lib/theme.ts";
 import { dismissToast, pushToast, toastStore, useToasts } from "./lib/toast.ts";
 import type { AppearancePref, LanguagePref } from "./lib/types.ts";
+import { updatesStore, useUpdatesStore } from "./lib/updates.ts";
 import { AccountsPage, type AccountsPageProps } from "./pages/AccountsPage.tsx";
 import { AccountSwitcherMenu } from "./pages/accounts/AccountSwitcherMenu.tsx";
 import { AddAccountDialog } from "./pages/accounts/AddAccountDialog.tsx";
@@ -23,6 +28,8 @@ import { LoginPage } from "./pages/LoginPage.tsx";
 import { OverviewPage } from "./pages/OverviewPage.tsx";
 import { PluginsPage } from "./pages/PluginsPage.tsx";
 import { SessionsPage } from "./pages/SessionsPage.tsx";
+import { StopAllDialog } from "./pages/sessions/StopAllDialog.tsx";
+import { StopRuntimeDialog } from "./pages/sessions/StopRuntimeDialog.tsx";
 import { SettingsPage } from "./pages/SettingsPage.tsx";
 import type { PageProps } from "./pages/types.ts";
 
@@ -52,6 +59,9 @@ function renderRoutePage(
 
 export function App() {
   const storeState = useWebStore();
+  const appData = useAppDataStore();
+  const updatesState = useUpdatesStore();
+  const stopDialogsState = useStopDialogsStore();
   const i18n = useI18n();
   const theme = useTheme();
   const { route, navigate } = useRouter();
@@ -74,6 +84,7 @@ export function App() {
     routerStore.ensureCanonicalHash();
     const controller = new AbortController();
     preferenceSync.syncSession(controller.signal);
+    void updatesStore.ensureChecked(controller.signal);
     return () => {
       controller.abort();
       preferenceSync.cancelPending();
@@ -194,6 +205,34 @@ export function App() {
     addAccountDialogOpen,
   };
 
+  const handleDismissUpdate = useCallback((version: string) => {
+    updatesStore.dismiss(version);
+  }, []);
+
+  const handleCloseStopAll = useCallback(() => {
+    stopDialogsStore.closeStopAll();
+  }, []);
+
+  const handleConfirmStopAll = useCallback(() => {
+    void stopDialogsStore.confirmStopAll();
+  }, []);
+
+  const handleCloseStopRuntime = useCallback(() => {
+    stopDialogsStore.closeStopRuntime();
+  }, []);
+
+  const handleConfirmStopRuntime = useCallback(() => {
+    void stopDialogsStore.confirmStopRuntime();
+  }, []);
+
+  const stopRuntimeRequest =
+    stopDialogsState.stopRuntime.open && stopDialogsState.stopRuntime.target
+      ? {
+          id: stopDialogsState.stopRuntime.openId,
+          ...stopDialogsState.stopRuntime.target,
+        }
+      : null;
+
   return (
     <div className="app-root">
       <AppShell
@@ -205,6 +244,9 @@ export function App() {
         t={t}
         onNavigate={navigate}
         onSignOut={handleSignOut}
+        updateBanner={updatesState.bannerUpdate}
+        updateBadge={updatesState.badgeVersion !== null}
+        onDismissUpdate={handleDismissUpdate}
         onModalDrawerChange={setModalDrawerOpen}
         renderAccountSlot={renderAccountSlot}
       >
@@ -228,6 +270,23 @@ export function App() {
           />
         </>
       )}
+      <StopRuntimeDialog
+        request={stopRuntimeRequest}
+        t={t}
+        pushToast={pushToast}
+        submitting={stopDialogsState.stopRuntime.submitting}
+        submitError={stopDialogsState.stopRuntime.submitError}
+        onClose={handleCloseStopRuntime}
+        onConfirm={handleConfirmStopRuntime}
+      />
+      <StopAllDialog
+        state={stopDialogsState.stopAll}
+        snapshot={storeState.snapshot}
+        sessionsRefreshing={appData.sessionsRefreshing}
+        t={t}
+        onClose={handleCloseStopAll}
+        onConfirm={handleConfirmStopAll}
+      />
       <ToastViewport toasts={toasts} t={t} inert={modalDrawerOpen} onDismiss={dismissToast} />
     </div>
   );
