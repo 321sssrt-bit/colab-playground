@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use axum::{
     Json,
@@ -7,7 +10,9 @@ use axum::{
 use colab_playground_core::{Error, ErrorKind};
 use colab_playground_shared::{
     defaults::sanitize,
-    settings::{AppearancePref, LanguagePref, LoadOutcome, Loaded, Settings, SettingsStore},
+    settings::{
+        AppearancePref, LanguagePref, LoadOutcome, Loaded, OnByDefault, Settings, SettingsStore,
+    },
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -32,7 +37,15 @@ impl WebSettings {
     }
 
     pub(crate) fn initial_settings(&self) -> Settings {
+        self.current()
+    }
+
+    pub(crate) fn current(&self) -> Settings {
         self.loaded.lock().expect("settings lock").settings.clone()
+    }
+
+    pub(crate) fn config_dir(&self) -> Option<PathBuf> {
+        self.store.dir().map(PathBuf::from)
     }
 
     fn view(&self, loaded: &Loaded) -> SettingsView {
@@ -46,6 +59,7 @@ impl WebSettings {
             language: loaded.settings.language,
             appearance: loaded.settings.appearance,
             defaults: loaded.settings.defaults.clone(),
+            check_updates: loaded.settings.check_updates.0,
             config_dir: self
                 .store
                 .dir()
@@ -62,6 +76,7 @@ pub(super) struct SettingsView {
     language: LanguagePref,
     appearance: AppearancePref,
     defaults: colab_playground_core::Defaults,
+    check_updates: bool,
     config_dir: Option<String>,
     load_status: &'static str,
     corrupt_backup: Option<String>,
@@ -74,6 +89,7 @@ pub(super) struct SettingsPatch {
     language: Option<LanguagePref>,
     appearance: Option<AppearancePref>,
     defaults: Option<Map<String, Value>>,
+    check_updates: Option<bool>,
 }
 
 pub(super) async fn get(State(state): State<StateData>) -> Result<Json<SettingsView>, ApiError> {
@@ -102,6 +118,9 @@ pub(super) async fn patch(
             }
             if let Some(appearance) = patch.appearance {
                 updated.appearance = appearance;
+            }
+            if let Some(check_updates) = patch.check_updates {
+                updated.check_updates = OnByDefault(check_updates);
             }
             if let Some(patch) = patch.defaults {
                 let Value::Object(mut fields) =

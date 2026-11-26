@@ -24,6 +24,9 @@ use tokio::task::JoinError;
 use crate::{http::StateData, i18n};
 
 pub(crate) use settings::WebSettings;
+#[cfg(test)]
+pub(crate) use updates::UpdateRepository;
+pub(crate) use updates::WebUpdates;
 
 pub(crate) fn routes() -> Router<StateData> {
     Router::new()
@@ -37,6 +40,7 @@ pub(crate) fn routes() -> Router<StateData> {
         )
         .route("/api/settings", get(settings::get).patch(settings::patch))
         .route("/api/updates", get(updates::get))
+        .route("/api/updates/check", post(updates::check_now))
         .route("/api/i18n/{locale}", get(dictionary))
         .merge(accounts::routes())
         .merge(plugins::routes())
@@ -54,7 +58,7 @@ async fn dictionary(Path(locale): Path<String>) -> Result<Json<i18n::Messages>, 
 }
 
 #[derive(Serialize)]
-struct ErrorMessage<'a> {
+pub(super) struct ErrorMessage<'a> {
     kind: &'static str,
     message_key: &'static str,
     args: BTreeMap<&'a str, &'a str>,

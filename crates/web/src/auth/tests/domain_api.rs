@@ -3,6 +3,8 @@ mod fixture;
 mod forwards;
 mod plugins;
 mod sessions;
+mod settings;
+mod updates;
 
 use std::{
     fs,
@@ -27,8 +29,8 @@ use ureq::{
 
 use super::{Auth, KeyStore};
 use crate::{
-    api::WebSettings,
-    http::{Origins, TrustedHost, router},
+    api::{WebSettings, WebUpdates},
+    http::{Origins, TrustedHost, router_with_updates},
 };
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -122,6 +124,22 @@ async fn exercise_backend<B: Backend + 'static>(
     store: SettingsStore,
     settings: WebSettings,
     backend: Arc<B>,
+    timing: (Option<ForwardPolicy>, Option<Duration>),
+    trusted: Vec<TrustedHost>,
+    run: impl FnOnce(Client, Arc<B>, SettingsStore) + Send + 'static,
+) {
+    let updates = WebUpdates::load(settings.config_dir());
+    exercise_backend_with_updates(dir, store, settings, updates, backend, timing, trusted, run)
+        .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn exercise_backend_with_updates<B: Backend + 'static>(
+    dir: &Path,
+    store: SettingsStore,
+    settings: WebSettings,
+    updates: WebUpdates,
+    backend: Arc<B>,
     (policy, login_inactivity): (Option<ForwardPolicy>, Option<Duration>),
     trusted: Vec<TrustedHost>,
     run: impl FnOnce(Client, Arc<B>, SettingsStore) + Send + 'static,
@@ -148,12 +166,13 @@ async fn exercise_backend<B: Backend + 'static>(
     let _lock = colab_playground_core::InstanceLock::acquire(keys.dir()).unwrap();
     let key = keys.replace().unwrap();
     let (_watcher, changes) = keys.watch();
-    let app = router(
+    let app = router_with_updates(
         Auth::new(keys),
         changes,
         Origins::new(addr, trusted),
         web.clone(),
         settings,
+        updates,
     );
     let server = tokio::spawn(async move {
         axum::serve(
@@ -274,6 +293,14 @@ async fn overview_updates_and_all_dictionaries() {
         assert_eq!(overview["unmanaged_runtimes"]["count"], 1);
         assert_eq!(overview["unmanaged_runtimes"]["incomplete"], false);
 
+        let current = colab_playground_core::update::Version::parse(env!("CARGO_PKG_VERSION"))
+            .expect("semantic version");
+        let next = format!("{}.{}.{}", current.major, current.minor, current.patch + 1);
+        let expected_now = backend
+            .now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         let update = client.get("/api/updates");
         assert_eq!(
             update,
@@ -281,6 +308,13 @@ async fn overview_updates_and_all_dictionaries() {
                 "current_version": env!("CARGO_PKG_VERSION"),
                 "update_available": true,
                 "releases_url": "https://github.com/321sssrt-bit/colab-playground/releases",
+                "release_url": format!("https://github.com/321sssrt-bit/colab-playground/releases/tag/v{next}"),
+                "latest_version": next,
+                "status": "available",
+                "checked_at": expected_now,
+                "check_updates": true,
+                "error": null,
+                "persist_error": null,
             })
         );
         assert_eq!(
@@ -501,11 +535,22 @@ async fn keyring_update_and_install_failures_have_localizable_diagnostics() {
                     .contains("Secret Service")
             );
         }
-        let error = json(
-            client.request("GET", "/api/updates", ""),
-            StatusCode::BAD_GATEWAY,
+        let failed_update = client.get("/api/updates");
+        assert_eq!(failed_update["current_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(failed_update["update_available"], false);
+        assert_eq!(failed_update["status"], "failed");
+        assert_eq!(
+            failed_update["releases_url"],
+            "https://github.com/321sssrt-bit/colab-playground/releases"
         );
-        assert_eq!(error["error"]["kind"], "http");
+        assert!(failed_update["latest_version"].is_null());
+        assert!(failed_update["release_url"].is_null());
+        assert!(failed_update["checked_at"].is_null());
+        assert_eq!(failed_update["check_updates"], true);
+        assert_eq!(failed_update["error"]["kind"], "http");
+        assert!(failed_update["persist_error"].is_null());
+        let update_err_key = failed_update["error"]["message_key"].as_str().unwrap();
+        assert!(dictionary[update_err_key].is_string());
         let mut reader = client.install();
         event(&mut reader, "started");
         for _ in 0..4 {
