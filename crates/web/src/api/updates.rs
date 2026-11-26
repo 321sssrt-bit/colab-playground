@@ -1,4 +1,6 @@
 use std::{
+    fs,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -12,11 +14,11 @@ use colab_playground_core::{
     CancelToken, Error, ErrorKind, Result,
     backend::{Backend, BackendKind},
     http::{HttpClient, default_client},
+    paths::write_atomic,
     update::{self, Release, UpdateStatus, Version},
 };
-use colab_playground_shared::settings::Settings;
 use colab_playground_web::state::WebState;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
 use super::{ApiError, ErrorMessage, WebSettings};
@@ -26,6 +28,7 @@ use crate::http::StateData;
 pub(crate) const UPDATE_INTERVAL: Duration = Duration::from_secs(24 * 3600);
 // Avoids hammering GitHub on repeated Settings opens while offline, without marking the daily check done.
 pub(crate) const UPDATE_RETRY_INTERVAL: Duration = Duration::from_secs(3600);
+pub(crate) const UPDATES_FILE: &str = "web-updates.json";
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
@@ -45,12 +48,48 @@ impl UpdateRepository {
         Self::from_url(REPOSITORY).expect("Web package uses a GitHub repository")
     }
 
+    fn canonical_url(&self) -> String {
+        format!("https://github.com/{}/{}", self.owner, self.repo)
+    }
+
     fn releases_url(&self) -> String {
-        format!("https://github.com/{}/{}/releases", self.owner, self.repo)
+        format!("{}/releases", self.canonical_url())
     }
 
     fn release_page(&self, version: &str) -> String {
         update::release_page(&self.owner, &self.repo, version)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredUpdateCache {
+    repository: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checked_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    latest_version: Option<String>,
+}
+
+impl StoredUpdateCache {
+    fn load(file: &Path, expected_repo: &str) -> Self {
+        let Ok(text) = fs::read_to_string(file) else {
+            return Self::default();
+        };
+        let Ok(stored) = serde_json::from_str::<Self>(&text) else {
+            return Self::default();
+        };
+        // Ignore cache entries written for a different repository so forks never cross-pollinate.
+        if stored.repository != expected_repo {
+            return Self::default();
+        }
+        stored
+    }
+
+    fn save(&self, file: &Path) -> Result<()> {
+        let mut text = serde_json::to_string_pretty(self).expect("update cache serializes to JSON");
+        text.push('\n');
+        write_atomic(file, text.as_bytes())
+            .map_err(|error| Error::new(ErrorKind::Io).detail(error.to_string()))
     }
 }
 
@@ -74,7 +113,10 @@ type FlightReceiver = watch::Receiver<Option<Result<FlightOutcome>>>;
 #[derive(Default)]
 struct UpdateState {
     check: UpdateCheck,
+    checked_at: Option<u64>,
+    latest_version: Option<String>,
     attempted_at: Option<u64>,
+    persist_error: Option<Error>,
     // Shares an in-progress check across concurrent callers and survives client disconnects.
     in_flight: Option<FlightReceiver>,
 }
@@ -96,19 +138,38 @@ impl Drop for ClearInFlight {
 pub(crate) struct WebUpdates {
     repository: UpdateRepository,
     http: Arc<dyn HttpClient>,
+    cache_file: Option<PathBuf>,
     state: Arc<Mutex<UpdateState>>,
 }
 
 impl WebUpdates {
-    pub(crate) fn new() -> Self {
-        Self::with_config(UpdateRepository::default_web(), default_client())
+    pub(crate) fn load(config_dir: Option<PathBuf>) -> Self {
+        Self::with_config(
+            UpdateRepository::default_web(),
+            default_client(),
+            config_dir,
+        )
     }
 
-    pub(crate) fn with_config(repository: UpdateRepository, http: Arc<dyn HttpClient>) -> Self {
+    pub(crate) fn with_config(
+        repository: UpdateRepository,
+        http: Arc<dyn HttpClient>,
+        config_dir: Option<PathBuf>,
+    ) -> Self {
+        let cache_file = config_dir.map(|dir| dir.join(UPDATES_FILE));
+        let stored = cache_file
+            .as_deref()
+            .map(|file| StoredUpdateCache::load(file, &repository.canonical_url()))
+            .unwrap_or_default();
         Self {
             repository,
             http,
-            state: Arc::new(Mutex::new(UpdateState::default())),
+            cache_file,
+            state: Arc::new(Mutex::new(UpdateState {
+                checked_at: stored.checked_at,
+                latest_version: stored.latest_version,
+                ..UpdateState::default()
+            })),
         }
     }
 
@@ -124,24 +185,23 @@ impl WebUpdates {
                 if let Some(existing) = &state.in_flight {
                     existing.clone()
                 } else {
-                    let current_settings = settings.current();
-                    if !manual && !current_settings.check_updates.0 {
-                        return Ok(self.notice_response(&current_settings, &state));
+                    let check_updates = settings.current().check_updates.0;
+                    if !manual && !check_updates {
+                        return Ok(self.notice_response(check_updates, &state));
                     }
-                    let checked_at = current_settings.update_checked_at;
+                    let checked_at = state.checked_at;
                     let attempted_at = state.attempted_at;
                     let (tx, rx) = watch::channel(None);
                     state.in_flight = Some(rx.clone());
                     let updates = self.clone();
                     let web = web.clone();
-                    let settings = settings.clone();
                     tokio::spawn(async move {
                         let mut guard = ClearInFlight {
                             state: updates.state.clone(),
                             armed: true,
                         };
                         let outcome = updates
-                            .run_flight(&web, &settings, manual, checked_at, attempted_at)
+                            .run_flight(&web, manual, checked_at, attempted_at)
                             .await;
                         guard.armed = false;
                         let _ = tx.send(Some(outcome));
@@ -157,9 +217,9 @@ impl WebUpdates {
             match outcome? {
                 FlightOutcome::Skipped if manual => continue,
                 FlightOutcome::Skipped | FlightOutcome::Checked => {
-                    let latest = settings.current();
+                    let check_updates = settings.current().check_updates.0;
                     let state = self.state.lock().expect("updates lock");
-                    return Ok(self.notice_response(&latest, &state));
+                    return Ok(self.notice_response(check_updates, &state));
                 }
             }
         }
@@ -168,7 +228,6 @@ impl WebUpdates {
     async fn run_flight(
         &self,
         web: &WebState,
-        settings: &WebSettings,
         manual: bool,
         checked_at: Option<u64>,
         attempted_at: Option<u64>,
@@ -207,36 +266,42 @@ impl WebUpdates {
             CheckExecution::Checked { result, now } => {
                 match result {
                     Ok(UpdateStatus::UpToDate) => {
-                        settings.update_metadata(|s| {
-                            s.update_checked_at = Some(now);
-                            if s.update_latest
+                        let next_latest = {
+                            let state = self.state.lock().expect("updates lock");
+                            state
+                                .latest_version
                                 .as_deref()
-                                .is_some_and(|v| newer_version(v).is_none())
-                            {
-                                s.update_latest = None;
-                            }
-                        });
+                                .and_then(newer_version)
+                                .map(|_| state.latest_version.clone().unwrap())
+                        };
+                        let persist_error =
+                            self.persist_cache(Some(now), next_latest.clone()).await;
                         let mut state = self.state.lock().expect("updates lock");
+                        state.checked_at = Some(now);
+                        state.latest_version = next_latest;
                         state.attempted_at = Some(now);
                         state.check = UpdateCheck::UpToDate;
+                        state.persist_error = persist_error;
                         state.in_flight = None;
                     }
                     Ok(UpdateStatus::Available(release)) => {
-                        let version = release.version.clone();
-                        settings.update_metadata(|s| {
-                            s.update_checked_at = Some(now);
-                            s.update_latest = Some(version);
-                        });
+                        let next_latest = Some(release.version.clone());
+                        let persist_error =
+                            self.persist_cache(Some(now), next_latest.clone()).await;
                         let mut state = self.state.lock().expect("updates lock");
+                        state.checked_at = Some(now);
+                        state.latest_version = next_latest;
                         state.attempted_at = Some(now);
                         state.check = UpdateCheck::Available(release);
+                        state.persist_error = persist_error;
                         state.in_flight = None;
                     }
                     Err(error) => {
-                        // A failed check does not record `update_checked_at`, so a restart retries.
+                        // A failed check does not record `checked_at`, so a restart retries.
                         let mut state = self.state.lock().expect("updates lock");
                         state.attempted_at = Some(now);
                         state.check = UpdateCheck::Failed(error);
+                        state.persist_error = None;
                         state.in_flight = None;
                     }
                 }
@@ -245,12 +310,30 @@ impl WebUpdates {
         }
     }
 
-    fn notice_response(&self, settings: &Settings, state: &UpdateState) -> Response {
+    async fn persist_cache(
+        &self,
+        checked_at: Option<u64>,
+        latest_version: Option<String>,
+    ) -> Option<Error> {
+        let file = self.cache_file.clone()?;
+        let cache = StoredUpdateCache {
+            repository: self.repository.canonical_url(),
+            checked_at,
+            latest_version,
+        };
+        match tokio::task::spawn_blocking(move || cache.save(&file)).await {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error),
+            Err(error) => Some(Error::new(ErrorKind::Io).detail(error.to_string())),
+        }
+    }
+
+    fn notice_response(&self, check_updates: bool, state: &UpdateState) -> Response {
         let available = match &state.check {
             UpdateCheck::Available(release) => {
                 Some((release.version.clone(), release.page.clone()))
             }
-            _ => settings.update_latest.as_deref().and_then(|stored| {
+            _ => state.latest_version.as_deref().and_then(|stored| {
                 let version = newer_version(stored)?;
                 let page = self.repository.release_page(&version);
                 Some((version, page))
@@ -266,6 +349,7 @@ impl WebUpdates {
             UpdateCheck::Failed(error) => Some(ErrorMessage::from(error)),
             _ => None,
         };
+        let persist_error = state.persist_error.as_ref().map(ErrorMessage::from);
         let (latest_version, release_url) = match available {
             Some((version, page)) => (Some(version), Some(page)),
             None => (None, None),
@@ -277,9 +361,10 @@ impl WebUpdates {
             release_url,
             latest_version,
             status,
-            checked_at: settings.update_checked_at,
-            check_updates: settings.check_updates.0,
+            checked_at: state.checked_at,
+            check_updates,
             error,
+            persist_error,
         })
         .into_response()
     }
@@ -304,6 +389,7 @@ struct UpdateNotice<'a> {
     checked_at: Option<u64>,
     check_updates: bool,
     error: Option<ErrorMessage<'a>>,
+    persist_error: Option<ErrorMessage<'a>>,
 }
 
 pub(super) async fn get(State(state): State<StateData>) -> std::result::Result<Response, ApiError> {
@@ -410,5 +496,32 @@ mod tests {
         assert_eq!(newer_version(VERSION), None);
         assert_eq!(newer_version("0.0.1"), None);
         assert_eq!(newer_version("not-a-version"), None);
+    }
+
+    #[test]
+    fn stored_cache_ignores_corrupt_or_mismatched_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(UPDATES_FILE);
+        let cache = StoredUpdateCache {
+            repository: "https://github.com/321sssrt-bit/colab-playground".into(),
+            checked_at: Some(12345),
+            latest_version: Some("9.0.0".into()),
+        };
+        cache.save(&file).unwrap();
+
+        assert_eq!(
+            StoredUpdateCache::load(&file, "https://github.com/321sssrt-bit/colab-playground"),
+            cache
+        );
+        assert_eq!(
+            StoredUpdateCache::load(&file, "https://github.com/scarletkc/colab-playground"),
+            StoredUpdateCache::default()
+        );
+
+        fs::write(&file, "{ not json").unwrap();
+        assert_eq!(
+            StoredUpdateCache::load(&file, "https://github.com/321sssrt-bit/colab-playground"),
+            StoredUpdateCache::default()
+        );
     }
 }

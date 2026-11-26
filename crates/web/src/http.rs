@@ -229,7 +229,8 @@ pub fn router(
     web: WebState,
     settings: WebSettings,
 ) -> Router {
-    router_with_updates(auth, key_changes, origins, web, settings, WebUpdates::new())
+    let updates = WebUpdates::load(settings.config_dir());
+    router_with_updates(auth, key_changes, origins, web, settings, updates)
 }
 
 pub(crate) fn router_with_updates(

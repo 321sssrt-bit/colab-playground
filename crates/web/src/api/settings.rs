@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use axum::{
     Json,
@@ -41,17 +44,8 @@ impl WebSettings {
         self.loaded.lock().expect("settings lock").settings.clone()
     }
 
-    /// Persists background metadata (such as update check timestamps) without clearing
-    /// start-up load diagnostics that Settings still needs to report to the user.
-    pub(crate) fn update_metadata(&self, change: impl FnOnce(&mut Settings)) -> Settings {
-        let mut loaded = self.loaded.lock().expect("settings lock");
-        let mut updated = loaded.settings.clone();
-        change(&mut updated);
-        if let Err(error) = self.store.save(&updated) {
-            eprintln!("Web Server: failed to save update metadata: {error}");
-        }
-        loaded.settings = updated.clone();
-        updated
+    pub(crate) fn config_dir(&self) -> Option<PathBuf> {
+        self.store.dir().map(PathBuf::from)
     }
 
     fn view(&self, loaded: &Loaded) -> SettingsView {

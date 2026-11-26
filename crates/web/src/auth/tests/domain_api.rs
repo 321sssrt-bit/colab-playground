@@ -128,17 +128,9 @@ async fn exercise_backend<B: Backend + 'static>(
     trusted: Vec<TrustedHost>,
     run: impl FnOnce(Client, Arc<B>, SettingsStore) + Send + 'static,
 ) {
-    exercise_backend_with_updates(
-        dir,
-        store,
-        settings,
-        WebUpdates::new(),
-        backend,
-        timing,
-        trusted,
-        run,
-    )
-    .await;
+    let updates = WebUpdates::load(settings.config_dir());
+    exercise_backend_with_updates(dir, store, settings, updates, backend, timing, trusted, run)
+        .await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -322,6 +314,7 @@ async fn overview_updates_and_all_dictionaries() {
                 "checked_at": expected_now,
                 "check_updates": true,
                 "error": null,
+                "persist_error": null,
             })
         );
         assert_eq!(
@@ -555,6 +548,7 @@ async fn keyring_update_and_install_failures_have_localizable_diagnostics() {
         assert!(failed_update["checked_at"].is_null());
         assert_eq!(failed_update["check_updates"], true);
         assert_eq!(failed_update["error"]["kind"], "http");
+        assert!(failed_update["persist_error"].is_null());
         let update_err_key = failed_update["error"]["message_key"].as_str().unwrap();
         assert!(dictionary[update_err_key].is_string());
         let mut reader = client.install();

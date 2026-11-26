@@ -22,6 +22,7 @@ use colab_playground_core::{
     update::Version,
 };
 use colab_playground_shared::settings::SettingsStore;
+use serde_json::Value;
 use ureq::http::StatusCode;
 
 use super::{exercise, exercise_backend_with_updates, json};
@@ -30,6 +31,8 @@ use crate::api::{UpdateRepository, WebSettings, WebUpdates};
 const DAY_SECS: u64 = 24 * 3600;
 const HOUR_SECS: u64 = 3600;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const WEB_REPO: &str = "https://github.com/321sssrt-bit/colab-playground";
+const UPDATES_FILE: &str = "web-updates.json";
 
 fn unix_secs(time: SystemTime) -> u64 {
     time.duration_since(UNIX_EPOCH).unwrap().as_secs()
@@ -38,6 +41,11 @@ fn unix_secs(time: SystemTime) -> u64 {
 fn next_patch_version() -> String {
     let v = Version::parse(VERSION).expect("semantic version");
     format!("{}.{}.{}", v.major, v.minor, v.patch + 1)
+}
+
+fn read_cache(dir: &Path) -> Value {
+    let text = fs::read_to_string(dir.join(UPDATES_FILE)).expect("web-updates.json");
+    serde_json::from_str(&text).expect("valid JSON cache")
 }
 
 struct RealKindMock {
@@ -133,8 +141,9 @@ impl HttpClient for FakeHttp {
 #[tokio::test(flavor = "multi_thread")]
 async fn automatic_checks_throttle_for_24h_and_manual_check_refreshes() {
     let dir = tempfile::tempdir().unwrap();
+    let dir_path = dir.path().to_owned();
     let (config, clock) = MockConfig::headless(MockScenario::demo());
-    exercise(dir.path(), config, move |client, backend, store| {
+    exercise(dir.path(), config, move |client, backend, _| {
         let t0 = unix_secs(backend.now());
         let first = client.get("/api/updates");
         assert_eq!(first["current_version"], VERSION);
@@ -143,8 +152,11 @@ async fn automatic_checks_throttle_for_24h_and_manual_check_refreshes() {
         assert_eq!(first["checked_at"], t0);
         assert_eq!(first["check_updates"], true);
         assert!(first["error"].is_null());
+        assert!(first["persist_error"].is_null());
         assert_eq!(backend.update_checks(), 1);
-        assert_eq!(store.load().settings.update_checked_at, Some(t0));
+        let cache = read_cache(&dir_path);
+        assert_eq!(cache["repository"], WEB_REPO);
+        assert_eq!(cache["checked_at"], t0);
 
         // Repeated automatic checks within 24 hours hit the cache without re-querying.
         assert_eq!(client.get("/api/updates"), first);
@@ -170,13 +182,14 @@ async fn automatic_checks_throttle_for_24h_and_manual_check_refreshes() {
         assert_eq!(manual["latest_version"], next);
         assert_eq!(
             manual["release_url"],
-            format!("https://github.com/321sssrt-bit/colab-playground/releases/tag/v{next}")
+            format!("{WEB_REPO}/releases/tag/v{next}")
         );
         assert_eq!(manual["checked_at"], t1);
         assert!(manual["error"].is_null());
-        let saved = store.load().settings;
-        assert_eq!(saved.update_checked_at, Some(t1));
-        assert_eq!(saved.update_latest.as_deref(), Some(next.as_str()));
+        assert!(manual["persist_error"].is_null());
+        let cache = read_cache(&dir_path);
+        assert_eq!(cache["checked_at"], t1);
+        assert_eq!(cache["latest_version"], next);
 
         // The 24h window resets from the manual check timestamp.
         clock.advance(Duration::from_secs(DAY_SECS - 1));
@@ -188,22 +201,23 @@ async fn automatic_checks_throttle_for_24h_and_manual_check_refreshes() {
         let refreshed = client.get("/api/updates");
         assert_eq!(backend.update_checks(), 3);
         assert_eq!(refreshed["checked_at"], t2);
-        assert_eq!(store.load().settings.update_checked_at, Some(t2));
+        assert_eq!(read_cache(&dir_path)["checked_at"], t2);
     })
     .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn persisted_daily_throttle_survives_restart_and_clears_stale_latest() {
+async fn persisted_cache_survives_restart_clears_stale_latest_and_isolates_repositories() {
     let dir = tempfile::tempdir().unwrap();
     let (config, clock) = MockConfig::headless(MockScenario::demo());
     let now = unix_secs(clock.now());
     let checked_at = now.saturating_sub(10 * HOUR_SECS);
     fs::write(
-        dir.path().join("settings.json"),
+        dir.path().join(UPDATES_FILE),
         serde_json::json!({
-            "update_checked_at": checked_at,
-            "update_latest": "9.0.0",
+            "repository": WEB_REPO,
+            "checked_at": checked_at,
+            "latest_version": "9.0.0",
         })
         .to_string(),
     )
@@ -218,38 +232,80 @@ async fn persisted_daily_throttle_survives_restart_and_clears_stale_latest() {
         assert_eq!(cached["latest_version"], "9.0.0");
         assert_eq!(
             cached["release_url"],
-            "https://github.com/321sssrt-bit/colab-playground/releases/tag/v9.0.0"
+            format!("{WEB_REPO}/releases/tag/v9.0.0")
         );
         assert_eq!(cached["checked_at"], checked_at);
+        assert!(cached["persist_error"].is_null());
     })
     .await;
 
-    // A stored `update_latest` no newer than this build is ignored and pruned on the next check.
+    // A stored `latest_version` no newer than this build is ignored and pruned on the next check.
     let stale_dir = tempfile::tempdir().unwrap();
+    let stale_path = stale_dir.path().to_owned();
     let (stale_config, stale_clock) = MockConfig::headless(MockScenario::demo());
     let stale_checked_at = unix_secs(stale_clock.now()).saturating_sub(DAY_SECS + 10);
     fs::write(
-        stale_dir.path().join("settings.json"),
+        stale_dir.path().join(UPDATES_FILE),
         serde_json::json!({
-            "update_checked_at": stale_checked_at,
-            "update_latest": "0.1.0",
+            "repository": WEB_REPO,
+            "checked_at": stale_checked_at,
+            "latest_version": "0.1.0",
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    exercise(stale_dir.path(), stale_config, move |client, backend, _| {
+        let notice = client.get("/api/updates");
+        assert_eq!(backend.update_checks(), 1);
+        assert_eq!(notice["current_version"], VERSION);
+        assert_eq!(notice["status"], "up_to_date");
+        assert_eq!(notice["update_available"], false);
+        assert!(notice["latest_version"].is_null());
+        assert!(notice["release_url"].is_null());
+        assert!(read_cache(&stale_path).get("latest_version").is_none());
+    })
+    .await;
+
+    // Desktop settings.json update cache and mismatched web-updates.json repositories are ignored.
+    let isolated_dir = tempfile::tempdir().unwrap();
+    let isolated_path = isolated_dir.path().to_owned();
+    let (iso_config, iso_clock) = MockConfig::headless(MockScenario::demo());
+    let desktop_checked_at = unix_secs(iso_clock.now()).saturating_sub(HOUR_SECS);
+    fs::write(
+        isolated_dir.path().join("settings.json"),
+        serde_json::json!({
+            "update_checked_at": desktop_checked_at,
+            "update_latest": "9.9.9",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        isolated_dir.path().join(UPDATES_FILE),
+        serde_json::json!({
+            "repository": "https://github.com/scarletkc/colab-playground",
+            "checked_at": desktop_checked_at,
+            "latest_version": "9.9.9",
         })
         .to_string(),
     )
     .unwrap();
 
     exercise(
-        stale_dir.path(),
-        stale_config,
+        isolated_dir.path(),
+        iso_config,
         move |client, backend, store| {
             let notice = client.get("/api/updates");
             assert_eq!(backend.update_checks(), 1);
-            assert_eq!(notice["current_version"], VERSION);
             assert_eq!(notice["status"], "up_to_date");
             assert_eq!(notice["update_available"], false);
             assert!(notice["latest_version"].is_null());
-            assert!(notice["release_url"].is_null());
-            assert_eq!(store.load().settings.update_latest, None);
+            assert_eq!(read_cache(&isolated_path)["repository"], WEB_REPO);
+            // Desktop settings.json update metadata remains untouched.
+            let desktop = store.load().settings;
+            assert_eq!(desktop.update_checked_at, Some(desktop_checked_at));
+            assert_eq!(desktop.update_latest.as_deref(), Some("9.9.9"));
         },
     )
     .await;
@@ -258,8 +314,9 @@ async fn persisted_daily_throttle_survives_restart_and_clears_stale_latest() {
 #[tokio::test(flavor = "multi_thread")]
 async fn failed_checks_preserve_version_honor_retry_cooldown_and_keep_checked_at() {
     let dir = tempfile::tempdir().unwrap();
+    let dir_path = dir.path().to_owned();
     let (config, clock) = MockConfig::headless(MockScenario::demo());
-    exercise(dir.path(), config, move |client, backend, store| {
+    exercise(dir.path(), config, move |client, backend, _| {
         let t0 = unix_secs(backend.now());
         assert_eq!(client.get("/api/updates")["status"], "up_to_date");
         assert_eq!(backend.update_checks(), 1);
@@ -276,7 +333,8 @@ async fn failed_checks_preserve_version_honor_retry_cooldown_and_keep_checked_at
         assert_eq!(failed["update_available"], false);
         assert_eq!(failed["checked_at"], t0);
         assert_eq!(failed["error"]["kind"], "http");
-        assert_eq!(store.load().settings.update_checked_at, Some(t0));
+        assert!(failed["persist_error"].is_null());
+        assert_eq!(read_cache(&dir_path)["checked_at"], t0);
 
         // Automatic retry waits for the 1-hour retry cooldown.
         clock.advance(Duration::from_secs(HOUR_SECS - 1));
@@ -303,6 +361,7 @@ async fn failed_checks_preserve_version_honor_retry_cooldown_and_keep_checked_at
         assert_eq!(recovered["status"], "up_to_date");
         assert_eq!(recovered["checked_at"], t_recovered);
         assert!(recovered["error"].is_null());
+        assert!(recovered["persist_error"].is_null());
     })
     .await;
 }
@@ -310,8 +369,9 @@ async fn failed_checks_preserve_version_honor_retry_cooldown_and_keep_checked_at
 #[tokio::test(flavor = "multi_thread")]
 async fn auto_check_off_skips_automatic_checks_while_manual_check_still_runs() {
     let dir = tempfile::tempdir().unwrap();
+    let dir_path = dir.path().to_owned();
     let (config, _) = MockConfig::headless(MockScenario::demo());
-    exercise(dir.path(), config, move |client, backend, store| {
+    exercise(dir.path(), config, move |client, backend, _| {
         json(
             client.request("PATCH", "/api/settings", r#"{"check_updates":false}"#),
             StatusCode::OK,
@@ -325,6 +385,7 @@ async fn auto_check_off_skips_automatic_checks_while_manual_check_still_runs() {
         assert_eq!(idle["check_updates"], false);
         assert!(idle["checked_at"].is_null());
         assert!(idle["error"].is_null());
+        assert!(idle["persist_error"].is_null());
 
         let t0 = unix_secs(backend.now());
         let manual = json(
@@ -336,7 +397,8 @@ async fn auto_check_off_skips_automatic_checks_while_manual_check_still_runs() {
         assert_eq!(manual["status"], "up_to_date");
         assert_eq!(manual["check_updates"], false);
         assert_eq!(manual["checked_at"], t0);
-        assert_eq!(store.load().settings.update_checked_at, Some(t0));
+        assert!(manual["persist_error"].is_null());
+        assert_eq!(read_cache(&dir_path)["checked_at"], t0);
     })
     .await;
 }
@@ -344,7 +406,8 @@ async fn auto_check_off_skips_automatic_checks_while_manual_check_still_runs() {
 #[tokio::test(flavor = "multi_thread")]
 async fn real_backend_handles_no_releases_rate_limit_offline_and_custom_repository() {
     let dir = tempfile::tempdir().unwrap();
-    let store = SettingsStore::new(Some(dir.path().to_owned()));
+    let dir_path = dir.path().to_owned();
+    let store = SettingsStore::new(Some(dir_path.clone()));
     let settings = WebSettings::load(store.clone());
     let (mut config, clock) = MockConfig::headless(MockScenario::demo());
     config.defaults = settings.initial_settings().defaults;
@@ -371,7 +434,7 @@ async fn real_backend_handles_no_releases_rate_limit_offline_and_custom_reposito
         }),
     ]));
     let repo = UpdateRepository::from_url("https://github.com/acme/custom-fork").unwrap();
-    let updates = WebUpdates::with_config(repo, http.clone());
+    let updates = WebUpdates::with_config(repo, http.clone(), settings.config_dir());
     let http_check = http.clone();
 
     exercise_backend_with_updates(
@@ -382,7 +445,7 @@ async fn real_backend_handles_no_releases_rate_limit_offline_and_custom_reposito
         backend,
         (None, None),
         vec![],
-        move |client, backend, store| {
+        move |client, backend, _| {
             let t0 = unix_secs(backend.now());
             let no_release = client.get("/api/updates");
             assert_eq!(no_release["current_version"], VERSION);
@@ -394,6 +457,7 @@ async fn real_backend_handles_no_releases_rate_limit_offline_and_custom_reposito
             );
             assert_eq!(no_release["checked_at"], t0);
             assert!(no_release["error"].is_null());
+            assert!(no_release["persist_error"].is_null());
             assert_eq!(
                 http_check.asked(),
                 ["https://api.github.com/repos/acme/custom-fork/releases/latest"]
@@ -412,7 +476,8 @@ async fn real_backend_handles_no_releases_rate_limit_offline_and_custom_reposito
             assert_eq!(rate_limited["status"], "failed");
             assert_eq!(rate_limited["checked_at"], t0);
             assert_eq!(rate_limited["error"]["kind"], "rate_limited");
-            assert_eq!(store.load().settings.update_checked_at, Some(t0));
+            assert!(rate_limited["persist_error"].is_null());
+            assert_eq!(read_cache(&dir_path)["checked_at"], t0);
 
             let offline = json(
                 client.request("POST", "/api/updates/check", "{}"),
@@ -438,9 +503,52 @@ async fn real_backend_handles_no_releases_rate_limit_offline_and_custom_reposito
             );
             assert_eq!(available["checked_at"], t1);
             assert!(available["error"].is_null());
+            assert!(available["persist_error"].is_null());
+            assert_eq!(
+                read_cache(&dir_path)["repository"],
+                "https://github.com/acme/custom-fork"
+            );
             assert_eq!(http_check.asked().len(), 4);
         },
     )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn persist_failure_reports_persist_error_while_keeping_version_and_in_memory_throttle() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache_path = dir.path().join(UPDATES_FILE);
+    // Turning the target path into a directory forces atomic rename to fail deterministically.
+    fs::create_dir(&cache_path).unwrap();
+    let (config, _) = MockConfig::headless(MockScenario::demo());
+    exercise(dir.path(), config, move |client, backend, _| {
+        let t0 = unix_secs(backend.now());
+        let first = client.get("/api/updates");
+        assert_eq!(first["current_version"], VERSION);
+        assert_eq!(first["status"], "up_to_date");
+        assert_eq!(first["checked_at"], t0);
+        assert!(first["error"].is_null());
+        assert_eq!(first["persist_error"]["kind"], "io");
+        let err_key = first["persist_error"]["message_key"].as_str().unwrap();
+        let dict = client.get("/api/i18n/en-US");
+        assert!(dict[err_key].is_string());
+        assert_eq!(backend.update_checks(), 1);
+
+        // In-memory 24h throttle still holds while the persist error remains visible.
+        let cached = client.get("/api/updates");
+        assert_eq!(backend.update_checks(), 1);
+        assert_eq!(cached, first);
+
+        // Once the path is writable again, a manual check clears `persist_error`.
+        fs::remove_dir(&cache_path).unwrap();
+        let recovered = json(
+            client.request("POST", "/api/updates/check", "{}"),
+            StatusCode::OK,
+        );
+        assert_eq!(backend.update_checks(), 2);
+        assert!(recovered["persist_error"].is_null());
+        assert!(cache_path.is_file());
+    })
     .await;
 }
 
@@ -453,6 +561,7 @@ async fn background_update_persistence_preserves_corrupt_settings_diagnostics() 
         let update = client.get("/api/updates");
         assert_eq!(update["status"], "up_to_date");
         assert!(update["checked_at"].is_u64());
+        assert!(update["persist_error"].is_null());
 
         let settings = client.get("/api/settings");
         assert_eq!(settings["load_status"], "corrupt");
@@ -489,7 +598,8 @@ async fn concurrent_manual_checks_coalesce_and_disconnects_still_record_throttle
 
     // 1. Disconnecting an in-flight GET still completes and persists the 24h throttle.
     let dir = tempfile::tempdir().unwrap();
-    let store = SettingsStore::new(Some(dir.path().to_owned()));
+    let dir_path = dir.path().to_owned();
+    let store = SettingsStore::new(Some(dir_path.clone()));
     let settings = WebSettings::load(store.clone());
     let (mut config, _) = MockConfig::headless(MockScenario::demo());
     config.defaults = settings.initial_settings().defaults;
@@ -507,7 +617,11 @@ async fn concurrent_manual_checks_coalesce_and_disconnects_still_record_throttle
         },
         calls: std::sync::atomic::AtomicUsize::new(0),
     });
-    let updates = WebUpdates::with_config(UpdateRepository::default_web(), http.clone());
+    let updates = WebUpdates::with_config(
+        UpdateRepository::default_web(),
+        http.clone(),
+        settings.config_dir(),
+    );
     let http_check = http.clone();
 
     exercise_backend_with_updates(
@@ -518,7 +632,7 @@ async fn concurrent_manual_checks_coalesce_and_disconnects_still_record_throttle
         backend,
         (None, None),
         vec![],
-        move |client, _, store| {
+        move |client, _, _| {
             let addr = client.origin.strip_prefix("http://").unwrap().to_owned();
             let mut raw = TcpStream::connect(&addr).unwrap();
             write!(
@@ -540,7 +654,7 @@ async fn concurrent_manual_checks_coalesce_and_disconnects_still_record_throttle
             assert_eq!(notice["status"], "up_to_date");
             assert!(notice["checked_at"].is_u64());
             assert_eq!(http_check.calls.load(Ordering::SeqCst), 1);
-            assert!(store.load().settings.update_checked_at.is_some());
+            assert!(read_cache(&dir_path)["checked_at"].is_u64());
         },
     )
     .await;
@@ -565,7 +679,11 @@ async fn concurrent_manual_checks_coalesce_and_disconnects_still_record_throttle
         },
         calls: std::sync::atomic::AtomicUsize::new(0),
     });
-    let updates = WebUpdates::with_config(UpdateRepository::default_web(), http.clone());
+    let updates = WebUpdates::with_config(
+        UpdateRepository::default_web(),
+        http.clone(),
+        settings.config_dir(),
+    );
     let http_check = http.clone();
 
     exercise_backend_with_updates(
@@ -620,6 +738,7 @@ async fn concurrent_manual_checks_coalesce_and_disconnects_still_record_throttle
             assert_eq!(http_check.calls.load(Ordering::SeqCst), 1);
             assert_eq!(r1["status"], "available");
             assert_eq!(r1["latest_version"], "9.4.0");
+            assert!(r1["persist_error"].is_null());
             assert_eq!(r1, r2);
         },
     )

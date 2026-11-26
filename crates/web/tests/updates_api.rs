@@ -189,7 +189,9 @@ fn updates_throttle_manual_refresh_and_auto_check_toggle_persist_across_restarts
         assert_eq!(manual["update_available"], false);
         assert_eq!(manual["check_updates"], false);
         assert!(manual["error"].is_null());
+        assert!(manual["persist_error"].is_null());
         let checked_at = manual["checked_at"].as_u64().expect("checked_at saved");
+        assert!(dir.path().join("web-updates.json").is_file());
 
         // Read-only release contract stays enforced.
         assert_eq!(
@@ -252,6 +254,7 @@ fn updates_throttle_manual_refresh_and_auto_check_toggle_persist_across_restarts
     assert_eq!(after_restart["update_available"], false);
     assert_eq!(after_restart["checked_at"], checked_at);
     assert_eq!(after_restart["check_updates"], true);
+    assert!(after_restart["persist_error"].is_null());
     assert_eq!(
         after_restart["releases_url"],
         "https://github.com/321sssrt-bit/colab-playground/releases"
