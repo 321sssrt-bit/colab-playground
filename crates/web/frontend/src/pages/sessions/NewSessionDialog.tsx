@@ -30,7 +30,12 @@ import {
   type ProvisionOutcome,
   type ProvisionSpec,
 } from "./api.ts";
-import { formatEmail, formatErrorMessage, type FormattedError } from "./format.ts";
+import {
+  formatEmail,
+  formatErrorMessage,
+  isSessionsEnvironmentReady,
+  type FormattedError,
+} from "./format.ts";
 import { AlertTriangleIcon, PlayIcon, SmallAlertIcon, SmallInfoIcon } from "./Icons.tsx";
 import {
   buildProvisionSpecFromDraft,
@@ -49,6 +54,7 @@ import {
   ProvisionProgress,
 } from "./ProvisionProgress.tsx";
 import {
+  dismissTrackedProvision,
   refreshRearmDuration,
   setProvisionDialogOperationId,
   trackProvision,
@@ -145,10 +151,13 @@ export function NewSessionDialog({
   const validationErrorId = useId();
   const dialogRef = useRef<HTMLDialogElement | null>(null);
   const nameInputRef = useRef<HTMLInputElement | null>(null);
+  const mountedRef = useRef(true);
   const activeRequestIdRef = useRef<number>(0);
   const autoNameRef = useRef<string>("");
   const snapshotRef = useRef(snapshot);
   snapshotRef.current = snapshot;
+  const trackedProvisionRef = useRef(trackedProvision);
+  trackedProvisionRef.current = trackedProvision;
   const maxConcurrentRef = useRef(maxConcurrentSessions);
   maxConcurrentRef.current = maxConcurrentSessions;
   const tRef = useRef(t);
@@ -180,7 +189,10 @@ export function NewSessionDialog({
   };
 
   useEffect(() => {
+    mountedRef.current = true;
     return () => {
+      mountedRef.current = false;
+      activeRequestIdRef.current = 0;
       setProvisionDialogOperationId(null);
       onTrackingOperationRef.current(null);
     };
@@ -289,7 +301,16 @@ export function NewSessionDialog({
       setBaseTemplate(null);
       setTemplateMeasuredRates([]);
       setProvisionDraft(null);
-      setFormAccountContext(snapshotRef.current?.account ?? null);
+      const existingTracked =
+        trackedProvisionRef.current?.operationId === request.operationId
+          ? trackedProvisionRef.current
+          : null;
+      setFormAccountContext(
+        existingTracked?.submittedForm?.accountContext ??
+          existingTracked?.accountContext ??
+          snapshotRef.current?.account ??
+          null,
+      );
       setAttachedOperationId(request.operationId);
       reportTrackingOperation(request.operationId);
       trackProvision(
@@ -297,11 +318,40 @@ export function NewSessionDialog({
         request.sessionName,
         snapshotRef.current?.account ?? null,
       );
-      setPhase({
-        kind: "running",
-        operationId: request.operationId,
-        sessionName: request.sessionName,
-      });
+      if (existingTracked && existingTracked.phase !== "running") {
+        if (existingTracked.phase === "ready" && existingTracked.outcome) {
+          setPhase({ kind: "ready", outcome: existingTracked.outcome });
+        } else if (existingTracked.phase === "cancelled") {
+          setPhase({ kind: "cancelled" });
+        } else if (existingTracked.finishedError?.kind === "session_limit_reached") {
+          const parsedLimit = Number(existingTracked.finishedError.args?.limit);
+          const cap =
+            Number.isFinite(parsedLimit) && parsedLimit >= 1
+              ? Math.floor(parsedLimit)
+              : Math.max(1, maxConcurrentRef.current);
+          const targetAccount =
+            existingTracked.submittedForm?.accountContext.active ??
+            existingTracked.accountContext?.active ??
+            null;
+          setPhase({
+            kind: "limit",
+            limit: cap,
+            email: resolveAccountEmail(snapshotRef.current, targetAccount, tRef.current),
+            counted: countNamedRuntimesOnAccount(snapshotRef.current, targetAccount),
+          });
+        } else {
+          setPhase({
+            kind: "failed",
+            error: formatErrorMessage(existingTracked.finishedError, tRef.current),
+          });
+        }
+      } else {
+        setPhase({
+          kind: "running",
+          operationId: request.operationId,
+          sessionName: request.sessionName,
+        });
+      }
       return;
     }
 
@@ -359,10 +409,23 @@ export function NewSessionDialog({
     });
   }, [phase.kind, attachedTracked, request]);
 
+  const dismissAndClose = () => {
+    if (
+      attachedOperationId !== null &&
+      (phase.kind === "failed" ||
+        phase.kind === "cancelled" ||
+        phase.kind === "ready" ||
+        phase.kind === "limit")
+    ) {
+      dismissTrackedProvision(attachedOperationId);
+    }
+    onClose();
+  };
+
   const handleDialogCancel = (event: SyntheticEvent<HTMLDialogElement>) => {
     event.preventDefault();
     if (!submitting) {
-      onClose();
+      dismissAndClose();
     }
   };
 
@@ -372,7 +435,7 @@ export function NewSessionDialog({
       dialog.returnValue = "";
     }
     if (request && !submitting) {
-      onClose();
+      dismissAndClose();
     }
   };
 
@@ -384,13 +447,16 @@ export function NewSessionDialog({
         ? formAccountContext
         : request.mode === "create"
           ? request.accountContext
-          : (attachedTracked?.accountContext ?? null);
+          : (attachedTracked?.submittedForm?.accountContext ??
+            attachedTracked?.accountContext ??
+            null);
   const accountChanged =
     originAccountContext !== null &&
     currentAccountContext !== null &&
     (currentAccountContext.revision !== originAccountContext.revision ||
       currentAccountContext.active !== originAccountContext.active);
 
+  const environmentBlocked = snapshot !== null && !isSessionsEnvironmentReady(snapshot);
   const shuttingDown = Boolean(snapshot?.shutting_down);
   const blockedByActiveProvision =
     (activeProvisionOp !== null || trackedProvision?.phase === "running") && phase.kind === "form";
@@ -465,6 +531,7 @@ export function NewSessionDialog({
       !submitAccountContext ||
       submitting ||
       accountChanged ||
+      environmentBlocked ||
       blockedByActiveProvision ||
       shuttingDown
     ) {
@@ -505,17 +572,22 @@ export function NewSessionDialog({
 
     try {
       const accepted = await startProvision(submitAccountContext, built.spec);
-      if (
-        apiClient.getSessionGeneration() !== sessionGeneration ||
-        activeRequestIdRef.current !== requestId
-      ) {
+      if (apiClient.getSessionGeneration() !== sessionGeneration) {
+        return;
+      }
+      const dialogStillActive = mountedRef.current && activeRequestIdRef.current === requestId;
+      if (dialogStillActive) {
+        // Register the visible dialog before tracking so synchronous terminal frames stay in-modal.
+        reportTrackingOperation(accepted.id);
+      }
+      // Always track in the global store even if the user navigated away mid-request so off-page toasts fire.
+      trackProvision(accepted.id, built.spec.name, submitAccountContext, submittedForm);
+      if (!dialogStillActive) {
         return;
       }
       setSubmitting(false);
       setCancelRequested(false);
       setAttachedOperationId(accepted.id);
-      reportTrackingOperation(accepted.id);
-      trackProvision(accepted.id, built.spec.name, submitAccountContext, submittedForm);
       setPhase({
         kind: "running",
         operationId: accepted.id,
@@ -523,11 +595,14 @@ export function NewSessionDialog({
       });
     } catch (error) {
       if (error instanceof ApiError && error.isUnauthorized) {
-        setSubmitting(false);
-        onClose();
+        if (mountedRef.current) {
+          setSubmitting(false);
+          onClose();
+        }
         return;
       }
       if (
+        !mountedRef.current ||
         apiClient.getSessionGeneration() !== sessionGeneration ||
         activeRequestIdRef.current !== requestId
       ) {
@@ -585,12 +660,16 @@ export function NewSessionDialog({
   };
 
   const handleEditAgain = () => {
+    const finishedOpId = attachedOperationId;
     setSubmitError(null);
     setInvalidFields(new Set<ProvisionFieldErrorId>());
     setAttachedOperationId(null);
     reportTrackingOperation(null);
+    if (finishedOpId !== null) {
+      dismissTrackedProvision(finishedOpId);
+    }
     if (provisionDraft) {
-      setFormAccountContext((prev) => snapshotRef.current?.account ?? prev);
+      // Preserve the draft's original account context so external account switches stay blocked.
       setPhase({ kind: "form" });
       return;
     }
@@ -603,7 +682,8 @@ export function NewSessionDialog({
       setTemplateMeasuredRates(saved.measuredRates);
       setProvisionDraft(saved.draft);
       setRetryDelaySecs(saved.retryDelaySecs);
-      setFormAccountContext(snapshotRef.current?.account ?? saved.accountContext);
+      // Keep the account context captured when this draft was originally submitted.
+      setFormAccountContext(saved.accountContext);
       setPhase({ kind: "form" });
       return;
     }
@@ -683,6 +763,21 @@ export function NewSessionDialog({
           {phase.kind === "limit" && (
             <>
               <div className="dialog-body" data-new-session-limit="true">
+                {environmentBlocked && (
+                  <div
+                    className="inline-msg inline-msg-warning"
+                    role="alert"
+                    data-new-session-environment-blocked="true"
+                  >
+                    <AlertTriangleIcon className="icon-xs icon-warning" />
+                    <span className="inline-msg-text">
+                      {snapshot?.accounts_error === "keyring_unavailable"
+                        ? t("app.err.keyring_unavailable")
+                        : t("app.b2.sessions_setup_body")}
+                    </span>
+                  </div>
+                )}
+
                 {accountChanged && (
                   <div
                     className="inline-msg inline-msg-warning"
@@ -712,7 +807,7 @@ export function NewSessionDialog({
                 <p className="dialog-caption">{t("app.b3.new_limit_hint")}</p>
               </div>
               <div className="modal-actions">
-                <button type="button" className="btn btn-ghost" onClick={onClose}>
+                <button type="button" className="btn btn-ghost" onClick={dismissAndClose}>
                   {t("app.action.close")}
                 </button>
                 <button
@@ -721,7 +816,7 @@ export function NewSessionDialog({
                   data-new-session-open-settings="true"
                   autoFocus
                   onClick={() => {
-                    onClose();
+                    dismissAndClose();
                     navigate("settings");
                   }}
                 >
@@ -740,6 +835,21 @@ export function NewSessionDialog({
             >
               <div className="dialog-body">
                 <p className="dialog-paragraph">{t("app.b2.new_intro")}</p>
+
+                {environmentBlocked && (
+                  <div
+                    className="inline-msg inline-msg-warning"
+                    role="alert"
+                    data-new-session-environment-blocked="true"
+                  >
+                    <AlertTriangleIcon className="icon-xs icon-warning" />
+                    <span className="inline-msg-text">
+                      {snapshot?.accounts_error === "keyring_unavailable"
+                        ? t("app.err.keyring_unavailable")
+                        : t("app.b2.sessions_setup_body")}
+                    </span>
+                  </div>
+                )}
 
                 {accountChanged && (
                   <div
@@ -844,7 +954,13 @@ export function NewSessionDialog({
                   type="submit"
                   className="btn btn-primary"
                   data-new-session-start="true"
-                  disabled={submitting || accountChanged || blockedByActiveProvision || shuttingDown}
+                  disabled={
+                    submitting ||
+                    accountChanged ||
+                    environmentBlocked ||
+                    blockedByActiveProvision ||
+                    shuttingDown
+                  }
                 >
                   {submitting ? <span className="spinner" aria-hidden="true" /> : <PlayIcon />}
                   <span>{t("app.b2.new_start")}</span>
@@ -918,7 +1034,7 @@ export function NewSessionDialog({
                 </div>
               </div>
               <div className="modal-actions">
-                <button type="button" className="btn btn-primary" autoFocus onClick={onClose}>
+                <button type="button" className="btn btn-primary" autoFocus onClick={dismissAndClose}>
                   {t("app.action.close")}
                 </button>
               </div>
@@ -957,7 +1073,7 @@ export function NewSessionDialog({
               </div>
 
               <div className="modal-actions">
-                <button type="button" className="btn btn-ghost" onClick={onClose}>
+                <button type="button" className="btn btn-ghost" onClick={dismissAndClose}>
                   {t("app.action.close")}
                 </button>
                 <button

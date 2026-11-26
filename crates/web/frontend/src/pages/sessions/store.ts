@@ -38,7 +38,12 @@ import {
   type ProvisionProgressEvent,
   type ProvisionSpec,
 } from "./api.ts";
-import { formatErrorMessage, formatHardware } from "./format.ts";
+import {
+  endedRuntimeClearedSignature,
+  formatErrorMessage,
+  formatHardware,
+  mergeEndedRuntimes,
+} from "./format.ts";
 import {
   parseFinishedEvent,
   parseProvisionEvent,
@@ -73,6 +78,7 @@ export interface TrackedProvision {
   readonly outcome: ProvisionOutcome | null;
   readonly finishedError: ApiErrorPayload | null;
   readonly reconnecting: boolean;
+  readonly dismissed: boolean;
 }
 
 export interface SessionsLocalState {
@@ -108,6 +114,7 @@ export interface SessionsStore {
     submittedForm?: SubmittedProvisionForm | null,
   ): void;
   setDialogOperationId(operationId: number | null): void;
+  dismissTrackedProvision(operationId?: number): void;
   claimProvisionHandled(operationId: number): boolean;
   clearEndedRuntimes(): void;
   recordForwardAddresses(view: ForwardView): void;
@@ -135,8 +142,13 @@ export function createSessionsStore(options: SessionsStoreOptions = {}): Session
   let trackedProvision: TrackedProvision | null = null;
   let activeDialogOperationId: number | null = null;
   let pendingToastProvision: TrackedProvision | null = null;
+  let clearedSnapshotEnded = new Set<string>();
+  let lastGuardEnded = guard.getState().ended;
+  let lastSnapshotEnded = store.getState().snapshot?.ended ?? null;
+  let lastClearedVersion = 0;
+  let clearedVersion = 0;
   let cachedSnapshot: SessionsLocalState = {
-    ended: guard.getState().ended,
+    ended: mergeEndedRuntimes(lastSnapshotEnded, lastGuardEnded, clearedSnapshotEnded),
     reconcileSeq: guard.getState().reconcileSeq,
     trackedProvision: null,
   };
@@ -158,15 +170,26 @@ export function createSessionsStore(options: SessionsStoreOptions = {}): Session
 
   const refreshSnapshot = (): void => {
     const guardState = guard.getState();
+    const snapshotEnded = store.getState().snapshot?.ended ?? null;
+    const endedInputsChanged =
+      lastGuardEnded !== guardState.ended ||
+      lastSnapshotEnded !== snapshotEnded ||
+      lastClearedVersion !== clearedVersion;
     if (
-      cachedSnapshot.ended === guardState.ended &&
+      !endedInputsChanged &&
       cachedSnapshot.reconcileSeq === guardState.reconcileSeq &&
       cachedSnapshot.trackedProvision === trackedProvision
     ) {
       return;
     }
+    const nextEnded = endedInputsChanged
+      ? mergeEndedRuntimes(snapshotEnded, guardState.ended, clearedSnapshotEnded)
+      : cachedSnapshot.ended;
+    lastGuardEnded = guardState.ended;
+    lastSnapshotEnded = snapshotEnded;
+    lastClearedVersion = clearedVersion;
     cachedSnapshot = {
-      ended: guardState.ended,
+      ended: nextEnded,
       reconcileSeq: guardState.reconcileSeq,
       trackedProvision,
     };
@@ -289,6 +312,8 @@ export function createSessionsStore(options: SessionsStoreOptions = {}): Session
     activeDialogOperationId = null;
     clearPendingI18n();
     handledProvisionIds = new Set<number>();
+    clearedSnapshotEnded = new Set<string>();
+    clearedVersion += 1;
     setTrackedProvision(null);
   };
 
@@ -507,12 +532,28 @@ export function createSessionsStore(options: SessionsStoreOptions = {}): Session
       outcome: null,
       finishedError: null,
       reconnecting: false,
+      dismissed: false,
     });
     connectProvisionStream(operationId, seq, gen, 0);
   };
 
+  const dismissTrackedProvision = (operationId?: number): void => {
+    const cur = trackedProvision;
+    if (!cur || cur.phase === "running" || cur.dismissed) {
+      return;
+    }
+    if (operationId !== undefined && cur.operationId !== operationId) {
+      return;
+    }
+    setTrackedProvision({ ...cur, dismissed: true });
+  };
+
   const syncFromWebSnapshot = (snapshot: Snapshot | null): void => {
-    if (disposed || !snapshot) {
+    if (disposed) {
+      return;
+    }
+    refreshSnapshot();
+    if (!snapshot) {
       return;
     }
     for (const op of snapshot.operations) {
@@ -564,10 +605,17 @@ export function createSessionsStore(options: SessionsStoreOptions = {}): Session
       activeDialogOperationId = operationId;
     },
 
+    dismissTrackedProvision,
+
     claimProvisionHandled,
 
     clearEndedRuntimes(): void {
+      for (const item of cachedSnapshot.ended) {
+        clearedSnapshotEnded.add(endedRuntimeClearedSignature(item));
+      }
+      clearedVersion += 1;
       guard.clearEndedRuntimes();
+      refreshSnapshot();
     },
 
     recordForwardAddresses(view: ForwardView): void {
@@ -613,6 +661,14 @@ export function trackProvision(
  */
 export function setProvisionDialogOperationId(operationId: number | null): void {
   sessionsStore.setDialogOperationId(operationId);
+}
+
+/**
+ * Marks a finished provision result as acknowledged after closing or editing again
+ * so subsequent New Session clicks open a fresh form instead of replaying old errors.
+ */
+export function dismissTrackedProvision(operationId?: number): void {
+  sessionsStore.dismissTrackedProvision(operationId);
 }
 
 /**

@@ -14,7 +14,11 @@ import type {
   Snapshot,
 } from "../../lib/types.ts";
 import type { ProvisionSpec } from "./api.ts";
-import { endedRuntimeRowKey, isSessionsEnvironmentReady } from "./format.ts";
+import {
+  endedRuntimeRowKey,
+  isSessionsEnvironmentReady,
+  mergeEndedRuntimes,
+} from "./format.ts";
 import {
   buildProvisionSpecFromDraft,
   computeUnansweredForSecs,
@@ -380,6 +384,31 @@ describe("endedRuntimeRowKey", () => {
     assert.notEqual(endedRuntimeRowKey(first, 0), endedRuntimeRowKey(second, 1));
     assert.notEqual(endedRuntimeRowKey(unnamedA, 0), endedRuntimeRowKey(unnamedB, 1));
   });
+
+  it("preserves multiple empty-endpoint ended records from snapshot.ended even when guardStore collapses them", () => {
+    const alpha: EndedRuntime = {
+      runtime: { account: "acct-1", endpoint: "", name: "alpha" },
+      label: "alpha",
+      email: "alice@example.com",
+      reason: { kind: "user" },
+      at: 1_700_000_000,
+    };
+    const beta: EndedRuntime = {
+      runtime: { account: "acct-1", endpoint: "", name: "beta" },
+      label: "beta",
+      email: "alice@example.com",
+      reason: { kind: "user" },
+      at: 1_700_000_010,
+    };
+
+    // Simulate guardStore collapsing both empty-endpoint records down to only `beta`.
+    const merged = mergeEndedRuntimes([beta, alpha], [beta], new Set());
+    assert.equal(merged.length, 2);
+    assert.deepEqual(
+      merged.map((item) => item.runtime.name),
+      ["beta", "alpha"],
+    );
+  });
 });
 
 describe("createSessionsStore off-page provision tracking and serverClock timing", () => {
@@ -567,6 +596,34 @@ describe("createSessionsStore off-page provision tracking and serverClock timing
     assert.equal(toast.getToasts().length, 2);
     assert.equal(toast.getToasts()[1]?.tone, "danger");
     assert.equal(toast.getToasts()[1]?.title, "app.b2.new_failed");
+    assert.equal(store.getState().trackedProvision?.dismissed, false);
+
+    store.dismissTrackedProvision(12);
+    assert.equal(store.getState().trackedProvision?.dismissed, true);
+
+    // 4. Snapshot ended with two empty-endpoint distinct-name entries survives clear and merge cleanly.
+    const alphaEnded: EndedRuntime = {
+      runtime: { account: "acct-1", endpoint: "", name: "alpha" },
+      label: "alpha",
+      email: "alice@example.com",
+      reason: { kind: "user" },
+      at: 1_700_000_100,
+    };
+    const betaEnded: EndedRuntime = {
+      runtime: { account: "acct-1", endpoint: "", name: "beta" },
+      label: "beta",
+      email: "alice@example.com",
+      reason: { kind: "user" },
+      at: 1_700_000_110,
+    };
+    web.pushSnapshot(makeSnapshot({ version: 2, ended: [betaEnded, alphaEnded] }));
+    assert.equal(store.getState().ended.length, 2);
+
+    store.clearEndedRuntimes();
+    assert.equal(store.getState().ended.length, 0);
+    // Re-receiving the same snapshot ended entries stays cleared.
+    web.pushSnapshot(makeSnapshot({ version: 3, ended: [betaEnded, alphaEnded] }));
+    assert.equal(store.getState().ended.length, 0);
 
     store.dispose();
     toast.dispose();

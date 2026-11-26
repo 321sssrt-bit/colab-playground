@@ -139,20 +139,76 @@ export function isSessionsEnvironmentReady(
   return snapshot.accounts.accounts.length > 0;
 }
 
+const ENDED_DISPLAY_LIMIT = 20;
+
+/**
+ * Mirrors backend `same_runtime` (`crates/web/src/state/sessions.rs`): uses non-empty
+ * `endpoint` first, falls back to session `name` when `endpoint` is empty, and finally
+ * falls back to `label` + timestamp so empty-endpoint records never collapse onto each other.
+ */
+export function endedRuntimeIdentityKey(item: EndedRuntime): string {
+  const { account, endpoint, name } = item.runtime;
+  if (endpoint.length > 0) {
+    return `${account}/ep:${endpoint}`;
+  }
+  if (name && name.length > 0) {
+    return `${account}/name:${name}`;
+  }
+  const timestamp = item.at !== null ? String(item.at) : "na";
+  return `${account}/label:${item.label}/${timestamp}`;
+}
+
+export function endedRuntimeClearedSignature(item: EndedRuntime): string {
+  const identity = endedRuntimeIdentityKey(item);
+  const at = item.at !== null ? String(item.at) : "na";
+  return `${identity}@${item.reason.kind}@${at}`;
+}
+
+/**
+ * Merges authoritative `snapshot.ended` entries with local `guardStore.ended` entries
+ * using `endedRuntimeIdentityKey` so records with empty `endpoint` and distinct `name`
+ * survive intact even when upstream `guardRuntimeKey` collapses them.
+ */
+export function mergeEndedRuntimes(
+  snapshotEnded: readonly EndedRuntime[] | null | undefined,
+  guardEnded: readonly EndedRuntime[],
+  clearedSignatures: ReadonlySet<string>,
+): readonly EndedRuntime[] {
+  const merged: EndedRuntime[] = [];
+  const seen = new Set<string>();
+
+  const pushUnique = (item: EndedRuntime, checkCleared: boolean) => {
+    if (checkCleared && clearedSignatures.has(endedRuntimeClearedSignature(item))) {
+      return;
+    }
+    const key = endedRuntimeIdentityKey(item);
+    if (seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    merged.push(item);
+  };
+
+  for (const item of guardEnded) {
+    pushUnique(item, false);
+  }
+  if (snapshotEnded && snapshotEnded.length > 0) {
+    for (const item of snapshotEnded) {
+      pushUnique(item, true);
+    }
+  }
+
+  return merged.slice(0, ENDED_DISPLAY_LIMIT);
+}
+
 /**
  * Builds a collision-free key for an `EndedCard` entry even when `runtime.endpoint`
  * is empty or multiple entries share the same account and fallback label.
  */
 export function endedRuntimeRowKey(item: EndedRuntime, index: number): string {
-  const { account, endpoint, name } = item.runtime;
-  const identity =
-    endpoint.length > 0
-      ? `ep:${endpoint}`
-      : name && name.length > 0
-        ? `name:${name}`
-        : `label:${item.label}`;
+  const identity = endedRuntimeIdentityKey(item);
   const timestamp = item.at !== null ? String(item.at) : "na";
-  return `${account}/${identity}/${timestamp}/${index}`;
+  return `${identity}/${timestamp}/${index}`;
 }
 
 export function formatRuntimeCardLabel(runtime: Runtime): string {

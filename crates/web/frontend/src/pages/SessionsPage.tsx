@@ -86,10 +86,13 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
   );
 
   useEffect(() => {
-    if (snapshot === null) {
+    if (snapshot === null || !environmentReady) {
       setSwitchTarget(null);
+      setAutoStopDialog(null);
+      setForwardDialog(null);
+      setNewSessionDialog((prev) => (prev?.mode === "running" ? prev : null));
     }
-  }, [snapshot]);
+  }, [snapshot, environmentReady]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -190,7 +193,13 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
       });
       return;
     }
-    if (trackedProvision?.phase === "running") {
+    if (
+      trackedProvision &&
+      !trackedProvision.dismissed &&
+      (trackedProvision.phase === "running" ||
+        trackedProvision.phase === "failed" ||
+        trackedProvision.phase === "cancelled")
+    ) {
       setNewSessionDialog({
         id: dialogSeqRef.current,
         mode: "running",
