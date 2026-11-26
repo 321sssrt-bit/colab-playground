@@ -159,7 +159,9 @@ async fn submit_login(
 #[derive(Serialize)]
 struct CancelLoginResponse<'a> {
     outcome: &'static str,
-    account_context: AccountContext,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    account_context: Option<AccountContext>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     accounts: Option<AccountsView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     accounts_error: Option<ErrorKind>,

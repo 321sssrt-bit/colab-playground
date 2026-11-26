@@ -607,7 +607,10 @@ async fn submitting_cancel_waits_for_rollback_and_returns_real_cancelled_state()
             panic!("expected SubmittingSettled, got {settled:?}");
         };
         assert_eq!(settled.outcome, SubmitCancelOutcome::Cancelled);
-        assert_eq!(settled.account_context.active, account.active);
+        assert_eq!(
+            settled.account_context.as_ref().unwrap().active,
+            account.active
+        );
         let accounts = settled.accounts.as_ref().unwrap();
         assert_eq!(accounts.active, account.active);
         assert!(accounts.has_token);
@@ -695,12 +698,13 @@ async fn submitting_cancel_after_point_of_no_return_reports_completed_new_accoun
         settled.outcome,
         SubmitCancelOutcome::Completed(submitted.clone())
     );
-    assert_eq!(settled.account_context.active, Some(submitted.id.clone()));
+    let settled_ctx = settled.account_context.as_ref().unwrap();
+    assert_eq!(settled_ctx.active, Some(submitted.id.clone()));
     assert_eq!(
         settled.accounts.as_ref().unwrap().active,
         Some(submitted.id)
     );
-    assert_ne!(settled.account_context.active, account.active);
+    assert_ne!(settled_ctx.active, account.active);
     assert!(settled.accounts_error.is_none());
     assert!(state.shutdown(TEST_TIMEOUT).await.completed);
 }
@@ -769,7 +773,10 @@ async fn submitting_cancel_reports_failed_code_and_restored_active_account() {
         SubmitCancelOutcome::Failed(error) => assert!(error.is(ErrorKind::LoginInvalidCode)),
         other => panic!("expected Failed(LoginInvalidCode), got {other:?}"),
     }
-    assert_eq!(settled.account_context.active, account.active);
+    assert_eq!(
+        settled.account_context.as_ref().unwrap().active,
+        account.active
+    );
     let accounts = settled.accounts.as_ref().unwrap();
     assert_eq!(accounts.active, account.active);
     assert!(accounts.has_token);
@@ -831,6 +838,8 @@ async fn submitting_completed_and_failed_outcomes_survive_post_submit_accounts_r
         panic!("expected SubmittingSettled");
     };
     assert_eq!(settled.outcome, SubmitCancelOutcome::Completed(saved));
+    assert!(settled.account_context.is_none());
+    assert!(settled.accounts.is_none());
     assert_eq!(settled.accounts_error, Some(ErrorKind::KeyringUnavailable));
 
     // Recover snapshot accounts before Case 2.
@@ -893,6 +902,8 @@ async fn submitting_completed_and_failed_outcomes_survive_post_submit_accounts_r
         SubmitCancelOutcome::Failed(error) => assert!(error.is(ErrorKind::LoginInvalidCode)),
         other => panic!("expected Failed(LoginInvalidCode), got {other:?}"),
     }
+    assert!(settled.account_context.is_none());
+    assert!(settled.accounts.is_none());
     assert_eq!(settled.accounts_error, Some(ErrorKind::KeyringUnavailable));
     assert!(state.shutdown(TEST_TIMEOUT).await.completed);
 }

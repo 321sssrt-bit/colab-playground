@@ -34,17 +34,24 @@ enum ActiveLoginPhase {
 
 #[derive(Debug, Clone)]
 struct SettledAccounts {
-    account_context: AccountContext,
+    account_context: Option<AccountContext>,
     accounts: Option<AccountsView>,
     accounts_error: Option<ErrorKind>,
 }
 
 impl SettledAccounts {
     fn from_snapshot(snapshot: &Snapshot) -> Self {
+        if snapshot.accounts_error.is_some() {
+            return Self {
+                account_context: None,
+                accounts: None,
+                accounts_error: snapshot.accounts_error,
+            };
+        }
         Self {
-            account_context: snapshot.account.clone(),
+            account_context: Some(snapshot.account.clone()),
             accounts: snapshot.accounts.clone(),
-            accounts_error: snapshot.accounts_error,
+            accounts_error: None,
         }
     }
 }
@@ -114,7 +121,7 @@ pub enum CancelLoginOutcome {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SubmitCancelSettlement {
     pub outcome: SubmitCancelOutcome,
-    pub account_context: AccountContext,
+    pub account_context: Option<AccountContext>,
     pub accounts: Option<AccountsView>,
     pub accounts_error: Option<ErrorKind>,
 }
