@@ -199,7 +199,7 @@ impl WebState {
                 return Err(error);
             }
 
-            let result = state.0.backend.begin_add_account(&job.cancel);
+            let result = state.backend().begin_add_account(&job.cancel);
             state.sync_forwards();
             let flow = match result {
                 Ok(flow) => flow,
@@ -489,7 +489,7 @@ impl WebState {
 }
 
 fn record_accounts_after_login(state: &WebState) -> Option<Error> {
-    let accounts = state.0.backend.accounts(&CancelToken::new());
+    let accounts = state.backend().accounts(&CancelToken::new());
     let err = accounts.as_ref().err().cloned();
     state.record_accounts(accounts);
     err

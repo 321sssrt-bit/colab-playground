@@ -249,8 +249,9 @@ impl WebState {
 
     #[cfg(test)]
     pub(super) fn record_usage(&self, usage: Vec<AccountUsageView>) {
-        let now = self.0.backend.now();
-        let rates = self.0.backend.measured_rates();
+        let backend = self.backend();
+        let now = backend.now();
+        let rates = backend.measured_rates();
         self.update(|snapshot| {
             let mut changed = merge_usage_into_snapshot(snapshot, usage, now);
             if snapshot.measured_rates != rates {
@@ -265,7 +266,7 @@ impl WebState {
     /// Publishes an updated `server_now` when any cached usage sample crosses `USAGE_STALE_AFTER`,
     /// without mutating `sample.stale` (which stays reserved for failed/unverified fetches).
     pub(super) fn check_usage_age(&self) {
-        let now = self.0.backend.now();
+        let now = self.backend().now();
         self.0.snapshots.send_if_modified(|snapshot| {
             let prev = snapshot.usage_now;
             let age_crossed = snapshot
@@ -358,7 +359,8 @@ fn is_environment_blocked(kind: ErrorKind) -> bool {
 
 fn poll_backend(job: &Job, refresh: bool) {
     let state = &job.state;
-    let backend = &*state.0.backend;
+    let backend = state.backend();
+    let backend = &*backend;
     let cancel = &job.cancel;
     let snapshot = state.0.snapshots.borrow().clone();
 

@@ -50,7 +50,8 @@ impl WebState {
         let pending = self.lock().login.take();
         let cleanup = spawn_blocking(move || {
             state.discard_plugin_previews();
-            let backend = &*state.0.backend;
+            let backend = state.backend();
+            let backend = &*backend;
             let mut closed = 0;
             let mut failed = false;
             for tunnel in backend.tunnels() {
@@ -72,7 +73,7 @@ impl WebState {
 
         if drained {
             let state = self.clone();
-            let listing = spawn_blocking(move || state.0.backend.runtimes(&CancelToken::new()));
+            let listing = spawn_blocking(move || state.backend().runtimes(&CancelToken::new()));
             if let Ok(Ok(result)) = timeout_at(deadline, listing).await {
                 self.record_runtimes(result);
             } else {

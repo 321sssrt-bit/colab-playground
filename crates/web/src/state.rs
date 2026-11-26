@@ -1,4 +1,5 @@
 mod accounts;
+pub mod environment;
 mod forwards;
 mod login;
 pub mod plugins;
@@ -8,12 +9,12 @@ mod shutdown;
 
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Condvar, Mutex, MutexGuard},
+    sync::{Arc, Condvar, Mutex, MutexGuard, RwLock},
     time::{Duration, SystemTime},
 };
 
 use colab_playground_core::{
-    CancelToken, Error, ErrorKind, Result,
+    CancelToken, Defaults, Error, ErrorKind, Result,
     accounts::{AccountId, AccountsView},
     backend::{
         AccountUsageView, Backend, BackendKind, Events, GuardReport, PluginRunEvent,
@@ -33,12 +34,24 @@ use tokio::{
 };
 
 pub use accounts::{AccountSwitchApproval, AccountSwitchPreview};
+pub use environment::{
+    CliInstallEvent, CliInstallEvents, CliInstallOutcome, CliInstallPhase, CliInstallSnapshot,
+    CliInstallStart, CliInstallSummary, INSTALL_CLI_OP,
+};
 pub use forwards::ForwardPolicy;
 pub use login::{CancelLoginOutcome, LoginPrompt, SubmitCancelOutcome, SubmitCancelSettlement};
 pub use sessions::{EndReason, EndedRuntime, GuardEvent, GuardEventKind};
 pub use shutdown::{Billing, ShutdownReport};
 
 const LOGIN_INACTIVITY: Duration = Duration::from_secs(5 * 60);
+const REBUILD_BACKEND_OP: &str = "rebuild_backend";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SettingsNotice {
+    pub corrupt: bool,
+    pub corrupt_backup: Option<String>,
+    pub reset_defaults: Vec<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountContext {
@@ -84,6 +97,8 @@ impl Operation {
                     | "install_plugin"
                     | "set_plugin_enabled"
                     | "remove_plugin"
+                    | environment::INSTALL_CLI_OP
+                    | REBUILD_BACKEND_OP
             ),
             Self::Provision { .. }
             | Self::PluginRun { .. }
@@ -130,6 +145,8 @@ pub struct Snapshot {
     pub ended: Vec<EndedRuntime>,
     #[serde(skip)]
     guard_state: sessions::GuardLedger,
+    pub cli_install: CliInstallSummary,
+    pub settings_notice: Option<SettingsNotice>,
     pub operations: Vec<PendingOperation>,
     pub login_id: Option<u64>,
     pub shutting_down: bool,
@@ -148,7 +165,7 @@ pub enum Access {
 pub struct WebState(Arc<Inner>);
 
 struct Inner {
-    backend: Arc<dyn Backend>,
+    backend: RwLock<Arc<dyn Backend>>,
     control: Mutex<Control>,
     poll_slot: PollSlot,
     snapshots: watch::Sender<Arc<Snapshot>>,
@@ -159,6 +176,7 @@ struct Inner {
     forwards: Mutex<forwards::ForwardUpdates>,
     plugins: plugins::Plugins,
     provisions: sessions::Provisions,
+    cli_install: Mutex<Option<Arc<environment::CliInstallSession>>>,
 }
 
 #[derive(Default)]
@@ -340,12 +358,14 @@ impl WebState {
             guard_error: None,
             ended: Vec::new(),
             guard_state: sessions::GuardLedger::default(),
+            cli_install: CliInstallSummary::default(),
+            settings_notice: None,
             operations: Vec::new(),
             login_id: None,
             shutting_down: false,
         }));
         let state = Self(Arc::new(Inner {
-            backend,
+            backend: RwLock::new(backend),
             control: Mutex::default(),
             poll_slot: PollSlot::default(),
             snapshots,
@@ -356,15 +376,24 @@ impl WebState {
             forwards: Mutex::default(),
             plugins: plugins::Plugins::default(),
             provisions: Mutex::default(),
+            cli_install: Mutex::default(),
         }));
         tokio::spawn(state.clone().poll());
         tokio::spawn(state.clone().poll_forwards());
         Ok(state)
     }
 
+    pub(super) fn backend(&self) -> Arc<dyn Backend> {
+        self.0
+            .backend
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
     pub fn snapshot(&self) -> Arc<Snapshot> {
         let mut snapshot = self.0.snapshots.borrow().clone();
-        let now = self.0.backend.now();
+        let now = self.backend().now();
         if snapshot.server_now != now {
             Arc::make_mut(&mut snapshot).server_now = now;
         }
@@ -372,7 +401,7 @@ impl WebState {
     }
 
     pub fn subscribe(&self) -> watch::Receiver<Arc<Snapshot>> {
-        let now = self.0.backend.now();
+        let now = self.backend().now();
         // Refresh the clock in place without notifying existing subscribers or bumping version,
         // so a newly connected SSE client's initial frame carries the current server clock.
         self.0.snapshots.send_if_modified(|snapshot| {
@@ -388,6 +417,24 @@ impl WebState {
         self.0.forward_policy
     }
 
+    pub fn set_defaults(&self, defaults: Defaults) {
+        self.backend().set_defaults(defaults);
+    }
+
+    pub fn set_settings_notice(&self, notice: Option<SettingsNotice>) {
+        self.update(|snapshot| {
+            if snapshot.settings_notice == notice {
+                return false;
+            }
+            snapshot.settings_notice = notice;
+            true
+        });
+    }
+
+    pub fn can_change_host(&self) -> bool {
+        self.lock().can_change_host()
+    }
+
     pub fn reset_cli_probe(&self) {
         self.0.snapshots.send_if_modified(|snapshot| {
             if snapshot.cli_installed.is_none() {
@@ -395,6 +442,89 @@ impl WebState {
             }
             Arc::make_mut(snapshot).cli_installed = None;
             false
+        });
+    }
+
+    /// Runs a host-settings change atomically under an exclusive slot and the poll slot.
+    ///
+    /// Rejects with `ErrorKind::Busy` when any non-poll operation or pending login is active.
+    pub async fn apply_host_change<T, F>(&self, work: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&HostChangeCommit<'_>, &CancelToken) -> Result<T> + Send + 'static,
+    {
+        let operation = Operation::Domain {
+            name: REBUILD_BACKEND_OP,
+            key: String::new(),
+        };
+        let job = {
+            let mut control = self.lock();
+            if control.shutting_down {
+                return Err(Error::cancelled());
+            }
+            if !control.can_change_host() {
+                return Err(Error::new(ErrorKind::Busy));
+            }
+            self.reserve(&mut control, Some(operation), Slot::Exclusive, false)
+        };
+        let state = self.clone();
+        let (output, rebuilt_backend) = spawn_blocking(move || {
+            let _poll = job.state.lock_poll_slot();
+            job.cancel.check()?;
+            let commit = HostChangeCommit {
+                state: &job.state,
+                rebuilt: Mutex::new(None),
+            };
+            let output = work(&commit, &job.cancel)?;
+            let rebuilt = commit
+                .rebuilt
+                .into_inner()
+                .unwrap_or_else(|e| e.into_inner());
+            Ok::<_, Error>((output, rebuilt))
+        })
+        .await
+        .map_err(|_| Error::new(ErrorKind::Other))??;
+
+        if let Some(new_backend) = rebuilt_backend {
+            state.spawn_post_rebuild_probe(new_backend);
+        }
+        Ok(output)
+    }
+
+    fn spawn_post_rebuild_probe(&self, expected: Arc<dyn Backend>) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            let _ = spawn_blocking(move || {
+                let _poll = state.lock_poll_slot();
+                let job = {
+                    let mut control = state.lock();
+                    if !control.available(Slot::Poll) {
+                        return;
+                    }
+                    state.reserve(&mut control, None, Slot::Poll, false)
+                };
+                let current = state.backend();
+                if !Arc::ptr_eq(&current, &expected) {
+                    return;
+                }
+                match current.probe(&job.cancel) {
+                    Ok(report) => {
+                        let cli_installed = report.colab.is_some();
+                        state.set_cli_installed(cli_installed);
+                        if cli_installed {
+                            state.refresh_overview(&*current, &job.cancel);
+                        } else {
+                            state.clear_overview(current.measured_rates());
+                        }
+                    }
+                    Err(error) if error.is(ErrorKind::NotInstalled) => {
+                        state.set_cli_installed(false);
+                        state.clear_overview(current.measured_rates());
+                    }
+                    Err(_) => {}
+                }
+            })
+            .await;
         });
     }
 
@@ -406,19 +536,73 @@ impl WebState {
     }
 
     pub async fn probe_environment(&self) -> Result<(ProbeReport, Arc<Snapshot>, SystemTime)> {
+        let (report, snapshot, _, now, ()) = self.probe_environment_with(|| ()).await?;
+        Ok((report, snapshot, now))
+    }
+
+    /// Probes the host and captures both the CLI install state and caller-supplied host metadata
+    /// while holding `Slot::Shared`, preventing a concurrent host rebuild from mixing two hosts
+    /// into one response.
+    pub async fn probe_environment_with<M, F>(
+        &self,
+        read_meta: F,
+    ) -> Result<(
+        ProbeReport,
+        Arc<Snapshot>,
+        CliInstallSnapshot,
+        SystemTime,
+        M,
+    )>
+    where
+        M: Send + 'static,
+        F: FnOnce() -> M + Send + 'static,
+    {
         let state = self.clone();
         self.backend_job(Slot::Shared, move |backend, cancel| {
             let _poll = state.lock_poll_slot();
             cancel.check()?;
-            let report = backend.probe(cancel)?;
+            let recheck = state.begin_cli_recheck();
+            let report = match backend.probe(cancel) {
+                Ok(report) => report,
+                Err(error) => {
+                    if error.is(ErrorKind::Cancelled) {
+                        recheck.restore();
+                    } else if error.is(ErrorKind::NotInstalled) {
+                        recheck.finish(CliInstallOutcome {
+                            phase: CliInstallPhase::NotFound,
+                            cli_installed: false,
+                            error: None,
+                        });
+                    } else {
+                        recheck.finish(CliInstallOutcome {
+                            phase: CliInstallPhase::ProbeFailed,
+                            cli_installed: false,
+                            error: Some(error.clone()),
+                        });
+                    }
+                    return Err(error);
+                }
+            };
             let cli_installed = report.colab.is_some();
             state.set_cli_installed(cli_installed);
             if cli_installed {
                 state.refresh_overview(backend, cancel);
+                recheck.finish(CliInstallOutcome {
+                    phase: CliInstallPhase::Succeeded,
+                    cli_installed: true,
+                    error: None,
+                });
             } else {
                 state.clear_overview(backend.measured_rates());
+                recheck.finish(CliInstallOutcome {
+                    phase: CliInstallPhase::NotFound,
+                    cli_installed: false,
+                    error: None,
+                });
             }
-            Ok((report, state.snapshot(), backend.now()))
+            let meta = read_meta();
+            let cli_install = state.cli_install_snapshot();
+            Ok((report, state.snapshot(), cli_install, backend.now(), meta))
         })
         .await
     }
@@ -440,7 +624,8 @@ impl WebState {
         };
         spawn_blocking(move || {
             job.cancel.check()?;
-            work(&*job.state.0.backend, &job.cancel)
+            let backend = job.state.backend();
+            work(&*backend, &job.cancel)
         })
         .await
         .map_err(|_| Error::new(ErrorKind::Other))?
@@ -502,18 +687,29 @@ impl WebState {
     }
 
     pub fn cancel(&self, id: u64) -> bool {
-        let cancelled = {
+        let (cancelled, is_install) = {
             let control = self.lock();
-            let cancelled = control
-                .running
-                .get(&id)
-                .is_some_and(|running| running.operation.is_some() && running.cancel.cancel());
+            let entry = control.running.get(&id);
+            let is_install = entry.is_some_and(|running| {
+                matches!(
+                    running.operation,
+                    Some(Operation::Domain {
+                        name: environment::INSTALL_CLI_OP,
+                        ..
+                    })
+                )
+            });
+            let cancelled =
+                entry.is_some_and(|running| running.operation.is_some() && running.cancel.cancel());
             if cancelled {
                 self.publish_operations(&control);
             }
-            cancelled
+            (cancelled, is_install)
         };
         if cancelled {
+            if is_install {
+                self.mark_cli_install_cancelling(id);
+            }
             self.0.poll_slot.notify_waiters();
         }
         cancelled
@@ -527,7 +723,7 @@ impl WebState {
     }
 
     fn update(&self, change: impl FnOnce(&mut Snapshot) -> bool) {
-        let now = self.0.backend.now();
+        let now = self.backend().now();
         self.0.snapshots.send_if_modified(|snapshot| {
             let snapshot = Arc::make_mut(snapshot);
             if change(snapshot) {
@@ -630,7 +826,8 @@ impl WebState {
             if let Some(expected) = expected {
                 job.state.verify_account(&expected, &job.cancel)?;
             }
-            work(job.id, &*job.state.0.backend, &job.cancel)
+            let backend = job.state.backend();
+            work(job.id, &*backend, &job.cancel)
         }))
     }
 
@@ -649,7 +846,7 @@ impl WebState {
     }
 
     fn verify_account(&self, expected: &AccountContext, cancel: &CancelToken) -> Result<()> {
-        match self.0.backend.accounts(cancel) {
+        match self.backend().accounts(cancel) {
             Ok(view) => {
                 self.record_accounts(Ok(view));
                 self.check_account_context(expected)
@@ -783,9 +980,104 @@ impl WebState {
     }
 }
 
+/// Capability passed into [`WebState::apply_host_change`] while holding `Slot::Exclusive` and
+/// the poll slot.
+pub struct HostChangeCommit<'a> {
+    state: &'a WebState,
+    rebuilt: Mutex<Option<Arc<dyn Backend>>>,
+}
+
+impl HostChangeCommit<'_> {
+    /// Clears staged plugin previews before constructing a new backend whose initialization cleans
+    /// staging directories on disk.
+    pub fn discard_plugin_previews(&self) {
+        self.state.discard_plugin_previews();
+    }
+
+    /// Commits a host/WSL/CLI-path change: atomically swaps in `rebuilt` when provided,
+    /// clears the previous CLI install state, and resets host-derived snapshot state.
+    pub fn commit_host_change(&self, rebuilt: Option<Arc<dyn Backend>>, defaults: Defaults) {
+        if let Some(new_backend) = rebuilt {
+            self.state.discard_plugin_previews();
+            let old_backend = {
+                let mut slot = self
+                    .state
+                    .0
+                    .backend
+                    .write()
+                    .unwrap_or_else(|error| error.into_inner());
+                std::mem::replace(&mut *slot, new_backend.clone())
+            };
+            for tunnel in old_backend.tunnels() {
+                let _ = old_backend.close_tunnel(tunnel.id);
+            }
+            self.state.sync_forwards();
+            self.state.clear_cli_install();
+            let now = new_backend.now();
+            let kind = new_backend.kind();
+            let rates = new_backend.measured_rates();
+            self.state.update(|snapshot| {
+                snapshot.usage_now = now;
+                snapshot.cli_installed = None;
+                snapshot.pending_managed_check = false;
+                snapshot.backend = kind;
+                snapshot.account.active = None;
+                snapshot.account.revision += 1;
+                snapshot.accounts = None;
+                snapshot.accounts_error = None;
+                snapshot.recovered_pending_add_latched = false;
+                snapshot.runtimes = None;
+                snapshot.runtimes_error = None;
+                snapshot.usage.clear();
+                snapshot.measured_rates = rates;
+                snapshot.guard = None;
+                snapshot.guard_error = None;
+                snapshot.guard_state.clear_live();
+                snapshot.sync_guard_projection();
+                snapshot.cli_install = CliInstallSummary::default();
+                snapshot.settings_notice = None;
+                true
+            });
+            *self
+                .rebuilt
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(new_backend);
+        } else {
+            self.state.backend().set_defaults(defaults);
+            self.state.clear_cli_install();
+            self.state.reset_cli_probe();
+            self.state.set_settings_notice(None);
+        }
+    }
+
+    pub fn commit_non_host_change(&self, defaults: Defaults) {
+        self.state.backend().set_defaults(defaults);
+        self.state.set_settings_notice(None);
+    }
+}
+
 impl Control {
+    fn is_rebuilding(&self) -> bool {
+        self.running.values().any(|job| {
+            matches!(
+                job.operation,
+                Some(Operation::Domain {
+                    name: REBUILD_BACKEND_OP,
+                    ..
+                })
+            )
+        })
+    }
+
+    fn can_change_host(&self) -> bool {
+        !self.shutting_down
+            && self.login.is_none()
+            && self.running.values().all(|job| job.access == Slot::Poll)
+    }
+
     fn available(&self, slot: Slot) -> bool {
         !self.shutting_down
+            && !self.is_rebuilding()
             && match slot {
                 Slot::Independent => true,
                 Slot::Shared | Slot::Poll => {

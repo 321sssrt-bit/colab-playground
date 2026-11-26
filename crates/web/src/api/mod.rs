@@ -23,6 +23,8 @@ use tokio::task::JoinError;
 
 use crate::{http::StateData, i18n};
 
+#[cfg(test)]
+pub(crate) use settings::BackendBuilder;
 pub(crate) use settings::WebSettings;
 #[cfg(test)]
 pub(crate) use updates::UpdateRepository;
@@ -33,12 +35,27 @@ pub(crate) fn routes() -> Router<StateData> {
         .route("/api/forwards", get(forwards::list).post(forwards::open))
         .route("/api/forwards/{id}", delete(forwards::close))
         .route("/api/overview", get(overview::get))
-        .route("/api/overview/cli/install", post(overview::install))
+        .route(
+            "/api/overview/cli/install",
+            get(overview::install_status).post(overview::install),
+        )
+        .route(
+            "/api/overview/cli/install/events",
+            post(overview::install_events_latest),
+        )
+        .route(
+            "/api/overview/cli/install/{id}/events",
+            post(overview::install_events),
+        )
         .route(
             "/api/overview/cli/install/{id}/cancel",
             post(overview::cancel_install),
         )
         .route("/api/settings", get(settings::get).patch(settings::patch))
+        .route(
+            "/api/settings/notice/dismiss",
+            post(settings::dismiss_notice),
+        )
         .route("/api/updates", get(updates::get))
         .route("/api/updates/check", post(updates::check_now))
         .route("/api/i18n/{locale}", get(dictionary))
@@ -65,6 +82,23 @@ pub(super) struct ErrorMessage<'a> {
     hint_key: Option<&'static str>,
     action_key: Option<&'static str>,
     operation_id: Option<u64>,
+}
+
+impl ErrorMessage<'static> {
+    pub(super) fn localized(
+        kind: &'static str,
+        message_key: &'static str,
+        hint_key: Option<&'static str>,
+    ) -> Self {
+        Self {
+            kind,
+            message_key,
+            args: BTreeMap::new(),
+            hint_key,
+            action_key: None,
+            operation_id: None,
+        }
+    }
 }
 
 impl<'a> From<&'a Error> for ErrorMessage<'a> {
@@ -137,6 +171,13 @@ impl From<Error> for ApiError {
                     StatusCode::CONFLICT,
                     "active_account",
                     colab_playground_shared::i18n::keys::ACCOUNTS_REMOVE_ACTIVE,
+                );
+            }
+            K::InvalidInput if error.param("host_interpreter_alone").is_some() => {
+                return Self::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "invalid_input",
+                    colab_playground_shared::i18n::keys::HOST_INTERPRETER_ALONE,
                 );
             }
             K::Busy if error.param("switch_impact_changed").is_some() => {
