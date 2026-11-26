@@ -7,8 +7,6 @@
  * failures, and vanished runtimes remain persistent and visible on every route.
  */
 
-import { useSyncExternalStore } from "react";
-
 import { apiClient, type ApiClient } from "./api.ts";
 import { formatCu, formatDuration } from "./format.ts";
 import { i18nStore, type I18nStore, type TranslateFn } from "./i18n.ts";
@@ -104,7 +102,6 @@ export interface GuardStore {
   subscribe(listener: () => void): () => void;
   beginUserStop(target: RuntimeRef): () => void;
   beginStopAll(): () => void;
-  isStopPending(key: string): boolean;
   recordEndedRuntime(entry: Omit<EndedRuntime, "at"> & { readonly at?: number | null }): void;
   clearEndedRuntimes(): void;
   dispose(): void;
@@ -133,7 +130,7 @@ export function isKeyringLockedOrAccountsMissing(snapshot: Snapshot | null): boo
   );
 }
 
-export function formatGuardConcern(concern: Concern, locale: Locale, t: TranslateFn): string {
+function formatGuardConcern(concern: Concern, locale: Locale, t: TranslateFn): string {
   if (concern.kind === "usage_unknown") {
     return t("app.b2.guard_unknown", { limit: t(LIMIT_NAME_KEYS[concern.limit]) });
   }
@@ -156,7 +153,7 @@ export function formatGuardConcern(concern: Concern, locale: Locale, t: Translat
   });
 }
 
-export function formatGuardConcerns(
+function formatGuardConcerns(
   concerns: readonly Concern[],
   locale: Locale,
   t: TranslateFn,
@@ -164,7 +161,7 @@ export function formatGuardConcerns(
   return concerns.map((item) => formatGuardConcern(item, locale, t)).join("; ");
 }
 
-export function formatCoreErrorText(error: CoreError | null | undefined, t: TranslateFn): string {
+function formatCoreErrorText(error: CoreError | null | undefined, t: TranslateFn): string {
   if (!error) {
     return t("app.err.other");
   }
@@ -849,8 +846,6 @@ export function createGuardStore(options: GuardStoreOptions = {}): GuardStore {
       };
     },
 
-    isStopPending,
-
     recordEndedRuntime(entry: Omit<EndedRuntime, "at"> & { readonly at?: number | null }): void {
       recordEnded({
         runtime: entry.runtime,
@@ -883,7 +878,3 @@ export function createGuardStore(options: GuardStoreOptions = {}): GuardStore {
 
 /** Shared global Cost Guard observer and Ended recently store. */
 export const guardStore: GuardStore = createGuardStore();
-
-export function useGuardStore(store: GuardStore = guardStore): GuardState {
-  return useSyncExternalStore(store.subscribe, store.getState, store.getState);
-}

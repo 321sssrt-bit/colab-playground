@@ -20,7 +20,6 @@ import type {
   HardwareRate,
   RuntimeRef,
   SessionsListResponse,
-  StopAllRemainingItem,
   StopAllResponse,
   UnixSecs,
   WatchdogInfo,
@@ -32,8 +31,6 @@ export type {
   ForwardPolicyView,
   ForwardView,
   SessionsListResponse,
-  StopAllRemainingItem,
-  StopAllResponse,
 };
 
 export interface SessionTemplateResponse extends ProvisionSpec {
@@ -182,16 +179,6 @@ export function stopAllRuntimes(): Promise<StopAllResponse> {
     body: {
       confirmed: true,
     },
-  });
-}
-
-export function ackGuardEvents(payload: {
-  readonly up_to_id?: number;
-  readonly ids?: readonly number[];
-}): Promise<void> {
-  return apiClient.request<void>("/api/sessions/guard/ack", {
-    method: "POST",
-    body: payload,
   });
 }
 

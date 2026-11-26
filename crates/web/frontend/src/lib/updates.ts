@@ -14,7 +14,7 @@ import type { UpdateNoticeResponse } from "./types.ts";
 
 export const UPDATE_DISMISSED_STORAGE_KEY = "cpg_update_dismissed_version";
 /** Matches backend `UPDATE_RETRY_INTERVAL` (1 hour); server enforces the 24h GitHub throttle. */
-export const UPDATE_POLL_INTERVAL_MS = 3_600_000;
+const UPDATE_POLL_INTERVAL_MS = 3_600_000;
 
 export interface BannerUpdate {
   readonly version: string;

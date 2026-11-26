@@ -350,18 +350,6 @@ apiClient.subscribeAuth((event) => {
   }
 });
 
-export function beginUserStop(target: RuntimeRef): () => void {
-  return guardStore.beginUserStop(target);
-}
-
-export function beginStopAll(): () => void {
-  return guardStore.beginStopAll();
-}
-
-export function recordEndedRuntime(entry: EndedRuntime): void {
-  guardStore.recordEndedRuntime(entry);
-}
-
 export function clearEndedRuntimes(): void {
   guardStore.clearEndedRuntimes();
 }
