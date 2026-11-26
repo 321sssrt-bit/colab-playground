@@ -1,7 +1,4 @@
-use std::{
-    collections::VecDeque,
-    sync::{Arc, Mutex, MutexGuard, mpsc},
-};
+use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 
 use colab_playground_core::{
     CancelToken, Error, ErrorKind, Result, backend::InstallMethod, host::Line,
@@ -11,8 +8,6 @@ use tokio::{sync::watch, task::spawn_blocking};
 
 use super::{Operation, Slot, WebState};
 
-/// Maximum CLI install log lines kept in server memory for replay.
-pub const INSTALL_LOG_LINES_KEPT: usize = 2_000;
 pub const INSTALL_CLI_OP: &str = "install_cli";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -24,6 +19,7 @@ pub enum CliInstallPhase {
     Checking,
     Succeeded,
     NotFound,
+    ProbeFailed,
     Cancelled,
     Failed,
 }
@@ -36,8 +32,20 @@ impl CliInstallPhase {
             Self::Checking => "checking",
             Self::Succeeded => "succeeded",
             Self::NotFound => "not_found",
+            Self::ProbeFailed => "probe_failed",
             Self::Cancelled => "cancelled",
             Self::Failed => "failed",
+        }
+    }
+
+    /// Legacy SSE `finished.status` value (`succeeded | cancelled | failed`) for wire compatibility.
+    pub fn wire_status(self) -> &'static str {
+        match self {
+            Self::Succeeded | Self::NotFound => "succeeded",
+            Self::Cancelled => "cancelled",
+            Self::Failed | Self::ProbeFailed | Self::Idle | Self::Running | Self::Checking => {
+                "failed"
+            }
         }
     }
 }
@@ -49,7 +57,6 @@ pub struct CliInstallSummary {
     pub phase: CliInstallPhase,
     pub cancelling: bool,
     pub line_count: usize,
-    pub lines_truncated: bool,
     pub error_kind: Option<ErrorKind>,
 }
 
@@ -60,7 +67,6 @@ pub struct CliInstallSnapshot {
     pub phase: CliInstallPhase,
     pub cancelling: bool,
     pub lines: Vec<Line>,
-    pub lines_truncated: bool,
     pub error: Option<Error>,
 }
 
@@ -91,8 +97,7 @@ pub struct CliInstallSession {
 }
 
 struct InstallJournal {
-    first: usize,
-    lines: VecDeque<Line>,
+    lines: Vec<Line>,
     phase: CliInstallPhase,
     cancelling: bool,
     outcome: Option<CliInstallOutcome>,
@@ -104,8 +109,7 @@ impl CliInstallSession {
             id,
             method,
             journal: Mutex::new(InstallJournal {
-                first: 0,
-                lines: VecDeque::new(),
+                lines: Vec::new(),
                 phase: CliInstallPhase::Running,
                 cancelling: false,
                 outcome: None,
@@ -122,11 +126,7 @@ impl CliInstallSession {
 
     fn push_line(&self, line: Line) {
         let mut journal = self.lock();
-        journal.lines.push_back(line);
-        while journal.lines.len() > INSTALL_LOG_LINES_KEPT {
-            journal.lines.pop_front();
-            journal.first += 1;
-        }
+        journal.lines.push(line);
         self.changes.send_replace(());
     }
 
@@ -158,14 +158,21 @@ impl CliInstallSession {
         self.changes.send_replace(());
     }
 
-    fn begin_recheck(&self) -> bool {
+    fn begin_recheck(&self) -> Option<CliInstallOutcome> {
         let mut journal = self.lock();
-        if journal.phase != CliInstallPhase::NotFound {
-            return false;
+        if !matches!(
+            journal.phase,
+            CliInstallPhase::NotFound | CliInstallPhase::ProbeFailed
+        ) {
+            return None;
         }
+        let previous = journal.outcome.take().unwrap_or(CliInstallOutcome {
+            phase: journal.phase,
+            cli_installed: false,
+            error: None,
+        });
         journal.phase = CliInstallPhase::Checking;
-        journal.outcome = None;
-        true
+        Some(previous)
     }
 
     fn finish_recheck(&self, outcome: CliInstallOutcome) {
@@ -181,7 +188,6 @@ impl CliInstallSession {
             phase: journal.phase,
             cancelling: journal.cancelling,
             line_count: journal.lines.len(),
-            lines_truncated: journal.first > 0,
             error_kind: journal
                 .outcome
                 .as_ref()
@@ -196,8 +202,7 @@ impl CliInstallSession {
             method: Some(self.method),
             phase: journal.phase,
             cancelling: journal.cancelling,
-            lines: journal.lines.iter().cloned().collect(),
-            lines_truncated: journal.first > 0,
+            lines: journal.lines.clone(),
             error: journal
                 .outcome
                 .as_ref()
@@ -240,10 +245,7 @@ impl CliInstallEvents {
             self.changes.borrow_and_update();
             {
                 let journal = self.session.lock();
-                if self.next_line < journal.first {
-                    self.next_line = journal.first;
-                }
-                if let Some(line) = journal.lines.get(self.next_line - journal.first).cloned() {
+                if let Some(line) = journal.lines.get(self.next_line).cloned() {
                     self.next_line += 1;
                     return Some(CliInstallEvent::Line(line));
                 }
@@ -294,13 +296,20 @@ impl Drop for InstallFinishGuard {
 
 pub(super) struct CliRecheckGuard {
     state: WebState,
-    session: Option<Arc<CliInstallSession>>,
+    active: Option<(Arc<CliInstallSession>, CliInstallOutcome)>,
 }
 
 impl CliRecheckGuard {
     pub(super) fn finish(mut self, outcome: CliInstallOutcome) {
-        if let Some(session) = self.session.take() {
+        if let Some((session, _)) = self.active.take() {
             session.finish_recheck(outcome);
+            self.state.publish_cli_install();
+        }
+    }
+
+    pub(super) fn restore(mut self) {
+        if let Some((session, previous)) = self.active.take() {
+            session.finish_recheck(previous);
             self.state.publish_cli_install();
         }
     }
@@ -308,12 +317,8 @@ impl CliRecheckGuard {
 
 impl Drop for CliRecheckGuard {
     fn drop(&mut self) {
-        if let Some(session) = self.session.take() {
-            session.finish_recheck(CliInstallOutcome {
-                phase: CliInstallPhase::NotFound,
-                cli_installed: false,
-                error: None,
-            });
+        if let Some((session, previous)) = self.active.take() {
+            session.finish_recheck(previous);
             self.state.publish_cli_install();
         }
     }
@@ -421,7 +426,7 @@ impl WebState {
                                     state.set_cli_installed(false);
                                     state.clear_overview(backend.measured_rates());
                                     CliInstallOutcome {
-                                        phase: CliInstallPhase::NotFound,
+                                        phase: CliInstallPhase::ProbeFailed,
                                         cli_installed: false,
                                         error: Some(error),
                                     }
@@ -511,14 +516,16 @@ impl WebState {
     }
 
     pub(super) fn begin_cli_recheck(&self) -> CliRecheckGuard {
-        let session = self.cli_install_lock().clone();
-        let active = session.filter(|session| session.begin_recheck());
+        let active = self.cli_install_lock().clone().and_then(|session| {
+            let previous = session.begin_recheck()?;
+            Some((session, previous))
+        });
         if active.is_some() {
             self.publish_cli_install();
         }
         CliRecheckGuard {
             state: self.clone(),
-            session: active,
+            active,
         }
     }
 

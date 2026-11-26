@@ -22,8 +22,7 @@ use colab_playground_core::{
     tunnel::{TunnelEvent, TunnelId, TunnelInfo, TunnelSpec},
 };
 use colab_playground_web::state::{
-    Access, CliInstallEvent, CliInstallPhase, CliInstallStart, INSTALL_LOG_LINES_KEPT,
-    SettingsNotice, Submission, WebState,
+    Access, CliInstallEvent, CliInstallPhase, CliInstallStart, SettingsNotice, Submission, WebState,
 };
 use tokio::time::timeout;
 
@@ -32,6 +31,7 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(8);
 struct ProbeBarrierBackend {
     mock: MockBackend,
     hold_next_probe: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+    probe_error: Mutex<Option<Error>>,
     extra_install_lines: AtomicUsize,
 }
 
@@ -40,6 +40,7 @@ impl ProbeBarrierBackend {
         Self {
             mock: MockBackend::new(config),
             hold_next_probe: Mutex::new(None),
+            probe_error: Mutex::new(None),
             extra_install_lines: AtomicUsize::new(0),
         }
     }
@@ -49,6 +50,10 @@ impl ProbeBarrierBackend {
         let (release_tx, release_rx) = mpsc::channel();
         *self.hold_next_probe.lock().unwrap() = Some((entered_tx, release_rx));
         (entered_rx, release_tx)
+    }
+
+    fn set_probe_error(&self, error: Option<Error>) {
+        *self.probe_error.lock().unwrap() = error;
     }
 }
 
@@ -108,6 +113,9 @@ impl Backend for ProbeBarrierBackend {
         if let Some((entered, release)) = barrier {
             let _ = entered.send(());
             let _ = release.recv_timeout(TEST_TIMEOUT);
+        }
+        if let Some(error) = self.probe_error.lock().unwrap().clone() {
+            return Err(error);
         }
         self.mock.probe(cancel)
     }
@@ -212,17 +220,16 @@ async fn cli_install_buffers_logs_and_replays_across_disconnect_and_completion()
     assert_eq!(snapshot.id, Some(id));
     assert_eq!(snapshot.phase, CliInstallPhase::Succeeded);
     assert_eq!(snapshot.lines, lines);
-    assert!(!snapshot.lines_truncated);
 
     assert!(state.shutdown(TEST_TIMEOUT).await.completed);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cli_install_truncates_retained_logs_at_cap() {
+async fn cli_install_retains_and_replays_over_2000_lines_losslessly() {
     let (mut config, _) = MockConfig::headless(MockScenario::signed_out());
     config.failures.cli_missing = true;
     let backend = Arc::new(ProbeBarrierBackend::new(config));
-    let total_lines = INSTALL_LOG_LINES_KEPT + 25;
+    let total_lines = 2_050;
     backend
         .extra_install_lines
         .store(total_lines, Ordering::SeqCst);
@@ -238,28 +245,24 @@ async fn cli_install_truncates_retained_logs_at_cap() {
 
     let snap = state.cli_install_snapshot();
     assert_eq!(snap.id, Some(id));
-    assert!(snap.lines_truncated);
-    assert_eq!(snap.lines.len(), INSTALL_LOG_LINES_KEPT);
-    assert_eq!(snap.lines.first().unwrap().text, "line-25");
+    assert_eq!(snap.lines.len(), total_lines);
+    assert_eq!(snap.lines.first().unwrap().text, "line-0");
     assert_eq!(
         snap.lines.last().unwrap().text,
         format!("line-{}", total_lines - 1)
     );
-    assert!(state.snapshot().cli_install.lines_truncated);
-    assert_eq!(
-        state.snapshot().cli_install.line_count,
-        INSTALL_LOG_LINES_KEPT
-    );
+    assert_eq!(state.snapshot().cli_install.line_count, total_lines);
 
     let mut replay = state.subscribe_cli_install(Some(id)).unwrap();
     let (_, _, replayed_lines, _) = drain_install(&mut replay).await;
+    assert_eq!(replayed_lines.len(), total_lines);
     assert_eq!(replayed_lines, snap.lines);
 
     assert!(state.shutdown(TEST_TIMEOUT).await.completed);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cli_install_off_path_transitions_through_checking_and_not_found() {
+async fn cli_install_off_path_and_probe_error_preserve_distinct_phases_and_recheck() {
     let (mut config, _) = MockConfig::headless(MockScenario::signed_out());
     config.failures.cli_missing = true;
     config.failures.install_off_path = true;
@@ -302,10 +305,11 @@ async fn cli_install_off_path_transitions_through_checking_and_not_found() {
         CliInstallPhase::NotFound
     );
 
-    // Check again while colab is still missing: enters Checking, then returns to NotFound.
+    // Check again while colab is still missing: enters Checking, blocks host rebuilds, then returns to NotFound.
     let (entered_recheck, release_recheck) = backend.arm_probe_barrier();
     let probe_state = state.clone();
-    let probe_task = tokio::spawn(async move { probe_state.probe_environment().await });
+    let probe_task =
+        tokio::spawn(async move { probe_state.probe_environment_with(|| "distro-a").await });
     tokio::task::spawn_blocking(move || entered_recheck.recv_timeout(TEST_TIMEOUT).unwrap())
         .await
         .unwrap();
@@ -313,14 +317,45 @@ async fn cli_install_off_path_transitions_through_checking_and_not_found() {
         state.snapshot().cli_install.phase,
         CliInstallPhase::Checking
     );
+    assert_eq!(
+        state
+            .apply_host_change(|_, _| Ok(()))
+            .await
+            .unwrap_err()
+            .kind,
+        ErrorKind::Busy
+    );
     release_recheck.send(()).unwrap();
 
-    let (report, snapshot, _) = probe_task.await.unwrap().unwrap();
+    let (report, snapshot, cli_install, _, meta) = probe_task.await.unwrap().unwrap();
     assert!(report.colab.is_none());
+    assert_eq!(meta, "distro-a");
     assert_eq!(snapshot.cli_install.phase, CliInstallPhase::NotFound);
-    assert_eq!(state.cli_install_snapshot().lines, lines);
+    assert_eq!(cli_install.phase, CliInstallPhase::NotFound);
+    assert_eq!(cli_install.lines, lines);
 
-    // Once colab is found on PATH, Check again settles to Succeeded.
+    // Post-install probe returning a real error (e.g. non-executable custom colab_path) reports
+    // ProbeFailed rather than NotFound.
+    backend.set_probe_error(Some(Error::invalid("colab_path", "not executable")));
+    let CliInstallStart::Started { mut events, .. } =
+        state.start_cli_install(InstallMethod::Uv).unwrap()
+    else {
+        panic!("expected install to start");
+    };
+    let (_, _, _, probe_err_outcome) = drain_install(&mut events).await;
+    assert_eq!(probe_err_outcome.phase, CliInstallPhase::ProbeFailed);
+    assert!(!probe_err_outcome.cli_installed);
+    assert_eq!(
+        probe_err_outcome.error.as_ref().map(|error| error.kind),
+        Some(ErrorKind::InvalidInput)
+    );
+    assert_eq!(
+        state.snapshot().cli_install.phase,
+        CliInstallPhase::ProbeFailed
+    );
+
+    // Once the probe error and missing CLI are resolved, Check again settles to Succeeded.
+    backend.set_probe_error(None);
     backend.mock.set_failures(MockFailures::default());
     let (report, snapshot, _) = state.probe_environment().await.unwrap();
     assert!(report.colab.is_some());
@@ -330,7 +365,8 @@ async fn cli_install_off_path_transitions_through_checking_and_not_found() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn host_change_atomically_rebuilds_backend_closes_old_tunnels_and_clears_install() {
+async fn host_change_blocks_independent_writes_rebuilds_backend_closes_tunnels_and_clears_install()
+{
     let (mut old_config, _) = MockConfig::headless(MockScenario::demo());
     old_config.failures.cli_missing = false;
     let old_backend = Arc::new(MockBackend::new(old_config));
@@ -397,7 +433,7 @@ async fn host_change_atomically_rebuilds_backend_closes_old_tunnels_and_clears_i
     }));
     assert!(state.snapshot().settings_notice.is_some());
 
-    // Busy check: a running operation blocks host rebuilds.
+    // Busy check: a running independent operation blocks host rebuilds.
     let (entered_tx, entered_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let Submission::Started { job: blocker, .. } = state
@@ -419,36 +455,53 @@ async fn host_change_atomically_rebuilds_backend_closes_old_tunnels_and_clears_i
         .await
         .unwrap();
     assert!(!state.can_change_host());
-    let busy_err = state.apply_host_change(|_, _| Ok(())).await.unwrap_err();
-    assert_eq!(busy_err.kind, ErrorKind::Busy);
+    assert_eq!(
+        state
+            .apply_host_change(|_, _| Ok(()))
+            .await
+            .unwrap_err()
+            .kind,
+        ErrorKind::Busy
+    );
     release_tx.send(()).unwrap();
     blocker.await.unwrap().unwrap();
     assert!(state.can_change_host());
 
-    // A failed rebuild leaves the old backend and install state untouched.
-    let failed_err = state
-        .apply_host_change(|_, _| Err::<(), _>(Error::new(ErrorKind::Io)))
-        .await
-        .unwrap_err();
-    assert_eq!(failed_err.kind, ErrorKind::Io);
-    assert_eq!(
-        state.snapshot().cli_install.phase,
-        CliInstallPhase::NotFound
-    );
-    assert_eq!(old_backend.tunnels().len(), 1);
-
-    // Successful rebuild atomically swaps backend, closes old tunnels, clears install & notice.
+    // While a host rebuild is in progress, independent writes (such as plugin mutations) are
+    // rejected with Busy so they cannot mutate the old backend after the new one was initialized.
+    let (rebuild_entered_tx, rebuild_entered_rx) = mpsc::channel();
+    let (rebuild_release_tx, rebuild_release_rx) = mpsc::channel();
+    let rebuild_state = state.clone();
     let old_revision = state.snapshot().account.revision;
     let (new_config, _) = MockConfig::headless(MockScenario::single());
     let new_backend = Arc::new(MockBackend::new(new_config));
     let swap_target: Arc<dyn Backend> = new_backend.clone();
-    state
-        .apply_host_change(move |commit, _| {
-            commit.commit_host_change(Some(swap_target), Defaults::default());
-            Ok(())
-        })
+    let rebuild_task = tokio::spawn(async move {
+        rebuild_state
+            .apply_host_change(move |commit, _| {
+                let _ = rebuild_entered_tx.send(());
+                let _ = rebuild_release_rx.recv_timeout(TEST_TIMEOUT);
+                commit.commit_host_change(Some(swap_target), Defaults::default());
+                Ok(())
+            })
+            .await
+    });
+    tokio::task::spawn_blocking(move || rebuild_entered_rx.recv_timeout(TEST_TIMEOUT).unwrap())
         .await
         .unwrap();
+    assert_eq!(
+        state
+            .enable_plugin("llama-cpp".into(), false)
+            .err()
+            .map(|error| error.kind),
+        Some(ErrorKind::Busy)
+    );
+    assert_eq!(
+        state.run_backend(|_, _| Ok(())).await.unwrap_err().kind,
+        ErrorKind::Busy
+    );
+    rebuild_release_tx.send(()).unwrap();
+    rebuild_task.await.unwrap().unwrap();
 
     assert!(old_backend.tunnels().is_empty());
     assert!(state.snapshot().tunnels.is_empty());

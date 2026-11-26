@@ -36,7 +36,7 @@ use tokio::{
 pub use accounts::{AccountSwitchApproval, AccountSwitchPreview};
 pub use environment::{
     CliInstallEvent, CliInstallEvents, CliInstallOutcome, CliInstallPhase, CliInstallSnapshot,
-    CliInstallStart, CliInstallSummary, INSTALL_CLI_OP, INSTALL_LOG_LINES_KEPT,
+    CliInstallStart, CliInstallSummary, INSTALL_CLI_OP,
 };
 pub use forwards::ForwardPolicy;
 pub use login::{CancelLoginOutcome, LoginPrompt, SubmitCancelOutcome, SubmitCancelSettlement};
@@ -536,6 +536,27 @@ impl WebState {
     }
 
     pub async fn probe_environment(&self) -> Result<(ProbeReport, Arc<Snapshot>, SystemTime)> {
+        let (report, snapshot, _, now, ()) = self.probe_environment_with(|| ()).await?;
+        Ok((report, snapshot, now))
+    }
+
+    /// Probes the host and captures both the CLI install state and caller-supplied host metadata
+    /// while holding `Slot::Shared`, preventing a concurrent host rebuild from mixing two hosts
+    /// into one response.
+    pub async fn probe_environment_with<M, F>(
+        &self,
+        read_meta: F,
+    ) -> Result<(
+        ProbeReport,
+        Arc<Snapshot>,
+        CliInstallSnapshot,
+        SystemTime,
+        M,
+    )>
+    where
+        M: Send + 'static,
+        F: FnOnce() -> M + Send + 'static,
+    {
         let state = self.clone();
         self.backend_job(Slot::Shared, move |backend, cancel| {
             let _poll = state.lock_poll_slot();
@@ -544,14 +565,21 @@ impl WebState {
             let report = match backend.probe(cancel) {
                 Ok(report) => report,
                 Err(error) => {
-                    let kept_error = (!error.is(ErrorKind::Cancelled)
-                        && !error.is(ErrorKind::NotInstalled))
-                    .then(|| error.clone());
-                    recheck.finish(CliInstallOutcome {
-                        phase: CliInstallPhase::NotFound,
-                        cli_installed: false,
-                        error: kept_error,
-                    });
+                    if error.is(ErrorKind::Cancelled) {
+                        recheck.restore();
+                    } else if error.is(ErrorKind::NotInstalled) {
+                        recheck.finish(CliInstallOutcome {
+                            phase: CliInstallPhase::NotFound,
+                            cli_installed: false,
+                            error: None,
+                        });
+                    } else {
+                        recheck.finish(CliInstallOutcome {
+                            phase: CliInstallPhase::ProbeFailed,
+                            cli_installed: false,
+                            error: Some(error.clone()),
+                        });
+                    }
                     return Err(error);
                 }
             };
@@ -572,7 +600,9 @@ impl WebState {
                     error: None,
                 });
             }
-            Ok((report, state.snapshot(), backend.now()))
+            let meta = read_meta();
+            let cli_install = state.cli_install_snapshot();
+            Ok((report, state.snapshot(), cli_install, backend.now(), meta))
         })
         .await
     }
@@ -958,10 +988,17 @@ pub struct HostChangeCommit<'a> {
 }
 
 impl HostChangeCommit<'_> {
+    /// Clears staged plugin previews before constructing a new backend whose initialization cleans
+    /// staging directories on disk.
+    pub fn discard_plugin_previews(&self) {
+        self.state.discard_plugin_previews();
+    }
+
     /// Commits a host/WSL/CLI-path change: atomically swaps in `rebuilt` when provided,
     /// clears the previous CLI install state, and resets host-derived snapshot state.
     pub fn commit_host_change(&self, rebuilt: Option<Arc<dyn Backend>>, defaults: Defaults) {
         if let Some(new_backend) = rebuilt {
+            self.state.discard_plugin_previews();
             let old_backend = {
                 let mut slot = self
                     .state
@@ -1020,6 +1057,18 @@ impl HostChangeCommit<'_> {
 }
 
 impl Control {
+    fn is_rebuilding(&self) -> bool {
+        self.running.values().any(|job| {
+            matches!(
+                job.operation,
+                Some(Operation::Domain {
+                    name: REBUILD_BACKEND_OP,
+                    ..
+                })
+            )
+        })
+    }
+
     fn can_change_host(&self) -> bool {
         !self.shutting_down
             && self.login.is_none()
@@ -1028,6 +1077,7 @@ impl Control {
 
     fn available(&self, slot: Slot) -> bool {
         !self.shutting_down
+            && !self.is_rebuilding()
             && match slot {
                 Slot::Independent => true,
                 Slot::Shared | Slot::Poll => {

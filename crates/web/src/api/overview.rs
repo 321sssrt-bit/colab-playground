@@ -153,7 +153,6 @@ pub(super) struct CliInstallView {
     phase: CliInstallPhase,
     cancelling: bool,
     lines: Vec<Line>,
-    lines_truncated: bool,
     warning_title_key: Option<&'static str>,
     warning_body_key: Option<&'static str>,
     error: Option<serde_json::Value>,
@@ -171,7 +170,6 @@ impl From<CliInstallSnapshot> for CliInstallView {
             phase: snapshot.phase,
             cancelling: snapshot.cancelling,
             lines: snapshot.lines,
-            lines_truncated: snapshot.lines_truncated,
             warning_title_key: not_found.then_some(keys::INSTALL_NOT_FOUND_TITLE),
             warning_body_key: not_found.then_some(keys::INSTALL_NOT_FOUND_BODY),
             error,
@@ -180,8 +178,11 @@ impl From<CliInstallSnapshot> for CliInstallView {
 }
 
 pub(super) async fn get(State(state): State<StateData>) -> Result<Json<Overview>, ApiError> {
-    let (environment, snapshot, now) = state.web.probe_environment().await?;
-    let configured_distro = state.settings.current().wsl_distro;
+    let settings = state.settings.clone();
+    let (environment, snapshot, cli_install_snapshot, now, configured_distro) = state
+        .web
+        .probe_environment_with(move || settings.current().wsl_distro)
+        .await?;
     let host = HostCheck::from_probe(&environment, platform::uses_wsl(), configured_distro);
     let cli_installed = environment.colab.is_some();
     let helper_available = environment.helper_python.is_some();
@@ -223,7 +224,7 @@ pub(super) async fn get(State(state): State<StateData>) -> Result<Json<Overview>
         all_interfaces_allowed: policy.all_interfaces_allowed(),
         restriction: policy.all_interfaces_restriction(),
     };
-    let cli_install = CliInstallView::from(state.web.cli_install_snapshot());
+    let cli_install = CliInstallView::from(cli_install_snapshot);
     Ok(Json(Overview {
         environment,
         host,
@@ -273,6 +274,7 @@ fn stream_cli_install(state: StateData, session: Session, events: CliInstallEven
     #[derive(Serialize)]
     struct Finished<'a> {
         status: &'static str,
+        phase: CliInstallPhase,
         cli_installed: bool,
         warning_title_key: Option<&'static str>,
         warning_body_key: Option<&'static str>,
@@ -288,7 +290,8 @@ fn stream_cli_install(state: StateData, session: Session, events: CliInstallEven
             CliInstallEvent::Finished(outcome) => {
                 let not_found = outcome.phase == CliInstallPhase::NotFound;
                 Event::default().event("finished").json_data(Finished {
-                    status: outcome.phase.as_str(),
+                    status: outcome.phase.wire_status(),
+                    phase: outcome.phase,
                     cli_installed: outcome.cli_installed,
                     warning_title_key: not_found.then_some(keys::INSTALL_NOT_FOUND_TITLE),
                     warning_body_key: not_found.then_some(keys::INSTALL_NOT_FOUND_BODY),

@@ -1,7 +1,12 @@
 use std::{
     fs,
     io::BufReader,
-    sync::{Arc, Mutex, mpsc},
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
+    },
     time::Duration,
 };
 
@@ -17,7 +22,9 @@ use colab_playground_shared::{
 use colab_playground_web::state::Access;
 use ureq::http::StatusCode;
 
-use super::{INSTALL, TIMEOUT, event, exercise, exercise_backend, json, next_event};
+use super::{
+    INSTALL, TIMEOUT, event, exercise, exercise_backend, exercise_with_store, json, next_event,
+};
 use crate::api::{BackendBuilder, WebSettings};
 
 #[tokio::test(flavor = "multi_thread")]
@@ -81,6 +88,67 @@ async fn corrupt_check_updates_field_falls_back_to_true() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn legacy_standalone_colab_python_allows_unrelated_patches_and_blocks_toolchain_patch() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("settings.json"),
+        r#"{"colab_python":"/legacy/venv/bin/python"}"#,
+    )
+    .unwrap();
+    let (config, _) = MockConfig::headless(MockScenario::demo());
+    exercise(dir.path(), config, |client, _, store| {
+        let themed = json(
+            client.request("PATCH", "/api/settings", r#"{"appearance":"dark"}"#),
+            StatusCode::OK,
+        );
+        assert_eq!(themed["appearance"], "dark");
+        assert_eq!(themed["colab_python"], "/legacy/venv/bin/python");
+        assert!(themed["colab_path"].is_null());
+
+        let rejected = json(
+            client.request(
+                "PATCH",
+                "/api/settings",
+                r#"{"colab_python":"/other/python"}"#,
+            ),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        );
+        assert_eq!(
+            rejected["error"]["message_key"],
+            keys::HOST_INTERPRETER_ALONE
+        );
+        assert_eq!(
+            store.load().settings.colab_python.as_deref(),
+            Some("/legacy/venv/bin/python")
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn relative_config_dir_still_reports_absolute_settings_file_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let relative = PathBuf::from("./relative-settings-dir");
+    let (config, _) = MockConfig::headless(MockScenario::demo());
+    exercise_with_store(
+        dir.path(),
+        SettingsStore::new(Some(relative)),
+        config,
+        |client, _, _| {
+            let settings = client.get("/api/settings");
+            let file = settings["settings_file"].as_str().unwrap();
+            let path = Path::new(file);
+            assert!(path.is_absolute(), "expected absolute path, got {file}");
+            assert!(
+                path.ends_with(Path::new("relative-settings-dir").join("settings.json")),
+                "unexpected path: {file}"
+            );
+        },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn host_settings_hot_rebuild_clears_install_state_and_validates_interpreter_rule() {
     let dir = tempfile::tempdir().unwrap();
     let store = SettingsStore::new(Some(dir.path().to_owned()));
@@ -120,7 +188,8 @@ async fn host_settings_hot_rebuild_clears_install_state_and_validates_interprete
             assert!(initial["colab_python"].is_null());
             assert_eq!(initial["uses_wsl"], crate::platform::uses_wsl());
 
-            // Off-path install settles to `not_found`, never `succeeded`.
+            // Off-path install settles to phase `not_found` (never installed), while keeping wire
+            // `status: "succeeded"` so legacy SSE parsers do not report connection lost.
             let mut reader = client.install();
             let id = event(&mut reader, "started")["id"].as_u64().unwrap();
             for _ in 0..5 {
@@ -135,7 +204,8 @@ async fn host_settings_hot_rebuild_clears_install_state_and_validates_interprete
                     .contains("not on your PATH")
             );
             let finished = event(&mut reader, "finished");
-            assert_eq!(finished["status"], "not_found");
+            assert_eq!(finished["status"], "succeeded");
+            assert_eq!(finished["phase"], "not_found");
             assert_eq!(finished["cli_installed"], false);
             assert_eq!(finished["warning_title_key"], keys::INSTALL_NOT_FOUND_TITLE);
             assert_eq!(finished["warning_body_key"], keys::INSTALL_NOT_FOUND_BODY);
@@ -161,7 +231,10 @@ async fn host_settings_hot_rebuild_clears_install_state_and_validates_interprete
                 StatusCode::UNPROCESSABLE_ENTITY,
             );
             assert_eq!(rejected["error"]["kind"], "invalid_input");
-            assert_eq!(rejected["error"]["message_key"], keys::HOST_INTERPRETER_ALONE);
+            assert_eq!(
+                rejected["error"]["message_key"],
+                keys::HOST_INTERPRETER_ALONE
+            );
             assert!(built_configs.lock().unwrap().is_empty());
             assert_eq!(
                 client.get("/api/overview/cli/install")["phase"],
@@ -199,7 +272,9 @@ async fn host_settings_hot_rebuild_clears_install_state_and_validates_interprete
             assert!(cleared_install["id"].is_null());
             assert_eq!(cleared_install["lines"], serde_json::json!([]));
             assert_eq!(
-                client.request("POST", &format!("{INSTALL}/events"), "{}").status(),
+                client
+                    .request("POST", &format!("{INSTALL}/events"), "{}")
+                    .status(),
                 StatusCode::NOT_FOUND
             );
 
@@ -244,13 +319,35 @@ async fn host_settings_hot_rebuild_clears_install_state_and_validates_interprete
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn host_settings_patch_rejects_busy_and_rolls_back_on_builder_error() {
+async fn host_settings_patch_preserves_previews_on_save_error_and_discards_on_rebuild() {
     let dir = tempfile::tempdir().unwrap();
+    let plugin_dir = dir.path().join("sample-plugin");
+    fs::create_dir_all(&plugin_dir).unwrap();
+    fs::write(
+        plugin_dir.join("plugin.toml"),
+        r#"
+api = 1
+id = "sample-plugin"
+version = "0.1.0"
+
+[name]
+en = "Sample"
+
+[run]
+script = "run.py"
+"#,
+    )
+    .unwrap();
+    fs::write(plugin_dir.join("run.py"), "print('ok')\n").unwrap();
+
     let store = SettingsStore::new(Some(dir.path().to_owned()));
-    let fail_build = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let fail_build = Arc::new(AtomicBool::new(true));
+    let build_calls = Arc::new(AtomicUsize::new(0));
     let fail_flag = fail_build.clone();
+    let calls_ref = build_calls.clone();
     let builder: BackendBuilder = Arc::new(move |_| {
-        if fail_flag.load(std::sync::atomic::Ordering::SeqCst) {
+        calls_ref.fetch_add(1, Ordering::SeqCst);
+        if fail_flag.load(Ordering::SeqCst) {
             return Err(Error::new(ErrorKind::Io).detail("simulated rebuild failure"));
         }
         let (config, _) = MockConfig::headless(MockScenario::demo());
@@ -262,6 +359,7 @@ async fn host_settings_patch_rejects_busy_and_rolls_back_on_builder_error() {
     config.failures.install_off_path = true;
     let backend = Arc::new(MockBackend::new(config));
 
+    let plugin_path = plugin_dir.to_string_lossy().into_owned();
     exercise_backend(
         dir.path(),
         store,
@@ -276,7 +374,29 @@ async fn host_settings_patch_rejects_busy_and_rolls_back_on_builder_error() {
             for _ in 0..6 {
                 event(&mut reader, "line");
             }
-            assert_eq!(event(&mut reader, "finished")["status"], "not_found");
+            assert_eq!(event(&mut reader, "finished")["phase"], "not_found");
+
+            // Stage a plugin preview.
+            let preview = json(
+                client.request(
+                    "POST",
+                    "/api/plugins/previews",
+                    &serde_json::json!({"kind": "folder", "path": plugin_path}).to_string(),
+                ),
+                StatusCode::CREATED,
+            );
+            let preview_id = preview["preview_id"].as_str().unwrap().to_owned();
+
+            // When saving settings.json fails, the builder must NOT run and the preview stays valid.
+            let file = store.file().unwrap();
+            fs::create_dir(&file).unwrap();
+            let save_err = json(
+                client.request("PATCH", "/api/settings", r#"{"colab_path":"/opt/colab"}"#),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            );
+            assert_eq!(save_err["error"]["kind"], "io");
+            assert_eq!(build_calls.load(Ordering::SeqCst), 0);
+            fs::remove_dir(&file).unwrap();
 
             // While another operation is active, host changes return 409 Busy, while non-host succeeds.
             let (entered_tx, entered_rx) = mpsc::channel();
@@ -316,16 +436,28 @@ async fn host_settings_patch_rejects_busy_and_rolls_back_on_builder_error() {
                 std::thread::sleep(Duration::from_millis(10));
             }
 
-            // Builder error rolls back cleanly: disk, backend, and cli_install stay intact.
+            // Builder error rolls back settings.json and discards stale previews so no dangling
+            // preview ID remains in memory.
             let failed = json(
                 client.request("PATCH", "/api/settings", r#"{"colab_path":"/opt/colab"}"#),
                 StatusCode::INTERNAL_SERVER_ERROR,
             );
             assert_eq!(failed["error"]["kind"], "io");
+            assert_eq!(build_calls.load(Ordering::SeqCst), 1);
             assert!(store.load().settings.colab_path.is_none());
+            assert_eq!(
+                store.load().settings.appearance,
+                colab_playground_shared::settings::AppearancePref::Dark
+            );
             assert_eq!(
                 client.get("/api/overview/cli/install")["phase"],
                 "not_found"
+            );
+            assert_eq!(
+                client
+                    .request("POST", &format!("/api/plugins/previews/{preview_id}"), "{}")
+                    .status(),
+                StatusCode::NOT_FOUND
             );
         },
     )
@@ -371,7 +503,8 @@ async fn cli_install_sse_replays_after_disconnect_and_resolves_after_check_again
         assert_eq!(lines[0], first);
         assert_eq!(lines[5]["stream"], "stderr");
         let finished = event(&mut replay, "finished");
-        assert_eq!(finished["status"], "not_found");
+        assert_eq!(finished["status"], "succeeded");
+        assert_eq!(finished["phase"], "not_found");
         assert_eq!(finished["cli_installed"], false);
         assert_eq!(finished["warning_title_key"], keys::INSTALL_NOT_FOUND_TITLE);
         assert_eq!(finished["warning_body_key"], keys::INSTALL_NOT_FOUND_BODY);
@@ -384,7 +517,9 @@ async fn cli_install_sse_replays_after_disconnect_and_resolves_after_check_again
         for expected in &lines {
             assert_eq!(&event(&mut late, "line"), expected);
         }
-        assert_eq!(event(&mut late, "finished")["status"], "not_found");
+        let late_finished = event(&mut late, "finished");
+        assert_eq!(late_finished["status"], "succeeded");
+        assert_eq!(late_finished["phase"], "not_found");
         assert_eq!(
             client
                 .request("POST", &format!("{INSTALL}/999999/events"), "{}")

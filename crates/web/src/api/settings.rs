@@ -1,5 +1,6 @@
 use std::{
-    path::PathBuf,
+    fs,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
 };
 
@@ -7,7 +8,9 @@ use axum::{
     Json,
     extract::{State, rejection::JsonRejection},
 };
-use colab_playground_core::{Error, ErrorKind, Result as CoreResult, backend::Backend};
+use colab_playground_core::{
+    Error, ErrorKind, Result as CoreResult, backend::Backend, paths::write_atomic,
+};
 use colab_playground_shared::{
     defaults::sanitize,
     settings::{
@@ -101,13 +104,17 @@ impl WebSettings {
             settings_file: self
                 .store
                 .file()
-                .map(|path| path.to_string_lossy().into_owned()),
+                .map(|path| full_path(&path).to_string_lossy().into_owned()),
             load_status,
             corrupt_backup: corrupt_backup.map(|path| path.to_string_lossy().into_owned()),
             reset_defaults: loaded.reset_defaults.clone(),
             settings_notice: state.notice.clone(),
         }
     }
+}
+
+fn full_path(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn notice_from_loaded(loaded: &Loaded) -> Option<SettingsNotice> {
@@ -196,7 +203,8 @@ fn apply_patch(base: &Settings, patch: &SettingsPatch) -> CoreResult<Settings> {
     if let Some(colab_python) = &patch.colab_python {
         updated.colab_python.clone_from(colab_python);
     }
-    if updated.colab_path.is_none() && updated.colab_python.is_some() {
+    let toolchain_patched = patch.colab_path.is_some() || patch.colab_python.is_some();
+    if toolchain_patched && updated.colab_path.is_none() && updated.colab_python.is_some() {
         return Err(Error::new(ErrorKind::InvalidInput).with("host_interpreter_alone", "true"));
     }
     if let Some(defaults_patch) = &patch.defaults {
@@ -227,6 +235,20 @@ fn save_outcome(store: &SettingsStore) -> LoadOutcome {
         LoadOutcome::Loaded
     } else {
         LoadOutcome::NoConfigDir
+    }
+}
+
+fn restore_settings_file(file: Option<&Path>, previous_bytes: Option<&[u8]>) {
+    let Some(file) = file else {
+        return;
+    };
+    match previous_bytes {
+        Some(bytes) => {
+            let _ = write_atomic(file, bytes);
+        }
+        None => {
+            let _ = fs::remove_file(file);
+        }
     }
 }
 
@@ -322,20 +344,39 @@ pub(super) async fn patch(
             let mut guard = settings.lock();
             let updated = apply_patch(&guard.loaded.settings, &patch)?;
             let host_changed = host_fields_changed(&guard.loaded.settings, &updated);
-            let rebuilt = if host_changed {
-                settings
-                    .backend_builder
-                    .as_ref()
-                    .map(|builder| builder(&updated))
-                    .transpose()?
-            } else {
-                None
-            };
             cancel.commit()?;
+
+            let settings_file = settings.store.file();
+            let previous_bytes = settings_file
+                .as_deref()
+                .and_then(|path| fs::read(path).ok());
+            // Save before invoking the backend builder so a write failure never cleans up staged
+            // plugin previews on disk.
             settings
                 .store
                 .save(&updated)
                 .map_err(|error| Error::new(ErrorKind::Io).detail(error.to_string()))?;
+
+            let rebuilt = if host_changed {
+                if let Some(builder) = settings.backend_builder.as_ref() {
+                    commit.discard_plugin_previews();
+                    match builder(&updated) {
+                        Ok(backend) => Some(backend),
+                        Err(error) => {
+                            restore_settings_file(
+                                settings_file.as_deref(),
+                                previous_bytes.as_deref(),
+                            );
+                            return Err(error);
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             let defaults = updated.defaults.clone();
             guard.loaded = Loaded {
                 settings: updated,
