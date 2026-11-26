@@ -21,6 +21,13 @@ const TONE_ICON_CLASS: Readonly<Record<ToastTone, string>> = {
   danger: "alert-icon icon-danger",
 };
 
+const TONE_CARD_CLASS: Readonly<Record<ToastTone, string>> = {
+  info: "toast-card toast-card-info",
+  success: "toast-card toast-card-success",
+  warning: "toast-card toast-card-warning",
+  danger: "toast-card toast-card-danger",
+};
+
 function renderToneIcon(tone: ToastTone) {
   if (tone === "success") {
     return <CheckCircleIcon />;
@@ -34,7 +41,7 @@ function renderToneIcon(tone: ToastTone) {
 export function ToastViewport({ toasts, t, inert = false, onDismiss }: ToastViewportProps) {
   return (
     <div
-      className="toast-viewport"
+      className={toasts.length > 0 ? "toast-viewport toast-viewport-active" : "toast-viewport"}
       aria-live="polite"
       aria-relevant="additions text"
       aria-hidden={inert ? "true" : undefined}
@@ -42,8 +49,18 @@ export function ToastViewport({ toasts, t, inert = false, onDismiss }: ToastView
     >
       {toasts.map((toast) => {
         const urgent = toast.tone === "danger" || toast.tone === "warning";
+        const persistent = toast.durationMs === null;
+        const cardClass = persistent
+          ? `${TONE_CARD_CLASS[toast.tone]} toast-card-persistent`
+          : TONE_CARD_CLASS[toast.tone];
         return (
-          <div key={toast.id} className="toast-card" role={urgent ? "alert" : "status"}>
+          <div
+            key={toast.id}
+            className={cardClass}
+            role={urgent ? "alert" : "status"}
+            data-toast-tone={toast.tone}
+            data-toast-persistent={persistent ? "true" : undefined}
+          >
             <span className={TONE_ICON_CLASS[toast.tone]}>{renderToneIcon(toast.tone)}</span>
             <div className="toast-body">
               {toast.title && <p className="alert-title">{toast.title}</p>}

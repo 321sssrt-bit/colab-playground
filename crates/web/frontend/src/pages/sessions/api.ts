@@ -20,6 +20,7 @@ import type {
   HardwareRate,
   RuntimeRef,
   SessionsListResponse,
+  StopAllResponse,
   UnixSecs,
   WatchdogInfo,
 } from "../../lib/types.ts";
@@ -62,17 +63,6 @@ interface AutoStopResponse {
   readonly watchdog_armed: boolean;
   readonly watchdog: WatchdogInfo | null;
   readonly warning_key: string | null;
-}
-
-interface StopAllRemainingItem {
-  readonly target: RuntimeRef;
-  readonly error: ApiErrorPayload | null;
-}
-
-export interface StopAllResponse {
-  readonly verified: boolean;
-  readonly remaining: readonly StopAllRemainingItem[];
-  readonly account_errors: readonly AccountFailureResponse[];
 }
 
 export type ProvisionProgressEvent =

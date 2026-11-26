@@ -1,27 +1,23 @@
 /**
  * Reusable native modal `<dialog>` for stopping a single Managed or Unmanaged
  * runtime on any saved account, stating that everything on the runtime is wiped
- * and billing ends. Shared by Sessions and plugin failure cleanup views.
+ * and billing ends.
+ *
+ * Mounted globally in `App.tsx` via `stopDialogsStore`. Callers mounted inside
+ * a route (such as `PluginsPage`) that still render `<StopRuntimeDialog>` in
+ * standalone mode automatically forward their request into `stopDialogsStore`
+ * so navigating away mid-stop never unmounts the dialog or loses error/retry UI.
  */
 
-import { useEffect, useId, useRef, useState, type SyntheticEvent } from "react";
+import { useEffect, useId, useMemo, useRef, type SyntheticEvent } from "react";
 
 import { AlertIcon } from "../../components/Icons.tsx";
-import { apiClient, ApiError } from "../../lib/api.ts";
-import { appDataStore } from "../../lib/appCache.ts";
 import type { TranslateFn } from "../../lib/i18n.ts";
-import { webStore } from "../../lib/store.ts";
+import { stopDialogsStore } from "../../lib/stopDialogs.ts";
 import type { ToastInput } from "../../lib/toast.ts";
 import type { Runtime, RuntimeRef } from "../../lib/types.ts";
-import { stopRuntime } from "./api.ts";
-import {
-  formatEmail,
-  formatErrorMessage,
-  formatRuntimeCardLabel,
-  type FormattedError,
-} from "./format.ts";
+import { formatEmail, formatErrorMessage, formatRuntimeCardLabel } from "./format.ts";
 import { AlertTriangleIcon, SquareIcon } from "./Icons.tsx";
-import { beginUserStop, recordEndedRuntime } from "./store.ts";
 
 export interface StopRuntimeTarget {
   readonly target: RuntimeRef;
@@ -39,6 +35,10 @@ export interface StopRuntimeDialogProps {
   readonly pushToast: (toast: ToastInput) => number;
   readonly onClose: () => void;
   readonly onStopped?: (target: StopRuntimeTarget) => void;
+  /** Controlled global mode props driven by `stopDialogsStore` in `App.tsx`. */
+  readonly submitting?: boolean;
+  readonly submitError?: unknown | null;
+  readonly onConfirm?: () => void;
 }
 
 export function stopTargetFromRuntime(runtime: Runtime): StopRuntimeTarget {
@@ -52,36 +52,75 @@ export function stopTargetFromRuntime(runtime: Runtime): StopRuntimeTarget {
 export function StopRuntimeDialog({
   request,
   t,
-  pushToast,
   onClose,
   onStopped,
+  submitting: controlledSubmitting,
+  submitError: controlledSubmitError,
+  onConfirm: controlledOnConfirm,
 }: StopRuntimeDialogProps) {
   const titleId = useId();
   const dialogRef = useRef<HTMLDialogElement | null>(null);
-  const activeRequestIdRef = useRef<number>(0);
+  const forwardedIdRef = useRef<number | null>(null);
+  const callbacksRef = useRef({ onClose, onStopped });
+  callbacksRef.current = { onClose, onStopped };
 
-  const [submitting, setSubmitting] = useState(false);
-  const [submitError, setSubmitError] = useState<FormattedError | null>(null);
+  const isControlled = controlledOnConfirm !== undefined;
+  const submitting = Boolean(controlledSubmitting);
+  const submitError = useMemo(
+    () =>
+      isControlled && controlledSubmitError !== null && controlledSubmitError !== undefined
+        ? formatErrorMessage(controlledSubmitError, t)
+        : null,
+    [isControlled, controlledSubmitError, t],
+  );
+
+  // Route-local callers delegate to the global dialog host in `App.tsx` so route switches
+  // preserve the modal, error alert, and retry action across page unmounts.
+  useEffect(() => {
+    if (isControlled) {
+      return;
+    }
+    if (!request) {
+      forwardedIdRef.current = null;
+      return;
+    }
+    if (forwardedIdRef.current === request.id) {
+      return;
+    }
+    forwardedIdRef.current = request.id;
+    stopDialogsStore.openStopRuntime(
+      {
+        target: request.target,
+        label: request.label,
+        email: request.email,
+      },
+      {
+        onStopped: (stoppedTarget) => callbacksRef.current.onStopped?.(stoppedTarget),
+        onClose: () => callbacksRef.current.onClose(),
+      },
+    );
+  }, [isControlled, request]);
 
   useEffect(() => {
+    if (!isControlled) {
+      return;
+    }
     const dialog = dialogRef.current;
     if (!request) {
-      activeRequestIdRef.current = 0;
       if (dialog?.open) {
         dialog.close();
       }
       return;
     }
-
-    activeRequestIdRef.current = request.id;
-    setSubmitting(false);
-    setSubmitError(null);
-
     if (dialog && !dialog.open) {
       dialog.returnValue = "";
       dialog.showModal();
     }
-  }, [request?.id]);
+  }, [isControlled, request?.id]);
+
+  if (!isControlled) {
+    return null;
+  }
 
   const handleDialogCancel = (event: SyntheticEvent<HTMLDialogElement>) => {
     event.preventDefault();
@@ -97,68 +136,6 @@ export function StopRuntimeDialog({
     }
     if (request && !submitting) {
       onClose();
-    }
-  };
-
-  const handleConfirm = async () => {
-    if (!request || submitting) {
-      return;
-    }
-
-    const requestId = request.id;
-    const sessionGeneration = apiClient.getSessionGeneration();
-    const stopTarget: StopRuntimeTarget = {
-      target: request.target,
-      label: request.label,
-      email: request.email,
-    };
-    const releasePending = beginUserStop(stopTarget.target);
-    setSubmitting(true);
-    setSubmitError(null);
-
-    try {
-      await stopRuntime(stopTarget.target);
-      if (apiClient.getSessionGeneration() !== sessionGeneration) {
-        return;
-      }
-      recordEndedRuntime({
-        runtime: stopTarget.target,
-        label: stopTarget.label,
-        email: stopTarget.email,
-        reason: { kind: "user" },
-      });
-      if (activeRequestIdRef.current !== requestId) {
-        return;
-      }
-      pushToast({
-        tone: "success",
-        body: t("app.b2.stop_done", { name: stopTarget.label }),
-      });
-      setSubmitting(false);
-      void webStore.refreshSnapshot().catch(() => {});
-      onStopped?.(stopTarget);
-      onClose();
-    } catch (error) {
-      if (error instanceof ApiError && error.isUnauthorized) {
-        setSubmitting(false);
-        onClose();
-        return;
-      }
-      if (apiClient.getSessionGeneration() !== sessionGeneration) {
-        return;
-      }
-      if (error instanceof ApiError && error.kind === "session_gone") {
-        // `stop_runtime` returns `session_gone` before updating the backend snapshot, so re-list
-        // runtimes to clear the stale card and let snapshot transitions record it honestly.
-        void appDataStore.refreshSessions().catch(() => {});
-      }
-      if (activeRequestIdRef.current !== requestId) {
-        return;
-      }
-      setSubmitting(false);
-      setSubmitError(formatErrorMessage(error, t));
-    } finally {
-      releasePending();
     }
   };
 
@@ -225,7 +202,7 @@ export function StopRuntimeDialog({
               data-stop-runtime-confirm="true"
               disabled={submitting}
               onClick={() => {
-                void handleConfirm();
+                controlledOnConfirm();
               }}
             >
               {submitting ? <span className="spinner" aria-hidden="true" /> : <SquareIcon />}
