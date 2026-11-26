@@ -146,7 +146,7 @@ function createHarness(initialSnapshot: Snapshot | null = makeSnapshot()) {
     lastForwardEvent: null,
   };
 
-  let appDataState: Pick<
+  const appDataState: Pick<
     AppDataState,
     "overviewLoading" | "sessionsRefreshing" | "refreshingUsage" | "adopting"
   > = {
@@ -245,9 +245,6 @@ function createHarness(initialSnapshot: Snapshot | null = makeSnapshot()) {
     },
     setRefreshHandler: (fn: typeof refreshHandler) => {
       refreshHandler = fn;
-    },
-    setAppDataState: (next: Partial<typeof appDataState>) => {
-      appDataState = { ...appDataState, ...next };
     },
     pushSnapshot,
     emitAuth,

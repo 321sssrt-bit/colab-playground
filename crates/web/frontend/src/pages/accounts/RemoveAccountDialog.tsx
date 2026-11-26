@@ -12,9 +12,7 @@ import type { RemoveAccountDialogState } from "../../lib/accountDialogs.ts";
 import { isAccountChangeBlocked, useAppDataStore } from "../../lib/appCache.ts";
 import type { TranslateFn } from "../../lib/i18n.ts";
 import type { Snapshot } from "../../lib/types.ts";
-import { getAccountRemoveBlock, type RemoveTarget } from "./model.ts";
-
-export type { RemoveTarget };
+import { getAccountRemoveBlock } from "./model.ts";
 
 export interface RemoveAccountDialogProps {
   readonly state: RemoveAccountDialogState;
