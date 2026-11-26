@@ -17,6 +17,7 @@ import {
 
 import type { AccountSlotPlacement } from "../../components/AppShell.tsx";
 import { AccountsIcon, UserIcon } from "../../components/Icons.tsx";
+import { useAppDataStore } from "../../lib/appCache.ts";
 import { resolveActiveAccount } from "../../lib/format.ts";
 import type { TranslateFn } from "../../lib/i18n.ts";
 import { routeToHash } from "../../lib/router.ts";
@@ -89,6 +90,7 @@ export function AccountSwitcherMenu({
   const triggerId = useId();
   const menuId = useId();
   const groupHeadingId = useId();
+  const appData = useAppDataStore();
 
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const popoverRef = useRef<HTMLDivElement | null>(null);
@@ -322,7 +324,7 @@ export function AccountSwitcherMenu({
     );
   }
 
-  const accountChangeBlocked = isAccountChangeBlocked(snapshot);
+  const accountChangeBlocked = isAccountChangeBlocked(snapshot, appData);
   const shuttingDown = snapshot?.shutting_down === true;
   const blockedTitle = accountChangeBlocked ? t("app.b2.account_change_blocked") : undefined;
 

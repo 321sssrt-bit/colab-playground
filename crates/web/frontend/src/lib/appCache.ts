@@ -12,6 +12,11 @@ import { useSyncExternalStore } from "react";
 
 import { apiClient, ApiError, attachAbortSignal, type ApiClient } from "./api.ts";
 import { serverClock, type ServerClock } from "./clock.ts";
+import {
+  CORE_DEFAULTS,
+  MIN_CONCURRENT_SESSIONS,
+  START_MAX_RUNTIME_SECS,
+} from "./constants.ts";
 import { i18nStore, type TranslateFn } from "./i18n.ts";
 import { webStore, type WebStore } from "./store.ts";
 import { toastStore, type ToastStore } from "./toast.ts";
@@ -20,8 +25,10 @@ import type {
   AccountError,
   AccountFailureResponse,
   AccountsApiResponse,
+  ErrorKind,
   OverviewResponse,
   SessionsListResponse,
+  SettingsView,
   Snapshot,
 } from "./types.ts";
 
@@ -100,6 +107,43 @@ function accountErrorsMatch(
 }
 
 /**
+ * Account error kinds that the backend can only report after the Colab CLI is
+ * installed and invoked (never transient lock/shutdown/host-missing errors).
+ */
+const CLI_INSTALLED_ACCOUNT_ERRORS: ReadonlySet<ErrorKind> = new Set([
+  "keyring_unavailable",
+  "auth_required",
+  "no_active_account",
+  "active_account_not_adopted",
+  "legacy_token_present",
+  "add_in_progress",
+]);
+
+/**
+ * Infers live CLI installation state directly from the latest SSE `Snapshot`.
+ * Returns `null` when the snapshot does not carry definitive evidence either way
+ * (e.g. cold-start empty snapshot or transient `busy` / `cancelled` / `wsl_unavailable` error).
+ */
+export function isCliInstalledFromSnapshot(snapshot: Snapshot | null): boolean | null {
+  if (snapshot === null) {
+    return null;
+  }
+  if (snapshot.accounts_error === "not_installed") {
+    return false;
+  }
+  if (snapshot.accounts !== null || snapshot.runtimes !== null) {
+    return true;
+  }
+  if (
+    snapshot.accounts_error !== null &&
+    CLI_INSTALLED_ACCOUNT_ERRORS.has(snapshot.accounts_error)
+  ) {
+    return true;
+  }
+  return null;
+}
+
+/**
  * Overlays live SSE `Snapshot` account, usage, measured-rate, and keyring state
  * onto the cached `OverviewResponse` so Overview converges after sign-in,
  * switching, adoption, usage refresh, or keyring recovery without re-probing
@@ -118,10 +162,8 @@ export function resolveEffectiveOverview(
     return overview;
   }
 
-  const cliInstalled =
-    snapshot.accounts_error === "not_installed"
-      ? false
-      : overview.cli_installed || snapshot.accounts !== null || snapshot.runtimes !== null;
+  const liveCliInstalled = isCliInstalledFromSnapshot(snapshot);
+  const cliInstalled = liveCliInstalled !== null ? liveCliInstalled : overview.cli_installed;
   const keyring =
     snapshot.accounts_error === "keyring_unavailable"
       ? {
@@ -148,6 +190,34 @@ export function resolveEffectiveOverview(
   };
 }
 
+export interface SessionSettingsSummary {
+  readonly rearmDurationSecs: number;
+  readonly maxConcurrentSessions: number;
+}
+
+export interface SessionDefaultsInput {
+  readonly max_runtime?: unknown;
+  readonly max_concurrent_sessions?: unknown;
+}
+
+function extractSessionSettings(defaults?: SessionDefaultsInput | null): SessionSettingsSummary {
+  const configuredRearm = defaults?.max_runtime;
+  const rearmDurationSecs =
+    typeof configuredRearm === "number" &&
+    Number.isFinite(configuredRearm) &&
+    configuredRearm > 0
+      ? Math.floor(configuredRearm)
+      : START_MAX_RUNTIME_SECS;
+  const configuredMaxConcurrent = defaults?.max_concurrent_sessions;
+  const maxConcurrentSessions =
+    typeof configuredMaxConcurrent === "number" &&
+    Number.isFinite(configuredMaxConcurrent) &&
+    configuredMaxConcurrent >= MIN_CONCURRENT_SESSIONS
+      ? Math.floor(configuredMaxConcurrent)
+      : CORE_DEFAULTS.max_concurrent_sessions;
+  return { rearmDurationSecs, maxConcurrentSessions };
+}
+
 export interface AppDataState {
   readonly overview: OverviewResponse | null;
   readonly overviewLoading: boolean;
@@ -159,6 +229,8 @@ export interface AppDataState {
   readonly usageRefreshError: unknown | null;
   readonly adopting: boolean;
   readonly adoptError: unknown | null;
+  readonly rearmDurationSecs: number;
+  readonly maxConcurrentSessions: number;
 }
 
 export interface AppDataStoreOptions {
@@ -188,6 +260,10 @@ export interface AppDataStore {
    * completion toast and converge the snapshot.
    */
   adoptAccount(signal?: AbortSignal): Promise<Account>;
+  /** Immediately syncs default auto-stop duration & concurrency limit after Settings saves. */
+  applySessionDefaults(defaults?: SessionDefaultsInput | null): SessionSettingsSummary;
+  /** Deduplicated `GET /api/settings` read that discards stale responses superseded by a save. */
+  refreshSessionDefaults(signal?: AbortSignal): Promise<SessionSettingsSummary>;
   dispose(): void;
 }
 
@@ -208,6 +284,8 @@ const INITIAL_STATE: AppDataState = {
   usageRefreshError: null,
   adopting: false,
   adoptError: null,
+  rearmDurationSecs: START_MAX_RUNTIME_SECS,
+  maxConcurrentSessions: CORE_DEFAULTS.max_concurrent_sessions,
 };
 
 /**
@@ -222,11 +300,13 @@ export function createAppDataStore(options: AppDataStoreOptions = {}): AppDataSt
 
   let state: AppDataState = INITIAL_STATE;
   let disposed = false;
+  let settingsSeq = 0;
 
   let overviewInFlight: InFlightRequest<OverviewResponse> | null = null;
   let sessionsInFlight: InFlightRequest<SessionsListResponse> | null = null;
   let usageInFlight: InFlightRequest<AccountsApiResponse> | null = null;
   let adoptInFlight: InFlightRequest<Account> | null = null;
+  let settingsInFlight: InFlightRequest<SessionSettingsSummary> | null = null;
 
   const listeners = new Set<() => void>();
 
@@ -252,7 +332,9 @@ export function createAppDataStore(options: AppDataStoreOptions = {}): AppDataSt
       next.refreshingUsage === state.refreshingUsage &&
       next.usageRefreshError === state.usageRefreshError &&
       next.adopting === state.adopting &&
-      next.adoptError === state.adoptError
+      next.adoptError === state.adoptError &&
+      next.rearmDurationSecs === state.rearmDurationSecs &&
+      next.maxConcurrentSessions === state.maxConcurrentSessions
     ) {
       return;
     }
@@ -269,6 +351,9 @@ export function createAppDataStore(options: AppDataStoreOptions = {}): AppDataSt
     usageInFlight = null;
     adoptInFlight?.controller.abort();
     adoptInFlight = null;
+    settingsInFlight?.controller.abort();
+    settingsInFlight = null;
+    settingsSeq += 1;
   };
 
   const reset = (): void => {
@@ -368,15 +453,27 @@ export function createAppDataStore(options: AppDataStoreOptions = {}): AppDataSt
         method: "GET",
         signal: controller.signal,
       })
-      .then((response) => {
+      .then(async (response) => {
         if (!disposed && client.getSessionGeneration() === generation) {
           clock.sync(response.sampled_at);
-          setState({
-            sessionsRefreshing: false,
-            sessionsError: null,
-            sessionsAccountErrors: response.errors.length > 0 ? response.errors : null,
-          });
-          void store.refreshSnapshot().catch(() => {});
+          let latestSnapshot = store.getState().snapshot;
+          try {
+            latestSnapshot = await store.refreshSnapshot(controller.signal);
+          } catch {
+            latestSnapshot = store.getState().snapshot;
+          }
+          if (!disposed && client.getSessionGeneration() === generation) {
+            const keepAccountErrors =
+              response.errors.length > 0 &&
+              (latestSnapshot === null ||
+                latestSnapshot.runtimes === null ||
+                accountErrorsMatch(response.errors, latestSnapshot.runtimes.errors));
+            setState({
+              sessionsRefreshing: false,
+              sessionsError: null,
+              sessionsAccountErrors: keepAccountErrors ? response.errors : null,
+            });
+          }
         }
         return response;
       })
@@ -505,6 +602,55 @@ export function createAppDataStore(options: AppDataStoreOptions = {}): AppDataSt
     return attachAbortSignal(promise, signal);
   };
 
+  const applySessionDefaults = (
+    defaults?: SessionDefaultsInput | null,
+  ): SessionSettingsSummary => {
+    settingsSeq += 1;
+    settingsInFlight?.controller.abort();
+    settingsInFlight = null;
+    const summary = extractSessionSettings(defaults);
+    if (!disposed) {
+      setState(summary);
+    }
+    return summary;
+  };
+
+  const refreshSessionDefaults = (signal?: AbortSignal): Promise<SessionSettingsSummary> => {
+    const generation = client.getSessionGeneration();
+    if (settingsInFlight !== null && settingsInFlight.generation === generation) {
+      return attachAbortSignal(settingsInFlight.promise, signal);
+    }
+    const seq = settingsSeq;
+    const controller = new AbortController();
+    const promise = client
+      .request<SettingsView>("/api/settings", {
+        method: "GET",
+        signal: controller.signal,
+      })
+      .then((settings) => {
+        if (!disposed && client.getSessionGeneration() === generation && seq === settingsSeq) {
+          const summary = extractSessionSettings(settings.defaults);
+          setState(summary);
+          return summary;
+        }
+        return {
+          rearmDurationSecs: state.rearmDurationSecs,
+          maxConcurrentSessions: state.maxConcurrentSessions,
+        };
+      })
+      .catch(() => ({
+        rearmDurationSecs: state.rearmDurationSecs,
+        maxConcurrentSessions: state.maxConcurrentSessions,
+      }))
+      .finally(() => {
+        if (settingsInFlight?.promise === promise) {
+          settingsInFlight = null;
+        }
+      });
+    settingsInFlight = { generation, controller, promise };
+    return attachAbortSignal(promise, signal);
+  };
+
   return {
     getState(): AppDataState {
       return state;
@@ -546,10 +692,12 @@ export function createAppDataStore(options: AppDataStoreOptions = {}): AppDataSt
         if (disposed || client.getSessionGeneration() !== generation) {
           return null;
         }
-        const afterOverview = store.getState().snapshot;
-        if (afterOverview !== null && afterOverview.runtimes !== null) {
-          return null;
-        }
+      }
+      const current = store.getState().snapshot;
+      if (current !== null && current.runtimes !== null) {
+        return null;
+      }
+      if (state.overview !== null) {
         try {
           const fresh = await store.refreshSnapshot(signal);
           if (fresh.runtimes !== null) {
@@ -560,6 +708,9 @@ export function createAppDataStore(options: AppDataStoreOptions = {}): AppDataSt
             throw error;
           }
         }
+        if (disposed || client.getSessionGeneration() !== generation) {
+          return null;
+        }
       }
       return refreshSessions(signal);
     },
@@ -567,6 +718,8 @@ export function createAppDataStore(options: AppDataStoreOptions = {}): AppDataSt
     refreshSessions,
     refreshUsage,
     adoptAccount,
+    applySessionDefaults,
+    refreshSessionDefaults,
 
     dispose(): void {
       disposed = true;

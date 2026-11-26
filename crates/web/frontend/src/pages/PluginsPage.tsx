@@ -19,7 +19,6 @@ import {
   stopTargetFromRuntime,
   type StopRuntimeDialogRequest,
 } from "./sessions/StopRuntimeDialog.tsx";
-import { useSessionsLocalState } from "./sessions/store.ts";
 import {
   formatPluginApiError,
   listPlugins,
@@ -99,7 +98,6 @@ export function PluginsPage({ snapshot, locale, t, navigate, pushToast }: PagePr
   const toastedReadyRunIdRef = useRef<number | null>(null);
 
   const runsState = usePluginRunsStore();
-  const sessionsLocal = useSessionsLocalState();
   const appData = useAppDataStore();
   const forwardsState = useForwardsStore();
 
@@ -354,7 +352,7 @@ export function PluginsPage({ snapshot, locale, t, navigate, pushToast }: PagePr
             key={`${deployFormPlugin.manifest.id}:${runsState.formOpenSeq}`}
             plugin={deployFormPlugin}
             snapshot={snapshot}
-            maxConcurrentSessions={sessionsLocal.maxConcurrentSessions}
+            maxConcurrentSessions={appData.maxConcurrentSessions}
             hfTokenSaved={hfTokenSaved}
             locale={locale}
             t={t}

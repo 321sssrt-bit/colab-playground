@@ -10,6 +10,7 @@ import { useCallback, useEffect, useId, useRef, useState } from "react";
 
 import { AlertIcon } from "../../components/Icons.tsx";
 import { ApiError } from "../../lib/api.ts";
+import { appDataStore, useAppDataStore } from "../../lib/appCache.ts";
 import { serverClock } from "../../lib/clock.ts";
 import { formatDuration, useUsageClockSecs } from "../../lib/format.ts";
 import type { TranslateFn } from "../../lib/i18n.ts";
@@ -273,7 +274,7 @@ export function SwitchAccountDialog({
     ) {
       return;
     }
-    if (isAccountChangeBlocked(liveSnapshot) || liveSnapshot.shutting_down) {
+    if (isAccountChangeBlocked(liveSnapshot, appDataStore.getState()) || liveSnapshot.shutting_down) {
       return;
     }
 
@@ -347,7 +348,8 @@ export function SwitchAccountDialog({
     target !== null
       ? resolveAccountEmailLabel(target.id, snapshot, t, target.emailLabel)
       : "";
-  const accountChangeBlocked = isAccountChangeBlocked(snapshot);
+  const appData = useAppDataStore();
+  const accountChangeBlocked = isAccountChangeBlocked(snapshot, appData);
   const shuttingDown = snapshot.shutting_down;
   const confirming = phase.kind === "ready" && phase.confirming;
   const confirmDisabled =

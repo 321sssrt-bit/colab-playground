@@ -8,12 +8,8 @@
 
 import { useSyncExternalStore } from "react";
 
-import { apiClient, ApiError, attachAbortSignal } from "../../lib/api.ts";
-import {
-  CORE_DEFAULTS,
-  MIN_CONCURRENT_SESSIONS,
-  START_MAX_RUNTIME_SECS,
-} from "../../lib/constants.ts";
+import { apiClient, ApiError } from "../../lib/api.ts";
+import { appDataStore, type SessionSettingsSummary } from "../../lib/appCache.ts";
 import { forwardsStore } from "../../lib/forwards.ts";
 import type { TranslateFn } from "../../lib/i18n.ts";
 import type { ToastInput } from "../../lib/toast.ts";
@@ -29,7 +25,6 @@ import type {
   Snapshot,
 } from "../../lib/types.ts";
 import {
-  fetchSettings,
   openProvisionEventStream,
   type ProvisionOutcome,
   type ProvisionProgressEvent,
@@ -42,10 +37,7 @@ const PROVISION_RECONNECT_BASE_MS = 1000;
 const PROVISION_RECONNECT_MAX_MS = 5000;
 const PROVISION_RECONNECT_MAX_EXP = 3;
 
-export interface SessionSettingsSummary {
-  readonly rearmDurationSecs: number;
-  readonly maxConcurrentSessions: number;
-}
+export type { SessionSettingsSummary };
 
 export interface TrackedProvision {
   readonly operationId: number;
@@ -74,16 +66,12 @@ export interface EndedRuntime {
 
 interface SessionsLocalState {
   readonly ended: readonly EndedRuntime[];
-  readonly rearmDurationSecs: number;
-  readonly maxConcurrentSessions: number;
   readonly reconcileSeq: number;
   readonly trackedProvision: TrackedProvision | null;
 }
 
 const INITIAL_STATE: SessionsLocalState = {
   ended: [],
-  rearmDurationSecs: START_MAX_RUNTIME_SECS,
-  maxConcurrentSessions: CORE_DEFAULTS.max_concurrent_sessions,
   reconcileSeq: 0,
   trackedProvision: null,
 };
@@ -95,7 +83,6 @@ let pendingUserStopCounts = new Map<string, number>();
 let pendingStopAllCount = 0;
 let deferredPendingKeys = new Set<string>();
 let lastKnownRuntimesByAccount = new Map<AccountId, readonly Runtime[]>();
-let settingsInFlight: Promise<SessionSettingsSummary> | null = null;
 let provisionStreamController: AbortController | null = null;
 let provisionReconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let provisionStreamSeq = 0;
@@ -138,7 +125,6 @@ function resetLocalState(): void {
   pendingStopAllCount = 0;
   deferredPendingKeys = new Set<string>();
   lastKnownRuntimesByAccount = new Map<AccountId, readonly Runtime[]>();
-  settingsInFlight = null;
   state = INITIAL_STATE;
   emit();
 }
@@ -476,64 +462,8 @@ export function refreshForwards(signal?: AbortSignal): Promise<ForwardView[]> {
   return forwardsStore.refresh(signal);
 }
 
-function extractSessionSettings(defaults?: {
-  readonly max_runtime?: number | null;
-  readonly max_concurrent_sessions?: number | null;
-}): SessionSettingsSummary {
-  const configuredRearm = defaults?.max_runtime;
-  const rearmDurationSecs =
-    typeof configuredRearm === "number" &&
-    Number.isFinite(configuredRearm) &&
-    configuredRearm > 0
-      ? Math.floor(configuredRearm)
-      : START_MAX_RUNTIME_SECS;
-  const configuredMaxConcurrent = defaults?.max_concurrent_sessions;
-  const maxConcurrentSessions =
-    typeof configuredMaxConcurrent === "number" &&
-    Number.isFinite(configuredMaxConcurrent) &&
-    configuredMaxConcurrent >= MIN_CONCURRENT_SESSIONS
-      ? Math.floor(configuredMaxConcurrent)
-      : CORE_DEFAULTS.max_concurrent_sessions;
-  return { rearmDurationSecs, maxConcurrentSessions };
-}
-
-export function applySessionDefaults(defaults?: {
-  readonly max_runtime?: number | null;
-  readonly max_concurrent_sessions?: number | null;
-}): SessionSettingsSummary {
-  const summary = extractSessionSettings(defaults);
-  if (
-    state.rearmDurationSecs !== summary.rearmDurationSecs ||
-    state.maxConcurrentSessions !== summary.maxConcurrentSessions
-  ) {
-    setState(summary);
-  }
-  return summary;
-}
-
 export function refreshRearmDuration(signal?: AbortSignal): Promise<SessionSettingsSummary> {
-  if (settingsInFlight) {
-    return attachAbortSignal(settingsInFlight, signal);
-  }
-  const gen = apiClient.getSessionGeneration();
-  const promise = fetchSettings()
-    .then((settings) => {
-      if (apiClient.getSessionGeneration() === gen) {
-        return applySessionDefaults(settings.defaults);
-      }
-      return extractSessionSettings(settings.defaults);
-    })
-    .catch(() => ({
-      rearmDurationSecs: state.rearmDurationSecs,
-      maxConcurrentSessions: state.maxConcurrentSessions,
-    }))
-    .finally(() => {
-      if (settingsInFlight === promise) {
-        settingsInFlight = null;
-      }
-    });
-  settingsInFlight = promise;
-  return attachAbortSignal(promise, signal);
+  return appDataStore.refreshSessionDefaults(signal);
 }
 
 /**

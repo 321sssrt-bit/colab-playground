@@ -5,6 +5,7 @@ import { ApiError, createApiClient } from "./api.ts";
 import {
   createAppDataStore,
   isAccountChangeBlocked,
+  isCliInstalledFromSnapshot,
   resolveEffectiveOverview,
 } from "./appCache.ts";
 import { createServerClock } from "./clock.ts";
@@ -13,11 +14,6 @@ import { createForwardsStore } from "./forwards.ts";
 import { i18nStore } from "./i18n.ts";
 import { createWebStore } from "./store.ts";
 import { createToastStore } from "./toast.ts";
-
-// Stop the module-level i18n singleton's cold-start retry loop in headless Node test runs.
-after(() => {
-  i18nStore.dispose();
-});
 import type {
   Account,
   AccountsApiResponse,
@@ -26,10 +22,16 @@ import type {
   PendingOperation,
   Runtime,
   SessionsListResponse,
+  SettingsView,
   Snapshot,
   TunnelInfo,
   UsageSnapshot,
 } from "./types.ts";
+
+// Stop the module-level i18n singleton's cold-start retry loop in headless Node test runs.
+after(() => {
+  i18nStore.dispose();
+});
 
 interface Deferred<T> {
   readonly promise: Promise<T>;
@@ -721,6 +723,29 @@ test("resolveEffectiveOverview overlays live Snapshot state without re-probing /
   const postInstall = resolveEffectiveOverview(preInstallOverview, signedInSnap);
   assert.equal(postInstall?.cli_installed, true);
   assert.equal(postInstall?.accounts?.active, "acct-1");
+
+  // CLI-post-launch errors (keyring_unavailable / auth_required) prove CLI is installed;
+  // transient or host errors (busy / cancelled / wsl_unavailable / not_installed) do NOT.
+  const keyringOnlySnap = makeSnapshot({
+    accounts: null,
+    runtimes: null,
+    accounts_error: "keyring_unavailable",
+  });
+  assert.equal(isCliInstalledFromSnapshot(keyringOnlySnap), true);
+  assert.equal(resolveEffectiveOverview(preInstallOverview, keyringOnlySnap)?.cli_installed, true);
+  assert.equal(
+    isCliInstalledFromSnapshot(makeSnapshot({ accounts: null, runtimes: null, accounts_error: "auth_required" })),
+    true,
+  );
+  for (const nonProofError of ["busy", "cancelled", "wsl_unavailable"] as const) {
+    const snap = makeSnapshot({ accounts: null, runtimes: null, accounts_error: nonProofError });
+    assert.equal(isCliInstalledFromSnapshot(snap), null);
+    assert.equal(resolveEffectiveOverview(preInstallOverview, snap)?.cli_installed, false);
+  }
+  assert.equal(
+    isCliInstalledFromSnapshot(makeSnapshot({ accounts: null, runtimes: null, accounts_error: "not_installed" })),
+    false,
+  );
 });
 
 test("forwardsStore re-hydrates when a new tunnel arrives during an in-flight GET /api/forwards", async (t) => {
@@ -897,4 +922,190 @@ test("appDataStore clears stale sessionsAccountErrors when live snapshot failure
   await flushAsync();
 
   assert.equal(appData.getState().sessionsAccountErrors, null);
+});
+
+test("ensureSessions checks lightweight /api/snapshot after Overview settles before SSE delivers runtimes", async (t) => {
+  const counts = new Map<string, number>();
+  const sse = createSseControl();
+  const client = createApiClient({
+    fetchImpl: async (input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const key = `${init?.method ?? "GET"} ${url}`;
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+      if (url === "/api/login") {
+        return jsonResponse({ token: "tok-post-ov", expires_in: 3600 });
+      }
+      if (url === "/api/events") {
+        return sse.response;
+      }
+      if (url === "/api/overview") {
+        return jsonResponse(makeOverview());
+      }
+      if (url === "/api/snapshot") {
+        return jsonResponse(
+          makeSnapshot({ version: 2, runtimes: { runtimes: [makeRuntime()], errors: [] } }),
+        );
+      }
+      throw new Error(`unexpected fetch: ${key}`);
+    },
+  });
+  const clock = createServerClock({
+    setIntervalFn: () => 0 as unknown as ReturnType<typeof setInterval>,
+    clearIntervalFn: () => {},
+  });
+  const store = createWebStore({ client, clock, ...noopTimers });
+  const toast = createToastStore(noopTimers);
+  const appData = createAppDataStore({ client, store, clock, toast, t: (k) => k });
+  t.after(() => {
+    appData.dispose();
+    store.dispose();
+    sse.close();
+    toast.dispose();
+    clock.dispose();
+  });
+
+  await store.signIn("secret-key");
+  // Overview finishes before SSE pushes any snapshot with runtimes.
+  await appData.ensureOverview();
+  assert.equal(store.getState().snapshot, null);
+
+  // Navigating to Sessions after Overview already settled pulls memory /api/snapshot, NOT heavy /api/sessions.
+  const result = await appData.ensureSessions();
+  assert.equal(result, null);
+  assert.equal(counts.get("GET /api/snapshot"), 1);
+  assert.equal(counts.get("GET /api/sessions") ?? 0, 0);
+});
+
+test("slow HTTP /api/sessions arriving after SSE recovery never resurrects stale account errors", async (t) => {
+  const sessionsDeferred = createDeferred<Response>();
+  const sse = createSseControl();
+  const recoveredSnap = makeSnapshot({
+    version: 5,
+    runtimes: { runtimes: [], errors: [] },
+  });
+  const client = createApiClient({
+    fetchImpl: async (input) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/api/login") {
+        return jsonResponse({ token: "tok-slow-sess", expires_in: 3600 });
+      }
+      if (url === "/api/events") {
+        return sse.response;
+      }
+      if (url === "/api/sessions") {
+        return sessionsDeferred.promise;
+      }
+      if (url === "/api/snapshot") {
+        return jsonResponse(recoveredSnap);
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    },
+  });
+  const clock = createServerClock({
+    setIntervalFn: () => 0 as unknown as ReturnType<typeof setInterval>,
+    clearIntervalFn: () => {},
+  });
+  const store = createWebStore({ client, clock, ...noopTimers });
+  const toast = createToastStore(noopTimers);
+  const appData = createAppDataStore({ client, store, clock, toast, t: (k) => k });
+  t.after(() => {
+    appData.dispose();
+    store.dispose();
+    sse.close();
+    toast.dispose();
+    clock.dispose();
+  });
+
+  await store.signIn("secret-key");
+  const refreshPromise = appData.refreshSessions();
+
+  // Recovery SSE snapshot arrives BEFORE the slow HTTP /api/sessions response finishes.
+  sse.sendFrame("snapshot", recoveredSnap, "5");
+  await flushAsync();
+
+  const staleHttpBody: SessionsListResponse = {
+    account_context: { revision: 3, active: "acct-1" },
+    sampled_at: 1_700_000_010,
+    runtimes: [],
+    errors: [
+      {
+        account: "acct-a",
+        error: {
+          kind: "timeout",
+          message_key: "err.timeout",
+          args: {},
+          hint_key: null,
+          action_key: null,
+          operation_id: null,
+        },
+      },
+    ],
+    guard: null,
+    guard_events: [],
+    guard_error: null,
+    ended: [],
+  };
+  sessionsDeferred.resolve(jsonResponse(staleHttpBody));
+  await refreshPromise;
+
+  // Authoritative snapshot already recovered -> stale HTTP error must not be written back.
+  assert.equal(appData.getState().sessionsAccountErrors, null);
+});
+
+test("appDataStore discards stale in-flight GET /api/settings after Settings saves new defaults", async (t) => {
+  const staleSettings = createDeferred<Response>();
+  const sse = createSseControl();
+  const client = createApiClient({
+    fetchImpl: async (input) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/api/login") {
+        return jsonResponse({ token: "tok-settings", expires_in: 3600 });
+      }
+      if (url === "/api/events") {
+        return sse.response;
+      }
+      if (url === "/api/settings") {
+        return staleSettings.promise;
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    },
+  });
+  const clock = createServerClock({
+    setIntervalFn: () => 0 as unknown as ReturnType<typeof setInterval>,
+    clearIntervalFn: () => {},
+  });
+  const store = createWebStore({ client, clock, ...noopTimers });
+  const toast = createToastStore(noopTimers);
+  const appData = createAppDataStore({ client, store, clock, toast, t: (k) => k });
+  t.after(() => {
+    appData.dispose();
+    store.dispose();
+    sse.close();
+    toast.dispose();
+    clock.dispose();
+  });
+
+  await store.signIn("secret-key");
+  const inFlight = appData.refreshSessionDefaults();
+
+  // User navigates to Settings and saves max_runtime = 7200s while Sessions' older fetch is still in flight.
+  appData.applySessionDefaults({ max_runtime: 7200, max_concurrent_sessions: 3 });
+  assert.equal(appData.getState().rearmDurationSecs, 7200);
+  assert.equal(appData.getState().maxConcurrentSessions, 3);
+
+  // Older GET /api/settings returns stale 3600s -> must be discarded.
+  const stalePayload: SettingsView = {
+    language: "system",
+    appearance: "system",
+    defaults: { max_runtime: 3600, max_concurrent_sessions: 1 },
+    config_dir: null,
+    load_status: "loaded",
+    corrupt_backup: null,
+    reset_defaults: [],
+  };
+  staleSettings.resolve(jsonResponse(stalePayload));
+  const resolved = await inFlight;
+  assert.equal(resolved.rearmDurationSecs, 7200);
+  assert.equal(appData.getState().rearmDurationSecs, 7200);
+  assert.equal(appData.getState().maxConcurrentSessions, 3);
 });

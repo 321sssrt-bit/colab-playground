@@ -20,7 +20,6 @@ import type {
   HardwareRate,
   RuntimeRef,
   SessionsListResponse,
-  SettingsView,
   UnixSecs,
   WatchdogInfo,
 } from "../../lib/types.ts";
@@ -227,12 +226,5 @@ export function openProvisionEventStream(
   return apiClient.openEventStream(`/api/sessions/${encodeURIComponent(String(id))}/events`, {
     ...options,
     body: {},
-  });
-}
-
-export function fetchSettings(signal?: AbortSignal): Promise<SettingsView> {
-  return apiClient.request<SettingsView>("/api/settings", {
-    method: "GET",
-    signal,
   });
 }

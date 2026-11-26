@@ -8,7 +8,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { AlertIcon, SessionsIcon } from "../components/Icons.tsx";
-import { appDataStore, useAppDataStore } from "../lib/appCache.ts";
+import {
+  appDataStore,
+  isCliInstalledFromSnapshot,
+  useAppDataStore,
+} from "../lib/appCache.ts";
 import { forwardsStore, selectRuntimeForwards, useForwardsStore } from "../lib/forwards.ts";
 import { webStore } from "../lib/store.ts";
 import type { GuardDecision, Runtime, Snapshot } from "../lib/types.ts";
@@ -86,14 +90,13 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
   const accountErrorsOverride = appData.sessionsAccountErrors;
 
   const accounts = snapshot?.accounts?.accounts ?? null;
+  const liveCli = isCliInstalledFromSnapshot(snapshot);
   const cliReady =
-    snapshot?.accounts_error === "not_installed"
-      ? false
-      : snapshot?.accounts !== null || snapshot?.runtimes !== null
-        ? true
-        : appData.overview !== null
-          ? appData.overview.cli_installed
-          : true;
+    liveCli !== null
+      ? liveCli
+      : appData.overview !== null
+        ? appData.overview.cli_installed
+        : true;
   const hasSavedAccounts = accounts === null ? true : accounts.length > 0;
   const environmentReady = snapshot !== null && cliReady && hasSavedAccounts;
 
@@ -305,10 +308,10 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
         mode,
         runtime,
         accountContext: { revision: ctx.revision, active: ctx.active },
-        defaultSeconds: localState.rearmDurationSecs,
+        defaultSeconds: appData.rearmDurationSecs,
       });
     },
-    [snapshot, localState.rearmDurationSecs],
+    [snapshot, appData.rearmDurationSecs],
   );
 
   const openForwardModal = useCallback(
@@ -624,7 +627,7 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
                                     forwardsState,
                                     snapshot,
                                   )}
-                                  rearmDurationSecs={localState.rearmDurationSecs}
+                                  rearmDurationSecs={appData.rearmDurationSecs}
                                   stopping={stoppingKeys.has(key)}
                                   autoStopBusy={autoStopBusyKeys.has(key)}
                                   locale={locale}
@@ -693,7 +696,7 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
       <NewSessionDialog
         request={newSessionDialog}
         snapshot={snapshot}
-        maxConcurrentSessions={localState.maxConcurrentSessions}
+        maxConcurrentSessions={appData.maxConcurrentSessions}
         activeProvisionOp={activeProvisionOp}
         trackedProvision={trackedProvision}
         locale={locale}
