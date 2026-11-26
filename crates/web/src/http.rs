@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize, de::IgnoredAny};
 use tokio::sync::watch;
 
 use crate::{
-    api::{self, WebSettings},
+    api::{self, WebSettings, WebUpdates},
     auth::{Auth, SESSION_LIFETIME, Session},
     i18n,
 };
@@ -219,6 +219,7 @@ pub(crate) struct StateData {
     key_changes: watch::Receiver<()>,
     pub(crate) web: WebState,
     pub(crate) settings: WebSettings,
+    pub(crate) updates: WebUpdates,
 }
 
 pub fn router(
@@ -228,11 +229,23 @@ pub fn router(
     web: WebState,
     settings: WebSettings,
 ) -> Router {
+    router_with_updates(auth, key_changes, origins, web, settings, WebUpdates::new())
+}
+
+pub(crate) fn router_with_updates(
+    auth: Auth,
+    key_changes: watch::Receiver<()>,
+    origins: Origins,
+    web: WebState,
+    settings: WebSettings,
+    updates: WebUpdates,
+) -> Router {
     let state = StateData {
         auth: Arc::new(auth),
         key_changes,
         web,
         settings,
+        updates,
     };
     let protected = Router::new()
         .route("/api/session", get(|| async { StatusCode::NO_CONTENT }))
