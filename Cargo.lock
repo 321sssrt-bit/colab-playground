@@ -1136,7 +1136,7 @@ dependencies = [
 
 [[package]]
 name = "colab-playground"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "colab-playground-core",
@@ -1158,7 +1158,7 @@ dependencies = [
 
 [[package]]
 name = "colab-playground-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "base64 0.22.1",
  "dirs 6.0.0",
@@ -1176,7 +1176,7 @@ dependencies = [
 
 [[package]]
 name = "colab-playground-shared"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "colab-playground-core",
  "dirs 6.0.0",
@@ -1188,7 +1188,7 @@ dependencies = [
 
 [[package]]
 name = "colab-playground-web"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "axum",
  "base64 0.22.1",

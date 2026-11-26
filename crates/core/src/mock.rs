@@ -55,6 +55,8 @@ pub struct MockFailures {
     /// `colab` is not installed (until `install_cli` succeeds).
     pub cli_missing: bool,
     pub install_fails: bool,
+    /// The install succeeds but puts `colab` in a folder outside `PATH`, so it stays missing.
+    pub install_off_path: bool,
     pub keyring_unavailable: bool,
     pub login: Option<MockLoginFailure>,
     /// Accelerators the accounts are not entitled to.
@@ -119,6 +121,7 @@ impl Default for MockFailures {
         MockFailures {
             cli_missing: false,
             install_fails: false,
+            install_off_path: false,
             keyring_unavailable: false,
             login: None,
             not_entitled: vec![],
@@ -581,8 +584,7 @@ impl World {
         let entry = self.usage.entry(id.clone()).or_default();
         match (fails, reading) {
             (false, Some(u)) => {
-                entry.record_success(u, now, &live);
-                entry.ownership_verified = live.is_empty() || verified;
+                entry.record_success(u, now, &live, verified);
                 if verified && let Some(name) = u.sole_session(&live) {
                     let reading = RateReading {
                         cu_per_hour: u.rate_cu_per_hour,
@@ -1103,6 +1105,9 @@ fn catalog() -> Vec<(&'static str, f64)> {
     ]
 }
 
+/// The bundled plugin whose worker's outputs a simulated run reports.
+const LLAMA_CPP: &str = "llama-cpp";
+
 fn mock_listing(repo: &str) -> GgufListing {
     let params = catalog()
         .into_iter()
@@ -1282,6 +1287,13 @@ impl Backend for MockBackend {
             stream: Stream::Stdout,
             text: "Installed 1 executable: colab".into(),
         });
+        if self.w().failures.install_off_path {
+            let _ = log.send(Line {
+                stream: Stream::Stderr,
+                text: "warning: `/home/demo/tools/bin` is not on your PATH.".into(),
+            });
+            return Ok(());
+        }
         let mut w = self.w();
         w.cli_installed = true;
         w.failures.cli_missing = false;
@@ -1918,35 +1930,39 @@ impl Backend for MockBackend {
             }
         }
         let mut outputs = serde_json::Map::new();
-        if let Some(crate::plugins::InputValue::Text(repo)) = resolved.values.get("repo") {
-            let listing = mock_listing(repo);
-            let input = FitInput {
-                vram_mib: vram.unwrap_or(16_384),
-                ctx: 0,
-                model_ctx: Some(131_072),
-                kv_bytes_per_token: Some(65_536),
-                mmproj_bytes: 0,
-                kv: None,
-            };
-            if let Ok(choice) = fit_auto(&listing, &input) {
-                outputs.insert("quant".into(), choice.quant.clone().into());
-                outputs.insert("n_ctx".into(), choice.ctx.into());
-                outputs.insert("kv".into(), choice.kv.as_str().into());
+        // A worker reports outputs of its own choosing, and the mock knows only the llama.cpp
+        // worker's, so any other plugin's run reports none.
+        if plugin.manifest.id == LLAMA_CPP {
+            if let Some(crate::plugins::InputValue::Text(repo)) = resolved.values.get("repo") {
+                let listing = mock_listing(repo);
+                let input = FitInput {
+                    vram_mib: vram.unwrap_or(16_384),
+                    ctx: 0,
+                    model_ctx: Some(131_072),
+                    kv_bytes_per_token: Some(65_536),
+                    mmproj_bytes: 0,
+                    kv: None,
+                };
+                if let Ok(choice) = fit_auto(&listing, &input) {
+                    outputs.insert("quant".into(), choice.quant.clone().into());
+                    outputs.insert("n_ctx".into(), choice.ctx.into());
+                    outputs.insert("kv".into(), choice.kv.as_str().into());
+                }
+                outputs.insert(
+                    "model_id".into(),
+                    repo.rsplit('/')
+                        .next()
+                        .unwrap_or(repo)
+                        .trim_end_matches("-GGUF")
+                        .to_ascii_lowercase()
+                        .into(),
+                );
             }
-            outputs.insert(
-                "model_id".into(),
-                repo.rsplit('/')
-                    .next()
-                    .unwrap_or(repo)
-                    .trim_end_matches("-GGUF")
-                    .to_ascii_lowercase()
-                    .into(),
-            );
+            if let Some(v) = vram {
+                outputs.insert("vram_total_mib".into(), v.into());
+            }
+            outputs.insert("tok_per_s".into(), 64.2.into());
         }
-        if let Some(v) = vram {
-            outputs.insert("vram_total_mib".into(), v.into());
-        }
-        outputs.insert("tok_per_s".into(), 64.2.into());
         let status = RunStatus {
             state: RunState::Ready,
             stage: stages.last().cloned(),
@@ -2471,6 +2487,105 @@ mod tests {
     }
 
     #[test]
+    fn a_session_left_alone_is_charged_what_the_account_burns() {
+        let (m, clock) = mock(MockScenario::single());
+        let start = |accelerator| {
+            let spec = ProvisionSpec {
+                accelerator,
+                min_vram_mib: None,
+                ..m.defaults().provision_spec(m.new_session_name(None))
+            };
+            let (tx, _rx) = mpsc::channel();
+            m.provision(spec, tx, &nc()).unwrap().name
+        };
+        let runtime = |name: &str| {
+            m.runtimes(&nc())
+                .unwrap()
+                .runtimes
+                .into_iter()
+                .find(|r| r.id.name.as_deref() == Some(name))
+                .unwrap()
+        };
+        let rate = |name: &str| runtime(name).estimated_rate_cu_per_hour.unwrap();
+        // An A100 and a T4 start between two readings, so they share the rise.
+        m.refresh_usage(&[], &nc()).unwrap();
+        let a100 = start(Accelerator::A100);
+        let t4 = start(Accelerator::T4);
+        m.refresh_usage(&[], &nc()).unwrap();
+        let shared = (mock_rate(Accelerator::A100) + mock_rate(Accelerator::T4)) / 2.0;
+        assert!((rate(&t4) - shared).abs() < 1e-9, "{}", rate(&t4));
+
+        m.stop_session(&runtime(&a100).id, StopOptions::default(), &nc())
+            .unwrap();
+        for _ in 0..4 {
+            m.refresh_usage(&[], &nc()).unwrap();
+            clock.advance(Duration::from_secs(30));
+        }
+        assert!((rate(&t4) - shared).abs() < 1e-9, "{}", rate(&t4));
+        m.refresh_usage(&[], &nc()).unwrap();
+        assert_eq!(rate(&t4), mock_rate(Accelerator::T4));
+    }
+
+    #[test]
+    fn a_session_beside_a_measured_one_is_charged_what_the_account_burns_beyond_it() {
+        let (m, clock) = mock(MockScenario::single());
+        let start = |accelerator| {
+            let spec = ProvisionSpec {
+                accelerator,
+                min_vram_mib: None,
+                ..m.defaults().provision_spec(m.new_session_name(None))
+            };
+            let (tx, _rx) = mpsc::channel();
+            m.provision(spec, tx, &nc()).unwrap().name
+        };
+        let runtime = |name: &str| {
+            m.runtimes(&nc())
+                .unwrap()
+                .runtimes
+                .into_iter()
+                .find(|r| r.id.name.as_deref() == Some(name))
+                .unwrap()
+        };
+        let rate = |name: &str| runtime(name).estimated_rate_cu_per_hour.unwrap();
+        let hold = || {
+            for _ in 0..4 {
+                m.refresh_usage(&[], &nc()).unwrap();
+                clock.advance(Duration::from_secs(30));
+            }
+            m.refresh_usage(&[], &nc()).unwrap();
+        };
+        // A T4 runs alone until it is measured.
+        m.refresh_usage(&[], &nc()).unwrap();
+        let t4 = start(Accelerator::T4);
+        hold();
+        // An A100 starts between the same two readings as a CPU in the
+        // browser, so its estimate holds the CPU's rate too.
+        let account = runtime(&t4).id.account;
+        let cpu = m.add_unmanaged_runtime(&account, Accelerator::None);
+        let a100 = start(Accelerator::A100);
+        m.refresh_usage(&[], &nc()).unwrap();
+        let both = mock_rate(Accelerator::A100) + mock_rate(Accelerator::None);
+        assert!((rate(&a100) - both).abs() < 1e-9, "{}", rate(&a100));
+
+        let browser = RuntimeRef {
+            account,
+            endpoint: cpu,
+            name: None,
+        };
+        m.stop_session(&browser, StopOptions::default(), &nc())
+            .unwrap();
+        for _ in 0..4 {
+            m.refresh_usage(&[], &nc()).unwrap();
+            clock.advance(Duration::from_secs(30));
+        }
+        assert!((rate(&a100) - both).abs() < 1e-9, "{}", rate(&a100));
+        m.refresh_usage(&[], &nc()).unwrap();
+        let a100_rate = mock_rate(Accelerator::A100);
+        assert!((rate(&a100) - a100_rate).abs() < 1e-9, "{}", rate(&a100));
+        assert_eq!(rate(&t4), mock_rate(Accelerator::T4));
+    }
+
+    #[test]
     fn provision_retries_to_80_gb_and_respects_the_session_cap() {
         let (m, _) = mock(MockScenario::single());
         let mut spec = m.defaults().provision_spec(m.new_session_name(None));
@@ -2656,6 +2771,31 @@ mod tests {
             assert!(told, "the retry is only reported once provisioning is over");
             assert_eq!(run.join().unwrap().unwrap().status.state, RunState::Ready);
         });
+    }
+
+    #[test]
+    fn a_run_of_another_plugin_reports_none_of_the_llama_cpp_outputs() {
+        let (m, _) = mock(MockScenario::single());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("plugin.toml"),
+            "api = 1\nid = \"images\"\nversion = \"0.1.0\"\n[name]\nen = \"Images\"\n\
+             [[inputs]]\nid = \"repo\"\ntype = \"text\"\n[inputs.label]\nen = \"Repository\"\n\
+             [run]\nscript = \"main.py\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("main.py"), "print('hi')\n").unwrap();
+        let preview = m.inspect_plugin_folder(dir.path()).unwrap();
+        m.install_plugin(&preview).unwrap();
+        let mut spec = m.plugin_run_template("images").unwrap();
+        spec.inputs.insert(
+            "repo".into(),
+            crate::plugins::InputValue::Text("someone/model".into()),
+        );
+        let (tx, _rx) = mpsc::channel();
+        let out = m.run_plugin(spec, tx, &nc()).unwrap();
+        assert_eq!(out.status.state, RunState::Ready);
+        assert!(out.status.outputs.is_empty(), "{:?}", out.status.outputs);
     }
 
     #[test]
