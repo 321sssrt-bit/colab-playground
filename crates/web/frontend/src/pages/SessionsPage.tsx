@@ -46,8 +46,8 @@ import {
 import {
   claimProvisionHandled,
   clearEndedRuntimes,
-  ensureRearmDuration,
   observeSnapshotTransitions,
+  refreshRearmDuration,
   trackProvision,
   useSessionsLocalState,
 } from "./sessions/store.ts";
@@ -87,15 +87,19 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
 
   const accounts = snapshot?.accounts?.accounts ?? null;
   const cliReady =
-    appData.overview !== null
-      ? appData.overview.cli_installed
-      : snapshot?.accounts_error !== "not_installed";
+    snapshot?.accounts_error === "not_installed"
+      ? false
+      : snapshot?.accounts !== null || snapshot?.runtimes !== null
+        ? true
+        : appData.overview !== null
+          ? appData.overview.cli_installed
+          : true;
   const hasSavedAccounts = accounts === null ? true : accounts.length > 0;
   const environmentReady = snapshot !== null && cliReady && hasSavedAccounts;
 
   useEffect(() => {
     const controller = new AbortController();
-    void ensureRearmDuration(controller.signal).catch(() => {});
+    void refreshRearmDuration(controller.signal).catch(() => {});
     return () => {
       controller.abort();
     };

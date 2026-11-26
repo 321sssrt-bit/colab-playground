@@ -17,6 +17,7 @@ import { webStore, type WebStore } from "./store.ts";
 import { toastStore, type ToastStore } from "./toast.ts";
 import type {
   Account,
+  AccountError,
   AccountFailureResponse,
   AccountsApiResponse,
   OverviewResponse,
@@ -40,10 +41,27 @@ const ACCOUNT_CHANGE_BLOCKING_DOMAIN_OPS: ReadonlySet<string> = new Set([
 
 /**
  * Returns true when an account mutation (`switch_account`, `adopt_account`,
- * `remove_account`, or `begin_login`) would collide with an active OAuth prompt
- * or any `Slot::Shared` / `Slot::Exclusive` backend job.
+ * `remove_account`, or `begin_login`) would collide with an active OAuth prompt,
+ * any `Slot::Shared` / `Slot::Exclusive` backend job published in `snapshot.operations`,
+ * or a client-initiated `Slot::Shared` / `Slot::Exclusive` request currently in flight
+ * in `appDataStore` (such as usage refresh, overview probe, or sessions list).
  */
-export function isAccountChangeBlocked(snapshot: Snapshot | null): boolean {
+export function isAccountChangeBlocked(
+  snapshot: Snapshot | null,
+  appData?: Pick<
+    AppDataState,
+    "overviewLoading" | "sessionsRefreshing" | "refreshingUsage" | "adopting"
+  > | null,
+): boolean {
+  if (
+    appData &&
+    (appData.overviewLoading ||
+      appData.sessionsRefreshing ||
+      appData.refreshingUsage ||
+      appData.adopting)
+  ) {
+    return true;
+  }
   if (snapshot === null) {
     return false;
   }
@@ -62,6 +80,25 @@ export function isAccountChangeBlocked(snapshot: Snapshot | null): boolean {
   });
 }
 
+function accountErrorsMatch(
+  override: readonly AccountFailureResponse[],
+  snapshotErrors: readonly AccountError[],
+): boolean {
+  if (override.length !== snapshotErrors.length) {
+    return false;
+  }
+  const byAccount = new Map<string, string>();
+  for (const item of override) {
+    byAccount.set(item.account, item.error.kind);
+  }
+  for (const item of snapshotErrors) {
+    if (byAccount.get(item.account) !== item.error.kind) {
+      return false;
+    }
+  }
+  return true;
+}
+
 /**
  * Overlays live SSE `Snapshot` account, usage, measured-rate, and keyring state
  * onto the cached `OverviewResponse` so Overview converges after sign-in,
@@ -75,14 +112,16 @@ export function resolveEffectiveOverview(
   if (overview === null || snapshot === null) {
     return overview;
   }
-  const hasLiveAccountsState = snapshot.accounts !== null || snapshot.accounts_error !== null;
-  if (!hasLiveAccountsState) {
+  const hasLiveState =
+    snapshot.accounts !== null || snapshot.accounts_error !== null || snapshot.runtimes !== null;
+  if (!hasLiveState) {
     return overview;
   }
 
   const cliInstalled =
-    overview.cli_installed ||
-    (snapshot.accounts !== null && snapshot.accounts_error !== "not_installed");
+    snapshot.accounts_error === "not_installed"
+      ? false
+      : overview.cli_installed || snapshot.accounts !== null || snapshot.runtimes !== null;
   const keyring =
     snapshot.accounts_error === "keyring_unavailable"
       ? {
@@ -100,7 +139,8 @@ export function resolveEffectiveOverview(
     ...overview,
     cli_installed: cliInstalled,
     keyring,
-    accounts: snapshot.accounts,
+    accounts:
+      snapshot.accounts_error !== null ? snapshot.accounts : (snapshot.accounts ?? overview.accounts),
     accounts_error: snapshot.accounts_error,
     usage: snapshot.usage,
     measured_rates: snapshot.measured_rates ?? overview.measured_rates,
@@ -256,7 +296,7 @@ export function createAppDataStore(options: AppDataStoreOptions = {}): AppDataSt
     const clearSessionsErrors =
       state.sessionsAccountErrors !== null &&
       snapshot.runtimes !== null &&
-      snapshot.runtimes.errors.length === 0;
+      !accountErrorsMatch(state.sessionsAccountErrors, snapshot.runtimes.errors);
     const clearAdoptError =
       state.adoptError !== null && snapshot.accounts !== null && !snapshot.accounts.unadopted;
     if (clearSessionsErrors || clearAdoptError) {
@@ -334,7 +374,7 @@ export function createAppDataStore(options: AppDataStoreOptions = {}): AppDataSt
           setState({
             sessionsRefreshing: false,
             sessionsError: null,
-            sessionsAccountErrors: response.errors,
+            sessionsAccountErrors: response.errors.length > 0 ? response.errors : null,
           });
           void store.refreshSnapshot().catch(() => {});
         }
@@ -489,9 +529,37 @@ export function createAppDataStore(options: AppDataStoreOptions = {}): AppDataSt
     },
 
     async ensureSessions(signal?: AbortSignal): Promise<SessionsListResponse | null> {
+      const generation = client.getSessionGeneration();
       const snapshot = store.getState().snapshot;
       if (snapshot !== null && snapshot.runtimes !== null) {
         return null;
+      }
+      if (overviewInFlight !== null && overviewInFlight.generation === generation) {
+        try {
+          await attachAbortSignal(overviewInFlight.promise, signal);
+        } catch (error: unknown) {
+          if (error instanceof ApiError && error.isAbort) {
+            throw error;
+          }
+          // Fall through to inspect the live snapshot if the overview probe failed.
+        }
+        if (disposed || client.getSessionGeneration() !== generation) {
+          return null;
+        }
+        const afterOverview = store.getState().snapshot;
+        if (afterOverview !== null && afterOverview.runtimes !== null) {
+          return null;
+        }
+        try {
+          const fresh = await store.refreshSnapshot(signal);
+          if (fresh.runtimes !== null) {
+            return null;
+          }
+        } catch (error: unknown) {
+          if (error instanceof ApiError && error.isAbort) {
+            throw error;
+          }
+        }
       }
       return refreshSessions(signal);
     },

@@ -241,6 +241,10 @@ test("serverClock stays accurate under +2h browser wall-clock skew and preserves
   browserWallMs += 36_000_000;
   assert.equal(clock.getNowSecs(), serverEpoch + 300);
 
+  // Delayed HTTP sampled_at older than current projected server time does not pull clock backwards.
+  assert.equal(clock.sync(serverEpoch + 10), false);
+  assert.equal(clock.getNowSecs(), serverEpoch + 300);
+
   // Usage sample at serverEpoch: fresh at 300s, old at 301s, never overwrites failure flag.
   const sample: UsageSnapshot = {
     balance_cu: 50,
@@ -335,20 +339,28 @@ test("appDataStore deduplicates initial Overview, caches across route switches, 
 
   await store.signIn("secret-key");
 
-  // Simulate double mount + simultaneous Accounts/Overview callers during first login.
+  // Simulate double mount + simultaneous Accounts/Overview callers during first login,
+  // plus switching to Sessions while Overview probe is still in flight (snapshot.runtimes === null).
   const abort1 = new AbortController();
   const p1 = appData.ensureOverview(abort1.signal);
   const p2 = appData.ensureOverview();
+  const pendingSessions = appData.ensureSessions();
   abort1.abort();
   await assert.rejects(p1, (err: unknown) => err instanceof ApiError && err.isAbort);
 
-  // Underlying probe survived caller-1 abort and only fired once.
+  // Underlying probe survived caller-1 abort and only fired once; Sessions waited instead of firing GET /api/sessions.
   assert.equal(counts.get("GET /api/overview"), 1);
+  assert.equal(counts.get("GET /api/sessions") ?? 0, 0);
 
   overviewDeferred.resolve(jsonResponse(makeOverview({ sampled_at: 1_700_000_010 })));
   const overview = await p2;
   assert.equal(overview.cli_installed, true);
   assert.equal(clock.getNowSecs(), 1_700_000_010);
+
+  // ensureSessions resolved via lightweight snapshot check without issuing GET /api/sessions.
+  const awaitedSessions = await pendingSessions;
+  assert.equal(awaitedSessions, null);
+  assert.equal(counts.get("GET /api/sessions") ?? 0, 0);
 
   // Navigating back to Overview / Accounts / opening ForwardDialog hits cache with zero network calls.
   const cached = await appData.ensureOverview();
@@ -368,9 +380,10 @@ test("appDataStore deduplicates initial Overview, caches across route switches, 
   assert.equal(skipped, null);
   assert.equal(counts.get("GET /api/sessions") ?? 0, 0);
 
-  // Concurrent refreshSnapshot calls deduplicate to one GET /api/snapshot.
+  // Concurrent refreshSnapshot calls deduplicate to one GET /api/snapshot (1 earlier from ensureSessions + 1 here = 2).
+  const snapshotBefore = counts.get("GET /api/snapshot") ?? 0;
   await Promise.all([store.refreshSnapshot(), store.refreshSnapshot()]);
-  assert.equal(counts.get("GET /api/snapshot"), 1);
+  assert.equal(counts.get("GET /api/snapshot"), snapshotBefore + 1);
 });
 
 test("forwardsStore keeps SSE forward state and health synchronized while away from Sessions", async (t) => {
@@ -623,6 +636,44 @@ test("isAccountChangeBlocked covers all Slot::Exclusive conflicts and allows Slo
       `expected ${JSON.stringify(op.operation)} not to block account changes`,
     );
   }
+
+  // In-flight client Slot::Shared / Slot::Exclusive requests in appDataStore also block account writes.
+  assert.equal(
+    isAccountChangeBlocked(makeSnapshot(), {
+      overviewLoading: false,
+      sessionsRefreshing: false,
+      refreshingUsage: true,
+      adopting: false,
+    }),
+    true,
+  );
+  assert.equal(
+    isAccountChangeBlocked(makeSnapshot(), {
+      overviewLoading: true,
+      sessionsRefreshing: false,
+      refreshingUsage: false,
+      adopting: false,
+    }),
+    true,
+  );
+  assert.equal(
+    isAccountChangeBlocked(makeSnapshot(), {
+      overviewLoading: false,
+      sessionsRefreshing: true,
+      refreshingUsage: false,
+      adopting: false,
+    }),
+    true,
+  );
+  assert.equal(
+    isAccountChangeBlocked(makeSnapshot(), {
+      overviewLoading: false,
+      sessionsRefreshing: false,
+      refreshingUsage: false,
+      adopting: false,
+    }),
+    false,
+  );
 });
 
 test("resolveEffectiveOverview overlays live Snapshot state without re-probing /api/overview", () => {
@@ -638,8 +689,8 @@ test("resolveEffectiveOverview overlays live Snapshot state without re-probing /
     keyring: { status: "unknown", hint_key: null },
   });
 
-  // Cold-start snapshot with accounts=null and accounts_error=null does not clobber cached overview.
-  const coldSnap = makeSnapshot({ accounts: null, accounts_error: null });
+  // Cold-start snapshot with accounts=null, accounts_error=null, and runtimes=null does not clobber cached overview.
+  const coldSnap = makeSnapshot({ accounts: null, accounts_error: null, runtimes: null });
   assert.equal(resolveEffectiveOverview(initialOverview, coldSnap), initialOverview);
 
   // Live snapshot after sign-in immediately updates accounts, usage, measured_rates, and keyring=ready.
@@ -664,4 +715,186 @@ test("resolveEffectiveOverview overlays live Snapshot state without re-probing /
   const locked = resolveEffectiveOverview(initialOverview, keyringErrSnap);
   assert.equal(locked?.keyring.status, "unavailable");
   assert.equal(locked?.accounts_error, "keyring_unavailable");
+
+  // Cached cli_installed=false from before another browser installed CLI is overridden by live snapshot.
+  const preInstallOverview = makeOverview({ cli_installed: false, accounts: null });
+  const postInstall = resolveEffectiveOverview(preInstallOverview, signedInSnap);
+  assert.equal(postInstall?.cli_installed, true);
+  assert.equal(postInstall?.accounts?.active, "acct-1");
+});
+
+test("forwardsStore re-hydrates when a new tunnel arrives during an in-flight GET /api/forwards", async (t) => {
+  const firstFetch = createDeferred<Response>();
+  let forwardsCalls = 0;
+  const sse = createSseControl();
+  const t1 = makeTunnel({ id: 101 });
+  const t2 = makeTunnel({ id: 102, spec: { ...makeTunnel().spec, local_port: 8001, remote_port: 8001 } });
+  const view1: ForwardView = {
+    ...t1,
+    addresses: {
+      open_url: "http://127.0.0.1:8000",
+      copy_url: "http://127.0.0.1:8000",
+      openai_base_url: null,
+      notice_key: null,
+      warning_key: null,
+    },
+  };
+  const view2: ForwardView = {
+    ...t2,
+    addresses: {
+      open_url: "http://127.0.0.1:8001",
+      copy_url: "http://127.0.0.1:8001",
+      openai_base_url: null,
+      notice_key: null,
+      warning_key: null,
+    },
+  };
+
+  const client = createApiClient({
+    fetchImpl: async (input) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/api/login") {
+        return jsonResponse({ token: "tok-rehydrate", expires_in: 3600 });
+      }
+      if (url === "/api/events") {
+        return sse.response;
+      }
+      if (url === "/api/forwards") {
+        forwardsCalls += 1;
+        return forwardsCalls === 1 ? firstFetch.promise : jsonResponse([view1, view2]);
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    },
+  });
+  const clock = createServerClock({
+    setIntervalFn: () => 0 as unknown as ReturnType<typeof setInterval>,
+    clearIntervalFn: () => {},
+  });
+  const store = createWebStore({ client, clock, ...noopTimers });
+  const forwards = createForwardsStore({ client, store });
+  t.after(() => {
+    forwards.dispose();
+    store.dispose();
+    sse.close();
+    clock.dispose();
+  });
+
+  await store.signIn("secret-key");
+
+  // Snapshot #1 triggers first GET /api/forwards (held in flight).
+  sse.sendFrame("snapshot", makeSnapshot({ version: 1, tunnels: [t1] }), "1");
+  await flushAsync();
+  assert.equal(forwardsCalls, 1);
+
+  // Snapshot #2 introduces tunnel #102 while first GET /api/forwards is still in flight.
+  sse.sendFrame("snapshot", makeSnapshot({ version: 2, tunnels: [t1, t2] }), "2");
+  await flushAsync();
+  assert.equal(forwardsCalls, 1);
+
+  // Completing first fetch (which only knew about #101) triggers follow-up hydration for #102.
+  firstFetch.resolve(jsonResponse([view1]));
+  await flushAsync();
+
+  assert.equal(forwardsCalls, 2);
+  assert.equal(forwards.getState().addressesById[101]?.open_url, "http://127.0.0.1:8000");
+  assert.equal(forwards.getState().addressesById[102]?.open_url, "http://127.0.0.1:8001");
+});
+
+test("appDataStore clears stale sessionsAccountErrors when live snapshot failure set changes", async (t) => {
+  const sse = createSseControl();
+  const client = createApiClient({
+    fetchImpl: async (input) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/api/login") {
+        return jsonResponse({ token: "tok-err", expires_in: 3600 });
+      }
+      if (url === "/api/events") {
+        return sse.response;
+      }
+      if (url === "/api/sessions") {
+        const body: SessionsListResponse = {
+          account_context: { revision: 3, active: "acct-1" },
+          sampled_at: 1_700_000_060,
+          runtimes: [],
+          errors: [
+            {
+              account: "acct-a",
+              error: {
+                kind: "timeout",
+                message_key: "err.timeout",
+                args: {},
+                hint_key: null,
+                action_key: null,
+                operation_id: null,
+              },
+            },
+          ],
+          guard: null,
+          guard_events: [],
+          guard_error: null,
+          ended: [],
+        };
+        return jsonResponse(body);
+      }
+      if (url === "/api/snapshot") {
+        return jsonResponse(
+          makeSnapshot({
+            version: 2,
+            runtimes: {
+              runtimes: [],
+              errors: [
+                {
+                  account: "acct-a",
+                  error: { kind: "timeout", params: {}, detail: "", next_step: "try_again" },
+                },
+              ],
+            },
+          }),
+        );
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    },
+  });
+  const clock = createServerClock({
+    setIntervalFn: () => 0 as unknown as ReturnType<typeof setInterval>,
+    clearIntervalFn: () => {},
+  });
+  const store = createWebStore({ client, clock, ...noopTimers });
+  const toast = createToastStore(noopTimers);
+  const appData = createAppDataStore({ client, store, clock, toast, t: (k) => k });
+  t.after(() => {
+    appData.dispose();
+    store.dispose();
+    sse.close();
+    toast.dispose();
+    clock.dispose();
+  });
+
+  await store.signIn("secret-key");
+  await appData.refreshSessions();
+  await flushAsync();
+
+  // Matching snapshot preserves the detailed HTTP error override for acct-a.
+  assert.equal(appData.getState().sessionsAccountErrors?.[0]?.account, "acct-a");
+
+  // Later background poll recovers acct-a and fails on acct-b -> stale override must clear.
+  sse.sendFrame(
+    "snapshot",
+    makeSnapshot({
+      version: 3,
+      runtimes: {
+        runtimes: [],
+        errors: [
+          {
+            account: "acct-b",
+            error: { kind: "io", params: {}, detail: "", next_step: "check_network" },
+          },
+        ],
+      },
+    }),
+    "3",
+  );
+  await flushAsync();
+
+  assert.equal(appData.getState().sessionsAccountErrors, null);
 });

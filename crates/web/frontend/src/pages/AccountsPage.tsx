@@ -114,7 +114,7 @@ export function AccountsPage({
     [diagnostics, snapshot],
   );
 
-  const accountChangeBlocked = isAccountChangeBlocked(snapshot);
+  const accountChangeBlocked = isAccountChangeBlocked(snapshot, appData);
   const shuttingDown = snapshot?.shutting_down === true;
   const canAdd = gate.kind === "ready" && !accountChangeBlocked && !shuttingDown;
   const addDisabledTitle =

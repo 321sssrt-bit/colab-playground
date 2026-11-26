@@ -11,6 +11,7 @@ import { useI18n } from "../lib/i18n.ts";
 import { preferenceSync } from "../lib/preferences.ts";
 import { useTheme } from "../lib/theme.ts";
 import type { AppearancePref, LanguagePref } from "../lib/types.ts";
+import { applySessionDefaults } from "./sessions/store.ts";
 import { AboutSection } from "./settings/AboutSection.tsx";
 import {
   fetchSettings,
@@ -175,6 +176,7 @@ export function SettingsPage({ snapshot, t, pushToast }: PageProps) {
           return false;
         }
         setSettings(updated);
+        applySessionDefaults(updated.defaults);
         setSavedNotice(true);
         pushToast({ tone: "success", body: t("web.settings.saved") });
         return true;

@@ -119,6 +119,7 @@ export function createForwardsStore(options: ForwardsStoreOptions = {}): Forward
   let state: ForwardsStoreState = INITIAL_STATE;
   let disposed = false;
   let mutationSeq = 0;
+  let hydratePending = false;
   let pendingRecordedIds = new Set<number>();
   let tunnelSignatures = new Map<number, string>();
   let inFlight: {
@@ -163,6 +164,7 @@ export function createForwardsStore(options: ForwardsStoreOptions = {}): Forward
   const reset = (): void => {
     cancelInFlight();
     mutationSeq += 1;
+    hydratePending = false;
     pendingRecordedIds = new Set<number>();
     tunnelSignatures = new Map<number, string>();
     setState(INITIAL_STATE);
@@ -199,6 +201,10 @@ export function createForwardsStore(options: ForwardsStoreOptions = {}): Forward
       .finally(() => {
         if (inFlight?.promise === promise) {
           inFlight = null;
+          if (!disposed && hydratePending && client.getSessionGeneration() === generation) {
+            hydratePending = false;
+            void refresh().catch(() => {});
+          }
         }
       });
     inFlight = { generation, seq, controller, promise };
@@ -259,7 +265,11 @@ export function createForwardsStore(options: ForwardsStoreOptions = {}): Forward
     }
 
     if (needsHydrate) {
-      void refresh().catch(() => {});
+      if (inFlight !== null && inFlight.generation === client.getSessionGeneration()) {
+        hydratePending = true;
+      } else {
+        void refresh().catch(() => {});
+      }
     }
   };
 

@@ -8,7 +8,7 @@
 
 import { useSyncExternalStore } from "react";
 
-import { apiClient, ApiError } from "../../lib/api.ts";
+import { apiClient, ApiError, attachAbortSignal } from "../../lib/api.ts";
 import {
   CORE_DEFAULTS,
   MIN_CONCURRENT_SESSIONS,
@@ -95,7 +95,6 @@ let pendingUserStopCounts = new Map<string, number>();
 let pendingStopAllCount = 0;
 let deferredPendingKeys = new Set<string>();
 let lastKnownRuntimesByAccount = new Map<AccountId, readonly Runtime[]>();
-let settingsLoaded = false;
 let settingsInFlight: Promise<SessionSettingsSummary> | null = null;
 let provisionStreamController: AbortController | null = null;
 let provisionReconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -139,7 +138,6 @@ function resetLocalState(): void {
   pendingStopAllCount = 0;
   deferredPendingKeys = new Set<string>();
   lastKnownRuntimesByAccount = new Map<AccountId, readonly Runtime[]>();
-  settingsLoaded = false;
   settingsInFlight = null;
   state = INITIAL_STATE;
   emit();
@@ -478,47 +476,52 @@ export function refreshForwards(signal?: AbortSignal): Promise<ForwardView[]> {
   return forwardsStore.refresh(signal);
 }
 
-export function ensureRearmDuration(signal?: AbortSignal): Promise<SessionSettingsSummary> {
-  if (settingsLoaded) {
-    return Promise.resolve({
-      rearmDurationSecs: state.rearmDurationSecs,
-      maxConcurrentSessions: state.maxConcurrentSessions,
-    });
+function extractSessionSettings(defaults?: {
+  readonly max_runtime?: number | null;
+  readonly max_concurrent_sessions?: number | null;
+}): SessionSettingsSummary {
+  const configuredRearm = defaults?.max_runtime;
+  const rearmDurationSecs =
+    typeof configuredRearm === "number" &&
+    Number.isFinite(configuredRearm) &&
+    configuredRearm > 0
+      ? Math.floor(configuredRearm)
+      : START_MAX_RUNTIME_SECS;
+  const configuredMaxConcurrent = defaults?.max_concurrent_sessions;
+  const maxConcurrentSessions =
+    typeof configuredMaxConcurrent === "number" &&
+    Number.isFinite(configuredMaxConcurrent) &&
+    configuredMaxConcurrent >= MIN_CONCURRENT_SESSIONS
+      ? Math.floor(configuredMaxConcurrent)
+      : CORE_DEFAULTS.max_concurrent_sessions;
+  return { rearmDurationSecs, maxConcurrentSessions };
+}
+
+export function applySessionDefaults(defaults?: {
+  readonly max_runtime?: number | null;
+  readonly max_concurrent_sessions?: number | null;
+}): SessionSettingsSummary {
+  const summary = extractSessionSettings(defaults);
+  if (
+    state.rearmDurationSecs !== summary.rearmDurationSecs ||
+    state.maxConcurrentSessions !== summary.maxConcurrentSessions
+  ) {
+    setState(summary);
   }
-  return refreshRearmDuration(signal);
+  return summary;
 }
 
 export function refreshRearmDuration(signal?: AbortSignal): Promise<SessionSettingsSummary> {
   if (settingsInFlight) {
-    return settingsInFlight;
+    return attachAbortSignal(settingsInFlight, signal);
   }
   const gen = apiClient.getSessionGeneration();
-  const promise = fetchSettings(signal)
+  const promise = fetchSettings()
     .then((settings) => {
-      const configuredRearm = settings.defaults?.max_runtime;
-      const rearmDurationSecs =
-        typeof configuredRearm === "number" &&
-        Number.isFinite(configuredRearm) &&
-        configuredRearm > 0
-          ? Math.floor(configuredRearm)
-          : START_MAX_RUNTIME_SECS;
-      const configuredMaxConcurrent = settings.defaults?.max_concurrent_sessions;
-      const maxConcurrentSessions =
-        typeof configuredMaxConcurrent === "number" &&
-        Number.isFinite(configuredMaxConcurrent) &&
-        configuredMaxConcurrent >= MIN_CONCURRENT_SESSIONS
-          ? Math.floor(configuredMaxConcurrent)
-          : CORE_DEFAULTS.max_concurrent_sessions;
       if (apiClient.getSessionGeneration() === gen) {
-        settingsLoaded = true;
-        if (
-          state.rearmDurationSecs !== rearmDurationSecs ||
-          state.maxConcurrentSessions !== maxConcurrentSessions
-        ) {
-          setState({ rearmDurationSecs, maxConcurrentSessions });
-        }
+        return applySessionDefaults(settings.defaults);
       }
-      return { rearmDurationSecs, maxConcurrentSessions };
+      return extractSessionSettings(settings.defaults);
     })
     .catch(() => ({
       rearmDurationSecs: state.rearmDurationSecs,
@@ -530,7 +533,7 @@ export function refreshRearmDuration(signal?: AbortSignal): Promise<SessionSetti
       }
     });
   settingsInFlight = promise;
-  return promise;
+  return attachAbortSignal(promise, signal);
 }
 
 /**

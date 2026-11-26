@@ -138,11 +138,11 @@ export function createServerClock(options: ServerClockOptions = {}): ServerClock
         return false;
       }
       const normalized = Math.floor(serverSecs);
-      if (!syncOptions?.authoritative && anchor !== null && normalized < anchor.serverSecs) {
+      const prevSecs = computeNowSecs();
+      if (!syncOptions?.authoritative && anchor !== null && normalized <= prevSecs) {
         return false;
       }
       const wasAnchored = anchor !== null;
-      const prevSecs = computeNowSecs();
       anchor = {
         serverSecs: normalized,
         monotonicMs: monotonicNow(),

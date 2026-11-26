@@ -148,7 +148,7 @@ export function OverviewPage({ snapshot, locale, t, navigate, pushToast }: PageP
   );
   const ready = checklist.complete && overview !== null;
   const snapshotVersion = snapshot?.version ?? -1;
-  const accountChangeBlocked = isAccountChangeBlocked(snapshot);
+  const accountChangeBlocked = isAccountChangeBlocked(snapshot, appData);
   const shuttingDown = snapshot?.shutting_down === true;
 
   // Reload plugins when entering ready state and whenever the monotonic snapshot version
