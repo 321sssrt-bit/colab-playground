@@ -40,10 +40,15 @@ impl WebState {
     }
 
     pub(super) fn refresh_overview(&self, backend: &dyn Backend, cancel: &CancelToken) {
-        let _ = self.refresh_all(backend, cancel);
+        let _ = self.refresh_all(backend, cancel, false);
     }
 
-    pub(super) fn refresh_all(&self, backend: &dyn Backend, cancel: &CancelToken) -> Result<()> {
+    pub(super) fn refresh_all(
+        &self,
+        backend: &dyn Backend,
+        cancel: &CancelToken,
+        require_runtimes: bool,
+    ) -> Result<()> {
         // An importable keyring module does not tell us whether the keyring is unlocked.
         let accounts = backend.accounts(cancel);
         match accounts {
@@ -59,42 +64,33 @@ impl WebState {
             Err(error) => {
                 let kind = error.kind;
                 self.record_accounts(Err(error.clone()));
-                if matches!(
-                    kind,
-                    ErrorKind::NotInstalled | ErrorKind::KeyringUnavailable
-                ) {
+                if is_environment_blocked(kind) {
                     self.record_runtimes(Err(Error::new(kind)));
                 }
                 return Err(error);
             }
         }
 
-        let need_initial_runtimes = {
-            let snapshot = self.0.snapshots.borrow();
-            snapshot.runtimes.is_none() || snapshot.runtimes_error.is_some()
-        };
-        let list_first = need_initial_runtimes || !self.has_managed_runtimes();
-        let mut runtimes_result = if list_first {
-            let view = backend.runtimes(cancel);
-            self.record_runtimes(view.clone());
-            Some(view)
-        } else {
-            None
-        };
-
-        let guard_changed = self.sync_usage_and_guard(backend, true, cancel);
-
-        if !list_first || guard_changed {
-            let view = backend.runtimes(cancel);
-            self.record_runtimes(view.clone());
-            runtimes_result = Some(view);
-        }
+        // Run the guard round before listing runtimes so `runtimes()` cannot consume vanished
+        // ledger entries ahead of `guard_poll()`.
+        let _ = self.sync_usage_and_guard(backend, true, cancel);
+        let runtimes = backend.runtimes(cancel);
+        self.record_runtimes(runtimes.clone());
         self.sync_forwards();
-        runtimes_result.transpose().map(|_| ())
+        if require_runtimes {
+            runtimes?;
+        }
+        Ok(())
     }
 
     pub(super) fn has_managed_runtimes(&self) -> bool {
         let snapshot = self.0.snapshots.borrow();
+        if snapshot.pending_managed_check {
+            return snapshot
+                .accounts
+                .as_ref()
+                .is_some_and(|view| !view.accounts.is_empty());
+        }
         match (&snapshot.runtimes, snapshot.runtimes_error) {
             (Some(view), None) => view.runtimes.iter().any(|runtime| runtime.managed),
             _ => snapshot
@@ -167,7 +163,10 @@ impl WebState {
     }
 
     pub(super) fn refresh_usage_after_stop(&self, backend: &dyn Backend, cancel: &CancelToken) {
-        self.refresh_usage_only(backend, true, None, cancel);
+        if self.sync_usage_and_guard(backend, true, cancel) {
+            self.record_runtimes(backend.runtimes(cancel));
+            self.sync_forwards();
+        }
     }
 
     fn refresh_usage_only(
@@ -309,19 +308,16 @@ impl WebState {
             changed |= snapshot.accounts_error.take().is_some();
             changed |= snapshot.runtimes.take().is_some();
             changed |= snapshot.runtimes_error.take().is_some();
-            changed |= snapshot.guard.take().is_some();
             changed |= snapshot.guard_error.take().is_some();
-            changed |= !snapshot.guard_events.is_empty();
-            snapshot.guard_events.clear();
-            changed |= !snapshot.ended.is_empty();
-            snapshot.ended.clear();
-            snapshot.guard_state.clear();
+            // Keep unconsumed guard events and ended history until explicitly acknowledged.
+            changed |= snapshot.guard_state.clear_live();
             changed |= !snapshot.usage.is_empty();
             snapshot.usage.clear();
             if snapshot.measured_rates != measured_rates {
                 snapshot.measured_rates = measured_rates;
                 changed = true;
             }
+            changed |= snapshot.sync_guard_projection();
             changed
         });
     }
@@ -331,6 +327,7 @@ impl WebState {
             let (view, error) = match result {
                 Ok(view) => {
                     snapshot.cli_installed = Some(true);
+                    snapshot.pending_managed_check = false;
                     let _ = snapshot.guard_state.retain_live(&view.runtimes);
                     (Some(view), None)
                 }
@@ -350,6 +347,13 @@ impl WebState {
     }
 }
 
+fn is_environment_blocked(kind: ErrorKind) -> bool {
+    matches!(
+        kind,
+        ErrorKind::NotInstalled | ErrorKind::KeyringUnavailable | ErrorKind::WslUnavailable
+    )
+}
+
 fn poll_backend(job: &Job, refresh: bool) {
     let state = &job.state;
     let backend = &*state.0.backend;
@@ -359,27 +363,12 @@ fn poll_backend(job: &Job, refresh: bool) {
     if snapshot.cli_installed == Some(false) {
         return;
     }
-    if !refresh
-        && matches!(
-            snapshot.accounts_error,
-            Some(ErrorKind::NotInstalled | ErrorKind::KeyringUnavailable)
-        )
-    {
+    if !refresh && snapshot.accounts_error.is_some_and(is_environment_blocked) {
         return;
     }
 
     let cold_start = snapshot.accounts.is_none() && snapshot.accounts_error.is_none();
-    let due = if cold_start {
-        true
-    } else {
-        backend.usage_poll_due()
-    };
-    if !refresh && !cold_start && !due && snapshot.runtimes.is_some() {
-        state.check_usage_age();
-        return;
-    }
-
-    if refresh || cold_start || due {
+    if refresh || cold_start {
         match backend.accounts(cancel) {
             Ok(view) => {
                 let has_accounts = !view.accounts.is_empty();
@@ -393,10 +382,7 @@ fn poll_backend(job: &Job, refresh: bool) {
             Err(error) => {
                 let kind = error.kind;
                 state.record_accounts(Err(error));
-                if matches!(
-                    kind,
-                    ErrorKind::NotInstalled | ErrorKind::KeyringUnavailable
-                ) {
+                if is_environment_blocked(kind) {
                     state.record_runtimes(Err(Error::new(kind)));
                 }
                 return;
@@ -416,15 +402,23 @@ fn poll_backend(job: &Job, refresh: bool) {
         return;
     }
 
-    let need_initial_runtimes =
-        refresh || snapshot.runtimes.is_none() || snapshot.runtimes_error.is_some();
-    if need_initial_runtimes {
+    let due = backend.usage_poll_due();
+    if !refresh && !cold_start && !due && snapshot.runtimes.is_some() {
+        state.check_usage_age();
+        return;
+    }
+
+    // Only on the initial cold start (before any runtime listing exists) list first so a
+    // zero-session startup skips `guard_poll()`. Later polls and refreshes run the guard
+    // round before listing so `runtimes()` cannot consume vanished sessions ahead of it.
+    let initial_probe = cold_start && snapshot.runtimes.is_none();
+    if initial_probe {
         state.record_runtimes(backend.runtimes(cancel));
     }
 
     let guard_changed = state.sync_usage_and_guard(backend, refresh, cancel);
 
-    if !need_initial_runtimes || guard_changed {
+    if !initial_probe || guard_changed {
         state.record_runtimes(backend.runtimes(cancel));
     }
     state.sync_forwards();

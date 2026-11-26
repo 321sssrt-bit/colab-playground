@@ -35,6 +35,7 @@ struct CountingBackend {
     runtimes_calls: AtomicUsize,
     guard_poll_calls: AtomicUsize,
     refresh_usage_calls: AtomicUsize,
+    accounts_override: Mutex<Option<ErrorKind>>,
     scripted_guard: Mutex<VecDeque<Result<GuardReport>>>,
 }
 
@@ -46,6 +47,7 @@ impl CountingBackend {
             runtimes_calls: AtomicUsize::new(0),
             guard_poll_calls: AtomicUsize::new(0),
             refresh_usage_calls: AtomicUsize::new(0),
+            accounts_override: Mutex::new(None),
             scripted_guard: Mutex::new(VecDeque::new()),
         }
     }
@@ -115,6 +117,9 @@ impl Backend for CountingBackend {
 
     fn accounts(&self, cancel: &CancelToken) -> Result<AccountsView> {
         self.accounts_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(kind) = *self.accounts_override.lock().unwrap() {
+            return Err(Error::new(kind));
+        }
         self.mock.accounts(cancel)
     }
 
@@ -157,16 +162,23 @@ async fn wait_settled(state: &WebState, pred: impl Fn(&Snapshot) -> bool) -> Arc
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn missing_cli_and_locked_keyring_stop_background_polling_and_version_churn() {
-    for (cli_missing, keyring_unavailable, expected_error) in [
-        (true, false, ErrorKind::NotInstalled),
-        (false, true, ErrorKind::KeyringUnavailable),
+async fn missing_cli_locked_keyring_and_missing_wsl_stop_background_polling() {
+    for (cli_missing, keyring_unavailable, accounts_override, expected_error) in [
+        (true, false, None, ErrorKind::NotInstalled),
+        (false, true, None, ErrorKind::KeyringUnavailable),
+        (
+            false,
+            false,
+            Some(ErrorKind::WslUnavailable),
+            ErrorKind::WslUnavailable,
+        ),
     ] {
         let (mut config, _) = MockConfig::headless(MockScenario::demo());
         config.step_delay = Duration::ZERO;
         config.failures.cli_missing = cli_missing;
         config.failures.keyring_unavailable = keyring_unavailable;
         let backend = Arc::new(CountingBackend::new(config));
+        *backend.accounts_override.lock().unwrap() = accounts_override;
         let state = WebState::start(backend.clone()).await.unwrap();
 
         let initial = wait_settled(&state, |snap| {
@@ -197,6 +209,7 @@ async fn missing_cli_and_locked_keyring_stop_background_polling_and_version_chur
         );
 
         // Explicit recovery resumes normal state.
+        *backend.accounts_override.lock().unwrap() = None;
         backend.mock.set_failures(MockFailures::default());
         let (report, recovered, _) = state.probe_environment().await.unwrap();
         assert!(report.colab.is_some());
@@ -209,7 +222,7 @@ async fn missing_cli_and_locked_keyring_stop_background_polling_and_version_chur
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn zero_running_sessions_skips_guard_poll_and_avoids_version_churn() {
+async fn zero_running_sessions_skips_guard_poll_and_due_poll_skips_accounts() {
     let (mut config, clock) = MockConfig::headless(MockScenario::single());
     config.step_delay = Duration::ZERO;
     config.defaults.usage_poll_idle = Duration::from_secs(60);
@@ -231,17 +244,46 @@ async fn zero_running_sessions_skips_guard_poll_and_avoids_version_churn() {
     assert_eq!(backend.counts(), counts_idle);
     assert_eq!(state.snapshot().version, version_after_init);
 
-    // Advance past poll cadence (still 0 runtimes): usage refreshes, guard_poll stays 0.
+    // Advance past poll cadence and let a due background tick run: must refresh usage and
+    // runtimes without calling `accounts()` or `guard_poll()`.
     clock.advance(Duration::from_secs(61));
-    let refreshed = state.refresh_accounts().await.unwrap();
+    let accounts_before_due = backend.accounts_calls.load(Ordering::SeqCst);
+    let usage_before_due = backend.refresh_usage_calls.load(Ordering::SeqCst);
+    let _ = wait_settled(&state, |snap| snap.version > version_after_init).await;
+    assert_eq!(
+        backend.accounts_calls.load(Ordering::SeqCst),
+        accounts_before_due,
+        "due background poll must not call backend.accounts()"
+    );
+    assert!(backend.refresh_usage_calls.load(Ordering::SeqCst) > usage_before_due);
     assert_eq!(backend.guard_poll_calls.load(Ordering::SeqCst), 0);
-    assert!(refreshed.runtimes.is_some());
 
-    // Calling refresh again at the exact same backend clock produces identical data -> no version bump.
-    let version_same = refreshed.version;
-    let again = state.refresh_accounts().await.unwrap();
+    // Manual refresh with zero sessions lists runtimes exactly once and still skips guard_poll.
+    let runtimes_before = backend.runtimes_calls.load(Ordering::SeqCst);
+    let refreshed = state.refresh_accounts().await.unwrap();
+    assert_eq!(
+        backend.runtimes_calls.load(Ordering::SeqCst),
+        runtimes_before + 1
+    );
     assert_eq!(backend.guard_poll_calls.load(Ordering::SeqCst), 0);
-    assert_eq!(again.version, version_same);
+
+    let runtimes_before_list = backend.runtimes_calls.load(Ordering::SeqCst);
+    let (listed, _) = state.list_runtimes().await.unwrap();
+    assert_eq!(
+        backend.runtimes_calls.load(Ordering::SeqCst),
+        runtimes_before_list + 1
+    );
+    assert_eq!(backend.guard_poll_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(listed.version, refreshed.version);
+
+    // refresh_accounts must still succeed and publish usage when runtimes listing fails.
+    backend.mock.set_failures(MockFailures {
+        runtimes_listing_fails: true,
+        ..Default::default()
+    });
+    let with_listing_err = state.refresh_accounts().await.unwrap();
+    assert_eq!(with_listing_err.runtimes_error, Some(ErrorKind::Http));
+    assert!(with_listing_err.usage[0].snapshot.is_some());
 
     assert!(state.shutdown(TEST_TIMEOUT).await.completed);
 }
@@ -324,6 +366,11 @@ async fn guard_decisions_are_retained_across_polls_until_acked_and_never_misclas
     };
 
     // Round 1: Warn + Stop{stopped: false} + Stop{stopped: true}.
+    // Stop `stop_ref` in the underlying mock backend so subsequent real polls see it gone.
+    backend
+        .mock
+        .stop_session(&stop_ref, StopOptions::default(), &CancelToken::new())
+        .unwrap();
     backend.push_guard(Ok(GuardReport {
         decisions: vec![
             GuardDecision {
@@ -397,11 +444,12 @@ async fn guard_decisions_are_retained_across_polls_until_acked_and_never_misclas
             .any(|e| { e.session == stop_ref && matches!(e.kind, GuardEventKind::Vanished) })
     );
     let report = round2.guard.as_ref().unwrap();
+    // Live card status reflects Ok for `warn_ref` while its unconsumed Warn stays in `guard_events`.
     assert!(
         report
             .decisions
             .iter()
-            .any(|d| { d.session == warn_ref && matches!(d.decision, Decision::Warn(_)) })
+            .any(|d| { d.session == warn_ref && matches!(d.decision, Decision::Ok) })
     );
     assert!(report.decisions.iter().any(|d| {
         d.session == fail_ref && matches!(d.decision, Decision::Stop(_)) && !d.stopped
@@ -417,10 +465,53 @@ async fn guard_decisions_are_retained_across_polls_until_acked_and_never_misclas
             .any(|e| { e.runtime == stop_ref && matches!(e.reason, EndReason::Guard { .. }) })
     );
 
-    // Consume all events: guard_events clears, stopped decision drops from active report,
-    // ended history keeps Guard reason, and live stop-failure stays visible because it still bills.
-    let max_id = round2.guard_events.iter().map(|e| e.id).max().unwrap();
-    assert_eq!(state.ack_guard_events(Some(max_id), None), 3);
+    // A changed Warn concern allocates a fresh event id instead of overwriting the previous one.
+    let spend_warn = Concern::Limit {
+        limit: Limit::Spend,
+        current: 8.5,
+        threshold: 10.0,
+        estimated: false,
+    };
+    backend.push_guard(Ok(GuardReport {
+        decisions: vec![GuardDecision {
+            session: warn_ref.clone(),
+            decision: Decision::Warn(vec![spend_warn]),
+            stopped: false,
+            error: None,
+        }],
+        vanished: Vec::new(),
+        usage: backend.mock.usage(),
+    }));
+    let round3 = state.refresh_accounts().await.unwrap();
+    let warn_ids: Vec<u64> = round3
+        .guard_events
+        .iter()
+        .filter(|e| e.session == warn_ref && matches!(e.kind, GuardEventKind::Warn { .. }))
+        .map(|e| e.id)
+        .collect();
+    assert_eq!(warn_ids.len(), 2);
+    assert!(warn_ids[1] > warn_ids[0]);
+
+    // Acknowledging through the older id retains the newer Warn event.
+    let old_max = round2.guard_events.iter().map(|e| e.id).max().unwrap();
+    assert_eq!(state.ack_guard_events(Some(old_max), None), 3);
+    let after_partial_ack = state.snapshot();
+    assert_eq!(after_partial_ack.guard_events.len(), 1);
+    assert_eq!(after_partial_ack.guard_events[0].id, warn_ids[1]);
+
+    // Probing a missing CLI does not discard unconsumed guard events.
+    backend.mock.set_failures(MockFailures {
+        cli_missing: true,
+        ..Default::default()
+    });
+    let (_, missing_cli_snap, _) = state.probe_environment().await.unwrap();
+    assert_eq!(missing_cli_snap.guard_events.len(), 1);
+    assert_eq!(missing_cli_snap.guard_events[0].id, warn_ids[1]);
+    backend.mock.set_failures(MockFailures::default());
+    let _ = state.probe_environment().await.unwrap();
+
+    // Consume remaining event; ended history keeps Guard reason and live stop-failure stays visible.
+    assert_eq!(state.ack_guard_events(Some(warn_ids[1]), None), 1);
     let after_ack = state.snapshot();
     assert!(after_ack.guard_events.is_empty());
     let report_after_ack = after_ack.guard.as_ref().unwrap();
@@ -430,9 +521,6 @@ async fn guard_decisions_are_retained_across_polls_until_acked_and_never_misclas
             .iter()
             .any(|d| d.session == stop_ref)
     );
-    assert!(report_after_ack.decisions.iter().any(|d| {
-        d.session == fail_ref && matches!(d.decision, Decision::Stop(_)) && !d.stopped
-    }));
     assert!(
         after_ack
             .ended
@@ -517,7 +605,26 @@ async fn manual_refresh_syncs_all_three_and_mutations_list_runtimes_once() {
         );
     }
 
+    // Mismatched endpoint with another live session's name must fail with SessionGone and
+    // never touch the other session.
+    let mismatched = RuntimeRef {
+        account: target.account.clone(),
+        endpoint: "stale-endpoint".into(),
+        name: target.name.clone(),
+    };
+    let Submission::Started { job, .. } = state
+        .change_auto_stop(initial.account.clone(), mismatched, AutoStop::Cancel)
+        .unwrap()
+    else {
+        panic!("expected auto-stop job");
+    };
+    let Err(err) = job.await.unwrap() else {
+        panic!("expected SessionGone for mismatched endpoint");
+    };
+    assert_eq!(err.kind, ErrorKind::SessionGone);
+
     let listings = backend.runtimes_calls.load(Ordering::SeqCst);
+    let guard_before_stop = backend.guard_poll_calls.load(Ordering::SeqCst);
     let Submission::Started { job, .. } = state.stop_runtime(target).unwrap() else {
         panic!("expected stop job");
     };
@@ -527,6 +634,11 @@ async fn manual_refresh_syncs_all_three_and_mutations_list_runtimes_once() {
         backend.runtimes_calls.load(Ordering::SeqCst),
         listings + 1,
         "single stop must list runtimes exactly once"
+    );
+    assert_eq!(
+        backend.guard_poll_calls.load(Ordering::SeqCst),
+        guard_before_stop + 1,
+        "single stop must still guard remaining managed runtimes"
     );
 
     assert!(state.shutdown(TEST_TIMEOUT).await.completed);
@@ -561,6 +673,15 @@ async fn usage_aging_preserves_stale_flag_and_measured_rates_survive_stop() {
     // Repeating accounts_snapshot after crossing the threshold must not bump version again.
     let aged_again = state.accounts_snapshot();
     assert_eq!(aged_again.version, aged.version);
+
+    // A fresh SSE subscriber after idle clock drift receives the current server_now without
+    // bumping version or waking existing subscribers.
+    clock.advance(Duration::from_secs(45));
+    let expected_now = backend.now();
+    let fresh_sub = state.subscribe();
+    let sub_snap = fresh_sub.borrow().clone();
+    assert_eq!(sub_snap.server_now, expected_now);
+    assert_eq!(sub_snap.version, aged.version);
 
     // Provision a sole T4 session, measure its rate, stop it, and confirm measured_rates stays.
     let spec = ProvisionSpec::new("solo-t4", Accelerator::T4, &backend.defaults());

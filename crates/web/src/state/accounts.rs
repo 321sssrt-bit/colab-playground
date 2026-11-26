@@ -54,7 +54,7 @@ impl WebState {
         let state = self.clone();
         self.backend_job(Slot::Shared, move |backend, cancel| {
             let _poll = state.lock_poll_slot();
-            state.refresh_all(backend, cancel)?;
+            state.refresh_all(backend, cancel, false)?;
             Ok(state.snapshot())
         })
         .await

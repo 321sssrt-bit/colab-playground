@@ -109,6 +109,8 @@ pub struct Snapshot {
     usage_now: SystemTime,
     #[serde(skip)]
     cli_installed: Option<bool>,
+    #[serde(skip)]
+    pending_managed_check: bool,
     pub backend: BackendKind,
     pub account: AccountContext,
     pub accounts: Option<AccountsView>,
@@ -263,6 +265,9 @@ impl Job {
             control.login_job = None;
         }
         self.state.publish_operations(control);
+        if running.allocating {
+            self.state.mark_pending_managed_check();
+        }
         if running
             .operation
             .as_ref()
@@ -315,6 +320,7 @@ impl WebState {
             server_now: now,
             usage_now: now,
             cli_installed: None,
+            pending_managed_check: false,
             backend: kind,
             account: AccountContext {
                 revision: 0,
@@ -366,6 +372,15 @@ impl WebState {
     }
 
     pub fn subscribe(&self) -> watch::Receiver<Arc<Snapshot>> {
+        let now = self.0.backend.now();
+        // Refresh the clock in place without notifying existing subscribers or bumping version,
+        // so a newly connected SSE client's initial frame carries the current server clock.
+        self.0.snapshots.send_if_modified(|snapshot| {
+            if snapshot.server_now != now {
+                Arc::make_mut(snapshot).server_now = now;
+            }
+            false
+        });
         self.0.snapshots.subscribe()
     }
 
@@ -532,6 +547,16 @@ impl WebState {
             }
             Arc::make_mut(snapshot).cli_installed = Some(installed);
             // Internal polling gate does not serialize onto the wire.
+            false
+        });
+    }
+
+    fn mark_pending_managed_check(&self) {
+        self.0.snapshots.send_if_modified(|snapshot| {
+            if snapshot.pending_managed_check {
+                return false;
+            }
+            Arc::make_mut(snapshot).pending_managed_check = true;
             false
         });
     }

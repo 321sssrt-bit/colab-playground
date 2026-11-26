@@ -12,7 +12,6 @@ use super::*;
 
 const FINISHED_PROVISION_LIMIT: usize = 32;
 const ENDED_KEPT: usize = 20;
-const GUARD_EVENTS_KEPT: usize = 100;
 const STOP_ALL: &str = "stop_all_runtimes";
 
 pub(super) type Provisions = Mutex<BTreeMap<u64, watch::Sender<Vec<ProvisionUpdate>>>>;
@@ -68,13 +67,16 @@ pub(super) struct GuardLedger {
 }
 
 impl GuardLedger {
-    pub(super) fn clear(&mut self) {
+    pub(super) fn clear_live(&mut self) -> bool {
+        let changed = self.has_report
+            || !self.warnings.is_empty()
+            || !self.stop_failures.is_empty()
+            || !self.ok_sessions.is_empty();
         self.warnings.clear();
         self.stop_failures.clear();
-        self.events.clear();
-        self.ended.clear();
         self.has_report = false;
         self.ok_sessions.clear();
+        changed
     }
 
     pub(super) fn retain_live(&mut self, live: &[Runtime]) -> bool {
@@ -162,19 +164,22 @@ impl GuardLedger {
                     let limits_changed = previous
                         .as_ref()
                         .is_none_or(|before| !same_concern_kinds(before, &concerns));
-                    if let Some(entry) = self.events.iter_mut().find(|event| {
-                        same_runtime(&event.session, &target)
-                            && matches!(event.kind, GuardEventKind::Warn { .. })
-                    }) {
-                        if let GuardEventKind::Warn {
-                            concerns: existing_concerns,
-                        } = &mut entry.kind
-                            && existing_concerns != &concerns
+                    let latest_unconsumed = self.events.iter().rev().find_map(|event| {
+                        if same_runtime(&event.session, &target)
+                            && let GuardEventKind::Warn { concerns } = &event.kind
                         {
-                            *existing_concerns = concerns.clone();
-                            entry.at = now;
+                            Some(concerns)
+                        } else {
+                            None
                         }
-                    } else if limits_changed {
+                    });
+                    // Assign a new event id when concerns change instead of mutating an existing
+                    // unconsumed event in place, so acknowledging an older id cannot drop newer data.
+                    let should_emit = match latest_unconsumed {
+                        Some(existing) => !same_concern_kinds(existing, &concerns),
+                        None => limits_changed,
+                    };
+                    if should_emit {
                         self.push_event(
                             now,
                             target.clone(),
@@ -246,21 +251,25 @@ impl GuardLedger {
                                 error.clone(),
                             ));
                         }
-                        if let Some(entry) = self.events.iter_mut().find(|event| {
-                            same_runtime(&event.session, &target)
-                                && matches!(event.kind, GuardEventKind::StopFailed { .. })
-                        }) {
-                            if let GuardEventKind::StopFailed {
-                                concern: existing_concern,
-                                error: existing_error,
-                            } = &mut entry.kind
-                                && (existing_concern != &concern || existing_error != &error)
+                        let latest_unconsumed = self.events.iter().rev().find_map(|event| {
+                            if same_runtime(&event.session, &target)
+                                && let GuardEventKind::StopFailed {
+                                    concern: existing_concern,
+                                    error: existing_error,
+                                } = &event.kind
                             {
-                                *existing_concern = concern;
-                                *existing_error = error;
-                                entry.at = now;
+                                Some((existing_concern, existing_error))
+                            } else {
+                                None
                             }
-                        } else if first {
+                        });
+                        let should_emit = match latest_unconsumed {
+                            Some((existing_concern, existing_error)) => {
+                                existing_concern != &concern || existing_error != &error
+                            }
+                            None => first,
+                        };
+                        if should_emit {
                             self.push_event(
                                 now,
                                 target,
@@ -325,57 +334,16 @@ impl GuardLedger {
         let mut decisions = Vec::new();
         let mut vanished = Vec::new();
 
-        for event in &self.events {
-            match &event.kind {
-                GuardEventKind::Stopped { concern } => {
-                    decisions.push(GuardDecision {
-                        session: event.session.clone(),
-                        decision: Decision::Stop(concern.clone()),
-                        stopped: true,
-                        error: None,
-                    });
-                }
-                GuardEventKind::StopFailed { concern, error } => {
-                    decisions.push(GuardDecision {
-                        session: event.session.clone(),
-                        decision: Decision::Stop(concern.clone()),
-                        stopped: false,
-                        error: Some(error.clone()),
-                    });
-                }
-                GuardEventKind::Warn { concerns } => {
-                    if !decisions
-                        .iter()
-                        .any(|d| same_runtime(&d.session, &event.session))
-                    {
-                        decisions.push(GuardDecision {
-                            session: event.session.clone(),
-                            decision: Decision::Warn(concerns.clone()),
-                            stopped: false,
-                            error: None,
-                        });
-                    }
-                }
-                GuardEventKind::Vanished => {
-                    if !vanished
-                        .iter()
-                        .any(|existing| same_runtime(existing, &event.session))
-                    {
-                        vanished.push(event.session.clone());
-                    }
-                }
-            }
-        }
-
+        // Live card state comes strictly from active stop failures, active warnings, and Ok
+        // decisions, so clearing a warning (via Ok, Extend, or Cancel auto-stop) is reflected
+        // immediately while unconsumed historical events stay intact in `guard_events`.
         for (target, concern, error) in &self.stop_failures {
-            if !decisions.iter().any(|d| same_runtime(&d.session, target)) {
-                decisions.push(GuardDecision {
-                    session: target.clone(),
-                    decision: Decision::Stop(concern.clone()),
-                    stopped: false,
-                    error: Some(error.clone()),
-                });
-            }
+            decisions.push(GuardDecision {
+                session: target.clone(),
+                decision: Decision::Stop(concern.clone()),
+                stopped: false,
+                error: Some(error.clone()),
+            });
         }
         for (target, concerns) in &self.warnings {
             if !decisions.iter().any(|d| same_runtime(&d.session, target)) {
@@ -395,6 +363,35 @@ impl GuardLedger {
                     stopped: false,
                     error: None,
                 });
+            }
+        }
+
+        // Unconsumed terminal guard decisions stay in `guard` until acknowledged so follow-up
+        // polls never drop a guard stop or let it be misclassified as vanished.
+        for event in &self.events {
+            match &event.kind {
+                GuardEventKind::Stopped { concern } => {
+                    if !decisions
+                        .iter()
+                        .any(|d| same_runtime(&d.session, &event.session) && d.stopped)
+                    {
+                        decisions.push(GuardDecision {
+                            session: event.session.clone(),
+                            decision: Decision::Stop(concern.clone()),
+                            stopped: true,
+                            error: None,
+                        });
+                    }
+                }
+                GuardEventKind::Vanished => {
+                    if !vanished
+                        .iter()
+                        .any(|existing| same_runtime(existing, &event.session))
+                    {
+                        vanished.push(event.session.clone());
+                    }
+                }
+                GuardEventKind::Warn { .. } | GuardEventKind::StopFailed { .. } => {}
             }
         }
 
@@ -428,10 +425,6 @@ impl GuardLedger {
             email,
             kind,
         });
-        if self.events.len() > GUARD_EVENTS_KEPT {
-            let overflow = self.events.len() - GUARD_EVENTS_KEPT;
-            self.events.drain(..overflow);
-        }
     }
 
     fn record_ended(
@@ -492,6 +485,16 @@ fn same_runtime(a: &RuntimeRef, b: &RuntimeRef) -> bool {
     } else {
         a == b
     }
+}
+
+fn matches_request_target(listed: &RuntimeRef, requested: &RuntimeRef) -> bool {
+    listed.account == requested.account
+        && listed.endpoint == requested.endpoint
+        && (!requested.endpoint.is_empty() || listed.name == requested.name)
+        && requested
+            .name
+            .as_ref()
+            .is_none_or(|name| listed.name.as_ref() == Some(name))
 }
 
 fn lookup_runtime_meta(
@@ -595,7 +598,7 @@ impl WebState {
         let state = self.clone();
         self.backend_job(Slot::Shared, move |backend, cancel| {
             let _poll = state.lock_poll_slot();
-            state.refresh_all(backend, cancel)?;
+            state.refresh_all(backend, cancel, true)?;
             Ok((state.snapshot(), backend.now()))
         })
         .await
@@ -723,26 +726,21 @@ impl WebState {
             Access::Account(account),
             move |backend, cancel| {
                 let _poll = state.lock_poll_slot();
-                let resolved = match state.find_cached_runtime(&target) {
-                    Some(runtime) => {
-                        if !runtime.managed || runtime.id.name.is_none() {
-                            return Err(Error::invalid(
-                                "target",
-                                "auto-stop requires a named managed runtime",
-                            ));
-                        }
-                        runtime.id
-                    }
-                    None => {
-                        if target.name.is_none() {
-                            return Err(Error::invalid(
-                                "target",
-                                "auto-stop requires a named managed runtime",
-                            ));
-                        }
-                        target
-                    }
+                let runtime = match state.find_exact_cached_runtime(&target) {
+                    Some(runtime) => runtime,
+                    None => list_account(backend, cancel, &target.account)?
+                        .runtimes
+                        .into_iter()
+                        .find(|runtime| matches_request_target(&runtime.id, &target))
+                        .ok_or_else(|| Error::new(ErrorKind::SessionGone))?,
                 };
+                if !runtime.managed || runtime.id.name.is_none() {
+                    return Err(Error::invalid(
+                        "target",
+                        "auto-stop requires a named managed runtime",
+                    ));
+                }
+                let resolved = runtime.id;
                 cancel.commit()?;
                 let (runtime, watchdog) = match action {
                     AutoStop::Set(duration) => (
@@ -774,6 +772,17 @@ impl WebState {
             .runtimes
             .iter()
             .find(|runtime| same_runtime(&runtime.id, target))
+            .cloned()
+    }
+
+    fn find_exact_cached_runtime(&self, target: &RuntimeRef) -> Option<Runtime> {
+        let snapshot = self.0.snapshots.borrow();
+        snapshot
+            .runtimes
+            .as_ref()?
+            .runtimes
+            .iter()
+            .find(|runtime| matches_request_target(&runtime.id, target))
             .cloned()
     }
 
