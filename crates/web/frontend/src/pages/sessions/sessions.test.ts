@@ -409,6 +409,43 @@ describe("endedRuntimeRowKey", () => {
       ["beta", "alpha"],
     );
   });
+
+  it("keeps both newest empty-endpoint entries when the 20-entry cap is full", () => {
+    const older: EndedRuntime[] = Array.from({ length: 20 }, (_, i) => ({
+      runtime: { account: "acct-1", endpoint: `ep-${20 - i}`, name: `old-${20 - i}` },
+      label: `old-${20 - i}`,
+      email: "alice@example.com",
+      reason: { kind: "user" },
+      at: 1_700_000_020 - i,
+    }));
+    const alpha: EndedRuntime = {
+      runtime: { account: "acct-1", endpoint: "", name: "alpha" },
+      label: "alpha",
+      email: "alice@example.com",
+      reason: { kind: "user" },
+      at: 1_700_000_100,
+    };
+    const beta: EndedRuntime = {
+      runtime: { account: "acct-1", endpoint: "", name: "beta" },
+      label: "beta",
+      email: "alice@example.com",
+      reason: { kind: "user" },
+      at: 1_700_000_110,
+    };
+
+    const snapshotEnded = [beta, alpha, ...older.slice(0, 18)];
+    // guardStore collapses `alpha` and retains 19 older entries + `beta` (20 total).
+    const guardEnded = [beta, ...older.slice(0, 19)];
+
+    const merged = mergeEndedRuntimes(snapshotEnded, guardEnded, new Set());
+    assert.equal(merged.length, 20);
+    assert.equal(merged[0]?.runtime.name, "beta");
+    assert.equal(merged[1]?.runtime.name, "alpha");
+    assert.equal(
+      merged.some((item) => item.runtime.name === "old-2"),
+      false,
+    );
+  });
 });
 
 describe("createSessionsStore off-page provision tracking and serverClock timing", () => {

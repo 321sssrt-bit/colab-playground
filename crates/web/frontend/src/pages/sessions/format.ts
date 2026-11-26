@@ -167,38 +167,72 @@ export function endedRuntimeClearedSignature(item: EndedRuntime): string {
 /**
  * Merges authoritative `snapshot.ended` entries with local `guardStore.ended` entries
  * using `endedRuntimeIdentityKey` so records with empty `endpoint` and distinct `name`
- * survive intact even when upstream `guardRuntimeKey` collapses them.
+ * survive intact even when upstream `guardRuntimeKey` collapses them or the 20-entry cap
+ * is reached. Entries are ordered newest-first (fresh local stops with `at === null`
+ * ahead of timestamped entries, then descending `at`, preserving backend order on ties).
  */
 export function mergeEndedRuntimes(
   snapshotEnded: readonly EndedRuntime[] | null | undefined,
   guardEnded: readonly EndedRuntime[],
   clearedSignatures: ReadonlySet<string>,
 ): readonly EndedRuntime[] {
-  const merged: EndedRuntime[] = [];
-  const seen = new Set<string>();
-
-  const pushUnique = (item: EndedRuntime, checkCleared: boolean) => {
-    if (checkCleared && clearedSignatures.has(endedRuntimeClearedSignature(item))) {
-      return;
-    }
-    const key = endedRuntimeIdentityKey(item);
-    if (seen.has(key)) {
-      return;
-    }
-    seen.add(key);
-    merged.push(item);
-  };
-
-  for (const item of guardEnded) {
-    pushUnique(item, false);
+  interface RankedEnded {
+    readonly item: EndedRuntime;
+    readonly fromSnapshot: boolean;
+    readonly order: number;
   }
+
+  const ranked: RankedEnded[] = [];
+  const seen = new Set<string>();
+  let order = 0;
+
   if (snapshotEnded && snapshotEnded.length > 0) {
     for (const item of snapshotEnded) {
-      pushUnique(item, true);
+      if (clearedSignatures.has(endedRuntimeClearedSignature(item))) {
+        continue;
+      }
+      const key = endedRuntimeIdentityKey(item);
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      ranked.push({ item, fromSnapshot: true, order: order++ });
     }
   }
 
-  return merged.slice(0, ENDED_DISPLAY_LIMIT);
+  for (const item of guardEnded) {
+    const key = endedRuntimeIdentityKey(item);
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    ranked.push({ item, fromSnapshot: false, order: order++ });
+  }
+
+  ranked.sort((a, b) => {
+    const aLocalPending = !a.fromSnapshot && a.item.at === null;
+    const bLocalPending = !b.fromSnapshot && b.item.at === null;
+    if (aLocalPending !== bLocalPending) {
+      return aLocalPending ? -1 : 1;
+    }
+    const aAt = a.item.at;
+    const bAt = b.item.at;
+    if (aAt !== null && bAt !== null && aAt !== bAt) {
+      return bAt - aAt;
+    }
+    if (aAt !== null && bAt === null) {
+      return -1;
+    }
+    if (aAt === null && bAt !== null) {
+      return 1;
+    }
+    if (a.fromSnapshot !== b.fromSnapshot) {
+      return a.fromSnapshot ? -1 : 1;
+    }
+    return a.order - b.order;
+  });
+
+  return ranked.slice(0, ENDED_DISPLAY_LIMIT).map((entry) => entry.item);
 }
 
 /**
