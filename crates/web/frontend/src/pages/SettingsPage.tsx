@@ -7,6 +7,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { AlertIcon } from "../components/Icons.tsx";
+import { apiClient } from "../lib/api.ts";
 import { appDataStore, useAppDataStore } from "../lib/appCache.ts";
 import { useI18n } from "../lib/i18n.ts";
 import { preferenceSync, usePreferenceSync } from "../lib/preferences.ts";
@@ -89,6 +90,7 @@ export function SettingsPage({
   const [savingCheckUpdates, setSavingCheckUpdates] = useState(false);
   const [checkUpdatesError, setCheckUpdatesError] = useState<unknown>(null);
 
+  const mountedRef = useRef(true);
   const mutationSeqRef = useRef(0);
   const loadAbortRef = useRef<AbortController | null>(null);
   const defaultsAbortRef = useRef<AbortController | null>(null);
@@ -135,15 +137,14 @@ export function SettingsPage({
   }, []);
 
   useEffect(() => {
+    mountedRef.current = true;
     loadSettings();
     const updatesController = new AbortController();
     void updatesStore.ensureChecked(updatesController.signal);
     return () => {
+      mountedRef.current = false;
       updatesController.abort();
       loadAbortRef.current?.abort();
-      defaultsAbortRef.current?.abort();
-      hostAbortRef.current?.abort();
-      checkUpdatesAbortRef.current?.abort();
       updateCheckAbortRef.current?.abort();
     };
   }, [loadSettings]);
@@ -191,6 +192,7 @@ export function SettingsPage({
       defaultsAbortRef.current?.abort();
       const controller = new AbortController();
       defaultsAbortRef.current = controller;
+      const gen = apiClient.getSessionGeneration();
       mutationSeqRef.current += 1;
 
       setSavingDefaults(true);
@@ -199,25 +201,33 @@ export function SettingsPage({
 
       try {
         const updated = await patchDefaults(patch, controller.signal);
-        if (controller.signal.aborted) {
+        if (controller.signal.aborted || apiClient.getSessionGeneration() !== gen) {
           return false;
         }
-        mutationSeqRef.current += 1;
-        setSettings((prev) =>
-          prev === null
-            ? updated
-            : { ...mergeMetadata(prev, updated), defaults: updated.defaults },
-        );
         settingsDraftStore.reconcileSavedDefaults(updated.defaults, patch);
         appDataStore.applySessionDefaults(updated.defaults);
-        setSavedNotice(true);
         pushToast({ tone: "success", body: t("web.settings.saved") });
+        if (mountedRef.current) {
+          mutationSeqRef.current += 1;
+          setSettings((prev) =>
+            prev === null
+              ? updated
+              : { ...mergeMetadata(prev, updated), defaults: updated.defaults },
+          );
+          setSavedNotice(true);
+        }
         return true;
       } catch (error: unknown) {
-        if (controller.signal.aborted || isAbortError(error)) {
+        if (
+          controller.signal.aborted ||
+          isAbortError(error) ||
+          apiClient.getSessionGeneration() !== gen
+        ) {
           return false;
         }
-        setSaveError(error);
+        if (mountedRef.current) {
+          setSaveError(error);
+        }
         pushToast({
           tone: "danger",
           title: t("app.toast.save_failed.title"),
@@ -228,7 +238,7 @@ export function SettingsPage({
         if (defaultsAbortRef.current === controller) {
           defaultsAbortRef.current = null;
         }
-        if (!controller.signal.aborted) {
+        if (!controller.signal.aborted && mountedRef.current) {
           setSavingDefaults(false);
         }
       }
@@ -241,6 +251,7 @@ export function SettingsPage({
       defaultsAbortRef.current?.abort();
       const controller = new AbortController();
       defaultsAbortRef.current = controller;
+      const gen = apiClient.getSessionGeneration();
       mutationSeqRef.current += 1;
 
       setSavingLimit(true);
@@ -249,25 +260,33 @@ export function SettingsPage({
 
       try {
         const updated = await patchDefaults({ max_concurrent_sessions: limit }, controller.signal);
-        if (controller.signal.aborted) {
+        if (controller.signal.aborted || apiClient.getSessionGeneration() !== gen) {
           return false;
         }
-        mutationSeqRef.current += 1;
-        setSettings((prev) =>
-          prev === null
-            ? updated
-            : { ...mergeMetadata(prev, updated), defaults: updated.defaults },
-        );
         settingsDraftStore.reconcileSavedConcurrentLimit(updated.defaults);
         appDataStore.applySessionDefaults(updated.defaults);
-        setLimitSavedNotice(true);
         pushToast({ tone: "success", body: t("web.settings.saved") });
+        if (mountedRef.current) {
+          mutationSeqRef.current += 1;
+          setSettings((prev) =>
+            prev === null
+              ? updated
+              : { ...mergeMetadata(prev, updated), defaults: updated.defaults },
+          );
+          setLimitSavedNotice(true);
+        }
         return true;
       } catch (error: unknown) {
-        if (controller.signal.aborted || isAbortError(error)) {
+        if (
+          controller.signal.aborted ||
+          isAbortError(error) ||
+          apiClient.getSessionGeneration() !== gen
+        ) {
           return false;
         }
-        setLimitSaveError(error);
+        if (mountedRef.current) {
+          setLimitSaveError(error);
+        }
         pushToast({
           tone: "danger",
           title: t("app.toast.save_failed.title"),
@@ -278,7 +297,7 @@ export function SettingsPage({
         if (defaultsAbortRef.current === controller) {
           defaultsAbortRef.current = null;
         }
-        if (!controller.signal.aborted) {
+        if (!controller.signal.aborted && mountedRef.current) {
           setSavingLimit(false);
         }
       }
@@ -312,6 +331,7 @@ export function SettingsPage({
       hostAbortRef.current?.abort();
       const controller = new AbortController();
       hostAbortRef.current = controller;
+      const gen = apiClient.getSessionGeneration();
       mutationSeqRef.current += 1;
 
       setSavingHost(true);
@@ -320,27 +340,35 @@ export function SettingsPage({
 
       void patchHostSettings({ wsl_distro: distro }, controller.signal)
         .then((updated) => {
-          if (controller.signal.aborted) {
+          if (controller.signal.aborted || apiClient.getSessionGeneration() !== gen) {
             return;
           }
-          mutationSeqRef.current += 1;
-          setSettings((prev) =>
-            prev === null
-              ? updated
-              : { ...mergeMetadata(prev, updated), wslDistro: updated.wslDistro },
-          );
-          setHostSavedNotice(true);
           pushToast({ tone: "success", body: t("web.settings.saved") });
           if (snapshot?.backend === "real") {
             void appDataStore.refreshOverview().catch(() => {});
           }
+          if (mountedRef.current) {
+            mutationSeqRef.current += 1;
+            setSettings((prev) =>
+              prev === null
+                ? updated
+                : { ...mergeMetadata(prev, updated), wslDistro: updated.wslDistro },
+            );
+            setHostSavedNotice(true);
+          }
         })
         .catch((error: unknown) => {
-          if (controller.signal.aborted || isAbortError(error)) {
+          if (
+            controller.signal.aborted ||
+            isAbortError(error) ||
+            apiClient.getSessionGeneration() !== gen
+          ) {
             return;
           }
           const message = formatSettingsError(error, t);
-          setHostError({ message, interpreterAlone: false });
+          if (mountedRef.current) {
+            setHostError({ message, interpreterAlone: false });
+          }
           pushToast({
             tone: "danger",
             title: t("app.toast.save_failed.title"),
@@ -351,7 +379,7 @@ export function SettingsPage({
           if (hostAbortRef.current === controller) {
             hostAbortRef.current = null;
           }
-          if (!controller.signal.aborted) {
+          if (!controller.signal.aborted && mountedRef.current) {
             setSavingHost(false);
           }
         });
@@ -375,6 +403,7 @@ export function SettingsPage({
       hostAbortRef.current?.abort();
       const controller = new AbortController();
       hostAbortRef.current = controller;
+      const gen = apiClient.getSessionGeneration();
       mutationSeqRef.current += 1;
 
       setSavingHost(true);
@@ -386,33 +415,41 @@ export function SettingsPage({
           { colab_path: nextColab, colab_python: nextPython },
           controller.signal,
         );
-        if (controller.signal.aborted) {
+        if (controller.signal.aborted || apiClient.getSessionGeneration() !== gen) {
           return false;
         }
-        mutationSeqRef.current += 1;
-        setSettings((prev) =>
-          prev === null
-            ? updated
-            : {
-                ...mergeMetadata(prev, updated),
-                colabPath: updated.colabPath,
-                colabPython: updated.colabPython,
-              },
-        );
         settingsDraftStore.clearHostDraft();
-        setHostSavedNotice(true);
         pushToast({ tone: "success", body: t("web.settings.saved") });
         if (snapshot?.backend === "real") {
           void appDataStore.refreshOverview().catch(() => {});
         }
+        if (mountedRef.current) {
+          mutationSeqRef.current += 1;
+          setSettings((prev) =>
+            prev === null
+              ? updated
+              : {
+                  ...mergeMetadata(prev, updated),
+                  colabPath: updated.colabPath,
+                  colabPython: updated.colabPython,
+                },
+          );
+          setHostSavedNotice(true);
+        }
         return true;
       } catch (error: unknown) {
-        if (controller.signal.aborted || isAbortError(error)) {
+        if (
+          controller.signal.aborted ||
+          isAbortError(error) ||
+          apiClient.getSessionGeneration() !== gen
+        ) {
           return false;
         }
         const interpreterAlone = isHostInterpreterAloneError(error);
         const message = formatSettingsError(error, t);
-        setHostError({ message, interpreterAlone });
+        if (mountedRef.current) {
+          setHostError({ message, interpreterAlone });
+        }
         if (interpreterAlone) {
           pushToast({ tone: "warning", body: message });
         } else {
@@ -427,7 +464,7 @@ export function SettingsPage({
         if (hostAbortRef.current === controller) {
           hostAbortRef.current = null;
         }
-        if (!controller.signal.aborted) {
+        if (!controller.signal.aborted && mountedRef.current) {
           setSavingHost(false);
         }
       }
@@ -476,6 +513,7 @@ export function SettingsPage({
       checkUpdatesAbortRef.current?.abort();
       const controller = new AbortController();
       checkUpdatesAbortRef.current = controller;
+      const gen = apiClient.getSessionGeneration();
       mutationSeqRef.current += 1;
 
       setSavingCheckUpdates(true);
@@ -483,22 +521,30 @@ export function SettingsPage({
 
       void patchCheckUpdates(enabled, controller.signal)
         .then((updated) => {
-          if (controller.signal.aborted) {
+          if (controller.signal.aborted || apiClient.getSessionGeneration() !== gen) {
             return;
           }
-          mutationSeqRef.current += 1;
-          setSettings((prev) =>
-            prev === null
-              ? updated
-              : { ...mergeMetadata(prev, updated), checkUpdates: updated.checkUpdates },
-          );
           updatesStore.setCheckUpdates(updated.checkUpdates);
+          if (mountedRef.current) {
+            mutationSeqRef.current += 1;
+            setSettings((prev) =>
+              prev === null
+                ? updated
+                : { ...mergeMetadata(prev, updated), checkUpdates: updated.checkUpdates },
+            );
+          }
         })
         .catch((error: unknown) => {
-          if (controller.signal.aborted || isAbortError(error)) {
+          if (
+            controller.signal.aborted ||
+            isAbortError(error) ||
+            apiClient.getSessionGeneration() !== gen
+          ) {
             return;
           }
-          setCheckUpdatesError(error);
+          if (mountedRef.current) {
+            setCheckUpdatesError(error);
+          }
           pushToast({
             tone: "danger",
             title: t("app.toast.save_failed.title"),
@@ -509,7 +555,7 @@ export function SettingsPage({
           if (checkUpdatesAbortRef.current === controller) {
             checkUpdatesAbortRef.current = null;
           }
-          if (!controller.signal.aborted) {
+          if (!controller.signal.aborted && mountedRef.current) {
             setSavingCheckUpdates(false);
           }
         });

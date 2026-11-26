@@ -1439,6 +1439,23 @@ test("settingsDraftStore persists unsaved drafts across route changes, reconcile
   assert.equal(afterMerge.draft.max_concurrent_sessions, "4");
   assert.equal(afterMerge.draft.max_attempts, "7");
 
+  // Navigating away before a LimitFocusCard response returns (so reconcile did not run) still
+  // preserves unsaved edits on other fields via three-way merge when returning with updated server state.
+  const withUnsavedAttemptsAndLimit = {
+    ...afterMerge.draft,
+    max_attempts: "9",
+    max_concurrent_sessions: "6",
+  };
+  drafts.saveDefaultsDraft(
+    serverAfterLimit,
+    withUnsavedAttemptsAndLimit,
+    afterMerge.forceInclude,
+  );
+  const serverAfterOffPageLimitSave = { ...serverAfterLimit, max_concurrent_sessions: 6 };
+  const afterReturn = drafts.resolveDefaultsDraft(serverAfterOffPageLimitSave);
+  assert.equal(afterReturn.draft.max_concurrent_sessions, "6");
+  assert.equal(afterReturn.draft.max_attempts, "9");
+
   // Sign-out wipes all unsaved drafts immediately.
   client.logout();
   const afterLogout = drafts.resolveDefaultsDraft(CORE_DEFAULTS);

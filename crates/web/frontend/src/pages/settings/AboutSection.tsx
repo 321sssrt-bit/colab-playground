@@ -16,8 +16,9 @@ import { formatApiErrorPayload } from "./api.ts";
 
 const DEFAULT_PROJECT_URL = "https://github.com/321sssrt-bit/colab-playground";
 const LICENSE_TEXT = "MIT · Copyright (c) 2026 ScarletKc";
-// Matches `[workspace.package].version`; superseded by `/api/updates` once it responds.
-const FALLBACK_APP_VERSION = "0.5.0";
+// Injected from root `Cargo.toml` at Vite build/dev time; superseded by `/api/updates` at runtime.
+const BUILD_APP_VERSION: string | null =
+  typeof __APP_VERSION__ === "string" && __APP_VERSION__.length > 0 ? __APP_VERSION__ : null;
 
 function CopyIcon() {
   return (
@@ -140,7 +141,7 @@ export const AboutSection = memo(function AboutSection({
 
   const projectUrl = deriveProjectUrl(updateNotice?.releases_url);
   const projectLabel = projectUrl.replace(/^https:\/\//i, "");
-  const currentVersion = updateNotice?.current_version ?? FALLBACK_APP_VERSION;
+  const currentVersion = updateNotice?.current_version ?? BUILD_APP_VERSION;
   const feedbackUrl = buildFeedbackUrl(projectUrl, currentVersion);
 
   const safeReleaseUrl =
@@ -195,7 +196,7 @@ export const AboutSection = memo(function AboutSection({
           </div>
           <div className="settings-row-control">
             <span className="mono" data-about-version="true">
-              {currentVersion}
+              {currentVersion ?? "—"}
             </span>
           </div>
         </div>

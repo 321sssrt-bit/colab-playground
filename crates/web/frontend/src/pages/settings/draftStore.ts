@@ -16,6 +16,7 @@ import {
   isDraftDirty,
   type DefaultsDraft,
   type DefaultsFieldKey,
+  type DurationDraft,
 } from "./draft.ts";
 
 export interface DefaultsDraftEntry {
@@ -66,6 +67,139 @@ export interface SettingsDraftStore {
   clearAll(): void;
   dispose(): void;
 }
+
+function durationEqual(a: DurationDraft, b: DurationDraft, withSeconds: boolean): boolean {
+  return (
+    a.hours.trim() === b.hours.trim() &&
+    a.minutes.trim() === b.minutes.trim() &&
+    (!withSeconds || a.seconds.trim() === b.seconds.trim())
+  );
+}
+
+function isFieldEdited(
+  draft: DefaultsDraft,
+  base: DefaultsDraft,
+  field: DefaultsFieldKey,
+): boolean {
+  switch (field) {
+    case "max_runtime":
+      return (
+        draft.max_runtime_enabled !== base.max_runtime_enabled ||
+        (draft.max_runtime_enabled && !durationEqual(draft.max_runtime, base.max_runtime, false))
+      );
+    case "max_spend_cu":
+      return (
+        draft.max_spend_enabled !== base.max_spend_enabled ||
+        (draft.max_spend_enabled && draft.max_spend_cu.trim() !== base.max_spend_cu.trim())
+      );
+    case "min_balance_cu":
+      return (
+        draft.min_balance_enabled !== base.min_balance_enabled ||
+        (draft.min_balance_enabled && draft.min_balance_cu.trim() !== base.min_balance_cu.trim())
+      );
+    case "idle_timeout":
+      return (
+        draft.idle_timeout_enabled !== base.idle_timeout_enabled ||
+        (draft.idle_timeout_enabled && !durationEqual(draft.idle_timeout, base.idle_timeout, false))
+      );
+    case "max_concurrent_sessions":
+      return draft.max_concurrent_sessions.trim() !== base.max_concurrent_sessions.trim();
+    case "max_attempts":
+      return draft.max_attempts.trim() !== base.max_attempts.trim();
+    case "retry_delay":
+      return !durationEqual(draft.retry_delay, base.retry_delay, true);
+    case "on_exhausted":
+      return draft.on_exhausted !== base.on_exhausted;
+    case "usage_poll_active":
+      return !durationEqual(draft.usage_poll_active, base.usage_poll_active, true);
+    case "usage_poll_idle":
+      return !durationEqual(draft.usage_poll_idle, base.usage_poll_idle, true);
+    case "accelerator":
+      return draft.accelerator !== base.accelerator;
+    case "high_mem":
+      return draft.high_mem !== base.high_mem;
+    case "min_vram_mib":
+      return (
+        draft.min_vram_enabled !== base.min_vram_enabled ||
+        (draft.min_vram_enabled && draft.min_vram_gib.trim() !== base.min_vram_gib.trim())
+      );
+    case "winddown_grace":
+      return !durationEqual(draft.winddown_grace, base.winddown_grace, true);
+  }
+}
+
+function copyDraftField(
+  target: { -readonly [K in keyof DefaultsDraft]: DefaultsDraft[K] },
+  source: DefaultsDraft,
+  field: DefaultsFieldKey,
+): void {
+  switch (field) {
+    case "max_runtime":
+      target.max_runtime_enabled = source.max_runtime_enabled;
+      target.max_runtime = source.max_runtime;
+      break;
+    case "max_spend_cu":
+      target.max_spend_enabled = source.max_spend_enabled;
+      target.max_spend_cu = source.max_spend_cu;
+      break;
+    case "min_balance_cu":
+      target.min_balance_enabled = source.min_balance_enabled;
+      target.min_balance_cu = source.min_balance_cu;
+      break;
+    case "idle_timeout":
+      target.idle_timeout_enabled = source.idle_timeout_enabled;
+      target.idle_timeout = source.idle_timeout;
+      break;
+    case "min_vram_mib":
+      target.min_vram_enabled = source.min_vram_enabled;
+      target.min_vram_gib = source.min_vram_gib;
+      break;
+    case "max_concurrent_sessions":
+      target.max_concurrent_sessions = source.max_concurrent_sessions;
+      break;
+    case "max_attempts":
+      target.max_attempts = source.max_attempts;
+      break;
+    case "retry_delay":
+      target.retry_delay = source.retry_delay;
+      break;
+    case "on_exhausted":
+      target.on_exhausted = source.on_exhausted;
+      break;
+    case "accelerator":
+      target.accelerator = source.accelerator;
+      break;
+    case "high_mem":
+      target.high_mem = source.high_mem;
+      break;
+    case "winddown_grace":
+      target.winddown_grace = source.winddown_grace;
+      break;
+    case "usage_poll_active":
+      target.usage_poll_active = source.usage_poll_active;
+      break;
+    case "usage_poll_idle":
+      target.usage_poll_idle = source.usage_poll_idle;
+      break;
+  }
+}
+
+const ALL_DEFAULT_KEYS: readonly DefaultsFieldKey[] = [
+  "max_runtime",
+  "max_spend_cu",
+  "min_balance_cu",
+  "idle_timeout",
+  "max_concurrent_sessions",
+  "max_attempts",
+  "retry_delay",
+  "on_exhausted",
+  "usage_poll_active",
+  "usage_poll_idle",
+  "accelerator",
+  "high_mem",
+  "min_vram_mib",
+  "winddown_grace",
+];
 
 function runtimeDefaultsEqual(a: RuntimeDefaults, b: RuntimeDefaults): boolean {
   return (
@@ -139,13 +273,40 @@ export function createSettingsDraftStore(client: ApiClient = apiClient): Setting
     readonly forceInclude: ReadonlySet<DefaultsFieldKey>;
   } => {
     const entry = state.defaultsEntry;
-    if (entry && runtimeDefaultsEqual(entry.baseServerDefaults, serverDefaults)) {
+    if (!entry) {
+      return {
+        draft: defaultsToDraft(serverDefaults),
+        forceInclude: new Set<DefaultsFieldKey>(),
+      };
+    }
+    if (runtimeDefaultsEqual(entry.baseServerDefaults, serverDefaults)) {
       return { draft: entry.draft, forceInclude: entry.forceInclude };
     }
-    return {
-      draft: defaultsToDraft(serverDefaults),
-      forceInclude: new Set<DefaultsFieldKey>(),
+    // Three-way merge: preserve unsaved user edits on fields untouched by the server update,
+    // and adopt server values for fields that changed on the server unless still divergently edited.
+    const oldBaseDraft = defaultsToDraft(entry.baseServerDefaults);
+    const nextServerDraft = defaultsToDraft(serverDefaults);
+    const mergedDraft: { -readonly [K in keyof DefaultsDraft]: DefaultsDraft[K] } = {
+      ...nextServerDraft,
     };
+    const mergedForce = new Set<DefaultsFieldKey>();
+
+    for (const field of ALL_DEFAULT_KEYS) {
+      const serverChanged = entry.baseServerDefaults[field] !== serverDefaults[field];
+      const userEdited =
+        entry.forceInclude.has(field) || isFieldEdited(entry.draft, oldBaseDraft, field);
+      if (!userEdited) {
+        continue;
+      }
+      if (!serverChanged || isFieldEdited(entry.draft, nextServerDraft, field)) {
+        copyDraftField(mergedDraft, entry.draft, field);
+        if (entry.forceInclude.has(field)) {
+          mergedForce.add(field);
+        }
+      }
+    }
+
+    return { draft: mergedDraft, forceInclude: mergedForce };
   };
 
   const saveDefaultsDraft = (
@@ -211,55 +372,7 @@ export function createSettingsDraftStore(client: ApiClient = apiClient): Setting
       const nextForce = new Set(entry.forceInclude);
       for (const key of Object.keys(savedPatch) as DefaultsFieldKey[]) {
         nextForce.delete(key);
-        switch (key) {
-          case "max_runtime":
-            nextDraft.max_runtime_enabled = savedDraft.max_runtime_enabled;
-            nextDraft.max_runtime = savedDraft.max_runtime;
-            break;
-          case "max_spend_cu":
-            nextDraft.max_spend_enabled = savedDraft.max_spend_enabled;
-            nextDraft.max_spend_cu = savedDraft.max_spend_cu;
-            break;
-          case "min_balance_cu":
-            nextDraft.min_balance_enabled = savedDraft.min_balance_enabled;
-            nextDraft.min_balance_cu = savedDraft.min_balance_cu;
-            break;
-          case "idle_timeout":
-            nextDraft.idle_timeout_enabled = savedDraft.idle_timeout_enabled;
-            nextDraft.idle_timeout = savedDraft.idle_timeout;
-            break;
-          case "min_vram_mib":
-            nextDraft.min_vram_enabled = savedDraft.min_vram_enabled;
-            nextDraft.min_vram_gib = savedDraft.min_vram_gib;
-            break;
-          case "max_concurrent_sessions":
-            nextDraft.max_concurrent_sessions = savedDraft.max_concurrent_sessions;
-            break;
-          case "max_attempts":
-            nextDraft.max_attempts = savedDraft.max_attempts;
-            break;
-          case "retry_delay":
-            nextDraft.retry_delay = savedDraft.retry_delay;
-            break;
-          case "on_exhausted":
-            nextDraft.on_exhausted = savedDraft.on_exhausted;
-            break;
-          case "accelerator":
-            nextDraft.accelerator = savedDraft.accelerator;
-            break;
-          case "high_mem":
-            nextDraft.high_mem = savedDraft.high_mem;
-            break;
-          case "winddown_grace":
-            nextDraft.winddown_grace = savedDraft.winddown_grace;
-            break;
-          case "usage_poll_active":
-            nextDraft.usage_poll_active = savedDraft.usage_poll_active;
-            break;
-          case "usage_poll_idle":
-            nextDraft.usage_poll_idle = savedDraft.usage_poll_idle;
-            break;
-        }
+        copyDraftField(nextDraft, savedDraft, key);
       }
       saveDefaultsDraft(updatedDefaults, nextDraft, nextForce);
     },

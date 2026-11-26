@@ -1,9 +1,36 @@
+import { readFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { defineConfig, type ProxyOptions } from "vite";
 import react from "@vitejs/plugin-react";
 
 const DEFAULT_PROXY_TARGET = "http://127.0.0.1:3000";
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
+
+function readWorkspaceVersion(): string {
+  const configDir = dirname(fileURLToPath(import.meta.url));
+  const cargoTomlPath = resolve(configDir, "../../../Cargo.toml");
+  const content = readFileSync(cargoTomlPath, "utf8");
+  let inWorkspacePackage = false;
+  for (const rawLine of content.split(/\r?\n/)) {
+    const line = rawLine.replace(/#.*$/, "").trim();
+    if (!line) {
+      continue;
+    }
+    if (line.startsWith("[")) {
+      inWorkspacePackage = line === "[workspace.package]";
+      continue;
+    }
+    if (inWorkspacePackage) {
+      const match = /^version\s*=\s*"([^"]+)"$/.exec(line);
+      if (match?.[1]) {
+        return match[1];
+      }
+    }
+  }
+  throw new Error(`Failed to read [workspace.package].version from ${cargoTomlPath}`);
+}
 
 function parseLoopbackTarget(raw: string): URL {
   const url = new URL(raw);
@@ -114,11 +141,15 @@ function createBackendProxy(targetUrl: URL): ProxyOptions {
 }
 
 export default defineConfig(({ command }) => {
+  const appVersion = readWorkspaceVersion();
   const proxyTarget = parseLoopbackTarget(
     process.env.CPG_WEB_PROXY_TARGET ?? DEFAULT_PROXY_TARGET,
   );
   return {
     plugins: [react()],
+    define: {
+      __APP_VERSION__: JSON.stringify(appVersion),
+    },
     base: command === "build" ? "/assets/" : "/",
     build: {
       outDir: "dist",
