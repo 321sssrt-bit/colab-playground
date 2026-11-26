@@ -25,10 +25,10 @@ use super::{ApiError, ErrorMessage, WebSettings};
 use crate::http::StateData;
 
 /// How often an automatic check asks GitHub (matches desktop `state::updates`).
-pub(crate) const UPDATE_INTERVAL: Duration = Duration::from_secs(24 * 3600);
+const UPDATE_INTERVAL: Duration = Duration::from_secs(24 * 3600);
 // Avoids hammering GitHub on repeated Settings opens while offline, without marking the daily check done.
-pub(crate) const UPDATE_RETRY_INTERVAL: Duration = Duration::from_secs(3600);
-pub(crate) const UPDATES_FILE: &str = "web-updates.json";
+const UPDATE_RETRY_INTERVAL: Duration = Duration::from_secs(3600);
+const UPDATES_FILE: &str = "web-updates.json";
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
