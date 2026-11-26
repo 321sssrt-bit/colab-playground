@@ -54,7 +54,7 @@ const PROVISION_RECONNECT_BASE_MS = 1000;
 const PROVISION_RECONNECT_MAX_MS = 5000;
 const PROVISION_RECONNECT_MAX_EXP = 3;
 
-export type { EndedRuntime, SessionSettingsSummary };
+export type { SessionSettingsSummary };
 
 export interface SubmittedProvisionForm {
   readonly name: string;
@@ -669,14 +669,6 @@ export function setProvisionDialogOperationId(operationId: number | null): void 
  */
 export function dismissTrackedProvision(operationId?: number): void {
   sessionsStore.dismissTrackedProvision(operationId);
-}
-
-/**
- * Claims one-time completion handling for `operationId` so returning to `#/sessions`
- * never replays an already-delivered ready, failed, or cancelled toast.
- */
-export function claimProvisionHandled(operationId: number): boolean {
-  return sessionsStore.claimProvisionHandled(operationId);
 }
 
 export function clearEndedRuntimes(): void {
