@@ -37,6 +37,8 @@ struct CountingBackend {
     refresh_usage_calls: AtomicUsize,
     accounts_override: Mutex<Option<ErrorKind>>,
     scripted_guard: Mutex<VecDeque<Result<GuardReport>>>,
+    scripted_runtimes: Mutex<VecDeque<Result<RuntimesView>>>,
+    call_log: Mutex<Vec<&'static str>>,
 }
 
 impl CountingBackend {
@@ -49,6 +51,8 @@ impl CountingBackend {
             refresh_usage_calls: AtomicUsize::new(0),
             accounts_override: Mutex::new(None),
             scripted_guard: Mutex::new(VecDeque::new()),
+            scripted_runtimes: Mutex::new(VecDeque::new()),
+            call_log: Mutex::new(Vec::new()),
         }
     }
 
@@ -63,6 +67,14 @@ impl CountingBackend {
 
     fn push_guard(&self, result: Result<GuardReport>) {
         self.scripted_guard.lock().unwrap().push_back(result);
+    }
+
+    fn push_runtimes(&self, result: Result<RuntimesView>) {
+        self.scripted_runtimes.lock().unwrap().push_back(result);
+    }
+
+    fn take_call_log(&self) -> Vec<&'static str> {
+        std::mem::take(&mut *self.call_log.lock().unwrap())
     }
 }
 
@@ -125,6 +137,10 @@ impl Backend for CountingBackend {
 
     fn runtimes(&self, cancel: &CancelToken) -> Result<RuntimesView> {
         self.runtimes_calls.fetch_add(1, Ordering::SeqCst);
+        self.call_log.lock().unwrap().push("runtimes");
+        if let Some(scripted) = self.scripted_runtimes.lock().unwrap().pop_front() {
+            return scripted;
+        }
         self.mock.runtimes(cancel)
     }
 
@@ -139,6 +155,7 @@ impl Backend for CountingBackend {
 
     fn guard_poll(&self, cancel: &CancelToken) -> Result<GuardReport> {
         self.guard_poll_calls.fetch_add(1, Ordering::SeqCst);
+        self.call_log.lock().unwrap().push("guard_poll");
         if let Some(scripted) = self.scripted_guard.lock().unwrap().pop_front() {
             return scripted;
         }
@@ -235,7 +252,11 @@ async fn zero_running_sessions_skips_guard_poll_and_due_poll_skips_accounts() {
             && snap.usage.iter().all(|u| u.snapshot.is_some())
     })
     .await;
-    assert_eq!(backend.guard_poll_calls.load(Ordering::SeqCst), 0);
+    // Cold start runs one guard round before the first listing so offline vanished sessions
+    // cannot be reconciled away; once zero managed sessions are confirmed, subsequent idle/due
+    // ticks and manual refreshes skip `guard_poll()`.
+    let guard_after_init = backend.guard_poll_calls.load(Ordering::SeqCst);
+    assert_eq!(guard_after_init, 1);
     let version_after_init = initial.version;
 
     // Poll tick while not due: no backend calls and no version bump.
@@ -256,7 +277,10 @@ async fn zero_running_sessions_skips_guard_poll_and_due_poll_skips_accounts() {
         "due background poll must not call backend.accounts()"
     );
     assert!(backend.refresh_usage_calls.load(Ordering::SeqCst) > usage_before_due);
-    assert_eq!(backend.guard_poll_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        backend.guard_poll_calls.load(Ordering::SeqCst),
+        guard_after_init
+    );
 
     // Manual refresh with zero sessions lists runtimes exactly once and still skips guard_poll.
     let runtimes_before = backend.runtimes_calls.load(Ordering::SeqCst);
@@ -265,7 +289,10 @@ async fn zero_running_sessions_skips_guard_poll_and_due_poll_skips_accounts() {
         backend.runtimes_calls.load(Ordering::SeqCst),
         runtimes_before + 1
     );
-    assert_eq!(backend.guard_poll_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        backend.guard_poll_calls.load(Ordering::SeqCst),
+        guard_after_init
+    );
 
     let runtimes_before_list = backend.runtimes_calls.load(Ordering::SeqCst);
     let (listed, _) = state.list_runtimes().await.unwrap();
@@ -273,7 +300,10 @@ async fn zero_running_sessions_skips_guard_poll_and_due_poll_skips_accounts() {
         backend.runtimes_calls.load(Ordering::SeqCst),
         runtimes_before_list + 1
     );
-    assert_eq!(backend.guard_poll_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        backend.guard_poll_calls.load(Ordering::SeqCst),
+        guard_after_init
+    );
     assert_eq!(listed.version, refreshed.version);
 
     // refresh_accounts must still succeed and publish usage when runtimes listing fails.
@@ -465,17 +495,12 @@ async fn guard_decisions_are_retained_across_polls_until_acked_and_never_misclas
             .any(|e| { e.runtime == stop_ref && matches!(e.reason, EndReason::Guard { .. }) })
     );
 
-    // A changed Warn concern allocates a fresh event id instead of overwriting the previous one.
-    let spend_warn = Concern::Limit {
-        limit: Limit::Spend,
-        current: 8.5,
-        threshold: 10.0,
-        estimated: false,
-    };
+    // Re-triggering the same Warn concern after Ok cleared live warnings allocates a fresh event
+    // id even while the earlier Warn event has not yet been acknowledged.
     backend.push_guard(Ok(GuardReport {
         decisions: vec![GuardDecision {
             session: warn_ref.clone(),
-            decision: Decision::Warn(vec![spend_warn]),
+            decision: Decision::Warn(vec![warn_concern.clone()]),
             stopped: false,
             error: None,
         }],
@@ -491,6 +516,26 @@ async fn guard_decisions_are_retained_across_polls_until_acked_and_never_misclas
         .collect();
     assert_eq!(warn_ids.len(), 2);
     assert!(warn_ids[1] > warn_ids[0]);
+
+    // Repeating the same live Warn without clearing must not queue a third duplicate event.
+    backend.push_guard(Ok(GuardReport {
+        decisions: vec![GuardDecision {
+            session: warn_ref.clone(),
+            decision: Decision::Warn(vec![warn_concern]),
+            stopped: false,
+            error: None,
+        }],
+        vanished: Vec::new(),
+        usage: backend.mock.usage(),
+    }));
+    let round3_repeat = state.refresh_accounts().await.unwrap();
+    let warn_ids_after_repeat: Vec<u64> = round3_repeat
+        .guard_events
+        .iter()
+        .filter(|e| e.session == warn_ref && matches!(e.kind, GuardEventKind::Warn { .. }))
+        .map(|e| e.id)
+        .collect();
+    assert_eq!(warn_ids_after_repeat, warn_ids);
 
     // Acknowledging through the older id retains the newer Warn event.
     let old_max = round2.guard_events.iter().map(|e| e.id).max().unwrap();
@@ -724,6 +769,117 @@ async fn usage_aging_preserves_stale_flag_and_measured_rates_survive_stop() {
         .find(|rate| rate.matches(Accelerator::T4, false))
         .expect("measured rate must survive stopping the session");
     assert!(t4_rate.reading.cu_per_hour > 0.0);
+
+    assert!(state.shutdown(TEST_TIMEOUT).await.completed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cold_start_and_stop_run_guard_before_runtimes_and_partial_errors_keep_guard_active() {
+    let (mut config, _) = MockConfig::headless(MockScenario::demo());
+    config.step_delay = Duration::ZERO;
+    let backend = Arc::new(CountingBackend::new(config));
+
+    let offline_vanished = RuntimeRef {
+        account: AccountId::new("a1").unwrap(),
+        endpoint: "offline-vanished".into(),
+        name: Some("offline-t4".into()),
+    };
+    backend.push_guard(Ok(GuardReport {
+        decisions: Vec::new(),
+        vanished: vec![offline_vanished.clone()],
+        usage: backend.mock.usage(),
+    }));
+
+    let state = WebState::start(backend.clone()).await.unwrap();
+    let initial = wait_settled(&state, |snap| {
+        snap.runtimes.is_some() && !snap.guard_events.is_empty()
+    })
+    .await;
+
+    // Cold start must call guard_poll before runtimes so offline vanished sessions are not
+    // silently reconciled away before the guard sees them.
+    let cold_log = backend.take_call_log();
+    let first_guard = cold_log.iter().position(|entry| *entry == "guard_poll");
+    let first_runtimes = cold_log.iter().position(|entry| *entry == "runtimes");
+    assert!(
+        first_guard.is_some() && first_runtimes.is_some() && first_guard < first_runtimes,
+        "expected guard_poll before runtimes on cold start, got {cold_log:?}"
+    );
+    assert!(
+        initial.guard_events.iter().any(|e| {
+            e.session == offline_vanished && matches!(e.kind, GuardEventKind::Vanished)
+        })
+    );
+    assert!(
+        initial
+            .ended
+            .iter()
+            .any(|e| e.runtime == offline_vanished && e.reason == EndReason::Vanished)
+    );
+
+    // Single stop must also run guard_poll before runtimes so another session that vanished
+    // concurrently is still captured.
+    let target = initial
+        .runtimes
+        .as_ref()
+        .unwrap()
+        .runtimes
+        .iter()
+        .find(|r| r.id.name.as_deref() == Some("a100-7f3a"))
+        .unwrap()
+        .id
+        .clone();
+    let concurrent_vanished = RuntimeRef {
+        account: AccountId::new("a2").unwrap(),
+        endpoint: "concurrent-vanished".into(),
+        name: Some("concurrent-l4".into()),
+    };
+    backend.push_guard(Ok(GuardReport {
+        decisions: Vec::new(),
+        vanished: vec![concurrent_vanished.clone()],
+        usage: backend.mock.usage(),
+    }));
+    let Submission::Started { job, .. } = state.stop_runtime(target).unwrap() else {
+        panic!("expected stop job");
+    };
+    job.await.unwrap().unwrap();
+    let stop_log = backend.take_call_log();
+    assert_eq!(
+        stop_log,
+        vec!["guard_poll", "runtimes"],
+        "single stop must run guard_poll before runtimes"
+    );
+    let after_stop = state.snapshot();
+    assert!(after_stop.guard_events.iter().any(|e| {
+        e.session == concurrent_vanished && matches!(e.kind, GuardEventKind::Vanished)
+    }));
+    assert!(
+        after_stop
+            .ended
+            .iter()
+            .any(|e| e.runtime == concurrent_vanished && e.reason == EndReason::Vanished)
+    );
+
+    // A partial listing error (0 returned runtimes, non-empty errors) must keep guard polling
+    // active instead of concluding there are no managed sessions.
+    backend.push_runtimes(Ok(RuntimesView {
+        runtimes: Vec::new(),
+        errors: vec![AccountError {
+            account: AccountId::new("a1").unwrap(),
+            error: Error::new(ErrorKind::Http),
+        }],
+    }));
+    let partial = state.refresh_accounts().await.unwrap();
+    assert!(partial.runtimes.as_ref().unwrap().runtimes.is_empty());
+    assert_eq!(partial.runtimes.as_ref().unwrap().errors.len(), 1);
+
+    let guard_before = backend.guard_poll_calls.load(Ordering::SeqCst);
+    let _ = state.refresh_accounts().await.unwrap();
+    assert_eq!(
+        backend.guard_poll_calls.load(Ordering::SeqCst),
+        guard_before + 1,
+        "partial listing errors must keep guard_poll enabled"
+    );
 
     assert!(state.shutdown(TEST_TIMEOUT).await.completed);
 }

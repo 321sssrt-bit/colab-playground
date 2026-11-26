@@ -92,7 +92,9 @@ impl WebState {
                 .is_some_and(|view| !view.accounts.is_empty());
         }
         match (&snapshot.runtimes, snapshot.runtimes_error) {
-            (Some(view), None) => view.runtimes.iter().any(|runtime| runtime.managed),
+            (Some(view), None) => {
+                !view.errors.is_empty() || view.runtimes.iter().any(|runtime| runtime.managed)
+            }
             _ => snapshot
                 .accounts
                 .as_ref()
@@ -408,19 +410,11 @@ fn poll_backend(job: &Job, refresh: bool) {
         return;
     }
 
-    // Only on the initial cold start (before any runtime listing exists) list first so a
-    // zero-session startup skips `guard_poll()`. Later polls and refreshes run the guard
-    // round before listing so `runtimes()` cannot consume vanished sessions ahead of it.
-    let initial_probe = cold_start && snapshot.runtimes.is_none();
-    if initial_probe {
-        state.record_runtimes(backend.runtimes(cancel));
-    }
-
-    let guard_changed = state.sync_usage_and_guard(backend, refresh, cancel);
-
-    if !initial_probe || guard_changed {
-        state.record_runtimes(backend.runtimes(cancel));
-    }
+    // Always run the guard round before listing runtimes (including on cold start, matching
+    // desktop `has_managed_runtimes`), so `runtimes()` cannot reconcile away vanished sessions
+    // ahead of `guard_poll()`.
+    let _ = state.sync_usage_and_guard(backend, refresh, cancel);
+    state.record_runtimes(backend.runtimes(cancel));
     state.sync_forwards();
 }
 

@@ -161,25 +161,14 @@ impl GuardLedger {
                         .iter()
                         .find(|(existing, _)| same_runtime(existing, &target))
                         .map(|(_, c)| c.clone());
+                    // Track re-triggers against the live warning state (matching desktop
+                    // `apply_guard`), not the unconsumed queue, so a warning cleared by Ok or
+                    // Extend and later re-triggered queues a fresh event id even if the earlier
+                    // notification was not yet acknowledged.
                     let limits_changed = previous
                         .as_ref()
                         .is_none_or(|before| !same_concern_kinds(before, &concerns));
-                    let latest_unconsumed = self.events.iter().rev().find_map(|event| {
-                        if same_runtime(&event.session, &target)
-                            && let GuardEventKind::Warn { concerns } = &event.kind
-                        {
-                            Some(concerns)
-                        } else {
-                            None
-                        }
-                    });
-                    // Assign a new event id when concerns change instead of mutating an existing
-                    // unconsumed event in place, so acknowledging an older id cannot drop newer data.
-                    let should_emit = match latest_unconsumed {
-                        Some(existing) => !same_concern_kinds(existing, &concerns),
-                        None => limits_changed,
-                    };
-                    if should_emit {
+                    if limits_changed {
                         self.push_event(
                             now,
                             target.clone(),
@@ -233,10 +222,16 @@ impl GuardLedger {
                             Error::new(ErrorKind::Other)
                                 .detail("the cost guard decided to stop it but no stop was made")
                         });
-                        let first = !self
+                        let prev_failure = self
                             .stop_failures
                             .iter()
-                            .any(|(existing, _, _)| same_runtime(existing, &target));
+                            .find(|(existing, _, _)| same_runtime(existing, &target))
+                            .map(|(_, c, e)| (c.clone(), e.clone()));
+                        let failure_changed = prev_failure.as_ref().is_none_or(
+                            |(existing_concern, existing_error)| {
+                                existing_concern != &concern || existing_error != &error
+                            },
+                        );
                         if let Some((_, existing_concern, existing_error)) = self
                             .stop_failures
                             .iter_mut()
@@ -251,25 +246,7 @@ impl GuardLedger {
                                 error.clone(),
                             ));
                         }
-                        let latest_unconsumed = self.events.iter().rev().find_map(|event| {
-                            if same_runtime(&event.session, &target)
-                                && let GuardEventKind::StopFailed {
-                                    concern: existing_concern,
-                                    error: existing_error,
-                                } = &event.kind
-                            {
-                                Some((existing_concern, existing_error))
-                            } else {
-                                None
-                            }
-                        });
-                        let should_emit = match latest_unconsumed {
-                            Some((existing_concern, existing_error)) => {
-                                existing_concern != &concern || existing_error != &error
-                            }
-                            None => first,
-                        };
-                        if should_emit {
+                        if failure_changed {
                             self.push_event(
                                 now,
                                 target,
@@ -701,9 +678,11 @@ impl WebState {
                 backend.stop_session(&resolved, Default::default(), cancel)?;
                 let now = backend.now();
                 state.record_user_stopped(&resolved, now);
+                // Run the guard round before listing runtimes so `runtimes()` cannot consume
+                // vanished ledger entries for other sessions ahead of `guard_poll()`.
+                let _ = state.sync_usage_and_guard(backend, true, cancel);
                 state.record_runtimes(backend.runtimes(cancel));
                 state.sync_forwards();
-                state.refresh_usage_after_stop(backend, cancel);
                 Ok(())
             },
         )
