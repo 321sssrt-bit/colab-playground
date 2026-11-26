@@ -170,6 +170,26 @@ export function App() {
     ],
   );
 
+  const handleDismissUpdate = useCallback((version: string) => {
+    updatesStore.dismiss(version);
+  }, []);
+
+  const handleCloseStopAll = useCallback(() => {
+    stopDialogsStore.closeStopAll();
+  }, []);
+
+  const handleConfirmStopAll = useCallback(() => {
+    void stopDialogsStore.confirmStopAll();
+  }, []);
+
+  const handleCloseStopRuntime = useCallback(() => {
+    stopDialogsStore.closeStopRuntime();
+  }, []);
+
+  const handleConfirmStopRuntime = useCallback(() => {
+    void stopDialogsStore.confirmStopRuntime();
+  }, []);
+
   // Avoid rendering unlabeled form controls before the first dictionary loads.
   if (i18n.dict === null) {
     return (
@@ -219,26 +239,6 @@ export function App() {
     onRequestAddAccount: handleRequestAddAccount,
     addAccountDialogOpen,
   };
-
-  const handleDismissUpdate = useCallback((version: string) => {
-    updatesStore.dismiss(version);
-  }, []);
-
-  const handleCloseStopAll = useCallback(() => {
-    stopDialogsStore.closeStopAll();
-  }, []);
-
-  const handleConfirmStopAll = useCallback(() => {
-    void stopDialogsStore.confirmStopAll();
-  }, []);
-
-  const handleCloseStopRuntime = useCallback(() => {
-    stopDialogsStore.closeStopRuntime();
-  }, []);
-
-  const handleConfirmStopRuntime = useCallback(() => {
-    void stopDialogsStore.confirmStopRuntime();
-  }, []);
 
   const stopRuntimeRequest =
     stopDialogsState.stopRuntime.open && stopDialogsState.stopRuntime.target
