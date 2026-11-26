@@ -5,15 +5,13 @@
  * structured outputs, and redacted streaming logs with truncation/skipped-path notices.
  */
 
-import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 
 import { AlertIcon, CheckCircleIcon, InfoIcon } from "../../components/Icons.tsx";
-import { apiClient, ApiError } from "../../lib/api.ts";
-import { appDataStore } from "../../lib/appCache.ts";
+import { ApiError } from "../../lib/api.ts";
 import { formatDuration } from "../../lib/format.ts";
 import type { TranslateFn } from "../../lib/i18n.ts";
 import type { RouteId } from "../../lib/router.ts";
-import { webStore } from "../../lib/store.ts";
 import type { ToastInput } from "../../lib/toast.ts";
 import type { Locale, Runtime, Snapshot } from "../../lib/types.ts";
 import type {
@@ -35,10 +33,15 @@ import {
   SquareIcon,
 } from "../sessions/Icons.tsx";
 import { resolveLocalizedText } from "./api.ts";
-import { selectEndpointTunnelById, type ForwardLiveOverlay } from "./endpoint.ts";
+import { selectEndpointTunnelByPort, type ForwardLiveOverlay } from "./endpoint.ts";
 import { EndpointCard } from "./EndpointCard.tsx";
-import { requestCancelPluginRun } from "./runStore.ts";
-import type { PluginInfo, PluginRunDetail } from "./types.ts";
+import {
+  canRunPluginAgain,
+  requestCancelPluginRun,
+  resolvePluginRunBillingState,
+  verifyPluginRunBilling,
+} from "./runStore.ts";
+import type { PluginInfo, PluginRunBillingCheck, PluginRunDetail } from "./types.ts";
 
 const SLOW_ANSWER_MS = 60_000;
 const SLOW_ANSWER_POLL_MS = 15_000;
@@ -48,14 +51,6 @@ const AUTO_SCROLL_TOLERANCE_PX = 24;
 interface ProvisionSentence {
   readonly text: string;
   readonly tone: "busy" | "good" | "warn" | "bad" | "neutral";
-}
-
-interface BillingCheckResult {
-  readonly runId: number;
-  readonly status: "checking" | "verified" | "error";
-  readonly runtime: Runtime | null;
-  readonly accountErrored: boolean;
-  readonly snapshotVersion: number;
 }
 
 function ArrowLeftIcon() {
@@ -189,6 +184,7 @@ export interface PluginRunViewProps {
   readonly run: PluginRunDetail;
   readonly plugin: PluginInfo | null;
   readonly snapshot: Snapshot | null;
+  readonly billingCheck: PluginRunBillingCheck | undefined;
   readonly endpointForwardIdsByKey: Readonly<Record<string, number | null>>;
   readonly forwardAddressesById: Readonly<Record<number, ForwardAddresses>>;
   readonly forwardOverlaysById: Readonly<Record<number, ForwardLiveOverlay>>;
@@ -196,14 +192,12 @@ export interface PluginRunViewProps {
   readonly forwardPolicyLoading: boolean;
   readonly forwardPolicyError: unknown | null;
   readonly onRetryForwardPolicy: () => void;
-  readonly billingRecheckSeq: number;
   readonly locale: Locale;
   readonly t: TranslateFn;
   readonly navigate: (route: RouteId) => void;
   readonly pushToast: (toast: ToastInput) => number;
   readonly onBack: () => void;
   readonly onRequestStopRuntime: (runtime: Runtime) => void;
-  /** Optional seam for #50 to reopen the dynamic plugin deploy form. */
   readonly onRunAgain?: (pluginId: string) => void;
 }
 
@@ -211,6 +205,7 @@ export function PluginRunView({
   run,
   plugin,
   snapshot,
+  billingCheck,
   endpointForwardIdsByKey,
   forwardAddressesById,
   forwardOverlaysById,
@@ -218,7 +213,6 @@ export function PluginRunView({
   forwardPolicyLoading,
   forwardPolicyError,
   onRetryForwardPolicy,
-  billingRecheckSeq,
   locale,
   t,
   navigate,
@@ -230,24 +224,8 @@ export function PluginRunView({
   const stageIdPrefix = useId();
   const logBoxRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef(true);
-  const billingSeqRef = useRef(0);
-  const mountedRef = useRef(true);
 
   const [nowMs, setNowMs] = useState<number>(() => Date.now());
-  const [billingCheck, setBillingCheck] = useState<BillingCheckResult>({
-    runId: run.id,
-    status: "checking",
-    runtime: null,
-    accountErrored: false,
-    snapshotVersion: 0,
-  });
-
-  useEffect(() => {
-    mountedRef.current = true;
-    return () => {
-      mountedRef.current = false;
-    };
-  }, []);
 
   const isRunning = run.phase === "running";
   const isEndedErrorOrCancel = run.phase === "failed" || run.phase === "cancelled";
@@ -269,67 +247,12 @@ export function PluginRunView({
     };
   }, [isAllocating]);
 
-  const verifyBilling = useCallback(async () => {
-    const seq = ++billingSeqRef.current;
-    const gen = apiClient.getSessionGeneration();
-    const targetRunId = run.id;
-    const targetAccount = run.account;
-    const targetSession = run.session;
-
-    setBillingCheck({
-      runId: targetRunId,
-      status: "checking",
-      runtime: null,
-      accountErrored: false,
-      snapshotVersion: webStore.getState().snapshot?.version ?? 0,
-    });
-
-    try {
-      const sessions = await appDataStore.refreshSessions();
-      if (
-        !mountedRef.current ||
-        seq !== billingSeqRef.current ||
-        apiClient.getSessionGeneration() !== gen
-      ) {
-        return;
-      }
-      const matched =
-        sessions.runtimes.find(
-          (rt) => rt.id.account === targetAccount && rt.id.name === targetSession,
-        ) ?? null;
-      const accountErrored = sessions.errors.some((err) => err.account === targetAccount);
-      setBillingCheck({
-        runId: targetRunId,
-        status: "verified",
-        runtime: matched,
-        accountErrored,
-        snapshotVersion: webStore.getState().snapshot?.version ?? 0,
-      });
-    } catch (error) {
-      if (
-        !mountedRef.current ||
-        seq !== billingSeqRef.current ||
-        apiClient.getSessionGeneration() !== gen ||
-        (error instanceof ApiError && error.isAbort)
-      ) {
-        return;
-      }
-      setBillingCheck({
-        runId: targetRunId,
-        status: "error",
-        runtime: null,
-        accountErrored: true,
-        snapshotVersion: webStore.getState().snapshot?.version ?? 0,
-      });
-    }
-  }, [run.id, run.account, run.session]);
-
   useEffect(() => {
-    if (!isEndedErrorOrCancel) {
+    if (!isEndedErrorOrCancel || billingCheck !== undefined) {
       return;
     }
-    void verifyBilling();
-  }, [isEndedErrorOrCancel, verifyBilling, billingRecheckSeq]);
+    void verifyPluginRunBilling(run.id);
+  }, [isEndedErrorOrCancel, billingCheck, run.id]);
 
   // Keep the log viewport pinned to the latest line unless the user scrolled up to read history.
   useEffect(() => {
@@ -396,36 +319,8 @@ export function PluginRunView({
   const runFailedOrCancelled =
     run.phase === "failed" || run.phase === "cancelled" || run.status?.state === "failed";
 
-  // Match the run's runtime against the freshly verified `/api/sessions` response, preferring
-  // any newer clean SSE snapshot so stops performed in another tab or by the guard clear immediately.
-  const snapshotRuntime =
-    snapshot?.runtimes?.runtimes.find(
-      (rt) => rt.id.account === run.account && rt.id.name === run.session,
-    ) ?? null;
-  const snapshotErroredForAccount =
-    snapshot?.runtimes_error !== null ||
-    Boolean(snapshot?.runtimes?.errors.some((err) => err.account === run.account));
-  const billingCheckMatchesRun = billingCheck.runId === run.id;
-  const snapshotNewerThanVerify =
-    billingCheckMatchesRun &&
-    snapshot !== null &&
-    snapshot.version > billingCheck.snapshotVersion &&
-    snapshot.runtimes !== null &&
-    !snapshotErroredForAccount;
-  const verifiedRuntime =
-    billingCheckMatchesRun && billingCheck.status === "verified"
-      ? snapshotNewerThanVerify
-        ? snapshotRuntime
-        : billingCheck.runtime
-      : snapshotRuntime;
-  const billingChecking =
-    !billingCheckMatchesRun || billingCheck.status === "checking";
-  const billingCheckFailed =
-    billingCheckMatchesRun &&
-    (billingCheck.status === "error" ||
-      (billingCheck.status === "verified" &&
-        billingCheck.accountErrored &&
-        !snapshotNewerThanVerify));
+  const billingState = resolvePluginRunBillingState(run, billingCheck, snapshot);
+  const runAgainAllowed = canRunPluginAgain(plugin, shuttingDown);
 
   const outputEntries = run.status?.outputs ? Object.entries(run.status.outputs) : [];
   const hasSecretInput =
@@ -646,7 +541,7 @@ export function PluginRunView({
 
           {isEndedErrorOrCancel && (
             <div className="run-outcome-section" data-plugin-run-billing="true">
-              {verifiedRuntime ? (
+              {billingState.phase === "billing" && billingState.runtime ? (
                 <div className="alert alert-warning" role="alert" data-run-session-billing="true">
                   <span className="alert-icon icon-warning">
                     <AlertTriangleIcon />
@@ -659,7 +554,11 @@ export function PluginRunView({
                         className="btn btn-danger btn-sm"
                         data-plugin-run-stop="true"
                         disabled={shuttingDown}
-                        onClick={() => onRequestStopRuntime(verifiedRuntime)}
+                        onClick={() => {
+                          if (billingState.runtime) {
+                            onRequestStopRuntime(billingState.runtime);
+                          }
+                        }}
                       >
                         <SquareIcon />
                         <span>{t("app.b2.stop_action")}</span>
@@ -667,12 +566,12 @@ export function PluginRunView({
                     </div>
                   </div>
                 </div>
-              ) : billingChecking ? (
+              ) : billingState.phase === "checking" ? (
                 <div className="busy-line" role="status" aria-live="polite" data-run-checking="true">
                   <span className="spinner" aria-hidden="true" />
                   <span>{t("app.b2.run_checking")}</span>
                 </div>
-              ) : billingCheckFailed ? (
+              ) : billingState.phase === "unknown" ? (
                 <div className="alert alert-warning" role="alert" data-run-session-unknown="true">
                   <span className="alert-icon icon-warning">
                     <AlertTriangleIcon />
@@ -684,7 +583,7 @@ export function PluginRunView({
                         type="button"
                         className="btn btn-sm"
                         onClick={() => {
-                          void verifyBilling();
+                          void verifyPluginRunBilling(run.id, { force: true });
                         }}
                       >
                         {t("app.action.retry")}
@@ -699,7 +598,7 @@ export function PluginRunView({
                     </div>
                   </div>
                 </div>
-              ) : run.provisions && !run.launched && !run.provisionAllocated ? (
+              ) : billingState.phase === "no_session" ? (
                 <p className="caption" data-run-no-session="true">
                   {t("app.b2.run_no_session")}
                 </p>
@@ -723,8 +622,12 @@ export function PluginRunView({
                 type="button"
                 className="btn"
                 data-plugin-run-again="true"
-                disabled={shuttingDown}
-                onClick={() => onRunAgain(run.plugin)}
+                disabled={!runAgainAllowed}
+                onClick={() => {
+                  if (runAgainAllowed) {
+                    onRunAgain(run.plugin);
+                  }
+                }}
               >
                 {t("app.b2.run_again")}
               </button>
@@ -739,11 +642,16 @@ export function PluginRunView({
             const trackedForwardId = Object.hasOwn(endpointForwardIdsByKey, forwardKey)
               ? endpointForwardIdsByKey[forwardKey]
               : (item.forward?.id ?? null);
-            const activeTunnel = selectEndpointTunnelById(
+            const activeTunnel = selectEndpointTunnelByPort(
               snapshot?.tunnels ?? [],
-              trackedForwardId,
+              {
+                account: run.outcome!.account,
+                session: run.outcome!.session,
+                remotePort: item.endpoint.remote_port,
+              },
               forwardOverlaysById,
               snapshot?.version ?? 0,
+              trackedForwardId,
             );
             const serverAddresses = activeTunnel
               ? (forwardAddressesById[activeTunnel.id] ??

@@ -11,6 +11,7 @@ import type {
   GgufEstimateResponse,
   HfModel,
   HfTokenStatus,
+  KvType,
   LocalizedText,
   PluginInfo,
   PluginOrigin,
@@ -19,6 +20,7 @@ import type {
   PluginRunTemplateSpec,
   StartPluginRunRequest,
 } from "./types.ts";
+import type { Accelerator } from "../../lib/types.ts";
 
 const BYTES_PER_KIB = 1024;
 const BYTES_PER_MIB = BYTES_PER_KIB * BYTES_PER_KIB;
@@ -182,6 +184,17 @@ export async function previewPlugin(
   });
 }
 
+export async function cancelPluginPreview(
+  signal?: AbortSignal,
+  client: ApiClient = apiClient,
+): Promise<void> {
+  await client.request<void>("/api/plugins/previews/cancel", {
+    method: "POST",
+    body: {},
+    signal,
+  });
+}
+
 export async function installPluginPreview(
   previewId: string,
   signal?: AbortSignal,
@@ -272,6 +285,65 @@ export async function searchHfModels(
     body: { query },
     signal,
   });
+}
+
+export interface HfGgufFitParams {
+  readonly accelerator: Accelerator | null;
+  readonly vramMib: number | null;
+  readonly ctx: number;
+  readonly quant: string | null;
+  readonly kv: KvType | null;
+}
+
+export function buildGgufFitKey(repo: string, params: HfGgufFitParams): string {
+  return JSON.stringify([
+    repo,
+    params.accelerator,
+    params.vramMib,
+    params.ctx,
+    params.quant,
+    params.kv,
+  ]);
+}
+
+export interface GgufFetchPlan {
+  readonly action: "skip" | "fetch";
+  readonly showLoading: boolean;
+  readonly refresh: boolean;
+}
+
+/**
+ * Decides how `HfModelField` should query `POST /api/plugins/hf/gguf`:
+ * - Exact cached `(repo, fitParams)` match skips the request (e.g. restored draft).
+ * - Parameter-only changes on the same loaded repo recalculate via the backend's
+ *   cached GGUF listing (`refresh: false`) without clearing the preview to loading.
+ * - Explicit refresh ("List files") sets `refresh: true` to bypass the backend cache.
+ */
+export function planGgufEstimateFetch(params: {
+  readonly targetRepo: string;
+  readonly targetFitKey: string;
+  readonly currentKind: "idle" | "loading" | "ready" | "error";
+  readonly currentRepo: string | null;
+  readonly currentFitKey: string | null;
+  readonly forceRefresh: boolean;
+}): GgufFetchPlan {
+  if (
+    !params.forceRefresh &&
+    params.currentKind === "ready" &&
+    params.currentRepo === params.targetRepo &&
+    params.currentFitKey === params.targetFitKey
+  ) {
+    return { action: "skip", showLoading: false, refresh: false };
+  }
+  const sameRepoParamRecalc =
+    !params.forceRefresh &&
+    params.currentKind === "ready" &&
+    params.currentRepo === params.targetRepo;
+  return {
+    action: "fetch",
+    showLoading: !sameRepoParamRecalc,
+    refresh: params.forceRefresh,
+  };
 }
 
 export async function fetchHfGgufEstimate(

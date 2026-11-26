@@ -20,8 +20,6 @@ import { resolveActiveAccount } from "../../lib/format.ts";
 import type { TranslateFn } from "../../lib/i18n.ts";
 import type { RouteId } from "../../lib/router.ts";
 import type {
-  AccountContext,
-  AccountId,
   Locale,
   Runtime,
   RuntimeRef,
@@ -47,16 +45,25 @@ import {
 } from "../sessions/ProvisionFields.tsx";
 import { refreshRearmDuration } from "../sessions/store.ts";
 import {
-  fetchPluginRunTemplate,
   formatPluginApiError,
-  getHfTokenStatus,
   isValidHfRepoId,
   resolveLocalizedText,
-  startPluginRun,
 } from "./api.ts";
 import { HfModelField, type HfGgufFitParams } from "./HfModelField.tsx";
+import { pluginCacheStore } from "./pluginCache.ts";
+import {
+  latchPluginDeployOriginAccountContext,
+  loadPluginDeployFormTemplate,
+  reconcilePluginDeployTarget,
+  submitPluginDeployRun,
+  updatePluginDeployDraft,
+  type DeployTemplateMapper,
+} from "./runStore.ts";
 import type {
+  HfTokenState,
   KvType,
+  PluginDeployFormDraft,
+  PluginDeployHfDraft,
   PluginInfo,
   PluginInputSpec,
   PluginInputValue,
@@ -72,28 +79,21 @@ const INPUT_CTX = "ctx";
 const INPUT_QUANT = "quant";
 const INPUT_KV = "kv";
 const QUANT_AUTO = "auto";
-
-interface SelectedExistingTarget {
-  readonly name: string;
-  readonly account: AccountId;
-  readonly runtime: RuntimeRef;
-}
-
-type TargetLost =
-  | { readonly kind: "ended"; readonly name: string }
-  | { readonly kind: "other_account"; readonly name: string };
+const EMPTY_TEXT_VALUES: Readonly<Record<string, string>> = {};
+const EMPTY_BOOL_VALUES: Readonly<Record<string, boolean>> = {};
+const EMPTY_HF_DRAFTS: Readonly<Record<string, PluginDeployHfDraft>> = {};
 
 interface PluginDeployFormProps {
   readonly plugin: PluginInfo;
+  readonly draft: PluginDeployFormDraft | null;
+  readonly hfTokenState: HfTokenState;
   readonly snapshot: Snapshot | null;
   readonly maxConcurrentSessions: number;
-  readonly hfTokenSaved: boolean | null;
   readonly locale: Locale;
   readonly t: TranslateFn;
   readonly navigate: (route: RouteId) => void;
   readonly onBack: () => void;
   readonly onOpenHfTokenDialog: () => void;
-  readonly onHfTokenStatusLoaded: (saved: boolean) => void;
   readonly onRunStarted: (runId: number, summary: PluginRunSummary) => void;
 }
 
@@ -285,17 +285,60 @@ function countNamedRuntimesOnActiveAccount(snapshot: Snapshot | null): string[] 
   return names;
 }
 
+function mapTemplateToDraft(
+  plugin: PluginInfo,
+  template: PluginRunTemplateSpec,
+): ReturnType<DeployTemplateMapper> {
+  const initial = buildInitialFieldState(plugin, template);
+  if (template.target.kind === "provision") {
+    const { kind: _kind, ...provSpec } = template.target;
+    return {
+      textValues: initial.texts,
+      boolValues: initial.bools,
+      baseProvisionSpec: provSpec,
+      provisionDraft: specToProvisionDraft(provSpec),
+      sessionName: provSpec.name,
+      retryDelaySecs: provSpec.retry_delay,
+      stopOnFailure: template.stop_on_failure,
+    };
+  }
+  const fallbackSpec: ProvisionSpec = {
+    name: `${plugin.manifest.id}-run`,
+    accelerator: CORE_DEFAULTS.accelerator,
+    high_mem: CORE_DEFAULTS.high_mem,
+    min_vram_mib: CORE_DEFAULTS.min_vram_mib,
+    max_attempts: CORE_DEFAULTS.max_attempts,
+    retry_delay: CORE_DEFAULTS.retry_delay,
+    on_exhausted: CORE_DEFAULTS.on_exhausted,
+    guard: {
+      max_runtime: CORE_DEFAULTS.max_runtime,
+      max_spend_cu: CORE_DEFAULTS.max_spend_cu,
+      min_balance_cu: CORE_DEFAULTS.min_balance_cu,
+      idle_timeout: CORE_DEFAULTS.idle_timeout,
+    },
+  };
+  return {
+    textValues: initial.texts,
+    boolValues: initial.bools,
+    baseProvisionSpec: fallbackSpec,
+    provisionDraft: specToProvisionDraft(fallbackSpec),
+    sessionName: fallbackSpec.name,
+    retryDelaySecs: fallbackSpec.retry_delay,
+    stopOnFailure: template.stop_on_failure,
+  };
+}
+
 export function PluginDeployForm({
   plugin,
+  draft,
+  hfTokenState,
   snapshot,
   maxConcurrentSessions,
-  hfTokenSaved,
   locale,
   t,
   navigate,
   onBack,
   onOpenHfTokenDialog,
-  onHfTokenStatusLoaded,
   onRunStarted,
 }: PluginDeployFormProps) {
   const idPrefix = useId();
@@ -308,43 +351,33 @@ export function PluginDeployForm({
   const secretInputRefs = useRef<Map<string, HTMLInputElement>>(new Map());
   const mountedRef = useRef(true);
   const submitAbortRef = useRef<AbortController | null>(null);
-  const loadSeqRef = useRef(0);
-  const tRef = useRef(t);
-  tRef.current = t;
   const pluginRef = useRef(plugin);
   pluginRef.current = plugin;
-  const maxConcurrentRef = useRef(maxConcurrentSessions);
-  maxConcurrentRef.current = maxConcurrentSessions;
-  const onHfTokenStatusLoadedRef = useRef(onHfTokenStatusLoaded);
-  onHfTokenStatusLoadedRef.current = onHfTokenStatusLoaded;
 
-  const [loadPhase, setLoadPhase] = useState<"loading" | "ready" | "error">("loading");
-  const [loadError, setLoadError] = useState<string | null>(null);
   const [reloadSeq, setReloadSeq] = useState(0);
   const [resolvedMaxConcurrent, setResolvedMaxConcurrent] = useState(maxConcurrentSessions);
-  const [localTokenChecked, setLocalTokenChecked] = useState(hfTokenSaved !== null);
-  const [tokenCheckFailed, setTokenCheckFailed] = useState(false);
-
-  const [textValues, setTextValues] = useState<Record<string, string>>({});
-  const [boolValues, setBoolValues] = useState<Record<string, boolean>>({});
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
-
-  const [baseProvisionSpec, setBaseProvisionSpec] = useState<ProvisionSpec | null>(null);
-  const [provisionDraft, setProvisionDraft] = useState<ProvisionDraft | null>(null);
-  const [sessionName, setSessionName] = useState("");
-  const [retryDelaySecs, setRetryDelaySecs] = useState<number>(CORE_DEFAULTS.retry_delay);
   const [provisionInvalidFields, setProvisionInvalidFields] = useState<
     ReadonlySet<ProvisionFieldErrorId>
   >(() => new Set());
-  const [stopOnFailure, setStopOnFailure] = useState(true);
-
-  const [selectedExisting, setSelectedExisting] = useState<SelectedExistingTarget | null>(null);
-  const [targetLost, setTargetLost] = useState<TargetLost | null>(null);
-  const [originAccountContext, setOriginAccountContext] = useState<AccountContext | null>(
-    () => snapshot?.account ?? null,
-  );
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<FormattedError | null>(null);
+
+  const activeDraft = draft && draft.pluginId === plugin.manifest.id ? draft : null;
+  const loadPhase = activeDraft?.loadPhase ?? "loading";
+  const loadError = activeDraft?.loadError ? formatPluginApiError(activeDraft.loadError, t) : null;
+  const textValues = activeDraft?.textValues ?? EMPTY_TEXT_VALUES;
+  const boolValues = activeDraft?.boolValues ?? EMPTY_BOOL_VALUES;
+  const baseProvisionSpec = activeDraft?.baseProvisionSpec ?? null;
+  const provisionDraft = activeDraft?.provisionDraft ?? null;
+  const sessionName = activeDraft?.sessionName ?? "";
+  const retryDelaySecs = activeDraft?.retryDelaySecs ?? CORE_DEFAULTS.retry_delay;
+  const stopOnFailure = activeDraft?.stopOnFailure ?? true;
+  const selectedExisting = activeDraft?.selectedExisting ?? null;
+  const targetLost = activeDraft?.targetLost ?? null;
+  const originAccountContext = activeDraft?.originAccountContext ?? null;
+  const hfByInputId = activeDraft?.hfByInputId ?? EMPTY_HF_DRAFTS;
+  const draftOpenSeq = activeDraft?.openSeq ?? 0;
 
   const clearSecretInputs = useCallback(() => {
     for (const inputEl of secretInputRefs.current.values()) {
@@ -363,168 +396,52 @@ export function PluginDeployForm({
   }, [clearSecretInputs]);
 
   useEffect(() => {
-    if (hfTokenSaved !== null) {
-      setLocalTokenChecked(true);
-      setTokenCheckFailed(false);
-    }
-  }, [hfTokenSaved]);
-
-  useEffect(() => {
     setResolvedMaxConcurrent(maxConcurrentSessions);
   }, [maxConcurrentSessions]);
 
   useEffect(() => {
-    if (originAccountContext === null && snapshot?.account) {
-      setOriginAccountContext(snapshot.account);
-    }
-  }, [originAccountContext, snapshot?.account]);
+    latchPluginDeployOriginAccountContext(snapshot?.account ?? null);
+  }, [snapshot?.account]);
 
   const wantsHfToken = plugin.manifest.needs.includes("hf_token");
 
   useEffect(() => {
-    const seq = ++loadSeqRef.current;
-    const controller = new AbortController();
-    const gen = apiClient.getSessionGeneration();
-
-    setLoadPhase("loading");
-    setLoadError(null);
-    setSubmitError(null);
-    setFieldErrors({});
-    setProvisionInvalidFields(new Set());
-    clearSecretInputs();
-
-    const activePlugin = pluginRef.current;
-    const templatePromise = fetchPluginRunTemplate(activePlugin.manifest.id, controller.signal);
-    const settingsPromise = refreshRearmDuration(controller.signal)
-      .then((res) => res.maxConcurrentSessions)
-      .catch(() => maxConcurrentRef.current);
-
     if (wantsHfToken) {
-      void getHfTokenStatus(controller.signal)
-        .then((res) => {
-          if (
-            controller.signal.aborted ||
-            !mountedRef.current ||
-            seq !== loadSeqRef.current ||
-            apiClient.getSessionGeneration() !== gen
-          ) {
-            return;
-          }
-          setLocalTokenChecked(true);
-          setTokenCheckFailed(false);
-          onHfTokenStatusLoadedRef.current(res.saved);
-        })
-        .catch((err: unknown) => {
-          if (
-            controller.signal.aborted ||
-            !mountedRef.current ||
-            seq !== loadSeqRef.current ||
-            (err instanceof ApiError && err.isAbort)
-          ) {
-            return;
-          }
-          setLocalTokenChecked(true);
-          setTokenCheckFailed(true);
-        });
+      // Uses cached global HF token status when already `ready`, avoiding repeated keyring spawns.
+      void pluginCacheStore.ensureHfTokenStatus().catch(() => {});
     }
+  }, [wantsHfToken]);
 
-    void Promise.all([templatePromise, settingsPromise]).then(
-      ([template, cap]) => {
-        if (
-          controller.signal.aborted ||
-          !mountedRef.current ||
-          seq !== loadSeqRef.current ||
-          apiClient.getSessionGeneration() !== gen
-        ) {
-          return;
-        }
-        const initial = buildInitialFieldState(activePlugin, template);
-        setTextValues(initial.texts);
-        setBoolValues(initial.bools);
-        setStopOnFailure(template.stop_on_failure);
-        setResolvedMaxConcurrent(Math.max(1, cap));
-        setSelectedExisting(null);
-        setTargetLost(null);
+  useEffect(() => {
+    if (draftOpenSeq <= 0) {
+      return;
+    }
+    const controller = new AbortController();
+    const activePlugin = pluginRef.current;
 
-        if (template.target.kind === "provision") {
-          const { kind: _kind, ...provSpec } = template.target;
-          setBaseProvisionSpec(provSpec);
-          setProvisionDraft(specToProvisionDraft(provSpec));
-          setSessionName(provSpec.name);
-          setRetryDelaySecs(provSpec.retry_delay);
-        } else {
-          const fallbackSpec: ProvisionSpec = {
-            name: `${activePlugin.manifest.id}-run`,
-            accelerator: CORE_DEFAULTS.accelerator,
-            high_mem: CORE_DEFAULTS.high_mem,
-            min_vram_mib: CORE_DEFAULTS.min_vram_mib,
-            max_attempts: CORE_DEFAULTS.max_attempts,
-            retry_delay: CORE_DEFAULTS.retry_delay,
-            on_exhausted: CORE_DEFAULTS.on_exhausted,
-            guard: {
-              max_runtime: CORE_DEFAULTS.max_runtime,
-              max_spend_cu: CORE_DEFAULTS.max_spend_cu,
-              min_balance_cu: CORE_DEFAULTS.min_balance_cu,
-              idle_timeout: CORE_DEFAULTS.idle_timeout,
-            },
-          };
-          setBaseProvisionSpec(fallbackSpec);
-          setProvisionDraft(specToProvisionDraft(fallbackSpec));
-          setSessionName(fallbackSpec.name);
-          setRetryDelaySecs(fallbackSpec.retry_delay);
+    void refreshRearmDuration(controller.signal)
+      .then((res) => {
+        if (!controller.signal.aborted && mountedRef.current) {
+          setResolvedMaxConcurrent(Math.max(1, res.maxConcurrentSessions));
         }
+      })
+      .catch(() => {});
 
-        setLoadPhase("ready");
-      },
-      (err: unknown) => {
-        if (
-          controller.signal.aborted ||
-          !mountedRef.current ||
-          seq !== loadSeqRef.current ||
-          (err instanceof ApiError && err.isAbort)
-        ) {
-          return;
-        }
-        setLoadError(formatPluginApiError(err, tRef.current));
-        setLoadPhase("error");
-      },
+    void loadPluginDeployFormTemplate(
+      activePlugin.manifest.id,
+      draftOpenSeq,
+      (template) => mapTemplateToDraft(activePlugin, template),
+      { force: reloadSeq > 0 },
     );
 
     return () => {
       controller.abort();
     };
-  }, [plugin.manifest.id, reloadSeq, wantsHfToken, clearSecretInputs]);
+  }, [plugin.manifest.id, draftOpenSeq, reloadSeq]);
 
   useEffect(() => {
-    if (!selectedExisting || !snapshot) {
-      return;
-    }
-    const activeAccount = snapshot.accounts?.active ?? snapshot.account.active ?? null;
-    if (!activeAccount || selectedExisting.account !== activeAccount) {
-      setTargetLost({ kind: "other_account", name: selectedExisting.name });
-      setSelectedExisting(null);
-      return;
-    }
-    if (
-      !snapshot.runtimes ||
-      snapshot.runtimes_error !== null ||
-      snapshot.runtimes.errors.some((err) => err.account === activeAccount)
-    ) {
-      return;
-    }
-    const matched = snapshot.runtimes.runtimes.find(
-      (rt) =>
-        rt.on_active_account &&
-        rt.managed &&
-        rt.id.account === selectedExisting.account &&
-        rt.id.endpoint === selectedExisting.runtime.endpoint &&
-        rt.id.name === selectedExisting.name,
-    );
-    if (!matched) {
-      setTargetLost({ kind: "ended", name: selectedExisting.name });
-      setSelectedExisting(null);
-    }
-  }, [selectedExisting, snapshot]);
+    reconcilePluginDeployTarget(snapshot);
+  }, [snapshot]);
 
   const activeManagedRuntimes = useMemo<readonly Runtime[]>(() => {
     const list = snapshot?.runtimes?.runtimes ?? [];
@@ -672,23 +589,37 @@ export function PluginDeployForm({
   };
 
   const handleTargetChange = (nextKey: string) => {
-    setTargetLost(null);
     setSubmitError(null);
     setProvisionInvalidFields(new Set());
     if (!nextKey) {
-      setSelectedExisting(null);
+      updatePluginDeployDraft((prev) => ({
+        ...prev,
+        selectedExisting: null,
+        targetLost: null,
+      }));
       return;
     }
     const matched = activeManagedRuntimes.find((rt) => runtimeKey(rt.id) === nextKey);
     if (!matched || !matched.id.name) {
-      setSelectedExisting(null);
+      updatePluginDeployDraft((prev) => ({
+        ...prev,
+        selectedExisting: null,
+        targetLost: null,
+      }));
       return;
     }
-    setSelectedExisting({
-      name: matched.id.name,
-      account: matched.id.account,
-      runtime: matched.id,
-    });
+    const pickedName = matched.id.name;
+    const pickedAccount = matched.id.account;
+    const pickedRuntime = matched.id;
+    updatePluginDeployDraft((prev) => ({
+      ...prev,
+      selectedExisting: {
+        name: pickedName,
+        account: pickedAccount,
+        runtime: pickedRuntime,
+      },
+      targetLost: null,
+    }));
   };
 
   const focusFirstInvalid = () => {
@@ -700,7 +631,14 @@ export function PluginDeployForm({
 
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (loadPhase !== "ready" || !provisionDraft || deployDisabled || !currentAccountContext) {
+    const lockedAccountContext = originAccountContext ?? currentAccountContext;
+    if (
+      loadPhase !== "ready" ||
+      !provisionDraft ||
+      deployDisabled ||
+      !currentAccountContext ||
+      !lockedAccountContext
+    ) {
       return;
     }
 
@@ -746,8 +684,11 @@ export function PluginDeployForm({
 
     if (selectedExisting !== null) {
       if (selectedExisting.account !== currentAccountContext.active) {
-        setTargetLost({ kind: "other_account", name: selectedExisting.name });
-        setSelectedExisting(null);
+        updatePluginDeployDraft((prev) => ({
+          ...prev,
+          selectedExisting: null,
+          targetLost: { kind: "other_account", name: selectedExisting.name },
+        }));
         return;
       }
       const liveMatch = activeManagedRuntimes.find(
@@ -757,8 +698,11 @@ export function PluginDeployForm({
           rt.id.name === selectedExisting.name,
       );
       if (!liveMatch) {
-        setTargetLost({ kind: "ended", name: selectedExisting.name });
-        setSelectedExisting(null);
+        updatePluginDeployDraft((prev) => ({
+          ...prev,
+          selectedExisting: null,
+          targetLost: { kind: "ended", name: selectedExisting.name },
+        }));
         return;
       }
       requestTarget = { kind: "existing", name: selectedExisting.name };
@@ -788,20 +732,6 @@ export function PluginDeployForm({
       return;
     }
 
-    const requestPayload: StartPluginRunRequest = {
-      account_context: currentAccountContext,
-      spec: {
-        plugin: plugin.manifest.id,
-        inputs: builtInputs,
-        target: requestTarget,
-        stop_on_failure: stopOnFailure,
-      },
-      existing: requestExisting,
-    };
-
-    // Clear every masked secret input immediately before awaiting network I/O so plaintext never lingers in DOM.
-    clearSecretInputs();
-
     submitAbortRef.current?.abort();
     const controller = new AbortController();
     submitAbortRef.current = controller;
@@ -813,7 +743,19 @@ export function PluginDeployForm({
     setSubmitError(null);
 
     try {
-      const accepted = await startPluginRun(requestPayload, controller.signal);
+      const { id, summary } = await submitPluginDeployRun({
+        originAccountContext: lockedAccountContext,
+        spec: {
+          plugin: plugin.manifest.id,
+          inputs: builtInputs,
+          target: requestTarget,
+          stop_on_failure: stopOnFailure,
+        },
+        existing: requestExisting,
+        resolvedSessionName,
+        clearSecrets: clearSecretInputs,
+        signal: controller.signal,
+      });
       if (
         controller.signal.aborted ||
         !mountedRef.current ||
@@ -821,15 +763,7 @@ export function PluginDeployForm({
       ) {
         return;
       }
-      const summary: PluginRunSummary = {
-        id: accepted.id,
-        plugin: plugin.manifest.id,
-        account: currentAccountContext.active ?? "",
-        session: resolvedSessionName,
-        provisions: requestExisting === null,
-        finished: false,
-      };
-      onRunStarted(accepted.id, summary);
+      onRunStarted(id, summary);
     } catch (err) {
       if (
         controller.signal.aborted ||
@@ -932,10 +866,32 @@ export function PluginDeployForm({
                           error={fieldError}
                           disabled={submitting}
                           fitParams={fitParams}
+                          persistedDraft={hfByInputId[input.id]}
+                          onPersistDraft={(nextHf) => {
+                            updatePluginDeployDraft((prev) => {
+                              const existing = prev.hfByInputId[input.id];
+                              if (
+                                existing &&
+                                existing.searchQuery === nextHf.searchQuery &&
+                                existing.searchModels === nextHf.searchModels &&
+                                existing.activeRepo === nextHf.activeRepo &&
+                                existing.ggufPreview === nextHf.ggufPreview
+                              ) {
+                                return prev;
+                              }
+                              return {
+                                ...prev,
+                                hfByInputId: { ...prev.hfByInputId, [input.id]: nextHf },
+                              };
+                            });
+                          }}
                           locale={locale}
                           t={t}
                           onChange={(nextValue) => {
-                            setTextValues((prev) => ({ ...prev, [input.id]: nextValue }));
+                            updatePluginDeployDraft((prev) => ({
+                              ...prev,
+                              textValues: { ...prev.textValues, [input.id]: nextValue },
+                            }));
                             clearFieldError(input.id);
                           }}
                           onBlur={() => validateSingleFieldOnBlur(input)}
@@ -982,9 +938,13 @@ export function PluginDeployForm({
                               disabled={submitting}
                               aria-describedby={describedBy}
                               onChange={(event) => {
-                                setBoolValues((prev) => ({
+                                const checked = event.target.checked;
+                                updatePluginDeployDraft((prev) => ({
                                   ...prev,
-                                  [input.id]: event.target.checked,
+                                  boolValues: {
+                                    ...prev.boolValues,
+                                    [input.id]: checked,
+                                  },
                                 }));
                                 clearFieldError(input.id);
                               }}
@@ -1023,9 +983,13 @@ export function PluginDeployForm({
                             aria-invalid={fieldError ? "true" : undefined}
                             aria-describedby={describedBy}
                             onChange={(event) => {
-                              setTextValues((prev) => ({
+                              const nextValue = event.target.value;
+                              updatePluginDeployDraft((prev) => ({
                                 ...prev,
-                                [input.id]: event.target.value,
+                                textValues: {
+                                  ...prev.textValues,
+                                  [input.id]: nextValue,
+                                },
                               }));
                               clearFieldError(input.id);
                             }}
@@ -1057,9 +1021,13 @@ export function PluginDeployForm({
                             aria-invalid={fieldError ? "true" : undefined}
                             aria-describedby={describedBy}
                             onChange={(event) => {
-                              setTextValues((prev) => ({
+                              const nextValue = event.target.value;
+                              updatePluginDeployDraft((prev) => ({
                                 ...prev,
-                                [input.id]: event.target.value,
+                                textValues: {
+                                  ...prev.textValues,
+                                  [input.id]: nextValue,
+                                },
                               }));
                               clearFieldError(input.id);
                             }}
@@ -1104,9 +1072,13 @@ export function PluginDeployForm({
                             aria-invalid={fieldError ? "true" : undefined}
                             aria-describedby={describedBy}
                             onChange={(event) => {
-                              setTextValues((prev) => ({
+                              const nextValue = event.target.value;
+                              updatePluginDeployDraft((prev) => ({
                                 ...prev,
-                                [input.id]: event.target.value,
+                                textValues: {
+                                  ...prev.textValues,
+                                  [input.id]: nextValue,
+                                },
                               }));
                               clearFieldError(input.id);
                             }}
@@ -1139,8 +1111,9 @@ export function PluginDeployForm({
               </section>
             )}
 
-            {wantsHfToken && localTokenChecked && (
-              hfTokenSaved === true ? (
+            {wantsHfToken &&
+              (hfTokenState.kind === "ready" || hfTokenState.kind === "error") &&
+              (hfTokenState.kind === "ready" && hfTokenState.saved ? (
                 <div
                   className="inline-msg inline-msg-info"
                   role="status"
@@ -1153,7 +1126,7 @@ export function PluginDeployForm({
                 <div
                   className="alert alert-info"
                   role="status"
-                  data-plugin-hf-token={tokenCheckFailed ? "unknown" : "missing"}
+                  data-plugin-hf-token={hfTokenState.kind === "error" ? "unknown" : "missing"}
                 >
                   <span className="alert-icon icon-info">
                     <InfoIcon />
@@ -1173,8 +1146,7 @@ export function PluginDeployForm({
                     </div>
                   </div>
                 </div>
-              )
-            )}
+              ))}
 
             <section className="card card-compact" data-plugin-target-card="true">
               <div className="card-header">
@@ -1319,7 +1291,11 @@ export function PluginDeployForm({
                       }
                       data-plugin-session-name="true"
                       onChange={(event) => {
-                        setSessionName(event.target.value);
+                        const nextName = event.target.value;
+                        updatePluginDeployDraft((prev) => ({
+                          ...prev,
+                          sessionName: nextName,
+                        }));
                         if (provisionInvalidFields.has("name")) {
                           setProvisionInvalidFields((prev) => {
                             const next = new Set(prev);
@@ -1343,7 +1319,10 @@ export function PluginDeployForm({
                     locale={locale}
                     t={t}
                     onChange={(nextDraft) => {
-                      setProvisionDraft(nextDraft);
+                      updatePluginDeployDraft((prev) => ({
+                        ...prev,
+                        provisionDraft: nextDraft,
+                      }));
                       if (provisionInvalidFields.size > 0) {
                         setProvisionInvalidFields(new Set());
                       }
@@ -1364,7 +1343,13 @@ export function PluginDeployForm({
                         data-plugin-stop-on-failure="true"
                         checked={stopOnFailure}
                         disabled={submitting}
-                        onChange={(event) => setStopOnFailure(event.target.checked)}
+                        onChange={(event) => {
+                          const checked = event.target.checked;
+                          updatePluginDeployDraft((prev) => ({
+                            ...prev,
+                            stopOnFailure: checked,
+                          }));
+                        }}
                       />
                       <span>{t("app.b2.run_stop_on_failure")}</span>
                     </label>

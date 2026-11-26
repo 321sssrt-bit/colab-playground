@@ -21,22 +21,25 @@ import {
 } from "./sessions/StopRuntimeDialog.tsx";
 import {
   formatPluginApiError,
-  listPlugins,
   resolveLocalizedText,
   setPluginEnabled,
 } from "./plugins/api.ts";
 import { HfTokenDialog } from "./plugins/HfTokenDialog.tsx";
 import { InstallPluginDialog } from "./plugins/InstallPluginDialog.tsx";
+import { pluginCacheStore, usePluginCacheStore } from "./plugins/pluginCache.ts";
 import { PluginDeployForm, RocketIcon } from "./plugins/PluginDeployForm.tsx";
 import { PluginRunView } from "./plugins/PluginRunView.tsx";
 import { RemovePluginDialog, type RemovePluginTarget } from "./plugins/RemovePluginDialog.tsx";
 import {
+  canRunPluginAgain,
   closePluginDeployForm,
   openPluginDeployForm,
   openPluginRun,
   refreshPluginRuns,
+  setPluginRunsLocale,
   showPluginList,
   usePluginRunsStore,
+  verifyPluginRunBilling,
 } from "./plugins/runStore.ts";
 import type { PluginInfo, PluginRunPhase, PluginRunSummary } from "./plugins/types.ts";
 import type { PageProps } from "./types.ts";
@@ -70,7 +73,10 @@ function bannerMetaForRun(
   pluginName: string,
   t: PageProps["t"],
 ): { readonly tone: "info" | "success" | "danger"; readonly text: string } {
-  const phase: PluginRunPhase | null = !run.finished ? "running" : (knownPhase ?? null);
+  const phase: PluginRunPhase | null =
+    knownPhase && knownPhase !== "running"
+      ? knownPhase
+      : run.phase ?? (!run.finished ? "running" : null);
   if (phase === "running") {
     return { tone: "info", text: t("app.b2.run_banner_running", { name: pluginName }) };
   }
@@ -91,95 +97,42 @@ function bannerMetaForRun(
 
 export function PluginsPage({ snapshot, locale, t, navigate, pushToast }: PageProps) {
   const switchIdPrefix = useId();
-  const loadAbortRef = useRef<AbortController | null>(null);
-  const loadSeqRef = useRef(0);
   const mountedRef = useRef(true);
   const stopRequestSeqRef = useRef(0);
-  const toastedReadyRunIdRef = useRef<number | null>(null);
 
   const runsState = usePluginRunsStore();
+  const pluginCache = usePluginCacheStore();
   const appData = useAppDataStore();
   const forwardsState = useForwardsStore();
 
-  const [plugins, setPlugins] = useState<readonly PluginInfo[] | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [loadError, setLoadError] = useState<string | null>(null);
+  const plugins = pluginCache.plugins;
+  const loading = pluginCache.pluginsLoading;
+  const loadError = pluginCache.pluginsError
+    ? formatPluginApiError(pluginCache.pluginsError, t)
+    : null;
+
   const [togglingIds, setTogglingIds] = useState<ReadonlySet<string>>(() => new Set());
   const [tokenDialogOpen, setTokenDialogOpen] = useState(false);
-  const [hfTokenSaved, setHfTokenSaved] = useState<boolean | null>(null);
   const [installOpen, setInstallOpen] = useState(false);
   const [removeTarget, setRemoveTarget] = useState<RemovePluginTarget | null>(null);
   const [stopDialogRequest, setStopDialogRequest] = useState<StopRuntimeDialogRequest | null>(null);
-  const [billingRecheckSeq, setBillingRecheckSeq] = useState(0);
+
+  useEffect(() => {
+    setPluginRunsLocale(locale);
+  }, [locale]);
 
   const fetchPlugins = useCallback(async () => {
-    loadAbortRef.current?.abort();
-    const controller = new AbortController();
-    loadAbortRef.current = controller;
-    const seq = ++loadSeqRef.current;
-
-    setLoading(true);
-    setLoadError(null);
-
-    try {
-      const items = await listPlugins(controller.signal);
-      if (controller.signal.aborted || !mountedRef.current || seq !== loadSeqRef.current) {
-        return;
-      }
-      setPlugins(items);
-      setLoadError(null);
-    } catch (error) {
-      if (
-        controller.signal.aborted ||
-        !mountedRef.current ||
-        seq !== loadSeqRef.current ||
-        (error instanceof ApiError && error.isAbort)
-      ) {
-        return;
-      }
-      setLoadError(formatPluginApiError(error, t));
-    } finally {
-      if (mountedRef.current && seq === loadSeqRef.current) {
-        setLoading(false);
-      }
-      if (loadAbortRef.current === controller) {
-        loadAbortRef.current = null;
-      }
-    }
-  }, [t]);
+    await pluginCacheStore.refreshPlugins().catch(() => {});
+  }, []);
 
   useEffect(() => {
     mountedRef.current = true;
-    void fetchPlugins();
+    void pluginCacheStore.ensurePlugins().catch(() => {});
     void refreshPluginRuns({ autoAttach: true });
     return () => {
       mountedRef.current = false;
-      loadAbortRef.current?.abort();
-      loadAbortRef.current = null;
     };
-  }, [fetchPlugins]);
-
-  const prevPluginRunOpIdsRef = useRef("");
-
-  // Refresh `/api/plugins/runs` whenever a `plugin_run` operation starts or finishes in the live snapshot.
-  const pluginRunOpIds = (snapshot?.operations ?? [])
-    .filter(({ operation }) => operation.kind === "plugin_run")
-    .map((op) => op.id)
-    .join(",");
-
-  useEffect(() => {
-    const prevIds = prevPluginRunOpIdsRef.current;
-    prevPluginRunOpIdsRef.current = pluginRunOpIds;
-    if (pluginRunOpIds) {
-      const ids = pluginRunOpIds.split(",").map(Number);
-      const hasUnknownRun = ids.some((id) => !runsState.runs.some((run) => run.id === id));
-      if (hasUnknownRun) {
-        void refreshPluginRuns({ autoAttach: true });
-      }
-    } else if (prevIds) {
-      void refreshPluginRuns({ autoAttach: false });
-    }
-  }, [pluginRunOpIds, runsState.runs]);
+  }, []);
 
   // Hydrate forward policy once from the global overview cache for ready plugin endpoints.
   const viewingReadyRun =
@@ -198,27 +151,6 @@ export function PluginsPage({ snapshot, locale, t, navigate, pushToast }: PagePr
     }
   }, [viewingReadyRun, appData.overview, appData.overviewLoading, appData.overviewError]);
 
-  // Announce live completion once per run when transitioning to `ready`.
-  const activeRun = runsState.activeRun;
-  useEffect(() => {
-    if (
-      activeRun &&
-      activeRun.phase === "ready" &&
-      activeRun.finishedLive &&
-      toastedReadyRunIdRef.current !== activeRun.id
-    ) {
-      toastedReadyRunIdRef.current = activeRun.id;
-      const matched = plugins?.find((item) => item.manifest.id === activeRun.plugin) ?? null;
-      const name = matched
-        ? resolveLocalizedText(matched.manifest.name, locale, matched.manifest.id)
-        : activeRun.plugin;
-      pushToast({
-        tone: "success",
-        body: t("app.b2.run_ready_toast", { name }),
-      });
-    }
-  }, [activeRun, plugins, locale, t, pushToast]);
-
   const handleToggleEnabled = async (plugin: PluginInfo, nextEnabled: boolean) => {
     const id = plugin.manifest.id;
     if (togglingIds.has(id)) {
@@ -232,18 +164,9 @@ export function PluginsPage({ snapshot, locale, t, navigate, pushToast }: PagePr
 
     try {
       await setPluginEnabled(id, nextEnabled);
-      if (!mountedRef.current) {
-        return;
-      }
-      // Reflect the committed server toggle immediately so a transient list refresh failure
-      // cannot revert the switch and trap the user from undoing the change.
-      setPlugins((prev) =>
-        prev === null
-          ? null
-          : prev.map((item) =>
-              item.manifest.id === id ? { ...item, enabled: nextEnabled } : item,
-            ),
-      );
+      // Reflect the committed server toggle immediately in the global cache so a transient list
+      // refresh failure cannot revert the switch and trap the user from undoing the change.
+      pluginCacheStore.setPluginEnabledLocal(id, nextEnabled);
       await fetchPlugins();
       void webStore.refreshSnapshot().catch(() => {});
     } catch (error) {
@@ -308,6 +231,17 @@ export function PluginsPage({ snapshot, locale, t, navigate, pushToast }: PagePr
   const shuttingDown = snapshot?.shutting_down === true;
   const operations = snapshot?.operations ?? [];
 
+  const handleRunAgain = useCallback(
+    (pluginId: string) => {
+      const target = pluginCacheStore.getPluginById(pluginId);
+      if (!canRunPluginAgain(target, shuttingDown)) {
+        return;
+      }
+      openPluginDeployForm(pluginId);
+    },
+    [shuttingDown],
+  );
+
   const isViewingRunDetail =
     runsState.selectedRunId !== null &&
     runsState.activeRun !== null &&
@@ -330,6 +264,7 @@ export function PluginsPage({ snapshot, locale, t, navigate, pushToast }: PagePr
           run={runsState.activeRun}
           plugin={activeRunPlugin}
           snapshot={snapshot}
+          billingCheck={runsState.billingChecksByRunId[runsState.activeRun.id]}
           endpointForwardIdsByKey={runsState.endpointForwardIdsByKey}
           forwardAddressesById={forwardsState.addressesById}
           forwardOverlaysById={forwardsState.overlaysById}
@@ -337,29 +272,28 @@ export function PluginsPage({ snapshot, locale, t, navigate, pushToast }: PagePr
           forwardPolicyLoading={appData.overviewLoading}
           forwardPolicyError={appData.overviewError}
           onRetryForwardPolicy={handleRetryForwardPolicy}
-          billingRecheckSeq={billingRecheckSeq}
           locale={locale}
           t={t}
           navigate={navigate}
           pushToast={pushToast}
           onBack={showPluginList}
           onRequestStopRuntime={handleRequestStopRuntime}
-          onRunAgain={openPluginDeployForm}
+          onRunAgain={handleRunAgain}
         />
       ) : isViewingDeployForm ? (
         deployFormPlugin ? (
           <PluginDeployForm
             key={`${deployFormPlugin.manifest.id}:${runsState.formOpenSeq}`}
             plugin={deployFormPlugin}
+            draft={runsState.deployDraft}
+            hfTokenState={pluginCache.hfToken}
             snapshot={snapshot}
             maxConcurrentSessions={appData.maxConcurrentSessions}
-            hfTokenSaved={hfTokenSaved}
             locale={locale}
             t={t}
             navigate={navigate}
             onBack={closePluginDeployForm}
             onOpenHfTokenDialog={() => setTokenDialogOpen(true)}
-            onHfTokenStatusLoaded={setHfTokenSaved}
             onRunStarted={handleRunStarted}
           />
         ) : loading && plugins === null ? (
@@ -662,7 +596,6 @@ export function PluginsPage({ snapshot, locale, t, navigate, pushToast }: PagePr
         t={t}
         disabled={shuttingDown || isHfTokenBusyInSnapshot(operations)}
         onClose={() => setTokenDialogOpen(false)}
-        onStatusChange={setHfTokenSaved}
       />
 
       <InstallPluginDialog
@@ -686,7 +619,9 @@ export function PluginsPage({ snapshot, locale, t, navigate, pushToast }: PagePr
         pushToast={pushToast}
         onClose={() => setStopDialogRequest(null)}
         onStopped={() => {
-          setBillingRecheckSeq((prev) => prev + 1);
+          if (runsState.selectedRunId !== null) {
+            void verifyPluginRunBilling(runsState.selectedRunId, { force: true });
+          }
         }}
       />
     </>
