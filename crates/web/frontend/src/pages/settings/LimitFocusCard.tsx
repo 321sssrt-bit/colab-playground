@@ -12,6 +12,7 @@ import {
   type RuntimeDefaults,
 } from "../../lib/constants.ts";
 import type { Dictionary, TranslateFn } from "../../lib/i18n.ts";
+import { scrollSettingsToTop } from "./focus.ts";
 
 const INTEGER_RE = /^\d+$/;
 
@@ -59,12 +60,13 @@ export const LimitFocusCard = memo(function LimitFocusCard({
   const inputId = useId();
   const descId = useId();
   const errorId = useId();
+  const sectionRef = useRef<HTMLElement | null>(null);
   const headingRef = useRef<HTMLHeadingElement | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
   const [invalid, setInvalid] = useState(false);
 
   useEffect(() => {
-    window.scrollTo({ top: 0, behavior: "auto" });
+    scrollSettingsToTop(sectionRef.current);
     headingRef.current?.focus({ preventScroll: true });
   }, []);
 
@@ -90,6 +92,7 @@ export const LimitFocusCard = memo(function LimitFocusCard({
 
   return (
     <section
+      ref={sectionRef}
       className="card settings-section settings-focus-card"
       data-settings-limit-focus="true"
     >

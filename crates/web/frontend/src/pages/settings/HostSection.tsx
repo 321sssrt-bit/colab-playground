@@ -8,6 +8,7 @@ import { memo, useEffect, useId, useMemo, useRef, type FormEvent } from "react";
 
 import { AlertIcon, CheckCircleIcon } from "../../components/Icons.tsx";
 import type { Dictionary, TranslateFn } from "../../lib/i18n.ts";
+import { scrollSettingsToTop } from "./focus.ts";
 
 export interface HostSaveError {
   readonly message: string;
@@ -57,6 +58,7 @@ export const HostSection = memo(function HostSection({
   const pythonHintId = useId();
   const errorId = useId();
 
+  const sectionRef = useRef<HTMLElement | null>(null);
   const headingRef = useRef<HTMLHeadingElement | null>(null);
   const colabPathRef = useRef<HTMLInputElement | null>(null);
 
@@ -64,7 +66,7 @@ export const HostSection = memo(function HostSection({
     if (!focused) {
       return;
     }
-    window.scrollTo({ top: 0, behavior: "auto" });
+    scrollSettingsToTop(sectionRef.current);
     headingRef.current?.focus({ preventScroll: true });
   }, [focused]);
 
@@ -99,6 +101,7 @@ export const HostSection = memo(function HostSection({
 
   return (
     <section
+      ref={sectionRef}
       className={focused ? "card settings-section settings-focus-card" : "card settings-section"}
       data-settings-host="true"
       data-settings-host-focus={focused ? "true" : undefined}

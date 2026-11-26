@@ -1262,27 +1262,36 @@ test("preferenceSync surfaces language/appearance save failures and clears after
 
   await client.login("secret-key");
   sync.setLanguage("zh-CN");
-  sync.setAppearance("dark");
   await flushAsync(6);
 
   assert.equal(patchBodies.length, 1);
-  assert.deepEqual(patchBodies[0], { language: "zh-CN", appearance: "dark" });
+  assert.deepEqual(patchBodies[0], { language: "zh-CN" });
   const failedState = sync.getState();
   assert.ok(failedState.lastError !== null);
-  assert.deepEqual(failedState.lastError.fields, ["language", "appearance"]);
+  assert.deepEqual(failedState.lastError.fields, ["language"]);
   assert.equal(failedState.lastError.error instanceof ApiError, true);
   assert.equal((failedState.lastError.error as ApiError).messageKey, "app.err.io");
 
-  // Retry succeeds and clears lastError.
+  // Changing appearance while language save failed bundles the unresolved language field too.
+  sync.setAppearance("dark");
+  await flushAsync(6);
+  assert.equal(patchBodies.length, 2);
+  assert.deepEqual(patchBodies[1], { language: "zh-CN", appearance: "dark" });
+  assert.deepEqual(sync.getState().lastError?.fields, ["language", "appearance"]);
+
+  // Retry succeeds for both fields and clears lastError.
   failPatch = false;
   sync.retryLastFailed();
   await flushAsync(6);
-  assert.equal(patchBodies.length, 2);
+  assert.equal(patchBodies.length, 3);
+  assert.deepEqual(patchBodies[2], { language: "zh-CN", appearance: "dark" });
   assert.equal(sync.getState().lastError, null);
 });
 
-test("updatesStore checkNow preserves current_version on offline failure and supersedes slower GET", async (t) => {
+test("updatesStore checkNow preserves current_version on offline failure, supersedes slower GET, and survives check_updates toggle", async (t) => {
   const slowGet = createDeferred<Response>();
+  const manualDeferred = createDeferred<Response>();
+  let manualCalls = 0;
   let failManualTransport = false;
   const baseNotice: UpdateNoticeResponse = {
     current_version: "0.5.0",
@@ -1315,8 +1324,12 @@ test("updatesStore checkNow preserves current_version on offline failure and sup
         return slowGet.promise;
       }
       if (url === "/api/updates/check" && method === "POST") {
+        manualCalls += 1;
         if (failManualTransport) {
           throw new TypeError("network down");
+        }
+        if (manualCalls === 2) {
+          return manualDeferred.promise;
         }
         return jsonResponse(baseNotice);
       }
@@ -1351,8 +1364,24 @@ test("updatesStore checkNow preserves current_version on offline failure and sup
   await autoPromise;
   assert.equal(updates.getState().notice?.status, "failed");
 
-  // Toggling auto-check updates the cached notice immediately.
+  // Toggling auto-check while a manual check is in flight keeps both the toggle and the found release.
+  const secondManual = updates.checkNow();
   updates.setCheckUpdates(false);
+  assert.equal(updates.getState().notice?.check_updates, false);
+  manualDeferred.resolve(
+    jsonResponse({
+      ...baseNotice,
+      update_available: true,
+      latest_version: "0.6.0",
+      release_url: "https://github.com/321sssrt-bit/colab-playground/releases/tag/v0.6.0",
+      status: "available",
+      check_updates: true,
+      error: null,
+    } satisfies UpdateNoticeResponse),
+  );
+  await secondManual;
+  assert.equal(updates.getState().notice?.status, "available");
+  assert.equal(updates.getState().notice?.latest_version, "0.6.0");
   assert.equal(updates.getState().notice?.check_updates, false);
 
   // Even a transport error on manual check keeps the last known current_version intact.
@@ -1362,7 +1391,7 @@ test("updatesStore checkNow preserves current_version on offline failure and sup
   assert.ok(updates.getState().manualError !== null);
 });
 
-test("settingsDraftStore persists unsaved drafts across route changes, merges limit saves, and clears on sign-out", async (t) => {
+test("settingsDraftStore persists unsaved drafts across route changes, reconciles partial saves, and clears on sign-out", async (t) => {
   const client = createApiClient({
     fetchImpl: async (input) => {
       const url = typeof input === "string" ? input : input.toString();
@@ -1394,12 +1423,21 @@ test("settingsDraftStore persists unsaved drafts across route changes, merges li
   assert.equal(restoredHost.colabPath, "/usr/local/bin/colab");
   assert.equal(restoredHost.colabPython, "/usr/bin/python3");
 
+  // Reconciling a Defaults save for max_attempts keeps an in-flight max_concurrent_sessions edit.
+  const serverAfterAttempts = { ...CORE_DEFAULTS, max_attempts: 5 };
+  drafts.reconcileSavedDefaults(serverAfterAttempts, { max_attempts: 5 });
+  const afterPartialDefaults = drafts.resolveDefaultsDraft(serverAfterAttempts);
+  assert.equal(afterPartialDefaults.draft.max_attempts, "5");
+  assert.equal(afterPartialDefaults.draft.max_concurrent_sessions, "4");
+
   // Saving concurrent limit from LimitFocusCard updates limit while keeping other unsaved Defaults fields.
-  const serverAfterLimit = { ...CORE_DEFAULTS, max_concurrent_sessions: 4 };
+  const withAnotherDraft = { ...afterPartialDefaults.draft, max_attempts: "7" };
+  drafts.saveDefaultsDraft(serverAfterAttempts, withAnotherDraft, afterPartialDefaults.forceInclude);
+  const serverAfterLimit = { ...serverAfterAttempts, max_concurrent_sessions: 4 };
   drafts.reconcileSavedConcurrentLimit(serverAfterLimit);
   const afterMerge = drafts.resolveDefaultsDraft(serverAfterLimit);
   assert.equal(afterMerge.draft.max_concurrent_sessions, "4");
-  assert.equal(afterMerge.draft.max_attempts, "5");
+  assert.equal(afterMerge.draft.max_attempts, "7");
 
   // Sign-out wipes all unsaved drafts immediately.
   client.logout();
@@ -1408,7 +1446,7 @@ test("settingsDraftStore persists unsaved drafts across route changes, merges li
   assert.deepEqual(drafts.resolveHostDraft(null, null), { colabPath: "", colabPython: "" });
 });
 
-test("settingsNoticeStore displays once globally, calls dismiss endpoint, and suppresses stale re-observations", async (t) => {
+test("settingsNoticeStore displays once globally, survives background null updates until dismissed, and suppresses stale re-observations", async (t) => {
   let dismissCalls = 0;
   const client = createApiClient({
     fetchImpl: async (input, init) => {
@@ -1440,6 +1478,10 @@ test("settingsNoticeStore displays once globally, calls dismiss endpoint, and su
   assert.equal(notices.getState().showCorrupt, true);
   assert.equal(notices.getState().showReset, false);
 
+  // Automatic login-sync PATCH clearing server settings_notice must not hide the banner before user dismiss.
+  notices.observe(null);
+  assert.equal(notices.getState().showCorrupt, true);
+
   await notices.dismissPart("corrupt");
   assert.equal(dismissCalls, 1);
   assert.equal(notices.getState().notice, null);
@@ -1448,13 +1490,14 @@ test("settingsNoticeStore displays once globally, calls dismiss endpoint, and su
   notices.observe(corruptNotice);
   assert.equal(notices.getState().notice, null);
 
-  // A distinct reset_defaults notice displays and clears authoritatively after PATCH /api/settings.
+  // A distinct reset_defaults notice displays until dismissed.
   notices.observe({
     corrupt: false,
     corrupt_backup: null,
     reset_defaults: ["max_runtime"],
   });
   assert.equal(notices.getState().showReset, true);
-  notices.observe(null, { authoritativeClear: true });
+  await notices.dismissPart("reset");
+  assert.equal(dismissCalls, 2);
   assert.equal(notices.getState().notice, null);
 });

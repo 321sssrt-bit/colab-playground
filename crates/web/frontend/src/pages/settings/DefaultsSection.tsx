@@ -211,10 +211,7 @@ export const DefaultsSection = memo(function DefaultsSection({
       return;
     }
     setInvalidFields(new Set<DefaultsFieldId>());
-    const ok = await onSave(result.patch);
-    if (ok) {
-      settingsDraftStore.clearDefaultsDraft();
-    }
+    await onSave(result.patch);
   };
 
   const handleDiscard = (): void => {

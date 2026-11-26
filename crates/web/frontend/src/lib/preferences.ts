@@ -3,8 +3,8 @@
  *
  * All login-sync and post-login preference writes flow through one ordered
  * pipeline per auth session so an older login-sync PATCH can never land on the
- * server after a newer user change. Save failures are surfaced to subscribers
- * so the UI reports persistence errors instead of swallowing them.
+ * server after a newer user change. Save failures are retained per field and
+ * retried alongside subsequent writes so an unresolved error is never dropped.
  */
 
 import { useSyncExternalStore } from "react";
@@ -58,6 +58,7 @@ export function createPreferenceSync(
   let activeController: AbortController | null = null;
   let pendingLanguage = false;
   let pendingAppearance = false;
+  const failedFields = new Set<PreferenceField>();
   let flushScheduled = false;
   let errorSeq = 0;
   let state: PreferenceSyncState = {
@@ -102,7 +103,6 @@ export function createPreferenceSync(
     patch: SettingsPatch,
     langVersion: number | undefined,
     appearanceVersion: number | undefined,
-    onSettingsLoaded?: (view: SettingsView) => void,
   ): Promise<void> => {
     const fields: PreferenceField[] = [];
     if (patch.language !== undefined) {
@@ -115,9 +115,10 @@ export function createPreferenceSync(
       return;
     }
 
-    setState({ saving: true, lastError: null });
+    // Preserve any existing unresolved error until the PATCH actually succeeds.
+    setState({ saving: true, lastError: state.lastError });
     try {
-      const updated = await client.request<SettingsView>("/api/settings", {
+      await client.request<SettingsView>("/api/settings", {
         method: "PATCH",
         body: patch,
         signal,
@@ -129,8 +130,17 @@ export function createPreferenceSync(
         if (appearanceVersion !== undefined) {
           theme.markSynced(appearanceVersion);
         }
-        onSettingsLoaded?.(updated);
-        setState({ saving: false, lastError: null });
+        for (const field of fields) {
+          failedFields.delete(field);
+        }
+        const remaining = Array.from(failedFields);
+        setState({
+          saving: false,
+          lastError:
+            remaining.length > 0 && state.lastError !== null
+              ? { ...state.lastError, fields: remaining }
+              : null,
+        });
       }
     } catch (error: unknown) {
       if (!isGenerationLive(generation, signal) || isIgnorableSaveError(error)) {
@@ -139,13 +149,16 @@ export function createPreferenceSync(
         }
         return;
       }
-      // Keep the browser choice active locally while surfacing the persistence failure.
+      // Keep the browser choice active locally and retain all failed fields until persisted.
+      for (const field of fields) {
+        failedFields.add(field);
+      }
       errorSeq += 1;
       setState({
         saving: false,
         lastError: {
           id: errorSeq,
-          fields,
+          fields: Array.from(failedFields),
           error,
         },
       });
@@ -171,12 +184,13 @@ export function createPreferenceSync(
       let langVersion: number | undefined;
       let appearanceVersion: number | undefined;
 
-      if (pendingLanguage) {
+      // Re-include any previously failed field so all preferences converge together on the server.
+      if (pendingLanguage || failedFields.has("language")) {
         pendingLanguage = false;
         langVersion = i18n.getVersion();
         patch.language = i18n.getState().preference;
       }
-      if (pendingAppearance) {
+      if (pendingAppearance || failedFields.has("appearance")) {
         pendingAppearance = false;
         appearanceVersion = theme.getVersion();
         patch.appearance = theme.getState().preference;
@@ -220,6 +234,7 @@ export function createPreferenceSync(
       const controller = resetController(externalSignal);
       const startLangVersion = i18n.getVersion();
       const startAppearanceVersion = theme.getVersion();
+      failedFields.clear();
       setState({ saving: false, lastError: null });
 
       enqueue(async () => {
@@ -280,20 +295,14 @@ export function createPreferenceSync(
           }
         }
 
-        await patchPreferences(
-          generation,
-          signal,
-          patch,
-          pushLangVersion,
-          pushAppearanceVersion,
-          options?.onSettingsLoaded,
-        );
+        await patchPreferences(generation, signal, patch, pushLangVersion, pushAppearanceVersion);
       });
     },
 
     cancelPending(): void {
       pendingLanguage = false;
       pendingAppearance = false;
+      failedFields.clear();
       flushScheduled = false;
       activeController?.abort();
       activeController = null;
@@ -319,20 +328,20 @@ export function createPreferenceSync(
     },
 
     retryLastFailed(): void {
-      const failed = state.lastError;
-      if (!failed || !client.isAuthenticated()) {
+      if (failedFields.size === 0 || !client.isAuthenticated()) {
         return;
       }
-      if (failed.fields.includes("language")) {
+      if (failedFields.has("language")) {
         pendingLanguage = true;
       }
-      if (failed.fields.includes("appearance")) {
+      if (failedFields.has("appearance")) {
         pendingAppearance = true;
       }
       scheduleFlush(client.getSessionGeneration());
     },
 
     clearError(): void {
+      failedFields.clear();
       if (state.lastError !== null) {
         setState({ saving: state.saving, lastError: null });
       }

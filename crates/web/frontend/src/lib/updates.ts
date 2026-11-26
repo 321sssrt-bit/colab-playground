@@ -142,6 +142,7 @@ export function createUpdatesStore(options: UpdatesStoreOptions = {}): UpdatesSt
   let checkedGeneration: number | null = null;
   let requestSeq = 0;
   let appliedSeq = 0;
+  let checkUpdatesOverride: { readonly seq: number; readonly enabled: boolean } | null = null;
   let inFlightAuto: InFlightUpdate<UpdateNoticeResponse | null> | null = null;
   let inFlightManual: InFlightUpdate<UpdateNoticeResponse> | null = null;
   let pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -225,6 +226,19 @@ export function createUpdatesStore(options: UpdatesStoreOptions = {}): UpdatesSt
     emit();
   };
 
+  const applyCheckUpdatesOverride = (
+    notice: UpdateNoticeResponse,
+    seq: number,
+  ): UpdateNoticeResponse => {
+    if (checkUpdatesOverride !== null && seq <= checkUpdatesOverride.seq) {
+      if (notice.check_updates === checkUpdatesOverride.enabled) {
+        return notice;
+      }
+      return { ...notice, check_updates: checkUpdatesOverride.enabled };
+    }
+    return notice;
+  };
+
   const resetSession = (): void => {
     stopPolling();
     inFlightAuto?.controller.abort();
@@ -232,6 +246,7 @@ export function createUpdatesStore(options: UpdatesStoreOptions = {}): UpdatesSt
     inFlightManual?.controller.abort();
     inFlightManual = null;
     checkedGeneration = null;
+    checkUpdatesOverride = null;
     appliedSeq = ++requestSeq;
     updateState({ notice: null, loading: false, checkingManual: false, manualError: null });
   };
@@ -268,7 +283,8 @@ export function createUpdatesStore(options: UpdatesStoreOptions = {}): UpdatesSt
         method: "GET",
         signal: controller.signal,
       })
-      .then((notice) => {
+      .then((rawNotice) => {
+        const notice = applyCheckUpdatesOverride(rawNotice, seq);
         if (!disposed && client.getSessionGeneration() === generation && seq >= appliedSeq) {
           appliedSeq = seq;
           checkedGeneration = generation;
@@ -314,7 +330,8 @@ export function createUpdatesStore(options: UpdatesStoreOptions = {}): UpdatesSt
         body: {},
         signal: controller.signal,
       })
-      .then((notice) => {
+      .then((rawNotice) => {
+        const notice = applyCheckUpdatesOverride(rawNotice, seq);
         if (!disposed && client.getSessionGeneration() === generation && seq >= appliedSeq) {
           appliedSeq = seq;
           checkedGeneration = generation;
@@ -385,10 +402,15 @@ export function createUpdatesStore(options: UpdatesStoreOptions = {}): UpdatesSt
     },
 
     setCheckUpdates(enabled: boolean): void {
-      if (disposed || state.notice === null || state.notice.check_updates === enabled) {
+      if (disposed) {
         return;
       }
-      appliedSeq = ++requestSeq;
+      // Record the preference against the current request sequence without advancing `appliedSeq`,
+      // so an in-flight manual update check still lands its newer version/status result.
+      checkUpdatesOverride = { seq: requestSeq, enabled };
+      if (state.notice === null || state.notice.check_updates === enabled) {
+        return;
+      }
       updateState({ notice: { ...state.notice, check_updates: enabled } });
     },
 

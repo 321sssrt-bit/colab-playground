@@ -10,6 +10,7 @@ import { useSyncExternalStore } from "react";
 
 import { apiClient, type ApiClient } from "../../lib/api.ts";
 import type { RuntimeDefaults } from "../../lib/constants.ts";
+import type { RuntimeDefaultsPatch } from "./api.ts";
 import {
   defaultsToDraft,
   isDraftDirty,
@@ -48,6 +49,7 @@ export interface SettingsDraftStore {
     forceInclude: ReadonlySet<DefaultsFieldKey>,
   ): void;
   updateConcurrentLimitDraft(serverDefaults: RuntimeDefaults, value: string): void;
+  reconcileSavedDefaults(updatedDefaults: RuntimeDefaults, savedPatch: RuntimeDefaultsPatch): void;
   reconcileSavedConcurrentLimit(updatedDefaults: RuntimeDefaults): void;
   clearDefaultsDraft(): void;
   resolveHostDraft(
@@ -192,6 +194,74 @@ export function createSettingsDraftStore(client: ApiClient = apiClient): Setting
       const nextForce = new Set(current.forceInclude);
       nextForce.delete("max_concurrent_sessions");
       saveDefaultsDraft(serverDefaults, nextDraft, nextForce);
+    },
+
+    reconcileSavedDefaults(
+      updatedDefaults: RuntimeDefaults,
+      savedPatch: RuntimeDefaultsPatch,
+    ): void {
+      const entry = state.defaultsEntry;
+      if (!entry) {
+        return;
+      }
+      const savedDraft = defaultsToDraft(updatedDefaults);
+      const nextDraft: { -readonly [K in keyof DefaultsDraft]: DefaultsDraft[K] } = {
+        ...entry.draft,
+      };
+      const nextForce = new Set(entry.forceInclude);
+      for (const key of Object.keys(savedPatch) as DefaultsFieldKey[]) {
+        nextForce.delete(key);
+        switch (key) {
+          case "max_runtime":
+            nextDraft.max_runtime_enabled = savedDraft.max_runtime_enabled;
+            nextDraft.max_runtime = savedDraft.max_runtime;
+            break;
+          case "max_spend_cu":
+            nextDraft.max_spend_enabled = savedDraft.max_spend_enabled;
+            nextDraft.max_spend_cu = savedDraft.max_spend_cu;
+            break;
+          case "min_balance_cu":
+            nextDraft.min_balance_enabled = savedDraft.min_balance_enabled;
+            nextDraft.min_balance_cu = savedDraft.min_balance_cu;
+            break;
+          case "idle_timeout":
+            nextDraft.idle_timeout_enabled = savedDraft.idle_timeout_enabled;
+            nextDraft.idle_timeout = savedDraft.idle_timeout;
+            break;
+          case "min_vram_mib":
+            nextDraft.min_vram_enabled = savedDraft.min_vram_enabled;
+            nextDraft.min_vram_gib = savedDraft.min_vram_gib;
+            break;
+          case "max_concurrent_sessions":
+            nextDraft.max_concurrent_sessions = savedDraft.max_concurrent_sessions;
+            break;
+          case "max_attempts":
+            nextDraft.max_attempts = savedDraft.max_attempts;
+            break;
+          case "retry_delay":
+            nextDraft.retry_delay = savedDraft.retry_delay;
+            break;
+          case "on_exhausted":
+            nextDraft.on_exhausted = savedDraft.on_exhausted;
+            break;
+          case "accelerator":
+            nextDraft.accelerator = savedDraft.accelerator;
+            break;
+          case "high_mem":
+            nextDraft.high_mem = savedDraft.high_mem;
+            break;
+          case "winddown_grace":
+            nextDraft.winddown_grace = savedDraft.winddown_grace;
+            break;
+          case "usage_poll_active":
+            nextDraft.usage_poll_active = savedDraft.usage_poll_active;
+            break;
+          case "usage_poll_idle":
+            nextDraft.usage_poll_idle = savedDraft.usage_poll_idle;
+            break;
+        }
+      }
+      saveDefaultsDraft(updatedDefaults, nextDraft, nextForce);
     },
 
     reconcileSavedConcurrentLimit(updatedDefaults: RuntimeDefaults): void {

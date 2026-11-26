@@ -106,7 +106,7 @@ export function App() {
     const controller = new AbortController();
     preferenceSync.syncSession(controller.signal, {
       onSettingsLoaded: (view) => {
-        settingsNoticeStore.observe(view.settings_notice, { authoritativeClear: true });
+        settingsNoticeStore.observe(view.settings_notice);
       },
     });
     void updatesStore.ensureChecked(controller.signal);
@@ -128,9 +128,7 @@ export function App() {
       return;
     }
     if (storeState.snapshot.settings_notice !== undefined) {
-      settingsNoticeStore.observe(storeState.snapshot.settings_notice, {
-        authoritativeClear: true,
-      });
+      settingsNoticeStore.observe(storeState.snapshot.settings_notice);
     }
   }, [storeState.authStatus, storeState.snapshot]);
 

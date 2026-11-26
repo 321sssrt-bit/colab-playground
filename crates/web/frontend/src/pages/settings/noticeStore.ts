@@ -24,10 +24,7 @@ export interface SettingsNoticeState {
 export interface SettingsNoticeStore {
   getState(): SettingsNoticeState;
   subscribe(listener: () => void): () => void;
-  observe(
-    notice: SettingsNotice | null | undefined,
-    options?: { readonly authoritativeClear?: boolean },
-  ): void;
+  observe(notice: SettingsNotice | null | undefined): void;
   dismissPart(part: NoticePart): Promise<void>;
   dispose(): void;
 }
@@ -123,22 +120,14 @@ export function createSettingsNoticeStore(client: ApiClient = apiClient): Settin
       };
     },
 
-    observe(
-      rawNotice: SettingsNotice | null | undefined,
-      options: { readonly authoritativeClear?: boolean } = {},
-    ): void {
+    observe(rawNotice: SettingsNotice | null | undefined): void {
       if (disposed || rawNotice === undefined) {
         return;
       }
       const normalized = normalizeSettingsNotice(rawNotice);
       if (normalized === null) {
-        if (options.authoritativeClear) {
-          activeNotice = null;
-          activeSignature = null;
-          corruptDismissed = false;
-          resetDismissed = false;
-          syncState();
-        }
+        // Never dismiss an unacknowledged notice already shown to the user (for example,
+        // when login preference sync sends an automatic PATCH /api/settings).
         return;
       }
 

@@ -45,6 +45,18 @@ function normalizePathInput(raw: string): string | null {
   return trimmed.length > 0 ? trimmed : null;
 }
 
+function mergeMetadata(prev: LoadedSettings, updated: LoadedSettings): LoadedSettings {
+  return {
+    ...prev,
+    configDir: updated.configDir,
+    settingsFile: updated.settingsFile,
+    loadStatus: updated.loadStatus,
+    corruptBackup: updated.corruptBackup,
+    resetDefaults: updated.resetDefaults,
+    settingsNotice: updated.settingsNotice,
+  };
+}
+
 export function SettingsPage({
   snapshot,
   t,
@@ -77,9 +89,9 @@ export function SettingsPage({
   const [savingCheckUpdates, setSavingCheckUpdates] = useState(false);
   const [checkUpdatesError, setCheckUpdatesError] = useState<unknown>(null);
 
+  const mutationSeqRef = useRef(0);
   const loadAbortRef = useRef<AbortController | null>(null);
-  const saveAbortRef = useRef<AbortController | null>(null);
-  const limitAbortRef = useRef<AbortController | null>(null);
+  const defaultsAbortRef = useRef<AbortController | null>(null);
   const hostAbortRef = useRef<AbortController | null>(null);
   const checkUpdatesAbortRef = useRef<AbortController | null>(null);
   const updateCheckAbortRef = useRef<AbortController | null>(null);
@@ -88,6 +100,7 @@ export function SettingsPage({
     loadAbortRef.current?.abort();
     const controller = new AbortController();
     loadAbortRef.current = controller;
+    const startMutationSeq = mutationSeqRef.current;
 
     setLoadingSettings(true);
     setLoadError(null);
@@ -97,8 +110,12 @@ export function SettingsPage({
         if (controller.signal.aborted) {
           return;
         }
+        settingsNoticeStore.observe(loaded.settingsNotice);
+        if (mutationSeqRef.current !== startMutationSeq) {
+          setSettings((prev) => (prev === null ? loaded : prev));
+          return;
+        }
         setSettings(loaded);
-        settingsNoticeStore.observe(loaded.settingsNotice, { authoritativeClear: true });
         updatesStore.setCheckUpdates(loaded.checkUpdates);
       })
       .catch((error: unknown) => {
@@ -124,8 +141,7 @@ export function SettingsPage({
     return () => {
       updatesController.abort();
       loadAbortRef.current?.abort();
-      saveAbortRef.current?.abort();
-      limitAbortRef.current?.abort();
+      defaultsAbortRef.current?.abort();
       hostAbortRef.current?.abort();
       checkUpdatesAbortRef.current?.abort();
       updateCheckAbortRef.current?.abort();
@@ -172,9 +188,10 @@ export function SettingsPage({
 
   const handleSaveDefaults = useCallback(
     async (patch: RuntimeDefaultsPatch): Promise<boolean> => {
-      saveAbortRef.current?.abort();
+      defaultsAbortRef.current?.abort();
       const controller = new AbortController();
-      saveAbortRef.current = controller;
+      defaultsAbortRef.current = controller;
+      mutationSeqRef.current += 1;
 
       setSavingDefaults(true);
       setSaveError(null);
@@ -185,8 +202,13 @@ export function SettingsPage({
         if (controller.signal.aborted) {
           return false;
         }
-        setSettings(updated);
-        settingsNoticeStore.observe(updated.settingsNotice, { authoritativeClear: true });
+        mutationSeqRef.current += 1;
+        setSettings((prev) =>
+          prev === null
+            ? updated
+            : { ...mergeMetadata(prev, updated), defaults: updated.defaults },
+        );
+        settingsDraftStore.reconcileSavedDefaults(updated.defaults, patch);
         appDataStore.applySessionDefaults(updated.defaults);
         setSavedNotice(true);
         pushToast({ tone: "success", body: t("web.settings.saved") });
@@ -203,8 +225,8 @@ export function SettingsPage({
         });
         return false;
       } finally {
-        if (saveAbortRef.current === controller) {
-          saveAbortRef.current = null;
+        if (defaultsAbortRef.current === controller) {
+          defaultsAbortRef.current = null;
         }
         if (!controller.signal.aborted) {
           setSavingDefaults(false);
@@ -216,9 +238,10 @@ export function SettingsPage({
 
   const handleSaveLimitFocus = useCallback(
     async (limit: number): Promise<boolean> => {
-      limitAbortRef.current?.abort();
+      defaultsAbortRef.current?.abort();
       const controller = new AbortController();
-      limitAbortRef.current = controller;
+      defaultsAbortRef.current = controller;
+      mutationSeqRef.current += 1;
 
       setSavingLimit(true);
       setLimitSaveError(null);
@@ -229,9 +252,13 @@ export function SettingsPage({
         if (controller.signal.aborted) {
           return false;
         }
-        setSettings(updated);
+        mutationSeqRef.current += 1;
+        setSettings((prev) =>
+          prev === null
+            ? updated
+            : { ...mergeMetadata(prev, updated), defaults: updated.defaults },
+        );
         settingsDraftStore.reconcileSavedConcurrentLimit(updated.defaults);
-        settingsNoticeStore.observe(updated.settingsNotice, { authoritativeClear: true });
         appDataStore.applySessionDefaults(updated.defaults);
         setLimitSavedNotice(true);
         pushToast({ tone: "success", body: t("web.settings.saved") });
@@ -248,8 +275,8 @@ export function SettingsPage({
         });
         return false;
       } finally {
-        if (limitAbortRef.current === controller) {
-          limitAbortRef.current = null;
+        if (defaultsAbortRef.current === controller) {
+          defaultsAbortRef.current = null;
         }
         if (!controller.signal.aborted) {
           setSavingLimit(false);
@@ -285,6 +312,7 @@ export function SettingsPage({
       hostAbortRef.current?.abort();
       const controller = new AbortController();
       hostAbortRef.current = controller;
+      mutationSeqRef.current += 1;
 
       setSavingHost(true);
       setHostError(null);
@@ -295,8 +323,12 @@ export function SettingsPage({
           if (controller.signal.aborted) {
             return;
           }
-          setSettings(updated);
-          settingsNoticeStore.observe(updated.settingsNotice, { authoritativeClear: true });
+          mutationSeqRef.current += 1;
+          setSettings((prev) =>
+            prev === null
+              ? updated
+              : { ...mergeMetadata(prev, updated), wslDistro: updated.wslDistro },
+          );
           setHostSavedNotice(true);
           pushToast({ tone: "success", body: t("web.settings.saved") });
           if (snapshot?.backend === "real") {
@@ -343,6 +375,7 @@ export function SettingsPage({
       hostAbortRef.current?.abort();
       const controller = new AbortController();
       hostAbortRef.current = controller;
+      mutationSeqRef.current += 1;
 
       setSavingHost(true);
       setHostError(null);
@@ -356,9 +389,17 @@ export function SettingsPage({
         if (controller.signal.aborted) {
           return false;
         }
-        setSettings(updated);
+        mutationSeqRef.current += 1;
+        setSettings((prev) =>
+          prev === null
+            ? updated
+            : {
+                ...mergeMetadata(prev, updated),
+                colabPath: updated.colabPath,
+                colabPython: updated.colabPython,
+              },
+        );
         settingsDraftStore.clearHostDraft();
-        settingsNoticeStore.observe(updated.settingsNotice, { authoritativeClear: true });
         setHostSavedNotice(true);
         pushToast({ tone: "success", body: t("web.settings.saved") });
         if (snapshot?.backend === "real") {
@@ -435,6 +476,7 @@ export function SettingsPage({
       checkUpdatesAbortRef.current?.abort();
       const controller = new AbortController();
       checkUpdatesAbortRef.current = controller;
+      mutationSeqRef.current += 1;
 
       setSavingCheckUpdates(true);
       setCheckUpdatesError(null);
@@ -444,8 +486,12 @@ export function SettingsPage({
           if (controller.signal.aborted) {
             return;
           }
-          setSettings(updated);
-          settingsNoticeStore.observe(updated.settingsNotice, { authoritativeClear: true });
+          mutationSeqRef.current += 1;
+          setSettings((prev) =>
+            prev === null
+              ? updated
+              : { ...mergeMetadata(prev, updated), checkUpdates: updated.checkUpdates },
+          );
           updatesStore.setCheckUpdates(updated.checkUpdates);
         })
         .catch((error: unknown) => {
@@ -494,6 +540,7 @@ export function SettingsPage({
   const wslDistros = appData.overview?.environment.wsl_distros ?? [];
   const hostFirst = settingsFocus === "host";
   const limitFirst = settingsFocus === "limit";
+  const savingAnyDefaults = savingDefaults || savingLimit;
 
   const resolvedDefaultsDraft = settings
     ? settingsDraftStore.resolveDefaultsDraft(settings.defaults)
@@ -540,7 +587,7 @@ export function SettingsPage({
             serverDefaults={settings.defaults}
             draftValue={resolvedDefaultsDraft.draft.max_concurrent_sessions}
             dict={i18n.dict}
-            saving={savingLimit}
+            saving={savingAnyDefaults}
             saveError={limitSaveErrorText}
             savedNotice={limitSavedNotice}
             t={t}
@@ -573,7 +620,7 @@ export function SettingsPage({
             serverDefaults={settings.defaults}
             dict={i18n.dict}
             t={t}
-            saving={savingDefaults}
+            saving={savingAnyDefaults}
             saveError={saveErrorText}
             savedNotice={savedNotice}
             onSave={handleSaveDefaults}
