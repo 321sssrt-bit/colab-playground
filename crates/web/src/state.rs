@@ -8,7 +8,7 @@ mod shutdown;
 
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Condvar, Mutex, MutexGuard},
     time::Duration,
 };
 
@@ -32,7 +32,7 @@ use tokio::{
 
 pub use accounts::{AccountSwitchApproval, AccountSwitchPreview};
 pub use forwards::ForwardPolicy;
-pub use login::LoginPrompt;
+pub use login::{CancelLoginOutcome, LoginPrompt, SubmitCancelOutcome, SubmitCancelSettlement};
 pub use shutdown::{Billing, ShutdownReport};
 
 const LOGIN_INACTIVITY: Duration = Duration::from_secs(5 * 60);
@@ -80,6 +80,8 @@ pub struct Snapshot {
     pub account: AccountContext,
     pub accounts: Option<AccountsView>,
     pub accounts_error: Option<ErrorKind>,
+    #[serde(skip)]
+    recovered_pending_add_latched: bool,
     pub runtimes: Option<RuntimesView>,
     pub runtimes_error: Option<ErrorKind>,
     pub tunnels: Vec<TunnelInfo>,
@@ -108,7 +110,7 @@ pub struct WebState(Arc<Inner>);
 struct Inner {
     backend: Arc<dyn Backend>,
     control: Mutex<Control>,
-    poll_slot: Mutex<()>,
+    poll_slot: PollSlot,
     snapshots: watch::Sender<Arc<Snapshot>>,
     refresh: Notify,
     drained: Notify,
@@ -120,10 +122,59 @@ struct Inner {
 }
 
 #[derive(Default)]
+struct PollSlot {
+    locked: Mutex<bool>,
+    changed: Condvar,
+}
+
+struct PollSlotGuard<'a>(&'a PollSlot);
+
+impl Drop for PollSlotGuard<'_> {
+    fn drop(&mut self) {
+        let mut locked = self.0.locked.lock().unwrap_or_else(|e| e.into_inner());
+        *locked = false;
+        self.0.changed.notify_all();
+    }
+}
+
+impl PollSlot {
+    fn lock(&self) -> PollSlotGuard<'_> {
+        let mut locked = self.locked.lock().unwrap_or_else(|e| e.into_inner());
+        while *locked {
+            locked = self.changed.wait(locked).unwrap_or_else(|e| e.into_inner());
+        }
+        *locked = true;
+        PollSlotGuard(self)
+    }
+
+    fn lock_cancellable(&self, cancel: &CancelToken) -> Result<PollSlotGuard<'_>> {
+        let mut locked = self.locked.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            cancel.check()?;
+            if !*locked {
+                *locked = true;
+                return Ok(PollSlotGuard(self));
+            }
+            let (guard, _) = self
+                .changed
+                .wait_timeout(locked, Duration::from_millis(20))
+                .unwrap_or_else(|e| e.into_inner());
+            locked = guard;
+        }
+    }
+
+    fn notify_waiters(&self) {
+        let _locked = self.locked.lock().unwrap_or_else(|e| e.into_inner());
+        self.changed.notify_all();
+    }
+}
+
+#[derive(Default)]
 struct Control {
     next_id: u64,
     running: BTreeMap<u64, Running>,
     login: Option<login::PendingLogin>,
+    login_job: Option<login::ActiveLoginJob>,
     shutting_down: bool,
     uncertain_cleanup: bool,
 }
@@ -152,17 +203,42 @@ struct Job {
     state: WebState,
     id: u64,
     cancel: CancelToken,
+    finished: bool,
 }
 
-impl Drop for Job {
-    fn drop(&mut self) {
-        let mut control = self.state.lock();
+impl Job {
+    fn finish_locked(&mut self, control: &mut Control) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.release_locked(control);
+    }
+
+    fn release_locked(&self, control: &mut Control) {
         let running = control.running.remove(&self.id).expect("reserved job");
-        self.state.publish_operations(&control);
+        if control
+            .login_job
+            .as_ref()
+            .is_some_and(|active| active.job_id == self.id)
+        {
+            control.login_job = None;
+        }
+        self.state.publish_operations(control);
         if running.operation.is_some() {
             self.state.0.refresh.notify_one();
         }
         self.state.0.drained.notify_waiters();
+    }
+}
+
+impl Drop for Job {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let mut control = self.state.lock();
+        self.release_locked(&mut control);
     }
 }
 
@@ -199,6 +275,7 @@ impl WebState {
             },
             accounts: None,
             accounts_error: None,
+            recovered_pending_add_latched: false,
             runtimes: None,
             runtimes_error: None,
             tunnels: Vec::new(),
@@ -213,7 +290,7 @@ impl WebState {
         let state = Self(Arc::new(Inner {
             backend,
             control: Mutex::default(),
-            poll_slot: Mutex::default(),
+            poll_slot: PollSlot::default(),
             snapshots,
             refresh: Notify::new(),
             drained: Notify::new(),
@@ -342,13 +419,19 @@ impl WebState {
     }
 
     pub fn cancel(&self, id: u64) -> bool {
-        let control = self.lock();
-        let cancelled = control
-            .running
-            .get(&id)
-            .is_some_and(|running| running.operation.is_some() && running.cancel.cancel());
+        let cancelled = {
+            let control = self.lock();
+            let cancelled = control
+                .running
+                .get(&id)
+                .is_some_and(|running| running.operation.is_some() && running.cancel.cancel());
+            if cancelled {
+                self.publish_operations(&control);
+            }
+            cancelled
+        };
         if cancelled {
-            self.publish_operations(&control);
+            self.0.poll_slot.notify_waiters();
         }
         cancelled
     }
@@ -474,17 +557,26 @@ impl WebState {
         }
     }
 
-    fn lock_poll_slot(&self) -> MutexGuard<'_, ()> {
-        self.0
-            .poll_slot
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
+    fn lock_poll_slot(&self) -> PollSlotGuard<'_> {
+        self.0.poll_slot.lock()
+    }
+
+    fn lock_poll_slot_cancellable(&self, cancel: &CancelToken) -> Result<PollSlotGuard<'_>> {
+        self.0.poll_slot.lock_cancellable(cancel)
+    }
+
+    fn wake_poll_slot_waiters(&self) {
+        self.0.poll_slot.notify_waiters();
     }
 
     fn record_accounts(&self, result: Result<AccountsView>) {
         let now = self.0.backend.now();
         self.update(|snapshot| match result {
             Ok(mut view) => {
+                if view.recovered_pending_add {
+                    snapshot.recovered_pending_add_latched = true;
+                }
+                view.recovered_pending_add = snapshot.recovered_pending_add_latched;
                 let usage = view
                     .accounts
                     .iter_mut()
@@ -561,6 +653,7 @@ impl WebState {
             state: self.clone(),
             id,
             cancel,
+            finished: false,
         }
     }
 

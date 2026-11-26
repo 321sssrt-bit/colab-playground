@@ -4,6 +4,7 @@ use axum::{
     Json, Router,
     extract::{Path, State, rejection::JsonRejection},
     http::StatusCode,
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
 use colab_playground_core::{
@@ -12,17 +13,19 @@ use colab_playground_core::{
     backend::AccountUsageView,
 };
 use colab_playground_web::state::{
-    AccountContext, AccountSwitchApproval, AccountSwitchPreview, LoginPrompt, Snapshot,
+    AccountContext, AccountSwitchApproval, AccountSwitchPreview, CancelLoginOutcome, LoginPrompt,
+    Snapshot, Submission, SubmitCancelOutcome, WebState,
 };
 use serde::{Deserialize, Serialize};
 
-use super::{ApiError, finish};
+use super::{ApiError, ErrorMessage, finish};
 use crate::http::StateData;
 
 pub(super) fn routes() -> Router<StateData> {
     Router::new()
         .route("/api/accounts", get(list))
         .route("/api/accounts/usage/refresh", post(refresh))
+        .route("/api/accounts/recovered/dismiss", post(dismiss_recovered))
         .route("/api/accounts/adopt", post(adopt))
         .route("/api/accounts/login", post(begin_login))
         .route(
@@ -78,6 +81,15 @@ async fn refresh(
     Accounts::from_snapshot(state.web.refresh_accounts().await?)
 }
 
+async fn dismiss_recovered(
+    State(state): State<StateData>,
+    payload: Result<Json<Empty>, JsonRejection>,
+) -> Result<StatusCode, ApiError> {
+    let Json(_) = payload?;
+    state.web.dismiss_recovered_pending_add();
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[derive(Deserialize)]
 struct AccountAction {
     account_context: AccountContext,
@@ -93,12 +105,39 @@ async fn adopt(
     ))
 }
 
+struct CancelBeginOnDrop {
+    web: WebState,
+    id: u64,
+    armed: bool,
+}
+
+impl Drop for CancelBeginOnDrop {
+    fn drop(&mut self) {
+        // Dropping the HTTP future before returning 201 leaves nobody with the prompt id.
+        if self.armed {
+            self.web.abort_login_start(self.id);
+        }
+    }
+}
+
 async fn begin_login(
     State(state): State<StateData>,
     payload: Result<Json<AccountAction>, JsonRejection>,
 ) -> Result<(StatusCode, Json<LoginPrompt>), ApiError> {
     let Json(action) = payload?;
-    let prompt = finish(state.web.begin_login(action.account_context)?).await?;
+    let submission = state.web.begin_login(action.account_context)?;
+    let mut guard = match &submission {
+        Submission::Started { id, .. } => Some(CancelBeginOnDrop {
+            web: state.web.clone(),
+            id: *id,
+            armed: true,
+        }),
+        Submission::AlreadyRunning { .. } => None,
+    };
+    let prompt = finish(submission).await?;
+    if let Some(guard) = &mut guard {
+        guard.armed = false;
+    }
     Ok((StatusCode::CREATED, Json(prompt)))
 }
 
@@ -117,17 +156,58 @@ async fn submit_login(
     Ok(Json(account.ok_or(Error::cancelled())?))
 }
 
+#[derive(Serialize)]
+struct CancelLoginResponse<'a> {
+    outcome: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    account_context: Option<AccountContext>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    accounts: Option<AccountsView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    accounts_error: Option<ErrorKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    account: Option<Account>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<ErrorMessage<'a>>,
+}
+
+fn cancel_login_response(outcome: CancelLoginOutcome) -> Response {
+    match outcome {
+        CancelLoginOutcome::RolledBack => StatusCode::NO_CONTENT.into_response(),
+        CancelLoginOutcome::SubmittingSettled(settled) => {
+            let (outcome, account, error) = match &settled.outcome {
+                SubmitCancelOutcome::Cancelled => ("cancelled", None, None),
+                SubmitCancelOutcome::Completed(account) => {
+                    ("completed", Some(account.clone()), None)
+                }
+                SubmitCancelOutcome::Failed(error) => {
+                    ("failed", None, Some(ErrorMessage::from(error)))
+                }
+            };
+            (
+                StatusCode::OK,
+                Json(CancelLoginResponse {
+                    outcome,
+                    account_context: settled.account_context,
+                    accounts: settled.accounts,
+                    accounts_error: settled.accounts_error,
+                    account,
+                    error,
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
 async fn cancel_login(
     State(state): State<StateData>,
     Path(id): Path<u64>,
     payload: Result<Json<Empty>, JsonRejection>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<Response, ApiError> {
     let Json(_) = payload?;
-    if let Some(rollback) = state.web.cancel_login(id)? {
-        finish(rollback).await?;
-        return Ok(StatusCode::NO_CONTENT);
-    }
-    Ok(StatusCode::ACCEPTED)
+    let outcome = state.web.cancel_login_settled(id).await?;
+    Ok(cancel_login_response(outcome))
 }
 
 async fn preview_switch(

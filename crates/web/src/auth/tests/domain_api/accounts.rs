@@ -360,7 +360,7 @@ async fn cancellation_reaches_login_while_opening_and_while_submitting() {
             let route = format!("{LOGIN}/{opening_id}");
             assert_eq!(
                 client.request("DELETE", &route, "{}").status(),
-                StatusCode::ACCEPTED
+                StatusCode::NO_CONTENT
             );
             assert_eq!(opening.join().unwrap()["error"]["kind"], "cancelled");
         });
@@ -378,10 +378,11 @@ async fn cancellation_reaches_login_while_opening_and_while_submitting() {
             snapshot_when(&mut stream, |snapshot| {
                 snapshot["operations"][0]["operation"]["login_id"] == opened
             });
-            assert_eq!(
-                client.request("DELETE", &route, "{}").status(),
-                StatusCode::ACCEPTED
-            );
+            let settled = json(client.request("DELETE", &route, "{}"), StatusCode::OK);
+            assert_eq!(settled["outcome"], "cancelled");
+            assert_eq!(settled["account_context"]["active"], original);
+            assert_eq!(settled["accounts"]["active"], original);
+            assert_eq!(settled["accounts"]["has_token"], true);
             assert_eq!(submitting.join().unwrap()["error"]["kind"], "cancelled");
         });
         let finished = snapshot_when(&mut stream, |snapshot| {
@@ -403,6 +404,38 @@ async fn cancellation_reaches_login_while_opening_and_while_submitting() {
             original
         );
         assert_eq!(client.get(ACCOUNTS)["accounts"]["active"], original);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recovered_pending_add_persists_across_refreshes_until_dismissed_via_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut config, _) = MockConfig::headless(MockScenario::single());
+    config.failures.interrupted_add = true;
+    exercise(dir.path(), config, |client, _, _| {
+        let mut stream = events(&client);
+        let initial = client.get(ACCOUNTS);
+        assert_eq!(initial["accounts"]["recovered_pending_add"], true);
+        assert!(!initial["accounts"]["active"].is_null());
+
+        for _ in 0..2 {
+            let refreshed = mutate(&client, REFRESH, &json!({}), StatusCode::OK);
+            assert_eq!(refreshed["accounts"]["recovered_pending_add"], true);
+        }
+
+        assert_eq!(
+            client
+                .request("POST", "/api/accounts/recovered/dismiss", "{}")
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+        let dismissed = snapshot_when(&mut stream, |snapshot| {
+            snapshot["accounts"]["recovered_pending_add"] == false
+        });
+        assert_eq!(dismissed["accounts"]["recovered_pending_add"], false);
+        let after = mutate(&client, REFRESH, &json!({}), StatusCode::OK);
+        assert_eq!(after["accounts"]["recovered_pending_add"], false);
     })
     .await;
 }
