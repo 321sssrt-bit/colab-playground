@@ -21,6 +21,7 @@ import { webStore } from "../../lib/store.ts";
 import type { Locale } from "../../lib/types.ts";
 import {
   cancelPluginPreview,
+  confirmOwnedPreviewCancel,
   discardPluginPreview,
   findInspectPluginOpId,
   formatPluginApiError,
@@ -42,6 +43,7 @@ export interface InstallPluginDialogProps {
   readonly onClose: () => void;
   readonly onInstalled: (plugin: PluginInfo) => void;
   readonly onCheckCancelled?: () => void;
+  readonly onCheckCancelFailed?: (error: unknown) => void;
 }
 
 type DialogPhase = "source" | "checking" | "preview" | "installing";
@@ -55,6 +57,7 @@ export function InstallPluginDialog({
   onClose,
   onInstalled,
   onCheckCancelled,
+  onCheckCancelFailed,
 }: InstallPluginDialogProps) {
   const titleId = useId();
   const sourceInputId = useId();
@@ -93,29 +96,48 @@ export function InstallPluginDialog({
     void discardPluginPreview(previewId).catch(() => {});
   }, []);
 
-  const cancelInFlightCheck = useCallback((): boolean => {
-    const wasChecking = checkingRef.current;
-    const preExistingOpId = preExistingInspectOpIdRef.current;
-    checkingRef.current = false;
-    preExistingInspectOpIdRef.current = null;
-    // Always abort our own HTTP request so backend `CancelOperationOnDrop` cancels only
-    // an operation started by this request.
-    checkAbortRef.current?.abort();
-    checkAbortRef.current = null;
-    if (
-      wasChecking &&
-      shouldSendGlobalPreviewCancel(preExistingOpId, webStore.getState().snapshot?.operations)
-    ) {
-      // Proxy-buffering fallback: only call the global cancel endpoint when this tab did not
-      // collide with a pre-existing `inspect_plugin` op owned by another tab.
-      void cancelPluginPreview().catch(() => {});
-    }
-    return wasChecking;
-  }, []);
+  const onCheckCancelledRef = useRef(onCheckCancelled);
+  onCheckCancelledRef.current = onCheckCancelled;
+  const onCheckCancelFailedRef = useRef(onCheckCancelFailed);
+  onCheckCancelFailedRef.current = onCheckCancelFailed;
+
+  const cancelInFlightCheck = useCallback(
+    (notifyOutcome: boolean) => {
+      const wasChecking = checkingRef.current;
+      const preExistingOpId = preExistingInspectOpIdRef.current;
+      checkingRef.current = false;
+      preExistingInspectOpIdRef.current = null;
+      // Always abort our own HTTP request so backend `CancelOperationOnDrop` cancels only
+      // an operation started by this request.
+      checkAbortRef.current?.abort();
+      checkAbortRef.current = null;
+      if (!wasChecking) {
+        return;
+      }
+      if (!notifyOutcome) {
+        if (shouldSendGlobalPreviewCancel(preExistingOpId, webStore.getState().snapshot?.operations)) {
+          void cancelPluginPreview().catch(() => {});
+        }
+        return;
+      }
+      void confirmOwnedPreviewCancel({
+        preExistingInspectOpId: preExistingOpId,
+        currentOperations: webStore.getState().snapshot?.operations,
+        refreshOperations: async () => (await webStore.refreshSnapshot()).operations,
+      }).then((outcome) => {
+        if (outcome.kind === "cancelled") {
+          onCheckCancelledRef.current?.();
+        } else if (outcome.kind === "failed") {
+          onCheckCancelFailedRef.current?.(outcome.error);
+        }
+      });
+    },
+    [],
+  );
 
   const resetForOpen = useCallback(() => {
     checkSeqRef.current += 1;
-    cancelInFlightCheck();
+    cancelInFlightCheck(false);
     installAbortRef.current?.abort();
     installAbortRef.current = null;
     discardStagedPreview(activePreviewIdRef.current);
@@ -157,7 +179,7 @@ export function InstallPluginDialog({
     return () => {
       mountedRef.current = false;
       checkSeqRef.current += 1;
-      cancelInFlightCheck();
+      cancelInFlightCheck(false);
       installAbortRef.current?.abort();
       installAbortRef.current = null;
       discardStagedPreview(activePreviewIdRef.current);
@@ -176,7 +198,7 @@ export function InstallPluginDialog({
       dialog.returnValue = "";
     }
     checkSeqRef.current += 1;
-    const cancelledActiveCheck = cancelInFlightCheck();
+    cancelInFlightCheck(true);
     installAbortRef.current?.abort();
     installAbortRef.current = null;
     discardStagedPreview(activePreviewIdRef.current);
@@ -185,9 +207,6 @@ export function InstallPluginDialog({
     setErrorMessage(null);
     setCancelledNotice(false);
     setSourceInvalid(false);
-    if (cancelledActiveCheck) {
-      onCheckCancelled?.();
-    }
     if (openRef.current) {
       onClose();
     }

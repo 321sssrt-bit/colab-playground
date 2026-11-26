@@ -140,6 +140,9 @@ export function PluginsPage({ snapshot, locale, t, navigate, pushToast }: PagePr
 
   const fetchPlugins = useCallback(async () => {
     await pluginCacheStore.refreshPlugins().catch(() => {});
+    // Mirror upstream `load_plugins` -> `check_hf_token` so keyring failures surface promptly
+    // after plugin catalog mutations or manual retries without keeping a stale `saved: true`.
+    void pluginCacheStore.refreshHfTokenStatus({ silent: true }).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -261,9 +264,30 @@ export function PluginsPage({ snapshot, locale, t, navigate, pushToast }: PagePr
     });
   }, [pushToast, t]);
 
+  const handleInstallCheckCancelFailed = useCallback(
+    (error: unknown) => {
+      pushToast({
+        tone: "danger",
+        body: formatPluginApiError(error, t),
+      });
+    },
+    [pushToast, t],
+  );
+
   const handleRunAgain = useCallback(
     (pluginId: string) => {
       if (shuttingDown) {
+        return;
+      }
+      const cache = pluginCacheStore.getState();
+      if (cache.plugins === null) {
+        if (cache.pluginsLoading) {
+          return;
+        }
+        pushToast({
+          tone: "danger",
+          body: cache.pluginsError ? formatPluginApiError(cache.pluginsError, t) : t("app.err.other"),
+        });
         return;
       }
       const target = pluginCacheStore.getPluginById(pluginId);
@@ -310,6 +334,11 @@ export function PluginsPage({ snapshot, locale, t, navigate, pushToast }: PagePr
         <PluginRunView
           run={runsState.activeRun}
           plugin={activeRunPlugin}
+          pluginsCatalogLoading={loading}
+          pluginsCatalogError={plugins === null ? loadError : null}
+          onRetryPluginsCatalog={() => {
+            void fetchPlugins();
+          }}
           snapshot={snapshot}
           billingCheck={runsState.billingChecksByRunId[runsState.activeRun.id]}
           endpointForwardIdsByKey={runsState.endpointForwardIdsByKey}
@@ -655,6 +684,7 @@ export function PluginsPage({ snapshot, locale, t, navigate, pushToast }: PagePr
         onClose={() => setInstallOpen(false)}
         onInstalled={handleInstalled}
         onCheckCancelled={handleInstallCheckCancelled}
+        onCheckCancelFailed={handleInstallCheckCancelFailed}
       />
 
       <RemovePluginDialog

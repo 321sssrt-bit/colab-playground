@@ -286,6 +286,47 @@ export function shouldSendGlobalPreviewCancel(
   return findInspectPluginOpId(currentOperations) !== null;
 }
 
+export type PreviewCancelOutcome =
+  | { readonly kind: "cancelled" }
+  | { readonly kind: "skipped" }
+  | { readonly kind: "failed"; readonly error: unknown };
+
+/**
+ * Confirms backend cancellation of a plugin preview check started by this tab.
+ * - If another tab already owned `inspect_plugin` before submit, skips global cancel.
+ * - If `inspect_plugin` is active in the current snapshot, posts `/api/plugins/previews/cancel`.
+ * - If the snapshot has not yet observed `inspect_plugin` (e.g. fast cancel right after submit),
+ *   refreshes the snapshot once: if a proxy kept the op alive on the server, cancels it explicitly;
+ *   otherwise the aborted HTTP request already ended the op on the backend.
+ */
+export async function confirmOwnedPreviewCancel(params: {
+  readonly preExistingInspectOpId: number | null;
+  readonly currentOperations: readonly PendingOperation[] | undefined;
+  readonly refreshOperations: () => Promise<readonly PendingOperation[] | undefined>;
+  readonly cancelPreview?: () => Promise<void>;
+}): Promise<PreviewCancelOutcome> {
+  if (params.preExistingInspectOpId !== null) {
+    return { kind: "skipped" };
+  }
+  const sendCancel = params.cancelPreview ?? (() => cancelPluginPreview());
+  try {
+    if (shouldSendGlobalPreviewCancel(null, params.currentOperations)) {
+      await sendCancel();
+      return { kind: "cancelled" };
+    }
+    const latestOperations = await params.refreshOperations();
+    if (shouldSendGlobalPreviewCancel(null, latestOperations)) {
+      await sendCancel();
+    }
+    return { kind: "cancelled" };
+  } catch (error) {
+    if (error instanceof ApiError && (error.isAbort || error.isUnauthorized)) {
+      return { kind: "skipped" };
+    }
+    return { kind: "failed", error };
+  }
+}
+
 export async function installPluginPreview(
   previewId: string,
   signal?: AbortSignal,

@@ -202,6 +202,9 @@ function formatOutputValue(value: unknown): string {
 export interface PluginRunViewProps {
   readonly run: PluginRunDetail;
   readonly plugin: PluginInfo | null;
+  readonly pluginsCatalogLoading?: boolean;
+  readonly pluginsCatalogError?: string | null;
+  readonly onRetryPluginsCatalog?: () => void;
   readonly snapshot: Snapshot | null;
   readonly billingCheck: PluginRunBillingCheck | undefined;
   readonly endpointForwardIdsByKey: Readonly<Record<string, number | null>>;
@@ -223,6 +226,9 @@ export interface PluginRunViewProps {
 export function PluginRunView({
   run,
   plugin,
+  pluginsCatalogLoading = false,
+  pluginsCatalogError = null,
+  onRetryPluginsCatalog,
   snapshot,
   billingCheck,
   endpointForwardIdsByKey,
@@ -245,7 +251,9 @@ export function PluginRunView({
   const stickToBottomRef = useRef(true);
 
   const [nowMs, setNowMs] = useState<number>(() => Date.now());
-  const [runAgainBlocked, setRunAgainBlocked] = useState<"disabled" | "missing" | null>(null);
+  const [runAgainBlocked, setRunAgainBlocked] = useState<
+    "disabled" | "missing" | "load_error" | null
+  >(null);
 
   const isRunning = run.phase === "running";
   const isEndedErrorOrCancel = run.phase === "failed" || run.phase === "cancelled";
@@ -290,8 +298,10 @@ export function PluginRunView({
   useEffect(() => {
     if (plugin?.enabled) {
       setRunAgainBlocked(null);
+    } else if (pluginsCatalogError === null) {
+      setRunAgainBlocked((prev) => (prev === "load_error" ? null : prev));
     }
-  }, [plugin?.enabled]);
+  }, [plugin?.enabled, pluginsCatalogError]);
 
   const handleLogScroll = () => {
     const box = logBoxRef.current;
@@ -347,6 +357,7 @@ export function PluginRunView({
     run.phase === "failed" || run.phase === "cancelled" || run.status?.state === "failed";
 
   const billingState = resolvePluginRunBillingState(run, billingCheck, snapshot);
+  const pluginsPending = plugin === null && pluginsCatalogLoading;
   const runAgainAllowed = canRunPluginAgain(plugin, shuttingDown);
 
   const outputEntries = run.status?.outputs ? Object.entries(run.status.outputs) : [];
@@ -662,18 +673,25 @@ export function PluginRunView({
                   type="button"
                   className="btn"
                   data-plugin-run-again="true"
-                  disabled={shuttingDown}
+                  disabled={shuttingDown || pluginsPending}
+                  aria-busy={pluginsPending || undefined}
                   onClick={() => {
+                    if (pluginsPending || shuttingDown) {
+                      return;
+                    }
                     if (runAgainAllowed) {
                       setRunAgainBlocked(null);
                       onRunAgain(run.plugin);
-                    } else if (!shuttingDown) {
+                    } else if (plugin === null && pluginsCatalogError !== null) {
+                      setRunAgainBlocked("load_error");
+                      onRunAgain(run.plugin);
+                    } else {
                       setRunAgainBlocked(plugin === null ? "missing" : "disabled");
                       onRunAgain(run.plugin);
                     }
                   }}
                 >
-                  <RotateCcwIcon />
+                  {pluginsPending ? <span className="spinner" aria-hidden="true" /> : <RotateCcwIcon />}
                   <span>{t("app.b2.run_again")}</span>
                 </button>
               </div>
@@ -689,12 +707,30 @@ export function PluginRunView({
                   </span>
                   <div className="alert-text">
                     <p className="alert-body">
-                      {runAgainBlocked === "missing"
-                        ? t("app.err.plugin_not_found")
-                        : `${pluginName} · ${t("app.b2.plugin_off")}`}
+                      {runAgainBlocked === "load_error"
+                        ? (pluginsCatalogError ?? t("app.err.other"))
+                        : runAgainBlocked === "missing"
+                          ? t("app.err.plugin_not_found")
+                          : `${pluginName} · ${t("app.b2.plugin_off")}`}
                     </p>
                     <div className="alert-actions">
-                      <button type="button" className="btn btn-sm" onClick={onBack}>
+                      {runAgainBlocked === "load_error" && onRetryPluginsCatalog && (
+                        <button
+                          type="button"
+                          className="btn btn-sm"
+                          onClick={() => {
+                            setRunAgainBlocked(null);
+                            onRetryPluginsCatalog();
+                          }}
+                        >
+                          {t("app.action.retry")}
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        className={runAgainBlocked === "load_error" ? "btn btn-sm btn-ghost" : "btn btn-sm"}
+                        onClick={onBack}
+                      >
                         {t("app.b2.action_back")}
                       </button>
                     </div>

@@ -19,6 +19,7 @@ import type {
 import {
   buildGgufFitKey,
   cancelPluginPreview,
+  confirmOwnedPreviewCancel,
   findInspectPluginOpId,
   getHfTokenBadgeMeta,
   planGgufEstimateFetch,
@@ -1250,4 +1251,69 @@ test("resolvePluginRunBannerPhase reflects RunSummary.phase and getHfTokenBadgeM
     className: "badge badge-warning",
     text: "app.b2.hf_token_unknown",
   });
+});
+
+test("confirmOwnedPreviewCancel confirms server cancellation, handles proxy-delayed inspect op, and surfaces cancel failure", async () => {
+  const activeInspectOps = [
+    {
+      id: 91,
+      operation: { kind: "domain", name: "inspect_plugin", key: "" } as const,
+      cancelling: false,
+    },
+  ];
+
+  // 1. Pre-existing op owned by another tab is never cancelled.
+  let cancelCalls = 0;
+  const skipped = await confirmOwnedPreviewCancel({
+    preExistingInspectOpId: 91,
+    currentOperations: activeInspectOps,
+    refreshOperations: async () => activeInspectOps,
+    cancelPreview: async () => {
+      cancelCalls += 1;
+    },
+  });
+  assert.deepEqual(skipped, { kind: "skipped" });
+  assert.equal(cancelCalls, 0);
+
+  // 2. Active op already in snapshot cancels directly.
+  const direct = await confirmOwnedPreviewCancel({
+    preExistingInspectOpId: null,
+    currentOperations: activeInspectOps,
+    refreshOperations: async () => {
+      throw new Error("should not refresh when already visible");
+    },
+    cancelPreview: async () => {
+      cancelCalls += 1;
+    },
+  });
+  assert.deepEqual(direct, { kind: "cancelled" });
+  assert.equal(cancelCalls, 1);
+
+  // 3. Fast close before SSE arrives refreshes snapshot; if proxy kept op alive, cancels explicitly.
+  let refreshes = 0;
+  const proxyDelayed = await confirmOwnedPreviewCancel({
+    preExistingInspectOpId: null,
+    currentOperations: [],
+    refreshOperations: async () => {
+      refreshes += 1;
+      return activeInspectOps;
+    },
+    cancelPreview: async () => {
+      cancelCalls += 1;
+    },
+  });
+  assert.deepEqual(proxyDelayed, { kind: "cancelled" });
+  assert.equal(refreshes, 1);
+  assert.equal(cancelCalls, 2);
+
+  // 4. Cancel endpoint failure surfaces `failed` instead of falsely reporting cancelled.
+  const failed = await confirmOwnedPreviewCancel({
+    preExistingInspectOpId: null,
+    currentOperations: activeInspectOps,
+    refreshOperations: async () => activeInspectOps,
+    cancelPreview: async () => {
+      throw new ApiError({ status: 500, kind: "other", message: "boom" });
+    },
+  });
+  assert.equal(failed.kind, "failed");
 });
