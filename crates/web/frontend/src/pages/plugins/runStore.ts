@@ -43,6 +43,8 @@ const MAX_BACKOFF_EXPONENT = 8;
 export interface PluginRunsStoreState {
   readonly runs: readonly PluginRunSummary[];
   readonly selectedRunId: number | null;
+  readonly selectedFormPluginId: string | null;
+  readonly formOpenSeq: number;
   readonly activeRun: PluginRunDetail | null;
   readonly knownPhasesById: Readonly<Record<number, PluginRunPhase>>;
   readonly endpointForwardIdsByKey: Readonly<Record<string, number | null>>;
@@ -54,6 +56,8 @@ export interface PluginRunsStoreState {
 const INITIAL_STATE: PluginRunsStoreState = {
   runs: [],
   selectedRunId: null,
+  selectedFormPluginId: null,
+  formOpenSeq: 0,
   activeRun: null,
   knownPhasesById: {},
   endpointForwardIdsByKey: {},
@@ -67,6 +71,7 @@ let dismissedAutoRunId = 0;
 let highestSeenRunId = 0;
 let pendingAutoAttach = false;
 let runsListInFlight: Promise<PluginRunSummary[]> | null = null;
+let runsListSeq = 0;
 let forwardsInFlight: Promise<ForwardView[]> | null = null;
 let forwardsSeq = 0;
 let streamSeq = 0;
@@ -110,6 +115,7 @@ function resetStore(): void {
   highestSeenRunId = 0;
   pendingAutoAttach = false;
   runsListInFlight = null;
+  runsListSeq += 1;
   forwardsInFlight = null;
   forwardsSeq += 1;
   state = INITIAL_STATE;
@@ -545,18 +551,30 @@ function connectRunStream(
 }
 
 function attachRun(summary: PluginRunSummary): void {
+  // Invalidate any pre-submit `/api/plugins/runs` fetch so a delayed stale list cannot drop this run.
+  runsListSeq += 1;
+  runsListInFlight = null;
+  highestSeenRunId = Math.max(highestSeenRunId, summary.id);
+  const runs = state.runs.some((item) => item.id === summary.id)
+    ? state.runs
+    : [summary, ...state.runs];
   if (
     state.selectedRunId === summary.id &&
     state.activeRun?.id === summary.id &&
     (activeStreamRunId === summary.id || state.activeRun.phase !== "running")
   ) {
+    if (state.selectedFormPluginId !== null || runs !== state.runs) {
+      setState({ selectedFormPluginId: null, runs });
+    }
     return;
   }
   stopStream();
   activeStreamRunId = summary.id;
   const detail = createInitialDetail(summary);
   setState({
+    runs,
     selectedRunId: summary.id,
+    selectedFormPluginId: null,
     activeRun: detail,
     knownPhasesById:
       summary.finished && state.knownPhasesById[summary.id]
@@ -579,14 +597,15 @@ export function refreshPluginRuns(options?: {
     return runsListInFlight;
   }
   const gen = apiClient.getSessionGeneration();
+  const seq = ++runsListSeq;
 
   const promise = listPluginRuns()
     .then((runs) => {
+      if (apiClient.getSessionGeneration() !== gen || seq !== runsListSeq) {
+        return state.runs as PluginRunSummary[];
+      }
       const shouldConsiderAutoAttach = pendingAutoAttach;
       pendingAutoAttach = false;
-      if (apiClient.getSessionGeneration() !== gen) {
-        return runs;
-      }
       setState({ runs });
 
       const newest = runs[0] ?? null;
@@ -594,6 +613,7 @@ export function refreshPluginRuns(options?: {
         const isBrandNewRun = newest.id > highestSeenRunId;
         const shouldAutoAttach =
           newest.id > dismissedAutoRunId &&
+          state.selectedFormPluginId === null &&
           (state.selectedRunId === null ||
             (isBrandNewRun &&
               newest.id > state.selectedRunId &&
@@ -617,7 +637,9 @@ export function refreshPluginRuns(options?: {
       return runs;
     })
     .catch(() => {
-      pendingAutoAttach = false;
+      if (seq === runsListSeq) {
+        pendingAutoAttach = false;
+      }
       return state.runs as PluginRunSummary[];
     })
     .finally(() => {
@@ -649,6 +671,32 @@ export function openPluginRun(id: number, fallbackSummary?: PluginRunSummary): v
 }
 
 /**
+ * Opens the dynamic deploy form for `pluginId` (used by Plugins cards, Run Again,
+ * and Overview quick-deploy entry points). Suppresses auto-reopen of older runs so
+ * navigating to `#/plugins` lands directly on the form.
+ */
+export function openPluginDeployForm(pluginId: string): void {
+  const latestId = state.runs[0]?.id ?? state.selectedRunId ?? 0;
+  dismissedAutoRunId = Math.max(dismissedAutoRunId, latestId);
+  stopStream();
+  setState({
+    selectedRunId: null,
+    selectedFormPluginId: pluginId,
+    formOpenSeq: state.formOpenSeq + 1,
+  });
+}
+
+/**
+ * Closes the dynamic deploy form and returns to the Plugins list view.
+ */
+export function closePluginDeployForm(): void {
+  if (state.selectedFormPluginId === null) {
+    return;
+  }
+  setState({ selectedFormPluginId: null });
+}
+
+/**
  * Returns to the Plugins list view and suppresses immediate auto-reopen for the latest run
  * until a newer run ID appears or the user clicks "Show".
  */
@@ -656,7 +704,7 @@ export function showPluginList(): void {
   const latestId = state.runs[0]?.id ?? state.selectedRunId ?? 0;
   dismissedAutoRunId = Math.max(dismissedAutoRunId, latestId);
   stopStream();
-  setState({ selectedRunId: null });
+  setState({ selectedRunId: null, selectedFormPluginId: null });
 }
 
 /**

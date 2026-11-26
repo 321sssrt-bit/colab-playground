@@ -26,10 +26,13 @@ import {
 } from "./plugins/api.ts";
 import { HfTokenDialog } from "./plugins/HfTokenDialog.tsx";
 import { InstallPluginDialog } from "./plugins/InstallPluginDialog.tsx";
+import { PluginDeployForm, RocketIcon } from "./plugins/PluginDeployForm.tsx";
 import { PluginRunView } from "./plugins/PluginRunView.tsx";
 import { RemovePluginDialog, type RemovePluginTarget } from "./plugins/RemovePluginDialog.tsx";
 import {
   applyPluginForwardEvent,
+  closePluginDeployForm,
+  openPluginDeployForm,
   openPluginRun,
   refreshPluginForwards,
   refreshPluginRuns,
@@ -39,6 +42,8 @@ import {
 } from "./plugins/runStore.ts";
 import type { PluginInfo, PluginRunPhase, PluginRunSummary } from "./plugins/types.ts";
 import type { PageProps } from "./types.ts";
+
+export { closePluginDeployForm, openPluginDeployForm };
 
 function isHfTokenBusyInSnapshot(operations: readonly PendingOperation[]): boolean {
   return operations.some(
@@ -102,6 +107,7 @@ export function PluginsPage({ snapshot, locale, t, navigate, pushToast }: PagePr
   const [loadError, setLoadError] = useState<string | null>(null);
   const [togglingIds, setTogglingIds] = useState<ReadonlySet<string>>(() => new Set());
   const [tokenDialogOpen, setTokenDialogOpen] = useState(false);
+  const [hfTokenSaved, setHfTokenSaved] = useState<boolean | null>(null);
   const [installOpen, setInstallOpen] = useState(false);
   const [removeTarget, setRemoveTarget] = useState<RemovePluginTarget | null>(null);
   const [stopDialogRequest, setStopDialogRequest] = useState<StopRuntimeDialogRequest | null>(null);
@@ -321,6 +327,12 @@ export function PluginsPage({ snapshot, locale, t, navigate, pushToast }: PagePr
     void refreshOverviewHints().catch(() => {});
   }, []);
 
+  const handleRunStarted = useCallback((runId: number, summary: PluginRunSummary) => {
+    openPluginRun(runId, summary);
+    void refreshPluginRuns({ autoAttach: false });
+    void webStore.refreshSnapshot().catch(() => {});
+  }, []);
+
   const shuttingDown = snapshot?.shutting_down === true;
   const operations = snapshot?.operations ?? [];
 
@@ -329,8 +341,14 @@ export function PluginsPage({ snapshot, locale, t, navigate, pushToast }: PagePr
     runsState.activeRun !== null &&
     runsState.activeRun.id === runsState.selectedRunId;
 
+  const isViewingDeployForm = !isViewingRunDetail && runsState.selectedFormPluginId !== null;
+
   const activeRunPlugin = isViewingRunDetail
     ? (plugins?.find((item) => item.manifest.id === runsState.activeRun!.plugin) ?? null)
+    : null;
+
+  const deployFormPlugin = isViewingDeployForm
+    ? (plugins?.find((item) => item.manifest.id === runsState.selectedFormPluginId) ?? null)
     : null;
 
   return (
@@ -354,7 +372,78 @@ export function PluginsPage({ snapshot, locale, t, navigate, pushToast }: PagePr
           pushToast={pushToast}
           onBack={showPluginList}
           onRequestStopRuntime={handleRequestStopRuntime}
+          onRunAgain={openPluginDeployForm}
         />
+      ) : isViewingDeployForm ? (
+        deployFormPlugin ? (
+          <PluginDeployForm
+            key={`${deployFormPlugin.manifest.id}:${runsState.formOpenSeq}`}
+            plugin={deployFormPlugin}
+            snapshot={snapshot}
+            maxConcurrentSessions={sessionsLocal.maxConcurrentSessions}
+            hfTokenSaved={hfTokenSaved}
+            locale={locale}
+            t={t}
+            navigate={navigate}
+            onBack={closePluginDeployForm}
+            onOpenHfTokenDialog={() => setTokenDialogOpen(true)}
+            onHfTokenStatusLoaded={setHfTokenSaved}
+            onRunStarted={handleRunStarted}
+          />
+        ) : loading && plugins === null ? (
+          <>
+            <header className="page-header page-header-row">
+              <div className="page-header-heading">
+                <h1 className="page-title">{t("app.nav.plugins")}</h1>
+              </div>
+              <div className="page-header-actions">
+                <button type="button" className="btn btn-ghost" onClick={closePluginDeployForm}>
+                  {t("app.b2.action_back")}
+                </button>
+              </div>
+            </header>
+            <div className="page-sections">
+              <section className="card">
+                <div className="busy-line" role="status" aria-live="polite">
+                  <span className="spinner" aria-hidden="true" />
+                  <span>{t("app.b2.plugins_loading")}</span>
+                </div>
+              </section>
+            </div>
+          </>
+        ) : (
+          <>
+            <header className="page-header page-header-row">
+              <div className="page-header-heading">
+                <h1 className="page-title">{t("app.nav.plugins")}</h1>
+              </div>
+              <div className="page-header-actions">
+                <button type="button" className="btn btn-ghost" onClick={closePluginDeployForm}>
+                  {t("app.b2.action_back")}
+                </button>
+              </div>
+            </header>
+            <div className="page-sections">
+              <div className="alert alert-danger" role="alert">
+                <span className="alert-icon icon-danger">
+                  <AlertIcon />
+                </span>
+                <div className="alert-text">
+                  <p className="alert-body">{loadError ?? t("app.err.plugin_not_found")}</p>
+                  <div className="alert-actions">
+                    <button
+                      type="button"
+                      className="btn btn-sm"
+                      onClick={closePluginDeployForm}
+                    >
+                      {t("app.b2.action_back")}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </>
+        )
       ) : (
         <>
           <header className="page-header page-header-row">
@@ -535,6 +624,17 @@ export function PluginsPage({ snapshot, locale, t, navigate, pushToast }: PagePr
                       {description && <p className="card-desc">{description}</p>}
 
                       <div className="plugin-card-actions">
+                        <button
+                          type="button"
+                          className="btn btn-primary btn-sm"
+                          disabled={!plugin.enabled || busy}
+                          data-plugin-deploy={id}
+                          onClick={() => openPluginDeployForm(id)}
+                        >
+                          <RocketIcon />
+                          <span>{t("app.b2.deploy_action")}</span>
+                        </button>
+
                         <label className="switch-label" htmlFor={switchId}>
                           <input
                             id={switchId}
@@ -590,6 +690,7 @@ export function PluginsPage({ snapshot, locale, t, navigate, pushToast }: PagePr
         t={t}
         disabled={shuttingDown || isHfTokenBusyInSnapshot(operations)}
         onClose={() => setTokenDialogOpen(false)}
+        onStatusChange={setHfTokenSaved}
       />
 
       <InstallPluginDialog
