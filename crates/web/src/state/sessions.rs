@@ -1,16 +1,520 @@
 use std::{sync::mpsc, time::SystemTime};
 
 use colab_playground_core::{
-    backend::{AccountError, Runtime},
+    accounts::AccountsView,
+    backend::{AccountError, AccountUsageView, GuardDecision, GuardReport, Runtime},
+    clock::serde_secs,
+    guard::{Concern, Decision, Limit},
     sessions::WatchdogInfo,
 };
 
 use super::*;
 
 const FINISHED_PROVISION_LIMIT: usize = 32;
+const ENDED_KEPT: usize = 20;
 const STOP_ALL: &str = "stop_all_runtimes";
 
 pub(super) type Provisions = Mutex<BTreeMap<u64, watch::Sender<Vec<ProvisionUpdate>>>>;
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct GuardEvent {
+    pub id: u64,
+    #[serde(with = "serde_secs")]
+    pub at: SystemTime,
+    pub session: RuntimeRef,
+    pub label: String,
+    pub email: Option<String>,
+    #[serde(flatten)]
+    pub kind: GuardEventKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GuardEventKind {
+    Warn { concerns: Vec<Concern> },
+    StopFailed { concern: Concern, error: Error },
+    Stopped { concern: Concern },
+    Vanished,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EndedRuntime {
+    pub runtime: RuntimeRef,
+    pub label: String,
+    pub email: Option<String>,
+    pub reason: EndReason,
+    #[serde(default, with = "serde_secs::option")]
+    pub at: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EndReason {
+    User,
+    Guard { concern: Concern },
+    Vanished,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct GuardLedger {
+    next_event_id: u64,
+    warnings: Vec<(RuntimeRef, Vec<Concern>)>,
+    stop_failures: Vec<(RuntimeRef, Concern, Error)>,
+    events: Vec<GuardEvent>,
+    ended: Vec<EndedRuntime>,
+    has_report: bool,
+    ok_sessions: Vec<RuntimeRef>,
+}
+
+impl GuardLedger {
+    pub(super) fn clear_live(&mut self) -> bool {
+        let changed = self.has_report
+            || !self.warnings.is_empty()
+            || !self.stop_failures.is_empty()
+            || !self.ok_sessions.is_empty();
+        self.warnings.clear();
+        self.stop_failures.clear();
+        self.has_report = false;
+        self.ok_sessions.clear();
+        changed
+    }
+
+    pub(super) fn retain_live(&mut self, live: &[Runtime]) -> bool {
+        let before = (
+            self.warnings.len(),
+            self.stop_failures.len(),
+            self.ok_sessions.len(),
+        );
+        self.warnings
+            .retain(|(target, _)| live.iter().any(|rt| same_runtime(&rt.id, target)));
+        self.stop_failures
+            .retain(|(target, _, _)| live.iter().any(|rt| same_runtime(&rt.id, target)));
+        self.ok_sessions
+            .retain(|target| live.iter().any(|rt| same_runtime(&rt.id, target)));
+        before
+            != (
+                self.warnings.len(),
+                self.stop_failures.len(),
+                self.ok_sessions.len(),
+            )
+    }
+
+    pub(super) fn clear_warning(&mut self, target: &RuntimeRef) -> bool {
+        let before = self.warnings.len();
+        self.warnings
+            .retain(|(existing, _)| !same_runtime(existing, target));
+        self.warnings.len() != before
+    }
+
+    pub(super) fn record_user_stop(
+        &mut self,
+        target: RuntimeRef,
+        label: String,
+        email: Option<String>,
+        at: SystemTime,
+    ) {
+        self.warnings
+            .retain(|(existing, _)| !same_runtime(existing, &target));
+        self.stop_failures
+            .retain(|(existing, _, _)| !same_runtime(existing, &target));
+        self.ok_sessions
+            .retain(|existing| !same_runtime(existing, &target));
+        self.record_ended(target, label, email, EndReason::User, Some(at));
+    }
+
+    pub(super) fn apply_guard(
+        &mut self,
+        report: GuardReport,
+        runtimes: Option<&RuntimesView>,
+        accounts: Option<&AccountsView>,
+        now: SystemTime,
+    ) -> (bool, bool) {
+        let prev_has_report = self.has_report;
+        let prev_warnings = self.warnings.clone();
+        let prev_stop_failures = self.stop_failures.clone();
+        let prev_events = self.events.clone();
+        let prev_ended = self.ended.clone();
+        let prev_ok = self.ok_sessions.clone();
+
+        self.has_report = true;
+        self.ok_sessions.clear();
+        let mut mutated_runtimes = false;
+
+        for decision in report.decisions {
+            let target = decision.session;
+            let (label, email) = lookup_runtime_meta(&target, runtimes, accounts);
+            match decision.decision {
+                Decision::Ok => {
+                    self.warnings
+                        .retain(|(existing, _)| !same_runtime(existing, &target));
+                    if !self
+                        .stop_failures
+                        .iter()
+                        .any(|(existing, _, _)| same_runtime(existing, &target))
+                    {
+                        self.ok_sessions.push(target);
+                    }
+                }
+                Decision::Warn(concerns) => {
+                    let previous = self
+                        .warnings
+                        .iter()
+                        .find(|(existing, _)| same_runtime(existing, &target))
+                        .map(|(_, c)| c.clone());
+                    // Track re-triggers against the live warning state (matching desktop
+                    // `apply_guard`), not the unconsumed queue, so a warning cleared by Ok or
+                    // Extend and later re-triggered queues a fresh event id even if the earlier
+                    // notification was not yet acknowledged.
+                    let limits_changed = previous
+                        .as_ref()
+                        .is_none_or(|before| !same_concern_kinds(before, &concerns));
+                    if limits_changed {
+                        self.push_event(
+                            now,
+                            target.clone(),
+                            label,
+                            email,
+                            GuardEventKind::Warn {
+                                concerns: concerns.clone(),
+                            },
+                        );
+                    }
+                    if let Some((_, existing)) = self
+                        .warnings
+                        .iter_mut()
+                        .find(|(existing, _)| same_runtime(existing, &target))
+                    {
+                        *existing = concerns;
+                    } else {
+                        self.warnings.push((target, concerns));
+                    }
+                }
+                Decision::Stop(concern) => {
+                    if decision.stopped {
+                        self.warnings
+                            .retain(|(existing, _)| !same_runtime(existing, &target));
+                        self.stop_failures
+                            .retain(|(existing, _, _)| !same_runtime(existing, &target));
+                        self.record_ended(
+                            target.clone(),
+                            label.clone(),
+                            email.clone(),
+                            EndReason::Guard {
+                                concern: concern.clone(),
+                            },
+                            Some(now),
+                        );
+                        if !self.events.iter().any(|event| {
+                            same_runtime(&event.session, &target)
+                                && matches!(event.kind, GuardEventKind::Stopped { .. })
+                        }) {
+                            self.push_event(
+                                now,
+                                target,
+                                label,
+                                email,
+                                GuardEventKind::Stopped { concern },
+                            );
+                        }
+                        mutated_runtimes = true;
+                    } else {
+                        let error = decision.error.unwrap_or_else(|| {
+                            Error::new(ErrorKind::Other)
+                                .detail("the cost guard decided to stop it but no stop was made")
+                        });
+                        let prev_failure = self
+                            .stop_failures
+                            .iter()
+                            .find(|(existing, _, _)| same_runtime(existing, &target))
+                            .map(|(_, c, e)| (c.clone(), e.clone()));
+                        let failure_changed = prev_failure.as_ref().is_none_or(
+                            |(existing_concern, existing_error)| {
+                                existing_concern != &concern || existing_error != &error
+                            },
+                        );
+                        if let Some((_, existing_concern, existing_error)) = self
+                            .stop_failures
+                            .iter_mut()
+                            .find(|(existing, _, _)| same_runtime(existing, &target))
+                        {
+                            *existing_concern = concern.clone();
+                            *existing_error = error.clone();
+                        } else {
+                            self.stop_failures.push((
+                                target.clone(),
+                                concern.clone(),
+                                error.clone(),
+                            ));
+                        }
+                        if failure_changed {
+                            self.push_event(
+                                now,
+                                target,
+                                label,
+                                email,
+                                GuardEventKind::StopFailed { concern, error },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        for target in report.vanished {
+            if self.already_ended_with_cause(&target) {
+                continue;
+            }
+            let (label, email) = lookup_runtime_meta(&target, runtimes, accounts);
+            self.warnings
+                .retain(|(existing, _)| !same_runtime(existing, &target));
+            self.stop_failures
+                .retain(|(existing, _, _)| !same_runtime(existing, &target));
+            self.record_ended(
+                target.clone(),
+                label.clone(),
+                email.clone(),
+                EndReason::Vanished,
+                Some(now),
+            );
+            if !self.events.iter().any(|event| {
+                same_runtime(&event.session, &target)
+                    && matches!(event.kind, GuardEventKind::Vanished)
+            }) {
+                self.push_event(now, target, label, email, GuardEventKind::Vanished);
+            }
+            mutated_runtimes = true;
+        }
+
+        let ledger_changed = prev_has_report != self.has_report
+            || prev_warnings != self.warnings
+            || prev_stop_failures != self.stop_failures
+            || prev_events != self.events
+            || prev_ended != self.ended
+            || prev_ok != self.ok_sessions;
+        (mutated_runtimes, ledger_changed)
+    }
+
+    pub(super) fn ack(&mut self, up_to_id: Option<u64>, ids: Option<&[u64]>) -> usize {
+        let before = self.events.len();
+        match (ids, up_to_id) {
+            (Some(ids), _) => self.events.retain(|event| !ids.contains(&event.id)),
+            (None, Some(max_id)) => self.events.retain(|event| event.id > max_id),
+            (None, None) => self.events.clear(),
+        }
+        before - self.events.len()
+    }
+
+    pub(super) fn build_report(&self, usage: &[AccountUsageView]) -> Option<GuardReport> {
+        if !self.has_report && self.events.is_empty() {
+            return None;
+        }
+        let mut decisions = Vec::new();
+        let mut vanished = Vec::new();
+
+        // Live card state comes strictly from active stop failures, active warnings, and Ok
+        // decisions, so clearing a warning (via Ok, Extend, or Cancel auto-stop) is reflected
+        // immediately while unconsumed historical events stay intact in `guard_events`.
+        for (target, concern, error) in &self.stop_failures {
+            decisions.push(GuardDecision {
+                session: target.clone(),
+                decision: Decision::Stop(concern.clone()),
+                stopped: false,
+                error: Some(error.clone()),
+            });
+        }
+        for (target, concerns) in &self.warnings {
+            if !decisions.iter().any(|d| same_runtime(&d.session, target)) {
+                decisions.push(GuardDecision {
+                    session: target.clone(),
+                    decision: Decision::Warn(concerns.clone()),
+                    stopped: false,
+                    error: None,
+                });
+            }
+        }
+        for target in &self.ok_sessions {
+            if !decisions.iter().any(|d| same_runtime(&d.session, target)) {
+                decisions.push(GuardDecision {
+                    session: target.clone(),
+                    decision: Decision::Ok,
+                    stopped: false,
+                    error: None,
+                });
+            }
+        }
+
+        // Unconsumed terminal guard decisions stay in `guard` until acknowledged so follow-up
+        // polls never drop a guard stop or let it be misclassified as vanished.
+        for event in &self.events {
+            match &event.kind {
+                GuardEventKind::Stopped { concern } => {
+                    if !decisions
+                        .iter()
+                        .any(|d| same_runtime(&d.session, &event.session) && d.stopped)
+                    {
+                        decisions.push(GuardDecision {
+                            session: event.session.clone(),
+                            decision: Decision::Stop(concern.clone()),
+                            stopped: true,
+                            error: None,
+                        });
+                    }
+                }
+                GuardEventKind::Vanished => {
+                    if !vanished
+                        .iter()
+                        .any(|existing| same_runtime(existing, &event.session))
+                    {
+                        vanished.push(event.session.clone());
+                    }
+                }
+                GuardEventKind::Warn { .. } | GuardEventKind::StopFailed { .. } => {}
+            }
+        }
+
+        Some(GuardReport {
+            decisions,
+            vanished,
+            usage: usage.to_vec(),
+        })
+    }
+
+    fn already_ended_with_cause(&self, target: &RuntimeRef) -> bool {
+        self.ended.iter().any(|ended| {
+            same_runtime(&ended.runtime, target) && !matches!(ended.reason, EndReason::Vanished)
+        })
+    }
+
+    fn push_event(
+        &mut self,
+        at: SystemTime,
+        session: RuntimeRef,
+        label: String,
+        email: Option<String>,
+        kind: GuardEventKind,
+    ) {
+        self.next_event_id += 1;
+        self.events.push(GuardEvent {
+            id: self.next_event_id,
+            at,
+            session,
+            label,
+            email,
+            kind,
+        });
+    }
+
+    fn record_ended(
+        &mut self,
+        runtime: RuntimeRef,
+        label: String,
+        email: Option<String>,
+        reason: EndReason,
+        at: Option<SystemTime>,
+    ) {
+        if matches!(reason, EndReason::Vanished) && self.already_ended_with_cause(&runtime) {
+            return;
+        }
+        self.ended
+            .retain(|existing| !same_runtime(&existing.runtime, &runtime));
+        self.ended.insert(
+            0,
+            EndedRuntime {
+                runtime,
+                label,
+                email,
+                reason,
+                at,
+            },
+        );
+        self.ended.truncate(ENDED_KEPT);
+    }
+}
+
+impl Snapshot {
+    pub(super) fn sync_guard_projection(&mut self) -> bool {
+        let next_guard = self.guard_state.build_report(&self.usage);
+        let mut changed = false;
+        if self.guard != next_guard {
+            self.guard = next_guard;
+            changed = true;
+        }
+        if self.guard_events != self.guard_state.events {
+            self.guard_events.clone_from(&self.guard_state.events);
+            changed = true;
+        }
+        if self.ended != self.guard_state.ended {
+            self.ended.clone_from(&self.guard_state.ended);
+            changed = true;
+        }
+        changed
+    }
+}
+
+fn same_runtime(a: &RuntimeRef, b: &RuntimeRef) -> bool {
+    if a.account != b.account {
+        return false;
+    }
+    if !a.endpoint.is_empty() && !b.endpoint.is_empty() {
+        a.endpoint == b.endpoint
+    } else if a.name.is_some() && b.name.is_some() {
+        a.name == b.name
+    } else {
+        a == b
+    }
+}
+
+fn matches_request_target(listed: &RuntimeRef, requested: &RuntimeRef) -> bool {
+    listed.account == requested.account
+        && listed.endpoint == requested.endpoint
+        && (!requested.endpoint.is_empty() || listed.name == requested.name)
+        && requested
+            .name
+            .as_ref()
+            .is_none_or(|name| listed.name.as_ref() == Some(name))
+}
+
+fn lookup_runtime_meta(
+    target: &RuntimeRef,
+    runtimes: Option<&RuntimesView>,
+    accounts: Option<&AccountsView>,
+) -> (String, Option<String>) {
+    if let Some(runtime) =
+        runtimes.and_then(|view| view.runtimes.iter().find(|rt| same_runtime(&rt.id, target)))
+    {
+        let label = runtime
+            .id
+            .name
+            .clone()
+            .unwrap_or_else(|| runtime.hardware.clone());
+        return (label, runtime.account_email.clone());
+    }
+    let label = target
+        .name
+        .clone()
+        .unwrap_or_else(|| target.endpoint.clone());
+    let email = accounts.and_then(|view| {
+        view.accounts
+            .iter()
+            .find(|account| account.id == target.account)
+            .and_then(|account| account.email.clone())
+    });
+    (label, email)
+}
+
+fn concern_key(concern: &Concern) -> (bool, Limit) {
+    match concern {
+        Concern::Limit { limit, .. } => (true, *limit),
+        Concern::UsageUnknown { limit } => (false, *limit),
+    }
+}
+
+fn same_concern_kinds(a: &[Concern], b: &[Concern]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(left, right)| concern_key(left) == concern_key(right))
+}
 
 #[derive(Clone)]
 pub enum ProvisionUpdate {
@@ -71,15 +575,19 @@ impl WebState {
         let state = self.clone();
         self.backend_job(Slot::Shared, move |backend, cancel| {
             let _poll = state.lock_poll_slot();
-            let accounts = backend.accounts(cancel);
-            state.record_accounts(accounts.clone());
-            accounts?;
-            let view = backend.runtimes(cancel);
-            state.record_runtimes(view.clone());
-            view?;
+            state.refresh_all(backend, cancel, true)?;
             Ok((state.snapshot(), backend.now()))
         })
         .await
+    }
+
+    pub fn ack_guard_events(&self, up_to_id: Option<u64>, ids: Option<&[u64]>) -> usize {
+        let mut acknowledged = 0;
+        self.update(|snapshot| {
+            acknowledged = snapshot.guard_state.ack(up_to_id, ids);
+            acknowledged > 0 && snapshot.sync_guard_projection()
+        });
+        acknowledged
     }
 
     pub fn start_provision(&self, account: AccountContext, spec: ProvisionSpec) -> Result<u64> {
@@ -145,13 +653,37 @@ impl WebState {
     }
 
     pub fn stop_runtime(&self, target: RuntimeRef) -> Result<Submission<()>> {
-        self.change_runtime(
+        let key = format!("{}/{}", target.account, target.endpoint);
+        let state = self.clone();
+        self.start_operation(
             "stop_runtime",
+            key,
             Access::Runtime,
-            target,
-            |backend, cancel, runtime| {
+            move |backend, cancel| {
+                let _poll = state.lock_poll_slot();
+                let cached = state.find_cached_runtime(&target);
+                let resolved = match cached {
+                    Some(runtime) => runtime.id,
+                    None if target.endpoint.is_empty() => {
+                        list_account(backend, cancel, &target.account)?
+                            .runtimes
+                            .into_iter()
+                            .find(|runtime| same_runtime(&runtime.id, &target))
+                            .map(|runtime| runtime.id)
+                            .ok_or_else(|| Error::new(ErrorKind::SessionGone))?
+                    }
+                    None => target,
+                };
                 cancel.commit()?;
-                backend.stop_session(&runtime.id, Default::default(), cancel)
+                backend.stop_session(&resolved, Default::default(), cancel)?;
+                let now = backend.now();
+                state.record_user_stopped(&resolved, now);
+                // Run the guard round before listing runtimes so `runtimes()` cannot consume
+                // vanished ledger entries for other sessions ahead of `guard_poll()`.
+                let _ = state.sync_usage_and_guard(backend, true, cancel);
+                state.record_runtimes(backend.runtimes(cancel));
+                state.sync_forwards();
+                Ok(())
             },
         )
     }
@@ -165,62 +697,98 @@ impl WebState {
         if required_account(&account)? != target.account {
             return Err(Error::new(ErrorKind::AccountNotActive));
         }
-        self.change_runtime(
+        let key = format!("{}/{}", target.account, target.endpoint);
+        let state = self.clone();
+        self.start_operation(
             "auto_stop",
+            key,
             Access::Account(account),
-            target,
-            move |backend, cancel, runtime| {
+            move |backend, cancel| {
+                let _poll = state.lock_poll_slot();
+                let runtime = match state.find_exact_cached_runtime(&target) {
+                    Some(runtime) => runtime,
+                    None => list_account(backend, cancel, &target.account)?
+                        .runtimes
+                        .into_iter()
+                        .find(|runtime| matches_request_target(&runtime.id, &target))
+                        .ok_or_else(|| Error::new(ErrorKind::SessionGone))?,
+                };
                 if !runtime.managed || runtime.id.name.is_none() {
                     return Err(Error::invalid(
                         "target",
                         "auto-stop requires a named managed runtime",
                     ));
                 }
+                let resolved = runtime.id;
                 cancel.commit()?;
                 let (runtime, watchdog) = match action {
                     AutoStop::Set(duration) => (
                         Some(duration),
-                        Some(backend.set_auto_stop(&runtime.id, duration, cancel)?),
+                        Some(backend.set_auto_stop(&resolved, duration, cancel)?),
                     ),
                     AutoStop::Extend(by) => {
-                        let extended = backend.extend_session(&runtime.id, by, cancel)?;
+                        let extended = backend.extend_session(&resolved, by, cancel)?;
                         (Some(extended.runtime), Some(extended.watchdog))
                     }
                     AutoStop::Cancel => {
-                        backend.cancel_auto_stop(&runtime.id, cancel)?;
+                        backend.cancel_auto_stop(&resolved, cancel)?;
                         (None, None)
                     }
                 };
+                state.clear_runtime_warning(&resolved);
+                state.record_runtimes(backend.runtimes(cancel));
+                state.sync_forwards();
                 Ok(AutoStopStatus { runtime, watchdog })
             },
         )
     }
 
-    fn change_runtime<T: Send + 'static>(
-        &self,
-        operation: &'static str,
-        access: Access,
-        target: RuntimeRef,
-        work: impl FnOnce(&dyn Backend, &CancelToken, Runtime) -> Result<T> + Send + 'static,
-    ) -> Result<Submission<T>> {
-        let key = format!("{}/{}", target.account, target.endpoint);
-        let state = self.clone();
-        self.start_operation(operation, key, access, move |backend, cancel| {
-            let _poll = state.lock_poll_slot();
-            let runtime = list_account(backend, cancel, &target.account)?
-                .runtimes
-                .into_iter()
-                .find(|runtime| {
-                    runtime.id.account == target.account
-                        && runtime.id.endpoint == target.endpoint
-                        && (!target.endpoint.is_empty() || runtime.id.name == target.name)
-                })
-                .ok_or_else(|| Error::new(ErrorKind::SessionGone))?;
-            let result = work(backend, cancel, runtime);
-            state.record_runtimes(backend.runtimes(cancel));
-            state.sync_forwards();
-            result
-        })
+    fn find_cached_runtime(&self, target: &RuntimeRef) -> Option<Runtime> {
+        let snapshot = self.0.snapshots.borrow();
+        snapshot
+            .runtimes
+            .as_ref()?
+            .runtimes
+            .iter()
+            .find(|runtime| same_runtime(&runtime.id, target))
+            .cloned()
+    }
+
+    fn find_exact_cached_runtime(&self, target: &RuntimeRef) -> Option<Runtime> {
+        let snapshot = self.0.snapshots.borrow();
+        snapshot
+            .runtimes
+            .as_ref()?
+            .runtimes
+            .iter()
+            .find(|runtime| matches_request_target(&runtime.id, target))
+            .cloned()
+    }
+
+    fn clear_runtime_warning(&self, target: &RuntimeRef) {
+        self.update(|snapshot| {
+            let removed = snapshot.guard_state.clear_warning(target);
+            removed && snapshot.sync_guard_projection()
+        });
+    }
+
+    fn record_user_stopped(&self, target: &RuntimeRef, now: SystemTime) {
+        self.update(|snapshot| {
+            let (label, email) = lookup_runtime_meta(
+                target,
+                snapshot.runtimes.as_ref(),
+                snapshot.accounts.as_ref(),
+            );
+            snapshot
+                .guard_state
+                .record_user_stop(target.clone(), label, email, now);
+            if let Some(view) = &mut snapshot.runtimes {
+                view.runtimes
+                    .retain(|runtime| !same_runtime(&runtime.id, target));
+            }
+            snapshot.sync_guard_projection();
+            true
+        });
     }
 
     pub fn stop_all_runtimes(&self) -> Result<Submission<StopAllReport>> {
@@ -292,12 +860,35 @@ impl WebState {
             .runtimes(cancel)
             .inspect_err(|error| self.record_runtimes(Err(error.clone())))?;
         let mut errors = std::collections::HashMap::new();
+        let mut stopped = Vec::new();
         for runtime in before.runtimes {
-            if let Err(error) = backend.stop_session(&runtime.id, Default::default(), cancel)
-                && !error.is(ErrorKind::SessionGone)
-            {
-                errors.insert((runtime.id.account, runtime.id.endpoint), error);
+            match backend.stop_session(&runtime.id, Default::default(), cancel) {
+                Ok(()) => stopped.push(runtime),
+                Err(error) if error.is(ErrorKind::SessionGone) => {}
+                Err(error) => {
+                    errors.insert((runtime.id.account, runtime.id.endpoint), error);
+                }
             }
+        }
+        let now = backend.now();
+        if !stopped.is_empty() {
+            self.update(|snapshot| {
+                for runtime in &stopped {
+                    let label = runtime
+                        .id
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| runtime.hardware.clone());
+                    snapshot.guard_state.record_user_stop(
+                        runtime.id.clone(),
+                        label,
+                        runtime.account_email.clone(),
+                        now,
+                    );
+                }
+                snapshot.sync_guard_projection();
+                true
+            });
         }
         self.sync_forwards();
         let after = backend.runtimes(cancel);
@@ -306,6 +897,7 @@ impl WebState {
         if after.errors.is_empty() && after.runtimes.is_empty() {
             self.lock().uncertain_cleanup = false;
         }
+        self.refresh_usage_after_stop(backend, cancel);
         Ok(StopAllReport {
             remaining: after
                 .runtimes

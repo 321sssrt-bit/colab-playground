@@ -419,3 +419,165 @@ async fn stop_all_reports_remaining_runtime_and_unverifiable_account() {
     )
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn single_stop_and_auto_stop_do_not_trigger_redundant_runtime_listings() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut config, _) = MockConfig::headless(MockScenario::demo());
+    config.step_delay = Duration::ZERO;
+    exercise(dir.path(), config, |client, backend, _| {
+        let listed = client.get(SESSIONS);
+        let runtime = listed["runtimes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"]["name"] == "a100-7f3a")
+            .unwrap()
+            .clone();
+
+        for action in [
+            json!({"kind": "set", "seconds": 600}),
+            json!({"kind": "extend", "seconds": 120}),
+            json!({"kind": "cancel"}),
+        ] {
+            let before = backend.runtime_listings();
+            let _ = json(
+                post(
+                    &client,
+                    AUTO_STOP,
+                    json!({
+                        "account_context": listed["account_context"],
+                        "target": runtime["id"],
+                        "action": action,
+                    }),
+                ),
+                StatusCode::OK,
+            );
+            // Allow any accidental background refresh to fire if one had been scheduled.
+            std::thread::sleep(Duration::from_millis(50));
+            assert_eq!(backend.runtime_listings(), before + 1);
+        }
+
+        let before = backend.runtime_listings();
+        assert_eq!(
+            post(
+                &client,
+                STOP,
+                json!({"target": runtime["id"], "confirmed": true})
+            )
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(backend.runtime_listings(), before + 1);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn measured_rates_survive_stopping_and_guard_ack_consumes_retained_decisions() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut config, _) = MockConfig::headless(MockScenario::single());
+    config.step_delay = Duration::ZERO;
+    exercise(dir.path(), config, |client, _, _| {
+        let mut body = create_body(&client, "rate-t4");
+        body["spec"]["accelerator"] = json!("T4");
+        body["spec"]["min_vram_mib"] = Value::Null;
+        body["spec"]["guard"] = json!({"max_runtime": 3600});
+        let id = submit(&client, &body);
+        assert_eq!(finished(&mut updates(&client, id)).1["phase"], "ready");
+        guard_decision(&client, "rate-t4", false);
+
+        let listed = client.get(SESSIONS);
+        let runtime = listed["runtimes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"]["name"] == "rate-t4")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            post(
+                &client,
+                STOP,
+                json!({"target": runtime["id"], "confirmed": true})
+            )
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(client.get(SESSIONS)["runtimes"], json!([]));
+
+        let template = client.get("/api/sessions/template");
+        let _: ProvisionSpec = serde_json::from_value(template.clone()).unwrap();
+        let rates = template["measured_rates"].as_array().unwrap();
+        assert_eq!(rates.len(), 1);
+        assert_eq!(rates[0]["accelerator"], "T4");
+        assert!(rates[0]["reading"]["cu_per_hour"].as_f64().unwrap() > 0.0);
+        assert!(template["sampled_at"].is_u64());
+
+        let overview = client.get("/api/overview");
+        assert_eq!(overview["measured_rates"], template["measured_rates"]);
+        assert!(overview["sampled_at"].is_u64());
+
+        let snapshot = client.get("/api/snapshot");
+        assert_eq!(snapshot["measured_rates"], template["measured_rates"]);
+        assert!(snapshot["server_now"].is_u64());
+
+        // Trigger a guard stop, confirm it survives a follow-up GET /api/sessions, then ack it.
+        let mut low = create_body(&client, "guard-stopped");
+        low["spec"]["accelerator"] = json!("NONE");
+        low["spec"]["min_vram_mib"] = Value::Null;
+        low["spec"]["guard"] = json!({"min_balance_cu": 1000.0});
+        let id = submit(&client, &low);
+        assert_eq!(finished(&mut updates(&client, id)).1["phase"], "ready");
+        guard_decision(&client, "guard-stopped", true);
+
+        let after_refresh = client.get(SESSIONS);
+        let events = after_refresh["guard_events"].as_array().unwrap();
+        let stopped_event = events
+            .iter()
+            .find(|e| e["kind"] == "stopped" && e["session"]["name"] == "guard-stopped")
+            .expect("guard stopped event must survive subsequent refresh");
+        let event_id = stopped_event["id"].as_u64().unwrap();
+        assert!(
+            after_refresh["guard"]["decisions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|d| d["session"]["name"] == "guard-stopped" && d["stopped"] == true)
+        );
+        assert!(
+            after_refresh["ended"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["runtime"]["name"] == "guard-stopped" && e["reason"]["kind"] == "guard")
+        );
+
+        assert_eq!(
+            post(
+                &client,
+                "/api/sessions/guard/ack",
+                json!({"up_to_id": event_id})
+            )
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        let after_ack = client.get(SESSIONS);
+        assert!(
+            !after_ack["guard_events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["id"] == event_id)
+        );
+        assert!(
+            after_ack["ended"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["runtime"]["name"] == "guard-stopped" && e["reason"]["kind"] == "guard")
+        );
+    })
+    .await;
+}

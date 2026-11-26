@@ -119,7 +119,7 @@ async fn usage_preserves_the_cli_slot_and_distinguishes_unknown_stale_and_fresh(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn age_marks_a_cached_usage_sample_stale_even_with_no_fetch_failure() {
+async fn age_updates_server_clock_without_overwriting_stale_failure_flag() {
     let dir = tempfile::tempdir().unwrap();
     let (config, clock) = MockConfig::headless(MockScenario::single());
     fs::write(
@@ -132,15 +132,31 @@ async fn age_marks_a_cached_usage_sample_stale_even_with_no_fetch_failure() {
         let initial = snapshot_when(&mut stream, |snapshot| {
             snapshot["usage"][0]["snapshot"]["stale"] == false
         });
+        let fetched_at = initial["usage"][0]["snapshot"]["fetched_at"]
+            .as_u64()
+            .unwrap();
         assert_eq!(initial["usage"][0]["snapshot"]["balance_cu"], 100.0);
         clock.advance(USAGE_STALE_AFTER + Duration::from_secs(1));
         assert!(!backend.usage_poll_due());
         let aged = snapshot_when(&mut stream, |snapshot| {
-            snapshot["usage"][0]["snapshot"]["stale"] == true
+            snapshot["server_now"]
+                .as_u64()
+                .is_some_and(|now| now.saturating_sub(fetched_at) > USAGE_STALE_AFTER.as_secs())
         });
         assert_eq!(aged["usage"][0]["snapshot"]["balance_cu"], 100.0);
+        assert_eq!(aged["usage"][0]["snapshot"]["stale"], false);
         assert!(aged["usage"][0]["last_error"].is_null());
-        assert_eq!(client.get(ACCOUNTS)["usage"], aged["usage"]);
+
+        let accounts = client.get(ACCOUNTS);
+        assert_eq!(accounts["usage"], aged["usage"]);
+        assert!(
+            accounts["sampled_at"]
+                .as_u64()
+                .unwrap()
+                .saturating_sub(fetched_at)
+                > USAGE_STALE_AFTER.as_secs()
+        );
+
         backend.set_failures(MockFailures {
             usage_fetch_fails: true,
             ..Default::default()
@@ -152,6 +168,10 @@ async fn age_marks_a_cached_usage_sample_stale_even_with_no_fetch_failure() {
             StatusCode::OK,
         );
         assert_eq!(adopted["usage"], aged["usage"][0]["snapshot"]);
+
+        let failed = mutate(&client, REFRESH, &json!({}), StatusCode::OK);
+        assert_eq!(failed["usage"][0]["snapshot"]["stale"], true);
+        assert_eq!(failed["usage"][0]["last_error"]["kind"], "http");
     })
     .await;
 }

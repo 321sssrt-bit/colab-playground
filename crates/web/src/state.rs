@@ -9,7 +9,7 @@ mod shutdown;
 use std::{
     collections::BTreeMap,
     sync::{Arc, Condvar, Mutex, MutexGuard},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use colab_playground_core::{
@@ -19,9 +19,11 @@ use colab_playground_core::{
         AccountUsageView, Backend, BackendKind, Events, GuardReport, PluginRunEvent,
         PluginRunOutcome, PluginRunSpec, RuntimeRef, RuntimesView,
     },
+    clock::serde_secs,
     host::ProbeReport,
     plugins::ResolvedEndpoint,
     provision::{ProvisionEvent, ProvisionOutcome, ProvisionSpec},
+    sessions::HardwareRate,
     tunnel::{TunnelId, TunnelInfo},
 };
 use serde::{Deserialize, Serialize};
@@ -33,6 +35,7 @@ use tokio::{
 pub use accounts::{AccountSwitchApproval, AccountSwitchPreview};
 pub use forwards::ForwardPolicy;
 pub use login::{CancelLoginOutcome, LoginPrompt, SubmitCancelOutcome, SubmitCancelSettlement};
+pub use sessions::{EndReason, EndedRuntime, GuardEvent, GuardEventKind};
 pub use shutdown::{Billing, ShutdownReport};
 
 const LOGIN_INACTIVITY: Duration = Duration::from_secs(5 * 60);
@@ -66,6 +69,30 @@ pub enum Operation {
     },
 }
 
+impl Operation {
+    fn refreshes_overview(&self) -> bool {
+        match self {
+            Self::Domain { name, .. } => !matches!(
+                *name,
+                "stop_runtime"
+                    | "auto_stop"
+                    | "stop_all_runtimes"
+                    | "open_forward"
+                    | "close_forward"
+                    | "hf_token"
+                    | "inspect_plugin"
+                    | "install_plugin"
+                    | "set_plugin_enabled"
+                    | "remove_plugin"
+            ),
+            Self::Provision { .. }
+            | Self::PluginRun { .. }
+            | Self::SwitchAccount { .. }
+            | Self::Login { .. } => true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PendingOperation {
     pub id: u64,
@@ -76,6 +103,14 @@ pub struct PendingOperation {
 #[derive(Debug, Clone, Serialize)]
 pub struct Snapshot {
     pub version: u64,
+    #[serde(with = "serde_secs")]
+    pub server_now: SystemTime,
+    #[serde(skip)]
+    usage_now: SystemTime,
+    #[serde(skip)]
+    cli_installed: Option<bool>,
+    #[serde(skip)]
+    pending_managed_check: bool,
     pub backend: BackendKind,
     pub account: AccountContext,
     pub accounts: Option<AccountsView>,
@@ -88,8 +123,13 @@ pub struct Snapshot {
     #[serde(skip)]
     forward_endpoints: BTreeMap<TunnelId, ResolvedEndpoint>,
     pub usage: Vec<AccountUsageView>,
+    pub measured_rates: Vec<HardwareRate>,
     pub guard: Option<GuardReport>,
+    pub guard_events: Vec<GuardEvent>,
     pub guard_error: Option<ErrorKind>,
+    pub ended: Vec<EndedRuntime>,
+    #[serde(skip)]
+    guard_state: sessions::GuardLedger,
     pub operations: Vec<PendingOperation>,
     pub login_id: Option<u64>,
     pub shutting_down: bool,
@@ -225,7 +265,14 @@ impl Job {
             control.login_job = None;
         }
         self.state.publish_operations(control);
-        if running.operation.is_some() {
+        if running.allocating {
+            self.state.mark_pending_managed_check();
+        }
+        if running
+            .operation
+            .as_ref()
+            .is_some_and(Operation::refreshes_overview)
+        {
             self.state.0.refresh.notify_one();
         }
         self.state.0.drained.notify_waiters();
@@ -260,14 +307,20 @@ impl WebState {
         login_inactivity: Duration,
         forward_policy: ForwardPolicy,
     ) -> Result<Self> {
-        let (backend, kind) = spawn_blocking(move || {
+        let (backend, kind, now, measured_rates) = spawn_blocking(move || {
             let kind = backend.kind();
-            (backend, kind)
+            let now = backend.now();
+            let measured_rates = backend.measured_rates();
+            (backend, kind, now, measured_rates)
         })
         .await
         .map_err(|_| Error::new(ErrorKind::Other))?;
         let (snapshots, _) = watch::channel(Arc::new(Snapshot {
             version: 1,
+            server_now: now,
+            usage_now: now,
+            cli_installed: None,
+            pending_managed_check: false,
             backend: kind,
             account: AccountContext {
                 revision: 0,
@@ -281,8 +334,12 @@ impl WebState {
             tunnels: Vec::new(),
             forward_endpoints: BTreeMap::new(),
             usage: Vec::new(),
+            measured_rates,
             guard: None,
+            guard_events: Vec::new(),
             guard_error: None,
+            ended: Vec::new(),
+            guard_state: sessions::GuardLedger::default(),
             operations: Vec::new(),
             login_id: None,
             shutting_down: false,
@@ -306,15 +363,39 @@ impl WebState {
     }
 
     pub fn snapshot(&self) -> Arc<Snapshot> {
-        self.0.snapshots.borrow().clone()
+        let mut snapshot = self.0.snapshots.borrow().clone();
+        let now = self.0.backend.now();
+        if snapshot.server_now != now {
+            Arc::make_mut(&mut snapshot).server_now = now;
+        }
+        snapshot
     }
 
     pub fn subscribe(&self) -> watch::Receiver<Arc<Snapshot>> {
+        let now = self.0.backend.now();
+        // Refresh the clock in place without notifying existing subscribers or bumping version,
+        // so a newly connected SSE client's initial frame carries the current server clock.
+        self.0.snapshots.send_if_modified(|snapshot| {
+            if snapshot.server_now != now {
+                Arc::make_mut(snapshot).server_now = now;
+            }
+            false
+        });
         self.0.snapshots.subscribe()
     }
 
     pub fn forward_policy(&self) -> ForwardPolicy {
         self.0.forward_policy
+    }
+
+    pub fn reset_cli_probe(&self) {
+        self.0.snapshots.send_if_modified(|snapshot| {
+            if snapshot.cli_installed.is_none() {
+                return false;
+            }
+            Arc::make_mut(snapshot).cli_installed = None;
+            false
+        });
     }
 
     pub async fn run_backend<T: Send + 'static>(
@@ -324,18 +405,20 @@ impl WebState {
         self.backend_job(Slot::Independent, work).await
     }
 
-    pub async fn probe_environment(&self) -> Result<(ProbeReport, Arc<Snapshot>)> {
+    pub async fn probe_environment(&self) -> Result<(ProbeReport, Arc<Snapshot>, SystemTime)> {
         let state = self.clone();
         self.backend_job(Slot::Shared, move |backend, cancel| {
             let _poll = state.lock_poll_slot();
             cancel.check()?;
             let report = backend.probe(cancel)?;
-            if report.colab.is_some() {
+            let cli_installed = report.colab.is_some();
+            state.set_cli_installed(cli_installed);
+            if cli_installed {
                 state.refresh_overview(backend, cancel);
             } else {
-                state.clear_overview();
+                state.clear_overview(backend.measured_rates());
             }
-            Ok((report, state.snapshot()))
+            Ok((report, state.snapshot(), backend.now()))
         })
         .await
     }
@@ -444,14 +527,37 @@ impl WebState {
     }
 
     fn update(&self, change: impl FnOnce(&mut Snapshot) -> bool) {
+        let now = self.0.backend.now();
         self.0.snapshots.send_if_modified(|snapshot| {
             let snapshot = Arc::make_mut(snapshot);
             if change(snapshot) {
+                snapshot.server_now = now;
                 snapshot.version += 1;
                 true
             } else {
                 false
             }
+        });
+    }
+
+    fn set_cli_installed(&self, installed: bool) {
+        self.0.snapshots.send_if_modified(|snapshot| {
+            if snapshot.cli_installed == Some(installed) {
+                return false;
+            }
+            Arc::make_mut(snapshot).cli_installed = Some(installed);
+            // Internal polling gate does not serialize onto the wire.
+            false
+        });
+    }
+
+    fn mark_pending_managed_check(&self) {
+        self.0.snapshots.send_if_modified(|snapshot| {
+            if snapshot.pending_managed_check {
+                return false;
+            }
+            Arc::make_mut(snapshot).pending_managed_check = true;
+            false
         });
     }
 
@@ -570,9 +676,9 @@ impl WebState {
     }
 
     fn record_accounts(&self, result: Result<AccountsView>) {
-        let now = self.0.backend.now();
         self.update(|snapshot| match result {
             Ok(mut view) => {
+                snapshot.cli_installed = Some(true);
                 if view.recovered_pending_add {
                     snapshot.recovered_pending_add_latched = true;
                 }
@@ -581,7 +687,7 @@ impl WebState {
                     .accounts
                     .iter_mut()
                     .map(|account| {
-                        let mut usage = snapshot
+                        let usage = snapshot
                             .usage
                             .iter()
                             .find(|usage| usage.account == account.id)
@@ -597,9 +703,6 @@ impl WebState {
                                     0,
                                 )
                             });
-                        if let Some(sample) = &mut usage.snapshot {
-                            polling::expire_sample(sample, now);
-                        }
                         account.usage = usage.snapshot;
                         usage
                     })
@@ -622,6 +725,9 @@ impl WebState {
                 changed
             }
             Err(error) => {
+                if error.is(ErrorKind::NotInstalled) {
+                    snapshot.cli_installed = Some(false);
+                }
                 let changed = snapshot.accounts_error != Some(error.kind);
                 snapshot.accounts_error = Some(error.kind);
                 changed
