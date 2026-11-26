@@ -21,6 +21,7 @@ import { webStore } from "../../lib/store.ts";
 import type { Locale } from "../../lib/types.ts";
 import {
   cancelPluginPreview,
+  confirmOwnedPreviewCancel,
   discardPluginPreview,
   findInspectPluginOpId,
   formatPluginApiError,
@@ -35,20 +36,28 @@ import type { PluginInfo, PluginPreviewResponse } from "./types.ts";
 
 export interface InstallPluginDialogProps {
   readonly open: boolean;
+  readonly inspectBusy?: boolean;
+  readonly inspectCancelling?: boolean;
   readonly locale: Locale;
   readonly t: TranslateFn;
   readonly onClose: () => void;
   readonly onInstalled: (plugin: PluginInfo) => void;
+  readonly onCheckCancelled?: () => void;
+  readonly onCheckCancelFailed?: (error: unknown) => void;
 }
 
 type DialogPhase = "source" | "checking" | "preview" | "installing";
 
 export function InstallPluginDialog({
   open,
+  inspectBusy = false,
+  inspectCancelling = false,
   locale,
   t,
   onClose,
   onInstalled,
+  onCheckCancelled,
+  onCheckCancelFailed,
 }: InstallPluginDialogProps) {
   const titleId = useId();
   const sourceInputId = useId();
@@ -73,6 +82,7 @@ export function InstallPluginDialog({
   const [phase, setPhase] = useState<DialogPhase>("source");
   const [preview, setPreview] = useState<PluginPreviewResponse | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [cancelledNotice, setCancelledNotice] = useState(false);
   const [sourceInvalid, setSourceInvalid] = useState(false);
 
   const discardStagedPreview = useCallback((previewId: string | null) => {
@@ -86,28 +96,48 @@ export function InstallPluginDialog({
     void discardPluginPreview(previewId).catch(() => {});
   }, []);
 
-  const cancelInFlightCheck = useCallback(() => {
-    const wasChecking = checkingRef.current;
-    const preExistingOpId = preExistingInspectOpIdRef.current;
-    checkingRef.current = false;
-    preExistingInspectOpIdRef.current = null;
-    // Always abort our own HTTP request so backend `CancelOperationOnDrop` cancels only
-    // an operation started by this request.
-    checkAbortRef.current?.abort();
-    checkAbortRef.current = null;
-    if (
-      wasChecking &&
-      shouldSendGlobalPreviewCancel(preExistingOpId, webStore.getState().snapshot?.operations)
-    ) {
-      // Proxy-buffering fallback: only call the global cancel endpoint when this tab did not
-      // collide with a pre-existing `inspect_plugin` op owned by another tab.
-      void cancelPluginPreview().catch(() => {});
-    }
-  }, []);
+  const onCheckCancelledRef = useRef(onCheckCancelled);
+  onCheckCancelledRef.current = onCheckCancelled;
+  const onCheckCancelFailedRef = useRef(onCheckCancelFailed);
+  onCheckCancelFailedRef.current = onCheckCancelFailed;
+
+  const cancelInFlightCheck = useCallback(
+    (notifyOutcome: boolean) => {
+      const wasChecking = checkingRef.current;
+      const preExistingOpId = preExistingInspectOpIdRef.current;
+      checkingRef.current = false;
+      preExistingInspectOpIdRef.current = null;
+      // Always abort our own HTTP request so backend `CancelOperationOnDrop` cancels only
+      // an operation started by this request.
+      checkAbortRef.current?.abort();
+      checkAbortRef.current = null;
+      if (!wasChecking) {
+        return;
+      }
+      if (!notifyOutcome) {
+        if (shouldSendGlobalPreviewCancel(preExistingOpId, webStore.getState().snapshot?.operations)) {
+          void cancelPluginPreview().catch(() => {});
+        }
+        return;
+      }
+      void confirmOwnedPreviewCancel({
+        preExistingInspectOpId: preExistingOpId,
+        currentOperations: webStore.getState().snapshot?.operations,
+        refreshOperations: async () => (await webStore.refreshSnapshot()).operations,
+      }).then((outcome) => {
+        if (outcome.kind === "cancelled") {
+          onCheckCancelledRef.current?.();
+        } else if (outcome.kind === "failed") {
+          onCheckCancelFailedRef.current?.(outcome.error);
+        }
+      });
+    },
+    [],
+  );
 
   const resetForOpen = useCallback(() => {
     checkSeqRef.current += 1;
-    cancelInFlightCheck();
+    cancelInFlightCheck(false);
     installAbortRef.current?.abort();
     installAbortRef.current = null;
     discardStagedPreview(activePreviewIdRef.current);
@@ -116,6 +146,7 @@ export function InstallPluginDialog({
     setPhase("source");
     setPreview(null);
     setErrorMessage(null);
+    setCancelledNotice(false);
     setSourceInvalid(false);
   }, [cancelInFlightCheck, discardStagedPreview]);
 
@@ -148,7 +179,7 @@ export function InstallPluginDialog({
     return () => {
       mountedRef.current = false;
       checkSeqRef.current += 1;
-      cancelInFlightCheck();
+      cancelInFlightCheck(false);
       installAbortRef.current?.abort();
       installAbortRef.current = null;
       discardStagedPreview(activePreviewIdRef.current);
@@ -167,13 +198,14 @@ export function InstallPluginDialog({
       dialog.returnValue = "";
     }
     checkSeqRef.current += 1;
-    cancelInFlightCheck();
+    cancelInFlightCheck(true);
     installAbortRef.current?.abort();
     installAbortRef.current = null;
     discardStagedPreview(activePreviewIdRef.current);
     setPreview(null);
     setPhase("source");
     setErrorMessage(null);
+    setCancelledNotice(false);
     setSourceInvalid(false);
     if (openRef.current) {
       onClose();
@@ -194,12 +226,13 @@ export function InstallPluginDialog({
 
   const handleCheckSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (phase === "checking" || phase === "installing") {
+    if (phase === "checking" || phase === "installing" || inspectBusy) {
       return;
     }
     const trimmed = sourceText.trim();
     if (!trimmed) {
       setSourceInvalid(true);
+      setCancelledNotice(false);
       setErrorMessage(t("web.plugins.source_required"));
       sourceInputRef.current?.focus();
       return;
@@ -215,6 +248,7 @@ export function InstallPluginDialog({
     );
 
     setSourceInvalid(false);
+    setCancelledNotice(false);
     setErrorMessage(null);
     setPhase("checking");
     setCheckedSource(trimmed);
@@ -244,7 +278,13 @@ export function InstallPluginDialog({
         return;
       }
       setPhase("source");
-      setErrorMessage(formatPluginApiError(error, t));
+      if (error instanceof ApiError && error.kind === "cancelled") {
+        setErrorMessage(null);
+        setCancelledNotice(true);
+      } else {
+        setCancelledNotice(false);
+        setErrorMessage(formatPluginApiError(error, t));
+      }
       sourceInputRef.current?.focus();
     } finally {
       if (checkAbortRef.current === controller) {
@@ -325,6 +365,7 @@ export function InstallPluginDialog({
 
   const isSourceStep = phase === "source" || phase === "checking";
   const isChecking = phase === "checking";
+  const isExternalInspectBusy = !isChecking && inspectBusy;
   const isInstalling = phase === "installing";
 
   const previewManifest = preview?.manifest ?? null;
@@ -366,6 +407,8 @@ export function InstallPluginDialog({
     <dialog
       ref={dialogRef}
       className="modal-dialog"
+      data-install-plugin-dialog="true"
+      data-install-phase={phase}
       aria-labelledby={titleId}
       onCancel={handleDialogCancel}
       onClose={handleDialogClose}
@@ -378,7 +421,7 @@ export function InstallPluginDialog({
         <form className="dialog-form" method="post" onSubmit={handleCheckSubmit} noValidate>
           <div className="dialog-body">
             <p className="dialog-caption" id={sourceHintId}>
-              {t("web.plugins.source_required")}
+              {t("app.b2.plugin_install_hint")}
             </p>
 
             <div className="field-group">
@@ -397,6 +440,9 @@ export function InstallPluginDialog({
                   if (sourceInvalid) {
                     setSourceInvalid(false);
                   }
+                  if (cancelledNotice) {
+                    setCancelledNotice(false);
+                  }
                   if (errorMessage !== null) {
                     setErrorMessage(null);
                   }
@@ -408,16 +454,42 @@ export function InstallPluginDialog({
                 spellCheck={false}
                 enterKeyHint="next"
                 required
-                disabled={isChecking}
+                disabled={isChecking || isExternalInspectBusy}
                 aria-invalid={sourceInvalid ? "true" : undefined}
                 aria-describedby={describedBy}
               />
             </div>
 
             {isChecking && (
-              <div className="busy-line" role="status" aria-live="polite">
+              <div className="busy-line" role="status" aria-live="polite" data-install-checking="true">
                 <span className="spinner" aria-hidden="true" />
                 <span>{t("app.b2.plugin_checking")}</span>
+              </div>
+            )}
+
+            {isExternalInspectBusy && (
+              <div
+                className="busy-line"
+                role="status"
+                aria-live="polite"
+                data-install-cancelling={inspectCancelling ? "true" : "false"}
+              >
+                <span className="spinner" aria-hidden="true" />
+                <span>
+                  {t(inspectCancelling ? "app.b2.new_cancelling" : "app.b2.plugin_checking")}
+                </span>
+              </div>
+            )}
+
+            {cancelledNotice && (
+              <div
+                className="inline-msg inline-msg-info"
+                role="status"
+                aria-live="polite"
+                data-install-cancelled="true"
+              >
+                <InfoIcon />
+                <span className="inline-msg-text">{t("app.install.cancelled")}</span>
               </div>
             )}
 
@@ -434,16 +506,24 @@ export function InstallPluginDialog({
           </div>
 
           <div className="modal-actions">
-            <button type="button" className="btn" onClick={requestClose}>
+            <button
+              type="button"
+              className="btn"
+              data-install-cancel="true"
+              onClick={requestClose}
+            >
               {t("app.action.cancel")}
             </button>
             <button
               type="submit"
               className="btn btn-primary"
-              disabled={isChecking}
-              aria-busy={isChecking || undefined}
+              data-install-check="true"
+              disabled={isChecking || isExternalInspectBusy}
+              aria-busy={isChecking || isExternalInspectBusy || undefined}
             >
-              {isChecking && <span className="spinner" aria-hidden="true" />}
+              {(isChecking || isExternalInspectBusy) && (
+                <span className="spinner" aria-hidden="true" />
+              )}
               <span>{t("app.b2.plugin_check")}</span>
             </button>
           </div>

@@ -10,12 +10,14 @@ import type {
   GgufEstimateRequest,
   GgufEstimateResponse,
   HfModel,
+  HfTokenState,
   HfTokenStatus,
   KvType,
   LocalizedText,
   PluginInfo,
   PluginOrigin,
   PluginPreviewResponse,
+  PluginRunPhase,
   PluginRunSummary,
   PluginRunTemplateSpec,
   StartPluginRunRequest,
@@ -152,6 +154,65 @@ export function formatPluginApiError(error: unknown, t: TranslateFn): string {
   return t("app.err.other");
 }
 
+export interface HfTokenBadgeMeta {
+  readonly status: "saved" | "none" | "error" | "loading";
+  readonly className: string;
+  readonly text: string;
+}
+
+/**
+ * Resolves the status badge presentation for the Hugging Face token cache state.
+ * Shared by the Plugins list card and the modal token dialog so error states always
+ * surface clearly and never retain a stale `saved` badge.
+ */
+export function getHfTokenBadgeMeta(hfToken: HfTokenState, t: TranslateFn): HfTokenBadgeMeta {
+  if (hfToken.kind === "ready") {
+    return hfToken.saved
+      ? {
+          status: "saved",
+          className: "badge badge-success",
+          text: t("app.b2.hf_token_stored"),
+        }
+      : {
+          status: "none",
+          className: "badge",
+          text: t("app.b2.hf_token_none"),
+        };
+  }
+  if (hfToken.kind === "error") {
+    return {
+      status: "error",
+      className: "badge badge-warning",
+      text: t("app.b2.hf_token_unknown"),
+    };
+  }
+  return {
+    status: "loading",
+    className: "badge",
+    text: t("app.summary.unknown"),
+  };
+}
+
+/**
+ * Resolves the display phase for a Plugins list top run banner, preferring terminal
+ * phases from `RunSummary.phase` or live SSE updates so banners never stall on "running".
+ */
+export function resolvePluginRunBannerPhase(
+  run: Pick<PluginRunSummary, "phase" | "finished">,
+  knownPhase: PluginRunPhase | undefined,
+): PluginRunPhase | null {
+  if (run.phase && run.phase !== "running") {
+    return run.phase;
+  }
+  if (knownPhase && knownPhase !== "running") {
+    return knownPhase;
+  }
+  if (run.phase === "running" || !run.finished) {
+    return "running";
+  }
+  return null;
+}
+
 export async function listPlugins(
   signal?: AbortSignal,
   client: ApiClient = apiClient,
@@ -223,6 +284,47 @@ export function shouldSendGlobalPreviewCancel(
     return false;
   }
   return findInspectPluginOpId(currentOperations) !== null;
+}
+
+export type PreviewCancelOutcome =
+  | { readonly kind: "cancelled" }
+  | { readonly kind: "skipped" }
+  | { readonly kind: "failed"; readonly error: unknown };
+
+/**
+ * Confirms backend cancellation of a plugin preview check started by this tab.
+ * - If another tab already owned `inspect_plugin` before submit, skips global cancel.
+ * - If `inspect_plugin` is active in the current snapshot, posts `/api/plugins/previews/cancel`.
+ * - If the snapshot has not yet observed `inspect_plugin` (e.g. fast cancel right after submit),
+ *   refreshes the snapshot once: if a proxy kept the op alive on the server, cancels it explicitly;
+ *   otherwise the aborted HTTP request already ended the op on the backend.
+ */
+export async function confirmOwnedPreviewCancel(params: {
+  readonly preExistingInspectOpId: number | null;
+  readonly currentOperations: readonly PendingOperation[] | undefined;
+  readonly refreshOperations: () => Promise<readonly PendingOperation[] | undefined>;
+  readonly cancelPreview?: () => Promise<void>;
+}): Promise<PreviewCancelOutcome> {
+  if (params.preExistingInspectOpId !== null) {
+    return { kind: "skipped" };
+  }
+  const sendCancel = params.cancelPreview ?? (() => cancelPluginPreview());
+  try {
+    if (shouldSendGlobalPreviewCancel(null, params.currentOperations)) {
+      await sendCancel();
+      return { kind: "cancelled" };
+    }
+    const latestOperations = await params.refreshOperations();
+    if (shouldSendGlobalPreviewCancel(null, latestOperations)) {
+      await sendCancel();
+    }
+    return { kind: "cancelled" };
+  } catch (error) {
+    if (error instanceof ApiError && (error.isAbort || error.isUnauthorized)) {
+      return { kind: "skipped" };
+    }
+    return { kind: "failed", error };
+  }
 }
 
 export async function installPluginPreview(

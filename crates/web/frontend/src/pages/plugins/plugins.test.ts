@@ -19,8 +19,11 @@ import type {
 import {
   buildGgufFitKey,
   cancelPluginPreview,
+  confirmOwnedPreviewCancel,
   findInspectPluginOpId,
+  getHfTokenBadgeMeta,
   planGgufEstimateFetch,
+  resolvePluginRunBannerPhase,
   shouldSendGlobalPreviewCancel,
 } from "./api.ts";
 import { selectEndpointTunnelByPort, stripAnsi } from "./endpoint.ts";
@@ -1195,6 +1198,174 @@ test("pluginCacheStore refreshes catalog after in-flight GET /api/plugins when c
   assert.equal(shouldSendGlobalPreviewCancel(77, tabAOps), false);
   assert.equal(shouldSendGlobalPreviewCancel(null, tabAOps), true);
   assert.equal(shouldSendGlobalPreviewCancel(null, []), false);
+
+  pluginCache.dispose();
+});
+
+test("resolvePluginRunBannerPhase reflects RunSummary.phase and getHfTokenBadgeMeta surfaces error states cleanly", () => {
+  const t = (key: string) => key;
+
+  assert.equal(
+    resolvePluginRunBannerPhase({ phase: "running", finished: false }, undefined),
+    "running",
+  );
+  assert.equal(
+    resolvePluginRunBannerPhase({ phase: "ready", finished: true }, "running"),
+    "ready",
+  );
+  assert.equal(
+    resolvePluginRunBannerPhase({ phase: "failed", finished: true }, "running"),
+    "failed",
+  );
+  assert.equal(
+    resolvePluginRunBannerPhase({ phase: "cancelled", finished: true }, "running"),
+    "cancelled",
+  );
+  assert.equal(
+    resolvePluginRunBannerPhase({ phase: "running", finished: false }, "ready"),
+    "ready",
+  );
+
+  assert.deepEqual(getHfTokenBadgeMeta({ kind: "idle" }, t), {
+    status: "loading",
+    className: "badge",
+    text: "app.summary.unknown",
+  });
+  assert.deepEqual(getHfTokenBadgeMeta({ kind: "loading" }, t), {
+    status: "loading",
+    className: "badge",
+    text: "app.summary.unknown",
+  });
+  assert.deepEqual(getHfTokenBadgeMeta({ kind: "ready", saved: true }, t), {
+    status: "saved",
+    className: "badge badge-success",
+    text: "app.b2.hf_token_stored",
+  });
+  assert.deepEqual(getHfTokenBadgeMeta({ kind: "ready", saved: false }, t), {
+    status: "none",
+    className: "badge",
+    text: "app.b2.hf_token_none",
+  });
+  assert.deepEqual(getHfTokenBadgeMeta({ kind: "error", error: new Error("keyring locked") }, t), {
+    status: "error",
+    className: "badge badge-warning",
+    text: "app.b2.hf_token_unknown",
+  });
+});
+
+test("confirmOwnedPreviewCancel confirms server cancellation, handles proxy-delayed inspect op, and surfaces cancel failure", async () => {
+  const activeInspectOps = [
+    {
+      id: 91,
+      operation: { kind: "domain", name: "inspect_plugin", key: "" } as const,
+      cancelling: false,
+    },
+  ];
+
+  // 1. Pre-existing op owned by another tab is never cancelled.
+  let cancelCalls = 0;
+  const skipped = await confirmOwnedPreviewCancel({
+    preExistingInspectOpId: 91,
+    currentOperations: activeInspectOps,
+    refreshOperations: async () => activeInspectOps,
+    cancelPreview: async () => {
+      cancelCalls += 1;
+    },
+  });
+  assert.deepEqual(skipped, { kind: "skipped" });
+  assert.equal(cancelCalls, 0);
+
+  // 2. Active op already in snapshot cancels directly.
+  const direct = await confirmOwnedPreviewCancel({
+    preExistingInspectOpId: null,
+    currentOperations: activeInspectOps,
+    refreshOperations: async () => {
+      throw new Error("should not refresh when already visible");
+    },
+    cancelPreview: async () => {
+      cancelCalls += 1;
+    },
+  });
+  assert.deepEqual(direct, { kind: "cancelled" });
+  assert.equal(cancelCalls, 1);
+
+  // 3. Fast close before SSE arrives refreshes snapshot; if proxy kept op alive, cancels explicitly.
+  let refreshes = 0;
+  const proxyDelayed = await confirmOwnedPreviewCancel({
+    preExistingInspectOpId: null,
+    currentOperations: [],
+    refreshOperations: async () => {
+      refreshes += 1;
+      return activeInspectOps;
+    },
+    cancelPreview: async () => {
+      cancelCalls += 1;
+    },
+  });
+  assert.deepEqual(proxyDelayed, { kind: "cancelled" });
+  assert.equal(refreshes, 1);
+  assert.equal(cancelCalls, 2);
+
+  // 4. Cancel endpoint failure surfaces `failed` instead of falsely reporting cancelled.
+  const failed = await confirmOwnedPreviewCancel({
+    preExistingInspectOpId: null,
+    currentOperations: activeInspectOps,
+    refreshOperations: async () => activeInspectOps,
+    cancelPreview: async () => {
+      throw new ApiError({ status: 500, kind: "other", message: "boom" });
+    },
+  });
+  assert.equal(failed.kind, "failed");
+});
+
+test("pluginCacheStore queues a follow-up HF token check when refreshHfTokenStatus is called mid-flight", async () => {
+  const web = createFakeWebStore(makeSnapshot({ version: 1 }));
+  let tokenCalls = 0;
+  let releaseFirstCheck: ((res: { saved: boolean }) => void) | null = null;
+  let keyringBroken = false;
+
+  const harness = createFakeClient(async (method, path) => {
+    if (method === "GET" && path === "/api/plugins/hf/token") {
+      tokenCalls += 1;
+      if (tokenCalls === 1) {
+        return new Promise<{ saved: boolean }>((resolve) => {
+          releaseFirstCheck = resolve;
+        });
+      }
+      if (keyringBroken) {
+        throw new ApiError({
+          status: 503,
+          kind: "keyring_unavailable",
+          message: "keyring locked",
+        });
+      }
+      return { saved: true };
+    }
+    return [];
+  });
+
+  const pluginCache = createPluginCacheStore({ client: harness.client, store: web.store });
+
+  // First check starts while keyring still works.
+  const firstRefresh = pluginCache.refreshHfTokenStatus({ silent: true });
+  assert.equal(tokenCalls, 1);
+
+  // Keyring breaks before the first response arrives, and a plugin mutation requests a fresh check.
+  keyringBroken = true;
+  const queuedRefresh = pluginCache.refreshHfTokenStatus({ silent: true });
+  assert.equal(tokenCalls, 1, "must wait for in-flight request before issuing follow-up");
+
+  assert.ok(releaseFirstCheck);
+  (releaseFirstCheck as (res: { saved: boolean }) => void)({ saved: true });
+  await Promise.all([firstRefresh, queuedRefresh]);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(tokenCalls, 2, "must automatically issue follow-up check after in-flight settles");
+  assert.equal(
+    pluginCache.getState().hfToken.kind,
+    "error",
+    "follow-up keyring failure must overwrite the stale in-flight saved=true result",
+  );
 
   pluginCache.dispose();
 });

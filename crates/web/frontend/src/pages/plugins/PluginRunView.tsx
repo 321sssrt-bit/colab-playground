@@ -33,7 +33,7 @@ import {
   SquareIcon,
 } from "../sessions/Icons.tsx";
 import { resolveLocalizedText } from "./api.ts";
-import { selectEndpointTunnelByPort, type ForwardLiveOverlay } from "./endpoint.ts";
+import { selectEndpointTunnelByPort, stripAnsi, type ForwardLiveOverlay } from "./endpoint.ts";
 import { EndpointCard } from "./EndpointCard.tsx";
 import {
   canRunPluginAgain,
@@ -68,6 +68,25 @@ function ArrowLeftIcon() {
     >
       <path d="m12 19-7-7 7-7" />
       <path d="M19 12H5" />
+    </svg>
+  );
+}
+
+function RotateCcwIcon() {
+  return (
+    <svg
+      className="icon"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      focusable="false"
+    >
+      <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+      <path d="M3 3v5h5" />
     </svg>
   );
 }
@@ -183,6 +202,9 @@ function formatOutputValue(value: unknown): string {
 export interface PluginRunViewProps {
   readonly run: PluginRunDetail;
   readonly plugin: PluginInfo | null;
+  readonly pluginsCatalogLoading?: boolean;
+  readonly pluginsCatalogError?: string | null;
+  readonly onRetryPluginsCatalog?: () => void;
   readonly snapshot: Snapshot | null;
   readonly billingCheck: PluginRunBillingCheck | undefined;
   readonly endpointForwardIdsByKey: Readonly<Record<string, number | null>>;
@@ -204,6 +226,9 @@ export interface PluginRunViewProps {
 export function PluginRunView({
   run,
   plugin,
+  pluginsCatalogLoading = false,
+  pluginsCatalogError = null,
+  onRetryPluginsCatalog,
   snapshot,
   billingCheck,
   endpointForwardIdsByKey,
@@ -226,6 +251,9 @@ export function PluginRunView({
   const stickToBottomRef = useRef(true);
 
   const [nowMs, setNowMs] = useState<number>(() => Date.now());
+  const [runAgainBlocked, setRunAgainBlocked] = useState<
+    "disabled" | "missing" | "load_error" | null
+  >(null);
 
   const isRunning = run.phase === "running";
   const isEndedErrorOrCancel = run.phase === "failed" || run.phase === "cancelled";
@@ -264,7 +292,16 @@ export function PluginRunView({
 
   useEffect(() => {
     stickToBottomRef.current = true;
+    setRunAgainBlocked(null);
   }, [run.id]);
+
+  useEffect(() => {
+    if (plugin?.enabled) {
+      setRunAgainBlocked(null);
+    } else if (pluginsCatalogError === null) {
+      setRunAgainBlocked((prev) => (prev === "load_error" ? null : prev));
+    }
+  }, [plugin?.enabled, pluginsCatalogError]);
 
   const handleLogScroll = () => {
     const box = logBoxRef.current;
@@ -320,6 +357,7 @@ export function PluginRunView({
     run.phase === "failed" || run.phase === "cancelled" || run.status?.state === "failed";
 
   const billingState = resolvePluginRunBillingState(run, billingCheck, snapshot);
+  const pluginsPending = plugin === null && pluginsCatalogLoading;
   const runAgainAllowed = canRunPluginAgain(plugin, shuttingDown);
 
   const outputEntries = run.status?.outputs ? Object.entries(run.status.outputs) : [];
@@ -332,7 +370,14 @@ export function PluginRunView({
     <>
       <header className="page-header page-header-row">
         <div className="page-header-heading">
-          <h1 className="page-title">{pluginName}</h1>
+          <div className="plugin-run-title-row">
+            <h1 className="page-title">{pluginName}</h1>
+            {plugin !== null && !plugin.enabled && (
+              <span className="badge" data-plugin-run-off-badge="true">
+                {t("app.b2.plugin_off")}
+              </span>
+            )}
+          </div>
           <p className="page-subtitle">{subtitle}</p>
         </div>
         <div className="page-header-actions">
@@ -480,7 +525,7 @@ export function PluginRunView({
                           />
                         )}
                         {run.status?.message && (
-                          <span className="caption">{run.status.message}</span>
+                          <span className="caption">{stripAnsi(run.status.message)}</span>
                         )}
                       </div>
                     )}
@@ -567,9 +612,14 @@ export function PluginRunView({
                   </div>
                 </div>
               ) : billingState.phase === "checking" ? (
-                <div className="busy-line" role="status" aria-live="polite" data-run-checking="true">
+                <div
+                  className="inline-msg inline-msg-info plugin-billing-checking"
+                  role="status"
+                  aria-live="polite"
+                  data-run-checking="true"
+                >
                   <span className="spinner" aria-hidden="true" />
-                  <span>{t("app.b2.run_checking")}</span>
+                  <span className="inline-msg-text">{t("app.b2.run_checking")}</span>
                 </div>
               ) : billingState.phase === "unknown" ? (
                 <div className="alert alert-warning" role="alert" data-run-session-unknown="true">
@@ -617,21 +667,77 @@ export function PluginRunView({
           )}
 
           {!isRunning && onRunAgain && (
-            <div className="plugin-submit-row">
-              <button
-                type="button"
-                className="btn"
-                data-plugin-run-again="true"
-                disabled={!runAgainAllowed}
-                onClick={() => {
-                  if (runAgainAllowed) {
-                    onRunAgain(run.plugin);
-                  }
-                }}
-              >
-                {t("app.b2.run_again")}
-              </button>
-            </div>
+            <>
+              <div className="plugin-submit-row">
+                <button
+                  type="button"
+                  className="btn"
+                  data-plugin-run-again="true"
+                  disabled={shuttingDown || pluginsPending}
+                  aria-busy={pluginsPending || undefined}
+                  onClick={() => {
+                    if (pluginsPending || shuttingDown) {
+                      return;
+                    }
+                    if (runAgainAllowed) {
+                      setRunAgainBlocked(null);
+                      onRunAgain(run.plugin);
+                    } else if (plugin === null && pluginsCatalogError !== null) {
+                      setRunAgainBlocked("load_error");
+                      onRunAgain(run.plugin);
+                    } else {
+                      setRunAgainBlocked(plugin === null ? "missing" : "disabled");
+                      onRunAgain(run.plugin);
+                    }
+                  }}
+                >
+                  {pluginsPending ? <span className="spinner" aria-hidden="true" /> : <RotateCcwIcon />}
+                  <span>{t("app.b2.run_again")}</span>
+                </button>
+              </div>
+
+              {runAgainBlocked !== null && (
+                <div
+                  className="alert alert-warning"
+                  role="alert"
+                  data-plugin-run-again-blocked={runAgainBlocked}
+                >
+                  <span className="alert-icon icon-warning">
+                    <AlertTriangleIcon />
+                  </span>
+                  <div className="alert-text">
+                    <p className="alert-body">
+                      {runAgainBlocked === "load_error"
+                        ? (pluginsCatalogError ?? t("app.err.other"))
+                        : runAgainBlocked === "missing"
+                          ? t("app.err.plugin_not_found")
+                          : `${pluginName} · ${t("app.b2.plugin_off")}`}
+                    </p>
+                    <div className="alert-actions">
+                      {runAgainBlocked === "load_error" && onRetryPluginsCatalog && (
+                        <button
+                          type="button"
+                          className="btn btn-sm"
+                          onClick={() => {
+                            setRunAgainBlocked(null);
+                            onRetryPluginsCatalog();
+                          }}
+                        >
+                          {t("app.action.retry")}
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        className={runAgainBlocked === "load_error" ? "btn btn-sm btn-ghost" : "btn btn-sm"}
+                        onClick={onBack}
+                      >
+                        {t("app.b2.action_back")}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </>
           )}
         </div>
 
@@ -738,7 +844,7 @@ export function PluginRunView({
                 }
                 return (
                   <div className="run-log-line" key={`line-${index}`}>
-                    {entry.text}
+                    {stripAnsi(entry.text)}
                   </div>
                 );
               })}

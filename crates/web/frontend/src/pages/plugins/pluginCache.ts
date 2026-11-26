@@ -123,6 +123,7 @@ export function createPluginCacheStore(
   let pluginsInFlight: InFlight<readonly PluginInfo[]> | null = null;
   let pluginsRefreshPending = false;
   let tokenCheckInFlight: InFlight<HfTokenState> | null = null;
+  let tokenRefreshPending: { readonly silent: boolean } | null = null;
 
   const listeners = new Set<() => void>();
 
@@ -156,6 +157,7 @@ export function createPluginCacheStore(
     pluginsRefreshPending = false;
     tokenCheckInFlight?.controller.abort();
     tokenCheckInFlight = null;
+    tokenRefreshPending = null;
     pluginsSeq += 1;
     tokenSeq += 1;
   };
@@ -232,6 +234,14 @@ export function createPluginCacheStore(
   }): Promise<HfTokenState> => {
     const generation = client.getSessionGeneration();
     if (tokenCheckInFlight !== null && tokenCheckInFlight.generation === generation) {
+      // Queue one follow-up refresh after the in-flight check settles so concurrent mutations
+      // never leave a stale pre-mutation `saved: true` response in cache.
+      tokenRefreshPending = {
+        silent:
+          tokenRefreshPending === null
+            ? Boolean(opts?.silent)
+            : tokenRefreshPending.silent && Boolean(opts?.silent),
+      };
       return attachAbortSignal(tokenCheckInFlight.promise, opts?.signal);
     }
     const seq = ++tokenSeq;
@@ -262,6 +272,15 @@ export function createPluginCacheStore(
       .finally(() => {
         if (tokenCheckInFlight?.promise === promise) {
           tokenCheckInFlight = null;
+          if (
+            !disposed &&
+            tokenRefreshPending !== null &&
+            client.getSessionGeneration() === generation
+          ) {
+            const pending = tokenRefreshPending;
+            tokenRefreshPending = null;
+            void refreshHfTokenStatus({ silent: pending.silent }).catch(() => {});
+          }
         }
       });
     tokenCheckInFlight = { generation, controller, promise };
@@ -358,6 +377,7 @@ export function createPluginCacheStore(
       const generation = client.getSessionGeneration();
       tokenCheckInFlight?.controller.abort();
       tokenCheckInFlight = null;
+      tokenRefreshPending = null;
       const seq = ++tokenSeq;
       localTokenMutationActive = true;
       try {
@@ -386,6 +406,7 @@ export function createPluginCacheStore(
       const generation = client.getSessionGeneration();
       tokenCheckInFlight?.controller.abort();
       tokenCheckInFlight = null;
+      tokenRefreshPending = null;
       const seq = ++tokenSeq;
       localTokenMutationActive = true;
       try {
