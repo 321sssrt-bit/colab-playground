@@ -133,7 +133,7 @@ export function OverviewPage({ snapshot, locale, t, navigate, pushToast }: PageP
     runningInstallOp !== null;
   const checklist = useMemo(
     () =>
-      deriveChecklist(overview, probeError, probing, {
+      deriveChecklist(overview, probeError, {
         probeErrorKind,
         installing: installActive,
       }),

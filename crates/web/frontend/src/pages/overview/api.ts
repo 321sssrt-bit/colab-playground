@@ -34,9 +34,6 @@ import {
 import type { PluginInfo } from "../plugins/types.ts";
 
 export type {
-  CliInstallLine,
-  CliInstallPhase,
-  CliInstallView,
   ForwardPolicyView,
   InstallMethod,
   OverviewResponse,
@@ -44,14 +41,8 @@ export type {
   UnmanagedRuntimes,
 };
 
-export type InstallLine = CliInstallLine;
-
-export type InstallFinishedStatus = "succeeded" | "cancelled" | "failed";
-
 export interface InstallFinishedEvent {
-  readonly status: InstallFinishedStatus;
   readonly phase: CliInstallPhase;
-  readonly cli_installed: boolean;
   readonly warning_title_key: string | null;
   readonly warning_body_key: string | null;
   readonly error: ApiErrorPayload | null;
@@ -60,7 +51,7 @@ export interface InstallFinishedEvent {
 export interface InstallStreamCallbacks {
   readonly signal?: AbortSignal;
   readonly onStarted?: (id: number, method: InstallMethod | null) => void;
-  readonly onLine?: (line: InstallLine) => void;
+  readonly onLine?: (line: CliInstallLine) => void;
   readonly onFinished?: (event: InstallFinishedEvent) => void;
 }
 
@@ -186,13 +177,8 @@ function parseInstallFrame(frame: SseFrame, callbacks: InstallStreamCallbacks): 
     if (phase === null) {
       return;
     }
-    const status: InstallFinishedStatus =
-      rawStatus ?? (phase === "succeeded" ? "succeeded" : phase === "cancelled" ? "cancelled" : "failed");
     callbacks.onFinished?.({
-      status,
       phase,
-      cli_installed:
-        typeof raw.cli_installed === "boolean" ? raw.cli_installed : phase === "succeeded",
       warning_title_key: typeof raw.warning_title_key === "string" ? raw.warning_title_key : null,
       warning_body_key: typeof raw.warning_body_key === "string" ? raw.warning_body_key : null,
       error: parseErrorPayload(raw.error),
@@ -209,7 +195,7 @@ export function stripAnsi(text: string): string {
 }
 
 /** Strips ANSI sequences and caps hydrated install lines to `INSTALL_LOG_MAX_LINES`. */
-export function sanitizeInstallLines(lines: readonly CliInstallLine[]): readonly InstallLine[] {
+export function sanitizeInstallLines(lines: readonly CliInstallLine[]): readonly CliInstallLine[] {
   const sliced =
     lines.length > INSTALL_LOG_MAX_LINES
       ? lines.slice(lines.length - INSTALL_LOG_MAX_LINES)
@@ -340,7 +326,6 @@ export function selectQuickDeployPlugins(
 export function deriveChecklist(
   overview: OverviewResponse | null,
   probeError: FormattedApiError | null,
-  _probing: boolean,
   options: DeriveChecklistOptions = {},
 ): ChecklistModel {
   const probeErrorKind = options.probeErrorKind ?? null;

@@ -1529,7 +1529,7 @@ test("settingsNoticeStore displays once globally, survives background null updat
 test("deriveChecklist follows upstream 3-step flow and routes NotInstalled and re-probe failures accurately", () => {
   const err = { message: "err", hint: null };
   assert.deepEqual(
-    deriveChecklist(null, err, false, { probeErrorKind: "not_installed" }),
+    deriveChecklist(null, err, { probeErrorKind: "not_installed" }),
     {
       complete: false,
       hostStatus: "done",
@@ -1537,7 +1537,7 @@ test("deriveChecklist follows upstream 3-step flow and routes NotInstalled and r
       signinStatus: "waiting",
     },
   );
-  assert.deepEqual(deriveChecklist(null, err, false, { probeErrorKind: "io" }), {
+  assert.deepEqual(deriveChecklist(null, err, { probeErrorKind: "io" }), {
     complete: false,
     hostStatus: "failed",
     cliStatus: "waiting",
@@ -1550,7 +1550,7 @@ test("deriveChecklist follows upstream 3-step flow and routes NotInstalled and r
     cli_installed: false,
   });
   assert.deepEqual(
-    deriveChecklist(staleNotReadyHost, err, false, { probeErrorKind: "io" }),
+    deriveChecklist(staleNotReadyHost, err, { probeErrorKind: "io" }),
     {
       complete: false,
       hostStatus: "failed",
@@ -1560,7 +1560,7 @@ test("deriveChecklist follows upstream 3-step flow and routes NotInstalled and r
   );
   // New NotInstalled error overrides a stale host.ready=false cached report so Install is shown.
   assert.deepEqual(
-    deriveChecklist(staleNotReadyHost, err, false, { probeErrorKind: "not_installed" }),
+    deriveChecklist(staleNotReadyHost, err, { probeErrorKind: "not_installed" }),
     {
       complete: false,
       hostStatus: "done",
@@ -1574,7 +1574,7 @@ test("deriveChecklist follows upstream 3-step flow and routes NotInstalled and r
     accounts_error: "keyring_unavailable",
     keyring: { status: "unavailable", hint_key: "app.ns.unlock_keyring" },
   });
-  assert.deepEqual(deriveChecklist(keyringFailed, null, false), {
+  assert.deepEqual(deriveChecklist(keyringFailed, null), {
     complete: false,
     hostStatus: "done",
     cliStatus: "done",
@@ -1591,14 +1591,14 @@ test("deriveChecklist follows upstream 3-step flow and routes NotInstalled and r
       recovered_pending_add: false,
     },
   });
-  assert.deepEqual(deriveChecklist(signedOut, null, false), {
+  assert.deepEqual(deriveChecklist(signedOut, null), {
     complete: false,
     hostStatus: "done",
     cliStatus: "done",
     signinStatus: "todo",
   });
 
-  assert.deepEqual(deriveChecklist(makeOverview(), null, false), {
+  assert.deepEqual(deriveChecklist(makeOverview(), null), {
     complete: true,
     hostStatus: "done",
     cliStatus: "done",

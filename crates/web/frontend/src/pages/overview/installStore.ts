@@ -33,7 +33,6 @@ export interface CliInstallStoreState {
   readonly method: InstallMethod | null;
   readonly preferredMethod: InstallMethod | null;
   readonly phase: CliInstallPhase;
-  readonly cliInstalled: boolean;
   readonly cancelling: boolean;
   readonly lines: readonly CliInstallLine[];
   readonly warningTitleKey: string | null;
@@ -69,7 +68,6 @@ const INITIAL_STATE: CliInstallStoreState = {
   method: null,
   preferredMethod: null,
   phase: "idle",
-  cliInstalled: false,
   cancelling: false,
   lines: [],
   warningTitleKey: null,
@@ -138,7 +136,6 @@ export function createCliInstallStore(options: CliInstallStoreOptions = {}): Cli
       next.method === state.method &&
       next.preferredMethod === state.preferredMethod &&
       next.phase === state.phase &&
-      next.cliInstalled === state.cliInstalled &&
       next.cancelling === state.cancelling &&
       next.lines === state.lines &&
       next.warningTitleKey === state.warningTitleKey &&
@@ -235,7 +232,6 @@ export function createCliInstallStore(options: CliInstallStoreOptions = {}): Cli
       id: view.id,
       method: view.method,
       phase: view.phase,
-      cliInstalled: view.cli_installed,
       cancelling: view.cancelling,
       lines: incomingLines,
       warningTitleKey: notFound ? (view.warning_title_key ?? "app.install.not_found.title") : null,
@@ -255,7 +251,6 @@ export function createCliInstallStore(options: CliInstallStoreOptions = {}): Cli
     if (event.phase === "not_found") {
       setState({
         phase: "not_found",
-        cliInstalled: false,
         cancelling: false,
         warningTitleKey: event.warning_title_key ?? "app.install.not_found.title",
         warningBodyKey: event.warning_body_key ?? "app.install.not_found.body",
@@ -267,7 +262,6 @@ export function createCliInstallStore(options: CliInstallStoreOptions = {}): Cli
     if (event.phase === "succeeded") {
       setState({
         phase: "succeeded",
-        cliInstalled: true,
         cancelling: false,
         warningTitleKey: null,
         warningBodyKey: null,
@@ -280,7 +274,6 @@ export function createCliInstallStore(options: CliInstallStoreOptions = {}): Cli
     if (event.phase === "cancelled") {
       setState({
         phase: "cancelled",
-        cliInstalled: false,
         cancelling: false,
         warningTitleKey: null,
         warningBodyKey: null,
@@ -291,7 +284,6 @@ export function createCliInstallStore(options: CliInstallStoreOptions = {}): Cli
     }
     setState({
       phase: event.phase === "probe_failed" ? "probe_failed" : "failed",
-      cliInstalled: false,
       cancelling: false,
       warningTitleKey: null,
       warningBodyKey: null,
@@ -504,7 +496,6 @@ export function createCliInstallStore(options: CliInstallStoreOptions = {}): Cli
         id: summary.id,
         method: summary.method ?? state.method,
         phase: "running",
-        cliInstalled: false,
         cancelling: summary.cancelling || (sameSession && state.cancelling),
         ...(sameSession || startingLocal ? {} : { lines: [] }),
         warningTitleKey: null,
@@ -554,7 +545,6 @@ export function createCliInstallStore(options: CliInstallStoreOptions = {}): Cli
       hydratedTerminalKey = terminalKey;
       setState({
         phase: "not_found",
-        cliInstalled: false,
         cancelling: false,
         error: null,
         streamError: null,
@@ -642,7 +632,6 @@ export function createCliInstallStore(options: CliInstallStoreOptions = {}): Cli
       method,
       preferredMethod: method,
       phase: "running",
-      cliInstalled: false,
       cancelling: false,
       lines: [],
       warningTitleKey: null,
