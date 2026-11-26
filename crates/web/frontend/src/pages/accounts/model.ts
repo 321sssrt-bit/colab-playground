@@ -4,24 +4,32 @@
  */
 
 import { apiClient, ApiError } from "../../lib/api.ts";
-import { formatDuration } from "../../lib/format.ts";
+import { isAccountChangeBlocked } from "../../lib/appCache.ts";
+import { evaluateUsageSampleFreshness, formatDuration } from "../../lib/format.ts";
 import type { TranslateFn } from "../../lib/i18n.ts";
 import type {
   Accelerator,
   Account,
   AccountContext,
   AccountId,
+  AccountsApiResponse,
   AccountsView,
   AccountUsageView,
   CoreError,
   ErrorKind,
+  HostCheck,
+  KeyringCheck,
   RuntimeRef,
   Snapshot,
   TrackedSession,
   TunnelId,
   TunnelInfo,
+  UnixSecs,
   UsageSnapshot,
 } from "../../lib/types.ts";
+
+export { isAccountChangeBlocked };
+export type { AccountsApiResponse, HostCheck, KeyringCheck };
 
 export interface SwitchTarget {
   readonly id: AccountId;
@@ -51,19 +59,7 @@ export interface SwitchImpact {
 
 export interface AccountSwitchPreview extends AccountSwitchApproval {
   readonly impact: SwitchImpact;
-}
-
-const USAGE_OLD_THRESHOLD_SECS = 600;
-
-export interface HostCheck {
-  readonly kind: "wsl" | "shell_tools";
-  readonly ready: boolean;
-  readonly hint_key: string | null;
-}
-
-export interface KeyringCheck {
-  readonly status: "unavailable" | "ready" | "unknown";
-  readonly hint_key: string | null;
+  readonly sampled_at?: UnixSecs;
 }
 
 export interface OverviewDiagnostics {
@@ -72,13 +68,6 @@ export interface OverviewDiagnostics {
   readonly helper_available: boolean;
   readonly keyring: KeyringCheck;
   readonly accounts_error: ErrorKind | null;
-}
-
-export interface AccountsApiResponse {
-  readonly account_context: AccountContext;
-  readonly accounts: AccountsView;
-  readonly usage: AccountUsageView[];
-  readonly login_id: number | null;
 }
 
 export interface LoginPrompt {
@@ -95,6 +84,7 @@ export interface AccountRowView {
   readonly usage: AccountUsageView | null;
   readonly usageSnapshot: UsageSnapshot | null;
   readonly isStale: boolean;
+  readonly isFailed: boolean;
   readonly ageSecs: number | null;
   readonly removeBlock: RemoveBlock | null;
 }
@@ -251,32 +241,6 @@ export async function copyTextToClipboard(text: string): Promise<boolean> {
   }
 }
 
-export function fetchOverviewDiagnostics(signal?: AbortSignal): Promise<OverviewDiagnostics> {
-  return apiClient.request<OverviewDiagnostics>("/api/overview", {
-    method: "GET",
-    signal,
-  });
-}
-
-export function refreshAccountsUsage(signal?: AbortSignal): Promise<AccountsApiResponse> {
-  return apiClient.request<AccountsApiResponse>("/api/accounts/usage/refresh", {
-    method: "POST",
-    body: {},
-    signal,
-  });
-}
-
-export function adoptActiveAccount(
-  accountContext: AccountContext,
-  signal?: AbortSignal,
-): Promise<Account> {
-  return apiClient.request<Account>("/api/accounts/adopt", {
-    method: "POST",
-    body: { account_context: accountContext },
-    signal,
-  });
-}
-
 export function beginAccountLogin(
   accountContext: AccountContext,
   signal?: AbortSignal,
@@ -406,22 +370,6 @@ export function isSwitchConflictError(error: unknown): boolean {
   );
 }
 
-export function isUsageOutdated(
-  usageSnap: UsageSnapshot | null,
-  usageView: AccountUsageView | null,
-  nowSecs: number,
-): boolean {
-  if (usageSnap === null) {
-    return false;
-  }
-  const ageSecs = Math.max(0, Math.floor(nowSecs - usageSnap.fetched_at));
-  return (
-    usageSnap.stale ||
-    (usageView?.last_error ?? null) !== null ||
-    ageSecs >= USAGE_OLD_THRESHOLD_SECS
-  );
-}
-
 export function formatAccountTimeLeft(
   usageView: AccountUsageView | null,
   usageSnap: UsageSnapshot | null,
@@ -446,22 +394,6 @@ export function formatAccountTimeLeft(
     return t("app.summary.not_burning");
   }
   return t("app.summary.unknown");
-}
-
-export function isAccountChangeBlocked(snapshot: Snapshot | null): boolean {
-  if (snapshot === null) {
-    return false;
-  }
-  return snapshot.operations.some((pending) => {
-    const op = pending.operation;
-    return (
-      op.kind === "provision" ||
-      op.kind === "plugin_run" ||
-      op.kind === "switch_account" ||
-      (op.kind === "domain" &&
-        (op.name === "adopt_account" || op.name === "remove_account" || op.name === "install_cli"))
-    );
-  });
 }
 
 export function resolveAccountsGate(
@@ -556,9 +488,10 @@ export function buildAccountRows(
     const usageSnapshot = usage?.snapshot ?? account.usage ?? null;
     const active = accountsView.active === account.id;
     const emailLabel = account.email ?? usage?.email ?? t("app.accounts.no_email");
-    const ageSecs =
-      usageSnapshot !== null ? Math.max(0, Math.floor(nowSecs - usageSnapshot.fetched_at)) : null;
-    const isStale = isUsageOutdated(usageSnapshot, usage, nowSecs);
+    const freshness = evaluateUsageSampleFreshness(usageSnapshot, usage, nowSecs);
+    const ageSecs = freshness?.ageSecs ?? null;
+    const isStale = freshness?.outdated ?? false;
+    const isFailed = freshness?.isStale ?? false;
     const removeBlock = getAccountRemoveBlock(account.id, snapshot);
 
     return {
@@ -568,6 +501,7 @@ export function buildAccountRows(
       usage,
       usageSnapshot,
       isStale,
+      isFailed,
       ageSecs,
       removeBlock,
     };

@@ -10,19 +10,14 @@
 import { useSyncExternalStore } from "react";
 
 import { apiClient, ApiError } from "../../lib/api.ts";
+import { forwardsStore } from "../../lib/forwards.ts";
 import { routerStore } from "../../lib/router.ts";
 import type { SseFrame } from "../../lib/sse.ts";
 import { webStore } from "../../lib/store.ts";
-import type { ApiErrorPayload, TunnelEvent } from "../../lib/types.ts";
-import {
-  fetchForwards,
-  type ForwardAddresses,
-  type ForwardView,
-  type ProvisionProgressEvent,
-} from "../sessions/api.ts";
-import { recordForwardAddresses } from "../sessions/store.ts";
+import type { ApiErrorPayload, ForwardView } from "../../lib/types.ts";
+import type { ProvisionProgressEvent } from "../sessions/api.ts";
 import { cancelPluginRun, listPluginRuns, openPluginRunEventStream } from "./api.ts";
-import { stripAnsi, type ForwardLiveOverlay } from "./endpoint.ts";
+import { stripAnsi } from "./endpoint.ts";
 import type {
   PluginRunDetail,
   PluginRunEndpointResult,
@@ -49,9 +44,6 @@ export interface PluginRunsStoreState {
   readonly activeRun: PluginRunDetail | null;
   readonly knownPhasesById: Readonly<Record<number, PluginRunPhase>>;
   readonly endpointForwardIdsByKey: Readonly<Record<string, number | null>>;
-  readonly forwardAddressesById: Readonly<Record<number, ForwardAddresses>>;
-  readonly forwardOverlaysById: Readonly<Record<number, ForwardLiveOverlay>>;
-  readonly latestSnapshotVersion: number;
 }
 
 const INITIAL_STATE: PluginRunsStoreState = {
@@ -62,9 +54,6 @@ const INITIAL_STATE: PluginRunsStoreState = {
   activeRun: null,
   knownPhasesById: {},
   endpointForwardIdsByKey: {},
-  forwardAddressesById: {},
-  forwardOverlaysById: {},
-  latestSnapshotVersion: 0,
 };
 
 let state: PluginRunsStoreState = INITIAL_STATE;
@@ -73,8 +62,6 @@ let highestSeenRunId = 0;
 let pendingAutoAttach = false;
 let runsListInFlight: Promise<PluginRunSummary[]> | null = null;
 let runsListSeq = 0;
-let forwardsInFlight: Promise<ForwardView[]> | null = null;
-let forwardsSeq = 0;
 let streamSeq = 0;
 let streamAbort: AbortController | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -117,8 +104,6 @@ function resetStore(): void {
   pendingAutoAttach = false;
   runsListInFlight = null;
   runsListSeq += 1;
-  forwardsInFlight = null;
-  forwardsSeq += 1;
   state = INITIAL_STATE;
   emit();
 }
@@ -285,9 +270,7 @@ function updateActiveRun(id: number, updater: (prev: PluginRunDetail) => PluginR
 }
 
 function mergeEndpointResults(runId: number, endpoints: readonly PluginRunEndpointResult[]): void {
-  let addrChanged = false;
   let idChanged = false;
-  const nextAddrs = { ...state.forwardAddressesById };
   const nextIds = { ...state.endpointForwardIdsByKey };
   for (const item of endpoints) {
     const key = endpointForwardKey(runId, item.endpoint.id);
@@ -297,16 +280,11 @@ function mergeEndpointResults(runId: number, endpoints: readonly PluginRunEndpoi
       idChanged = true;
     }
     if (item.forward?.addresses) {
-      nextAddrs[item.forward.id] = item.forward.addresses;
-      recordForwardAddresses(item.forward);
-      addrChanged = true;
+      forwardsStore.recordForward(item.forward);
     }
   }
-  if (addrChanged || idChanged) {
-    setState({
-      ...(addrChanged ? { forwardAddressesById: nextAddrs } : {}),
-      ...(idChanged ? { endpointForwardIdsByKey: nextIds } : {}),
-    });
+  if (idChanged) {
+    setState({ endpointForwardIdsByKey: nextIds });
   }
 }
 
@@ -763,91 +741,18 @@ export function setEndpointForwardId(
 }
 
 /**
- * Caches server-validated forward addresses returned by `POST /api/forwards` for instant
- * endpoint link updates, mirroring them into the shared Sessions store as well.
+ * Caches server-validated forward addresses returned by `POST /api/forwards`
+ * in the global `forwardsStore`.
  */
 export function cachePluginForwardAddresses(view: ForwardView): void {
-  if (!view.addresses) {
-    return;
-  }
-  forwardsSeq += 1;
-  forwardsInFlight = null;
-  recordForwardAddresses(view);
-  setState({
-    forwardAddressesById: {
-      ...state.forwardAddressesById,
-      [view.id]: view.addresses,
-    },
-  });
+  forwardsStore.recordForward(view);
 }
 
 /**
- * Pulls `/api/forwards` to hydrate server-validated addresses for any live tunnel
- * whose addresses are not yet cached locally.
+ * Pulls `/api/forwards` via the global `forwardsStore` to hydrate server-validated addresses.
  */
 export function refreshPluginForwards(signal?: AbortSignal): Promise<ForwardView[]> {
-  if (forwardsInFlight) {
-    return forwardsInFlight;
-  }
-  const gen = apiClient.getSessionGeneration();
-  const seq = ++forwardsSeq;
-  const promise = fetchForwards(signal)
-    .then((list) => {
-      if (apiClient.getSessionGeneration() === gen && seq === forwardsSeq) {
-        const next: Record<number, ForwardAddresses> = { ...state.forwardAddressesById };
-        for (const fw of list) {
-          if (fw.addresses) {
-            next[fw.id] = fw.addresses;
-            recordForwardAddresses(fw);
-          }
-        }
-        setState({ forwardAddressesById: next });
-      }
-      return list;
-    })
-    .finally(() => {
-      if (forwardsInFlight === promise) {
-        forwardsInFlight = null;
-      }
-    });
-  forwardsInFlight = promise;
-  return promise;
-}
-
-/**
- * Advances the local snapshot version cursor so live SSE `forward` overlays stay aligned
- * with the current `snapshot.version` even when `SessionsPage` is not mounted.
- */
-export function syncPluginSnapshotVersion(version: number): void {
-  if (version <= state.latestSnapshotVersion) {
-    return;
-  }
-  setState({
-    latestSnapshotVersion: version,
-    forwardOverlaysById:
-      Object.keys(state.forwardOverlaysById).length > 0 ? {} : state.forwardOverlaysById,
-  });
-}
-
-/**
- * Applies a live `forward` SSE transition over the current snapshot version.
- */
-export function applyPluginForwardEvent(event: TunnelEvent): void {
-  const prev = state.forwardOverlaysById[event.id];
-  const base: ForwardLiveOverlay =
-    prev && prev.snapshotVersion === state.latestSnapshotVersion
-      ? prev
-      : { snapshotVersion: state.latestSnapshotVersion };
-  const next: ForwardLiveOverlay =
-    event.event === "state"
-      ? { ...base, state: event.state }
-      : { ...base, healthy: event.healthy };
-  setState({
-    forwardOverlaysById: {
-      ...state.forwardOverlaysById,
-      [event.id]: next,
-    },
-  });
+  return forwardsStore.refresh(signal);
 }
 
 function subscribe(listener: () => void): () => void {

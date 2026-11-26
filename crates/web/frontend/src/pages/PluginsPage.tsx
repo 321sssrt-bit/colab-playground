@@ -10,6 +10,8 @@ import { useCallback, useEffect, useId, useRef, useState } from "react";
 
 import { AlertIcon, CheckCircleIcon, InfoIcon, PluginsIcon } from "../components/Icons.tsx";
 import { ApiError } from "../lib/api.ts";
+import { appDataStore, useAppDataStore } from "../lib/appCache.ts";
+import { useForwardsStore } from "../lib/forwards.ts";
 import { webStore } from "../lib/store.ts";
 import type { PendingOperation, Runtime } from "../lib/types.ts";
 import {
@@ -17,7 +19,6 @@ import {
   stopTargetFromRuntime,
   type StopRuntimeDialogRequest,
 } from "./sessions/StopRuntimeDialog.tsx";
-import { refreshOverviewHints, useSessionsLocalState } from "./sessions/store.ts";
 import {
   formatPluginApiError,
   listPlugins,
@@ -30,14 +31,11 @@ import { PluginDeployForm, RocketIcon } from "./plugins/PluginDeployForm.tsx";
 import { PluginRunView } from "./plugins/PluginRunView.tsx";
 import { RemovePluginDialog, type RemovePluginTarget } from "./plugins/RemovePluginDialog.tsx";
 import {
-  applyPluginForwardEvent,
   closePluginDeployForm,
   openPluginDeployForm,
   openPluginRun,
-  refreshPluginForwards,
   refreshPluginRuns,
   showPluginList,
-  syncPluginSnapshotVersion,
   usePluginRunsStore,
 } from "./plugins/runStore.ts";
 import type { PluginInfo, PluginRunPhase, PluginRunSummary } from "./plugins/types.ts";
@@ -100,7 +98,8 @@ export function PluginsPage({ snapshot, locale, t, navigate, pushToast }: PagePr
   const toastedReadyRunIdRef = useRef<number | null>(null);
 
   const runsState = usePluginRunsStore();
-  const sessionsLocal = useSessionsLocalState();
+  const appData = useAppDataStore();
+  const forwardsState = useForwardsStore();
 
   const [plugins, setPlugins] = useState<readonly PluginInfo[] | null>(null);
   const [loading, setLoading] = useState(true);
@@ -160,19 +159,6 @@ export function PluginsPage({ snapshot, locale, t, navigate, pushToast }: PagePr
     };
   }, [fetchPlugins]);
 
-  // Keep live SSE forward state/health transitions synchronized while viewing Plugins.
-  useEffect(() => {
-    if (snapshot) {
-      syncPluginSnapshotVersion(snapshot.version);
-    }
-  }, [snapshot?.version]);
-
-  useEffect(() => {
-    return webStore.subscribeForwards((event) => {
-      applyPluginForwardEvent(event);
-    });
-  }, []);
-
   const prevPluginRunOpIdsRef = useRef("");
 
   // Refresh `/api/plugins/runs` whenever a `plugin_run` operation starts or finishes in the live snapshot.
@@ -195,36 +181,22 @@ export function PluginsPage({ snapshot, locale, t, navigate, pushToast }: PagePr
     }
   }, [pluginRunOpIds, runsState.runs]);
 
-  // Hydrate forward policy and server-validated forward addresses for ready plugin endpoints.
+  // Hydrate forward policy once from the global overview cache for ready plugin endpoints.
   const viewingReadyRun =
     runsState.selectedRunId !== null && runsState.activeRun?.phase === "ready";
-  const tunnelIdsKey = (snapshot?.tunnels ?? []).map((item) => item.id).join(",");
 
   useEffect(() => {
     if (!viewingReadyRun) {
       return;
     }
     if (
-      sessionsLocal.forwardPolicy === null &&
-      !sessionsLocal.forwardPolicyLoading &&
-      sessionsLocal.forwardPolicyError === null
+      appData.overview === null &&
+      !appData.overviewLoading &&
+      appData.overviewError === null
     ) {
-      void refreshOverviewHints().catch(() => {});
+      void appDataStore.ensureOverview().catch(() => {});
     }
-    const tunnels = snapshot?.tunnels ?? [];
-    const missingAddresses = tunnels.some((fw) => !runsState.forwardAddressesById[fw.id]);
-    if (missingAddresses) {
-      void refreshPluginForwards().catch(() => {});
-    }
-  }, [
-    viewingReadyRun,
-    tunnelIdsKey,
-    sessionsLocal.forwardPolicy,
-    sessionsLocal.forwardPolicyLoading,
-    sessionsLocal.forwardPolicyError,
-    runsState.forwardAddressesById,
-    snapshot?.tunnels,
-  ]);
+  }, [viewingReadyRun, appData.overview, appData.overviewLoading, appData.overviewError]);
 
   // Announce live completion once per run when transitioning to `ready`.
   const activeRun = runsState.activeRun;
@@ -324,7 +296,7 @@ export function PluginsPage({ snapshot, locale, t, navigate, pushToast }: PagePr
   }, []);
 
   const handleRetryForwardPolicy = useCallback(() => {
-    void refreshOverviewHints().catch(() => {});
+    void appDataStore.refreshOverview().catch(() => {});
   }, []);
 
   const handleRunStarted = useCallback((runId: number, summary: PluginRunSummary) => {
@@ -359,11 +331,11 @@ export function PluginsPage({ snapshot, locale, t, navigate, pushToast }: PagePr
           plugin={activeRunPlugin}
           snapshot={snapshot}
           endpointForwardIdsByKey={runsState.endpointForwardIdsByKey}
-          forwardAddressesById={runsState.forwardAddressesById}
-          forwardOverlaysById={runsState.forwardOverlaysById}
-          forwardPolicy={sessionsLocal.forwardPolicy}
-          forwardPolicyLoading={sessionsLocal.forwardPolicyLoading}
-          forwardPolicyError={sessionsLocal.forwardPolicyError}
+          forwardAddressesById={forwardsState.addressesById}
+          forwardOverlaysById={forwardsState.overlaysById}
+          forwardPolicy={appData.overview?.forward_policy ?? null}
+          forwardPolicyLoading={appData.overviewLoading}
+          forwardPolicyError={appData.overviewError}
           onRetryForwardPolicy={handleRetryForwardPolicy}
           billingRecheckSeq={billingRecheckSeq}
           locale={locale}
@@ -380,7 +352,7 @@ export function PluginsPage({ snapshot, locale, t, navigate, pushToast }: PagePr
             key={`${deployFormPlugin.manifest.id}:${runsState.formOpenSeq}`}
             plugin={deployFormPlugin}
             snapshot={snapshot}
-            maxConcurrentSessions={sessionsLocal.maxConcurrentSessions}
+            maxConcurrentSessions={appData.maxConcurrentSessions}
             hfTokenSaved={hfTokenSaved}
             locale={locale}
             t={t}

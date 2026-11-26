@@ -3,17 +3,16 @@
  * ages, active account identity, and the shell usage badge.
  */
 
-import { useEffect, useState } from "react";
-
+import { useServerClockSecs } from "./clock.ts";
 import type { TranslateFn } from "./i18n.ts";
 import type { AccountId, AccountUsageView, Locale, Snapshot, UsageSnapshot } from "./types.ts";
 
 const SECS_PER_MINUTE = 60;
 const SECS_PER_HOUR = 3600;
 const SECS_PER_DAY = 86_400;
-const USAGE_OLD_THRESHOLD_SECS = 600;
+/** Mirrors `colab_playground_core::guard::USAGE_STALE_AFTER` (5 minutes). */
+export const USAGE_STALE_AFTER_SECS = 5 * SECS_PER_MINUTE;
 const USAGE_CLOCK_INTERVAL_MS = 30_000;
-const MS_PER_SECOND = 1000;
 const CU_MIN_FRACTION_DIGITS = 1;
 const CU_MAX_FRACTION_DIGITS = 2;
 
@@ -40,27 +39,13 @@ export interface UsageFreshness {
   readonly outdated: boolean;
 }
 
-function readNowSecs(): number {
-  return Math.floor(Date.now() / MS_PER_SECOND);
-}
-
 /**
- * React hook returning the current Unix timestamp in seconds, updated periodically
- * so usage age tooltips and staleness thresholds converge even while offline.
+ * React hook returning the current backend-anchored Unix timestamp in seconds,
+ * updated periodically so usage age tooltips and staleness thresholds converge
+ * accurately regardless of browser wall-clock skew.
  */
 export function useUsageClockSecs(): number {
-  const [nowSecs, setNowSecs] = useState<number>(readNowSecs);
-
-  useEffect(() => {
-    const timer = window.setInterval(() => {
-      setNowSecs(readNowSecs());
-    }, USAGE_CLOCK_INTERVAL_MS);
-    return () => {
-      window.clearInterval(timer);
-    };
-  }, []);
-
-  return nowSecs;
+  return useServerClockSecs(USAGE_CLOCK_INTERVAL_MS);
 }
 
 function formatNumber(value: number, locale: Locale): string {
@@ -161,6 +146,30 @@ export function resolveActiveAccount(
 }
 
 /**
+ * Evaluates whether a usage reading is stale (a later fetch failed or was
+ * restored without verification) or old (older than `USAGE_STALE_AFTER_SECS`).
+ * Aging never overwrites the failed-refresh `isStale` flag.
+ */
+export function evaluateUsageSampleFreshness(
+  usageSnap: UsageSnapshot | null,
+  usageView: AccountUsageView | null,
+  nowSecs: number,
+): UsageFreshness | null {
+  if (usageSnap === null) {
+    return null;
+  }
+  const ageSecs = Math.max(0, Math.floor(nowSecs - usageSnap.fetched_at));
+  const isStale = usageSnap.stale || (usageView?.last_error ?? null) !== null;
+  const isOld = ageSecs > USAGE_STALE_AFTER_SECS;
+  return {
+    ageSecs,
+    isStale,
+    isOld,
+    outdated: isStale || isOld,
+  };
+}
+
+/**
  * Evaluates whether an active account's usage reading is stale (failed refresh)
  * or old (past the freshness threshold).
  */
@@ -168,19 +177,10 @@ export function evaluateUsageFreshness(
   active: ActiveAccountSummary,
   nowSecs: number,
 ): UsageFreshness | null {
-  const snap = active.usageSnapshot;
-  if (!active.signedIn || snap === null) {
+  if (!active.signedIn) {
     return null;
   }
-  const ageSecs = Math.max(0, Math.floor(nowSecs - snap.fetched_at));
-  const isStale = snap.stale || (active.usage?.last_error ?? null) !== null;
-  const isOld = ageSecs >= USAGE_OLD_THRESHOLD_SECS;
-  return {
-    ageSecs,
-    isStale,
-    isOld,
-    outdated: isStale || isOld,
-  };
+  return evaluateUsageSampleFreshness(active.usageSnapshot, active.usage, nowSecs);
 }
 
 /**

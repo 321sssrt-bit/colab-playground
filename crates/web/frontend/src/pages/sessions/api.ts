@@ -7,51 +7,34 @@ import type { OnExhausted } from "../../lib/constants.ts";
 import type {
   Accelerator,
   AccountContext,
+  AccountFailureResponse,
   AccountId,
   ApiErrorPayload,
   CoreError,
   DurationSecs,
-  ErrorKind,
+  ForwardAddresses,
   ForwardBind,
+  ForwardPolicyView,
+  ForwardView,
   GuardPolicy,
-  GuardReport,
-  Runtime,
+  HardwareRate,
   RuntimeRef,
-  SettingsView,
-  TunnelInfo,
+  SessionsListResponse,
   UnixSecs,
   WatchdogInfo,
 } from "../../lib/types.ts";
 
-export interface AccountFailureResponse {
-  readonly account: AccountId;
-  readonly error: ApiErrorPayload;
-}
+export type {
+  AccountFailureResponse,
+  ForwardAddresses,
+  ForwardPolicyView,
+  ForwardView,
+  SessionsListResponse,
+};
 
-interface SessionsListResponse {
-  readonly account_context: AccountContext;
-  readonly sampled_at: UnixSecs;
-  readonly runtimes: Runtime[];
-  readonly errors: AccountFailureResponse[];
-  readonly guard: GuardReport | null;
-  readonly guard_error: ErrorKind | null;
-}
-
-export interface ForwardAddresses {
-  readonly open_url: string | null;
-  readonly copy_url: string | null;
-  readonly openai_base_url: string | null;
-  readonly notice_key: string | null;
-  readonly warning_key: string | null;
-}
-
-export interface ForwardPolicyView {
-  readonly all_interfaces_allowed: boolean;
-  readonly restriction: "windows_or_wsl" | "loopback_listener" | string | null;
-}
-
-export interface ForwardView extends TunnelInfo {
-  readonly addresses?: ForwardAddresses | null;
+export interface SessionTemplateResponse extends ProvisionSpec {
+  readonly measured_rates?: readonly HardwareRate[];
+  readonly sampled_at?: UnixSecs;
 }
 
 interface OpenForwardPayload {
@@ -90,11 +73,6 @@ export interface StopAllResponse {
   readonly verified: boolean;
   readonly remaining: readonly StopAllRemainingItem[];
   readonly account_errors: readonly AccountFailureResponse[];
-}
-
-interface OverviewReadinessResponse {
-  readonly cli_installed: boolean;
-  readonly forward_policy?: ForwardPolicyView | null;
 }
 
 export type ProvisionProgressEvent =
@@ -166,20 +144,6 @@ export interface ProvisionFinishedEvent {
   readonly error?: ApiErrorPayload;
 }
 
-export function fetchSessions(signal?: AbortSignal): Promise<SessionsListResponse> {
-  return apiClient.request<SessionsListResponse>("/api/sessions", {
-    method: "GET",
-    signal,
-  });
-}
-
-export function fetchForwards(signal?: AbortSignal): Promise<ForwardView[]> {
-  return apiClient.request<ForwardView[]>("/api/forwards", {
-    method: "GET",
-    signal,
-  });
-}
-
 export function openForward(payload: OpenForwardPayload): Promise<ForwardView> {
   return apiClient.request<ForwardView>("/api/forwards", {
     method: "POST",
@@ -228,8 +192,8 @@ export function stopAllRuntimes(): Promise<StopAllResponse> {
   });
 }
 
-export function fetchSessionTemplate(signal?: AbortSignal): Promise<ProvisionSpec> {
-  return apiClient.request<ProvisionSpec>("/api/sessions/template", {
+export function fetchSessionTemplate(signal?: AbortSignal): Promise<SessionTemplateResponse> {
+  return apiClient.request<SessionTemplateResponse>("/api/sessions/template", {
     method: "GET",
     signal,
   });
@@ -262,19 +226,5 @@ export function openProvisionEventStream(
   return apiClient.openEventStream(`/api/sessions/${encodeURIComponent(String(id))}/events`, {
     ...options,
     body: {},
-  });
-}
-
-export function fetchSettings(signal?: AbortSignal): Promise<SettingsView> {
-  return apiClient.request<SettingsView>("/api/settings", {
-    method: "GET",
-    signal,
-  });
-}
-
-export function fetchOverviewReadiness(signal?: AbortSignal): Promise<OverviewReadinessResponse> {
-  return apiClient.request<OverviewReadinessResponse>("/api/overview", {
-    method: "GET",
-    signal,
   });
 }

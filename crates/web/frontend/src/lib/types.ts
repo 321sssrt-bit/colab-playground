@@ -146,6 +146,12 @@ export interface RateReading {
   at: UnixSecs;
 }
 
+export interface HardwareRate {
+  accelerator: Accelerator;
+  high_mem: boolean;
+  reading: RateReading;
+}
+
 export interface Account {
   id: AccountId;
   email: string | null;
@@ -328,6 +334,33 @@ export interface GuardReport {
   usage: AccountUsageView[];
 }
 
+export type GuardEventKind =
+  | { kind: "warn"; concerns: Concern[] }
+  | { kind: "stop_failed"; concern: Concern; error: CoreError }
+  | { kind: "stopped"; concern: Concern }
+  | { kind: "vanished" };
+
+export type GuardEvent = {
+  id: number;
+  at: UnixSecs;
+  session: RuntimeRef;
+  label: string;
+  email: string | null;
+} & GuardEventKind;
+
+export type EndReason =
+  | { kind: "user" }
+  | { kind: "guard"; concern: Concern }
+  | { kind: "vanished" };
+
+export interface EndedRuntime {
+  runtime: RuntimeRef;
+  label: string;
+  email: string | null;
+  reason: EndReason;
+  at: UnixSecs | null;
+}
+
 export type Operation =
   | { kind: "provision"; session: string }
   | { kind: "plugin_run"; plugin: string; session: string }
@@ -343,6 +376,7 @@ export interface PendingOperation {
 
 export interface Snapshot {
   version: number;
+  server_now?: UnixSecs;
   backend: BackendKind;
   account: AccountContext;
   accounts: AccountsView | null;
@@ -351,9 +385,107 @@ export interface Snapshot {
   runtimes_error: ErrorKind | null;
   tunnels: TunnelInfo[];
   usage: AccountUsageView[];
+  measured_rates?: HardwareRate[];
   guard: GuardReport | null;
+  guard_events?: GuardEvent[];
   guard_error: ErrorKind | null;
+  ended?: EndedRuntime[];
   operations: PendingOperation[];
   login_id: number | null;
   shutting_down: boolean;
+}
+
+export type InstallMethod = "uv" | "install_uv_then_cli" | "pip_user";
+
+export interface ProbeReport {
+  readonly wsl_installed: boolean;
+  readonly wsl_distros: readonly string[];
+  readonly bash: string | null;
+  readonly ssh: string | null;
+  readonly ssh_keygen: string | null;
+  readonly git: string | null;
+  readonly uv: string | null;
+  readonly python3: string | null;
+  readonly colab: string | null;
+  readonly colab_version: string | null;
+  readonly helper_python: string | null;
+  readonly keyring_ok: boolean;
+  readonly ssh_key_present: boolean;
+  readonly home: string | null;
+  readonly errors: readonly string[];
+}
+
+export interface HostCheck {
+  readonly kind: "wsl" | "shell_tools";
+  readonly ready: boolean;
+  readonly hint_key: string | null;
+}
+
+export interface KeyringCheck {
+  readonly status: "unavailable" | "ready" | "unknown";
+  readonly hint_key: string | null;
+}
+
+export interface ForwardPolicyView {
+  readonly all_interfaces_allowed: boolean;
+  readonly restriction: "windows_or_wsl" | "loopback_listener" | string | null;
+}
+
+export interface UnmanagedRuntimes {
+  readonly count: number | null;
+  readonly incomplete: boolean;
+  readonly unverified_accounts: readonly AccountId[];
+  readonly warning_key: string | null;
+}
+
+export interface OverviewResponse {
+  readonly environment: ProbeReport;
+  readonly host: HostCheck;
+  readonly forward_policy: ForwardPolicyView;
+  readonly cli_installed: boolean;
+  readonly helper_available: boolean;
+  readonly keyring: KeyringCheck;
+  readonly accounts: AccountsView | null;
+  readonly accounts_error: ErrorKind | null;
+  readonly usage: readonly AccountUsageView[];
+  readonly measured_rates?: readonly HardwareRate[];
+  readonly sampled_at?: UnixSecs;
+  readonly unmanaged_runtimes: UnmanagedRuntimes;
+  readonly install_methods: readonly InstallMethod[];
+}
+
+export interface ForwardAddresses {
+  readonly open_url: string | null;
+  readonly copy_url: string | null;
+  readonly openai_base_url: string | null;
+  readonly notice_key: string | null;
+  readonly warning_key: string | null;
+}
+
+export interface ForwardView extends TunnelInfo {
+  readonly addresses?: ForwardAddresses | null;
+}
+
+export interface AccountFailureResponse {
+  readonly account: AccountId;
+  readonly error: ApiErrorPayload;
+}
+
+export interface SessionsListResponse {
+  readonly account_context: AccountContext;
+  readonly sampled_at: UnixSecs;
+  readonly runtimes: Runtime[];
+  readonly errors: AccountFailureResponse[];
+  readonly guard: GuardReport | null;
+  readonly guard_events?: readonly GuardEvent[];
+  readonly guard_error: ErrorKind | null;
+  readonly ended?: readonly EndedRuntime[];
+}
+
+export interface AccountsApiResponse {
+  readonly account_context: AccountContext;
+  readonly accounts: AccountsView;
+  readonly usage: AccountUsageView[];
+  readonly login_id: number | null;
+  readonly sampled_at?: UnixSecs;
 }

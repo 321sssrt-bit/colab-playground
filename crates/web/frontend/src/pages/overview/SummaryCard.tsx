@@ -55,6 +55,7 @@ export function SummaryCard({
       : overview.accounts !== null
         ? {
             version: 0,
+            server_now: overview.sampled_at,
             backend: "mock",
             account: { revision: 0, active: overview.accounts.active },
             accounts: overview.accounts,
@@ -63,8 +64,11 @@ export function SummaryCard({
             runtimes_error: null,
             tunnels: [],
             usage: [...overview.usage],
+            measured_rates: overview.measured_rates ? [...overview.measured_rates] : [],
             guard: null,
+            guard_events: [],
             guard_error: null,
+            ended: [],
             operations: [],
             login_id: null,
             shutting_down: false,

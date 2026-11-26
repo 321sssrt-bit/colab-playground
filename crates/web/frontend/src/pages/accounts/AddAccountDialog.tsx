@@ -10,6 +10,7 @@ import { useCallback, useEffect, useId, useRef, useState, type FormEvent } from 
 
 import { AlertIcon, InfoIcon } from "../../components/Icons.tsx";
 import { ApiError } from "../../lib/api.ts";
+import { appDataStore, isAccountChangeBlocked, useAppDataStore } from "../../lib/appCache.ts";
 import type { TranslateFn } from "../../lib/i18n.ts";
 import { webStore } from "../../lib/store.ts";
 import type { ToastInput } from "../../lib/toast.ts";
@@ -248,7 +249,13 @@ export function AddAccountDialog({
     [onClose, pushToast, t],
   );
 
+  const appData = useAppDataStore();
+  const accountChangeBlocked = isAccountChangeBlocked(snapshot, appData);
+
   const handleStartLogin = useCallback(async () => {
+    if (snapshot.shutting_down || isAccountChangeBlocked(snapshot, appDataStore.getState())) {
+      return;
+    }
     const seq = ++loginSessionSeqRef.current;
     cancelStartRequestedRef.current = false;
     setCode("");
@@ -569,7 +576,8 @@ export function AddAccountDialog({
               type="button"
               className="btn btn-primary"
               autoFocus
-              disabled={snapshot.shutting_down}
+              disabled={snapshot.shutting_down || accountChangeBlocked}
+              title={accountChangeBlocked ? t("app.b2.account_change_blocked") : undefined}
               onClick={() => {
                 void handleStartLogin();
               }}
@@ -636,7 +644,8 @@ export function AddAccountDialog({
               type="button"
               className="btn btn-primary"
               autoFocus
-              disabled={snapshot.shutting_down}
+              disabled={snapshot.shutting_down || accountChangeBlocked}
+              title={accountChangeBlocked ? t("app.b2.account_change_blocked") : undefined}
               onClick={() => {
                 void handleStartLogin();
               }}

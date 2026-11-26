@@ -9,11 +9,11 @@ import { useEffect, useId, useRef, useState, type SyntheticEvent } from "react";
 
 import { AlertIcon } from "../../components/Icons.tsx";
 import { apiClient, ApiError } from "../../lib/api.ts";
+import { appDataStore } from "../../lib/appCache.ts";
 import type { TranslateFn } from "../../lib/i18n.ts";
-import { webStore } from "../../lib/store.ts";
 import type { ToastInput } from "../../lib/toast.ts";
 import type { Account, Runtime, RuntimeRef, Snapshot } from "../../lib/types.ts";
-import { fetchSessions, stopAllRuntimes, type StopAllResponse } from "./api.ts";
+import { stopAllRuntimes, type StopAllResponse } from "./api.ts";
 import {
   formatEmail,
   formatErrorMessage,
@@ -199,9 +199,7 @@ export function StopAllDialog({
       }
       // Refresh runtimes in the background so any runtimes stopped before a verification-listing
       // failure still reconcile into the live list and Recently ended once listing succeeds.
-      void fetchSessions()
-        .then(() => webStore.refreshSnapshot())
-        .catch(() => {});
+      void appDataStore.refreshSessions().catch(() => {});
       if (activeOpenIdRef.current !== requestOpenId) {
         return;
       }

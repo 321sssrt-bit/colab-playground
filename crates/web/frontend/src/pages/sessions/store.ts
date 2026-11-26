@@ -9,11 +9,8 @@
 import { useSyncExternalStore } from "react";
 
 import { apiClient, ApiError } from "../../lib/api.ts";
-import {
-  CORE_DEFAULTS,
-  MIN_CONCURRENT_SESSIONS,
-  START_MAX_RUNTIME_SECS,
-} from "../../lib/constants.ts";
+import { appDataStore, type SessionSettingsSummary } from "../../lib/appCache.ts";
+import { forwardsStore } from "../../lib/forwards.ts";
 import type { TranslateFn } from "../../lib/i18n.ts";
 import type { ToastInput } from "../../lib/toast.ts";
 import type {
@@ -21,22 +18,14 @@ import type {
   AccountId,
   ApiErrorPayload,
   Concern,
+  ForwardView,
   Locale,
   Runtime,
   RuntimeRef,
   Snapshot,
-  TunnelEvent,
-  TunnelInfo,
-  TunnelState,
 } from "../../lib/types.ts";
 import {
-  fetchForwards,
-  fetchOverviewReadiness,
-  fetchSettings,
   openProvisionEventStream,
-  type ForwardAddresses,
-  type ForwardPolicyView,
-  type ForwardView,
   type ProvisionOutcome,
   type ProvisionProgressEvent,
 } from "./api.ts";
@@ -48,10 +37,7 @@ const PROVISION_RECONNECT_BASE_MS = 1000;
 const PROVISION_RECONNECT_MAX_MS = 5000;
 const PROVISION_RECONNECT_MAX_EXP = 3;
 
-export interface SessionSettingsSummary {
-  readonly rearmDurationSecs: number;
-  readonly maxConcurrentSessions: number;
-}
+export type { SessionSettingsSummary };
 
 export interface TrackedProvision {
   readonly operationId: number;
@@ -78,36 +64,14 @@ export interface EndedRuntime {
   readonly reason: EndReason;
 }
 
-interface ForwardLiveOverlay {
-  readonly snapshotVersion: number;
-  readonly state?: TunnelState;
-  readonly healthy?: boolean | null;
-}
-
 interface SessionsLocalState {
   readonly ended: readonly EndedRuntime[];
-  readonly forwardAddressesById: Readonly<Record<number, ForwardAddresses>>;
-  readonly forwardOverlaysById: Readonly<Record<number, ForwardLiveOverlay>>;
-  readonly forwardPolicy: ForwardPolicyView | null;
-  readonly forwardPolicyLoading: boolean;
-  readonly forwardPolicyError: unknown | null;
-  readonly rearmDurationSecs: number;
-  readonly maxConcurrentSessions: number;
-  readonly cliInstalled: boolean | null;
   readonly reconcileSeq: number;
   readonly trackedProvision: TrackedProvision | null;
 }
 
 const INITIAL_STATE: SessionsLocalState = {
   ended: [],
-  forwardAddressesById: {},
-  forwardOverlaysById: {},
-  forwardPolicy: null,
-  forwardPolicyLoading: false,
-  forwardPolicyError: null,
-  rearmDurationSecs: START_MAX_RUNTIME_SECS,
-  maxConcurrentSessions: CORE_DEFAULTS.max_concurrent_sessions,
-  cliInstalled: null,
   reconcileSeq: 0,
   trackedProvision: null,
 };
@@ -119,11 +83,6 @@ let pendingUserStopCounts = new Map<string, number>();
 let pendingStopAllCount = 0;
 let deferredPendingKeys = new Set<string>();
 let lastKnownRuntimesByAccount = new Map<AccountId, readonly Runtime[]>();
-let latestSnapshotVersion = 0;
-let forwardsMutationSeq = 0;
-let forwardsInFlight: Promise<ForwardView[]> | null = null;
-let forwardPolicyInFlight: Promise<ForwardPolicyView | null> | null = null;
-let settingsInFlight: Promise<SessionSettingsSummary> | null = null;
 let provisionStreamController: AbortController | null = null;
 let provisionReconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let provisionStreamSeq = 0;
@@ -166,11 +125,6 @@ function resetLocalState(): void {
   pendingStopAllCount = 0;
   deferredPendingKeys = new Set<string>();
   lastKnownRuntimesByAccount = new Map<AccountId, readonly Runtime[]>();
-  latestSnapshotVersion = 0;
-  forwardsMutationSeq += 1;
-  forwardsInFlight = null;
-  forwardPolicyInFlight = null;
-  settingsInFlight = null;
   state = INITIAL_STATE;
   emit();
 }
@@ -496,165 +450,16 @@ export function clearEndedRuntimes(): void {
   setState({ ended: [] });
 }
 
-function setCliInstalledHint(installed: boolean): void {
-  if (state.cliInstalled === installed) {
-    return;
-  }
-  setState({ cliInstalled: installed });
-}
-
-function setForwardPolicy(policy: ForwardPolicyView | null): void {
-  const prev = state.forwardPolicy;
-  if (
-    prev?.all_interfaces_allowed === policy?.all_interfaces_allowed &&
-    prev?.restriction === policy?.restriction
-  ) {
-    return;
-  }
-  setState({ forwardPolicy: policy });
-}
-
-export function refreshOverviewHints(): Promise<ForwardPolicyView | null> {
-  if (forwardPolicyInFlight) {
-    return forwardPolicyInFlight;
-  }
-  const gen = apiClient.getSessionGeneration();
-  setState({ forwardPolicyLoading: true, forwardPolicyError: null });
-  const promise = fetchOverviewReadiness()
-    .then((overview) => {
-      if (apiClient.getSessionGeneration() === gen) {
-        setCliInstalledHint(Boolean(overview.cli_installed));
-        if (overview.forward_policy) {
-          setForwardPolicy(overview.forward_policy);
-        }
-        setState({ forwardPolicyLoading: false, forwardPolicyError: null });
-      }
-      return overview.forward_policy ?? null;
-    })
-    .catch((error: unknown) => {
-      if (apiClient.getSessionGeneration() === gen) {
-        setState({ forwardPolicyLoading: false, forwardPolicyError: error });
-      }
-      throw error;
-    })
-    .finally(() => {
-      if (forwardPolicyInFlight === promise) {
-        forwardPolicyInFlight = null;
-      }
-    });
-  forwardPolicyInFlight = promise;
-  return promise;
-}
-
 /**
  * Caches server-validated addresses immediately from a `POST /api/forwards` response
- * so the new row renders its links and notices without waiting for `GET /api/forwards`.
+ * in the global `forwardsStore`.
  */
 export function recordForwardAddresses(view: ForwardView): void {
-  if (!view.addresses) {
-    return;
-  }
-  forwardsMutationSeq += 1;
-  forwardsInFlight = null;
-  setState({
-    forwardAddressesById: {
-      ...state.forwardAddressesById,
-      [view.id]: view.addresses,
-    },
-  });
-}
-
-/**
- * Applies a live `forward` SSE transition over the current snapshot version.
- * Newer snapshots supersede any overlay from an older snapshot version.
- */
-export function applyForwardEvent(event: TunnelEvent): void {
-  const prev = state.forwardOverlaysById[event.id];
-  const base: ForwardLiveOverlay =
-    prev && prev.snapshotVersion === latestSnapshotVersion
-      ? prev
-      : { snapshotVersion: latestSnapshotVersion };
-  const next: ForwardLiveOverlay =
-    event.event === "state"
-      ? { ...base, state: event.state }
-      : { ...base, healthy: event.healthy };
-  setState({
-    forwardOverlaysById: {
-      ...state.forwardOverlaysById,
-      [event.id]: next,
-    },
-  });
-}
-
-export function refreshForwards(signal?: AbortSignal): Promise<ForwardView[]> {
-  if (forwardsInFlight) {
-    return forwardsInFlight;
-  }
-  const gen = apiClient.getSessionGeneration();
-  const seq = ++forwardsMutationSeq;
-  const promise = fetchForwards(signal)
-    .then((list) => {
-      if (apiClient.getSessionGeneration() === gen && seq === forwardsMutationSeq) {
-        const nextAddresses: Record<number, ForwardAddresses> = {};
-        for (const fw of list) {
-          if (fw.addresses) {
-            nextAddresses[fw.id] = fw.addresses;
-          }
-        }
-        setState({ forwardAddressesById: nextAddresses });
-      }
-      return list;
-    })
-    .finally(() => {
-      if (forwardsInFlight === promise) {
-        forwardsInFlight = null;
-      }
-    });
-  forwardsInFlight = promise;
-  return promise;
+  forwardsStore.recordForward(view);
 }
 
 export function refreshRearmDuration(signal?: AbortSignal): Promise<SessionSettingsSummary> {
-  if (settingsInFlight) {
-    return settingsInFlight;
-  }
-  const gen = apiClient.getSessionGeneration();
-  const promise = fetchSettings(signal)
-    .then((settings) => {
-      const configuredRearm = settings.defaults?.max_runtime;
-      const rearmDurationSecs =
-        typeof configuredRearm === "number" &&
-        Number.isFinite(configuredRearm) &&
-        configuredRearm > 0
-          ? Math.floor(configuredRearm)
-          : START_MAX_RUNTIME_SECS;
-      const configuredMaxConcurrent = settings.defaults?.max_concurrent_sessions;
-      const maxConcurrentSessions =
-        typeof configuredMaxConcurrent === "number" &&
-        Number.isFinite(configuredMaxConcurrent) &&
-        configuredMaxConcurrent >= MIN_CONCURRENT_SESSIONS
-          ? Math.floor(configuredMaxConcurrent)
-          : CORE_DEFAULTS.max_concurrent_sessions;
-      if (
-        apiClient.getSessionGeneration() === gen &&
-        (state.rearmDurationSecs !== rearmDurationSecs ||
-          state.maxConcurrentSessions !== maxConcurrentSessions)
-      ) {
-        setState({ rearmDurationSecs, maxConcurrentSessions });
-      }
-      return { rearmDurationSecs, maxConcurrentSessions };
-    })
-    .catch(() => ({
-      rearmDurationSecs: state.rearmDurationSecs,
-      maxConcurrentSessions: state.maxConcurrentSessions,
-    }))
-    .finally(() => {
-      if (settingsInFlight === promise) {
-        settingsInFlight = null;
-      }
-    });
-  settingsInFlight = promise;
-  return promise;
+  return appDataStore.refreshSessionDefaults(signal);
 }
 
 /**
@@ -672,13 +477,6 @@ export function observeSnapshotTransitions(
 ): void {
   if (!nextSnapshot) {
     return;
-  }
-
-  if (nextSnapshot.version > latestSnapshotVersion) {
-    latestSnapshotVersion = nextSnapshot.version;
-    if (Object.keys(state.forwardOverlaysById).length > 0) {
-      setState({ forwardOverlaysById: {} });
-    }
   }
 
   const prevRuntimes = prevSnapshot?.runtimes?.runtimes ?? [];
@@ -831,38 +629,6 @@ export function observeSnapshotTransitions(
       );
     }
   }
-}
-
-/**
- * Selects live forwards for one runtime from the authoritative `snapshot.tunnels`,
- * enriched with server-validated `addresses` from `GET /api/forwards` and any
- * in-between `forward` SSE transitions for the current snapshot version.
- */
-export function selectForwardsForRuntime(
-  runtime: Runtime,
-  localState: SessionsLocalState,
-  snapshot: Snapshot,
-): readonly ForwardView[] {
-  if (!runtime.id.name) {
-    return [];
-  }
-  const tunnels: readonly TunnelInfo[] = snapshot.tunnels;
-  const out: ForwardView[] = [];
-  for (const tunnel of tunnels) {
-    if (tunnel.spec.account !== runtime.id.account || tunnel.spec.session !== runtime.id.name) {
-      continue;
-    }
-    const overlay = localState.forwardOverlaysById[tunnel.id];
-    const activeOverlay =
-      overlay && overlay.snapshotVersion === snapshot.version ? overlay : null;
-    out.push({
-      ...tunnel,
-      state: activeOverlay?.state ?? tunnel.state,
-      healthy: activeOverlay?.healthy !== undefined ? activeOverlay.healthy : tunnel.healthy,
-      addresses: localState.forwardAddressesById[tunnel.id] ?? null,
-    });
-  }
-  return out;
 }
 
 function subscribe(listener: () => void): () => void {

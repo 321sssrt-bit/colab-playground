@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -1026,10 +1027,13 @@ for (const cssFile of walkFiles(SRC_DIR, [".css"])) {
   checkCss(cssFile);
 }
 
-// 3. Check TypeScript / TSX / JS files (including synchronous theme-init.js)
+// 3. Check TypeScript / TSX / JS files (including synchronous theme-init.js), excluding unit tests.
+const isTestFile = (absPath) => /\.test\.[cm]?[jt]sx?$/.test(absPath);
+const allSrcScripts = walkFiles(SRC_DIR, [".ts", ".tsx", ".js", ".jsx", ".mjs"]);
+const testFiles = allSrcScripts.filter(isTestFile);
 const scriptFiles = [
   ...walkFiles(PUBLIC_DIR, [".js", ".mjs"]),
-  ...walkFiles(SRC_DIR, [".ts", ".tsx", ".js", ".jsx", ".mjs"]),
+  ...allSrcScripts.filter((file) => !isTestFile(file)),
 ];
 for (const scriptFile of scriptFiles) {
   checkScript(scriptFile);
@@ -1048,3 +1052,14 @@ fs.writeFileSync(I18N_MANIFEST, `${JSON.stringify({ keys: sortedKeys }, null, 2)
 console.log(
   `Frontend static check passed (${scriptFiles.length} script(s), ${sortedKeys.length} i18n key(s) written to ${relPath(I18N_MANIFEST)}).`,
 );
+
+// 4. Run pure frontend state unit tests via Node's built-in test runner.
+if (testFiles.length > 0) {
+  const result = spawnSync(process.execPath, ["--test", ...testFiles], {
+    cwd: FRONTEND_ROOT,
+    stdio: "inherit",
+  });
+  if (result.status !== 0) {
+    process.exit(result.status ?? 1);
+  }
+}

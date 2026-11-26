@@ -103,6 +103,48 @@ function isAbortFailure(error: unknown, signal?: AbortSignal): boolean {
   return error instanceof Error && error.name === "AbortError";
 }
 
+/**
+ * Wraps a shared in-flight promise with a caller-local `AbortSignal` so one
+ * unmounting consumer can abort its own await without cancelling the underlying request.
+ */
+export function attachAbortSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) {
+    return promise;
+  }
+  const makeAbortError = (): ApiError =>
+    new ApiError({
+      status: 0,
+      kind: "cancelled",
+      message: "request aborted",
+      isAbort: true,
+    });
+  if (signal.aborted) {
+    // Suppress unhandled rejection on the caller branch while leaving the shared promise alive.
+    void promise.catch(() => {});
+    return Promise.reject(makeAbortError());
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => {
+      reject(makeAbortError());
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        if (!signal.aborted) {
+          resolve(value);
+        }
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        if (!signal.aborted) {
+          reject(error);
+        }
+      },
+    );
+  });
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }

@@ -4,10 +4,10 @@
  * pending-account adoption, OAuth sign-in dialog, and remove-account protection.
  */
 
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useState } from "react";
 
 import { AccountsIcon, AlertIcon, CloseIcon, InfoIcon } from "../components/Icons.tsx";
-import { ApiError } from "../lib/api.ts";
+import { appDataStore, isAccountChangeBlocked, useAppDataStore } from "../lib/appCache.ts";
 import {
   formatCu,
   formatCuRate,
@@ -17,20 +17,14 @@ import {
 import { webStore } from "../lib/store.ts";
 import { RefreshIcon, TerminalIcon, TrashIcon, UserPlusIcon } from "./accounts/Icons.tsx";
 import {
-  adoptActiveAccount,
   buildAccountRows,
   buildUnmanagedWarning,
   computeAccountsTotals,
-  fetchOverviewDiagnostics,
   formatAccountTimeLeft,
   formatApiError,
   formatCoreError,
   formatErrorKind,
-  isAccountChangeBlocked,
-  refreshAccountsUsage,
   resolveAccountsGate,
-  type FormattedApiError,
-  type OverviewDiagnostics,
   type SwitchTarget,
 } from "./accounts/model.ts";
 import { RemoveAccountDialog, type RemoveTarget } from "./accounts/RemoveAccountDialog.tsx";
@@ -54,131 +48,73 @@ export function AccountsPage({
 }: AccountsPageProps) {
   const idPrefix = useId();
   const nowSecs = useUsageClockSecs();
+  const appData = useAppDataStore();
 
-  const [diagnostics, setDiagnostics] = useState<OverviewDiagnostics | null>(null);
-  const [diagnosticsLoading, setDiagnosticsLoading] = useState(true);
-  const [refreshingUsage, setRefreshingUsage] = useState(false);
-  const [usageRefreshError, setUsageRefreshError] = useState<FormattedApiError | null>(null);
-  const [adopting, setAdopting] = useState(false);
-  const [adoptError, setAdoptError] = useState<FormattedApiError | null>(null);
   const [recoveredVisible, setRecoveredVisible] = useState(false);
   const [recoveredDismissed, setRecoveredDismissed] = useState(false);
   const [removeTarget, setRemoveTarget] = useState<RemoveTarget | null>(null);
   const [removingAccount, setRemovingAccount] = useState(false);
 
-  const probeSeqRef = useRef(0);
-  const mountedRef = useRef(true);
+  const needsOverviewDiagnostics =
+    snapshot !== null &&
+    ((snapshot.accounts === null && snapshot.accounts_error === null) ||
+      snapshot.accounts_error === "keyring_unavailable");
 
   useEffect(() => {
-    mountedRef.current = true;
-    return () => {
-      mountedRef.current = false;
-    };
-  }, []);
-
-  const loadDiagnostics = useCallback(async (signal?: AbortSignal) => {
-    const seq = ++probeSeqRef.current;
-    setDiagnosticsLoading(true);
-    try {
-      const report = await fetchOverviewDiagnostics(signal);
-      if (!mountedRef.current || seq !== probeSeqRef.current) {
-        return;
-      }
-      setDiagnostics(report);
-    } catch (error) {
-      if (!mountedRef.current || seq !== probeSeqRef.current) {
-        return;
-      }
-      if (error instanceof ApiError && error.isAbort) {
-        return;
-      }
-    } finally {
-      if (mountedRef.current && seq === probeSeqRef.current) {
-        setDiagnosticsLoading(false);
-      }
+    if (needsOverviewDiagnostics) {
+      void appDataStore.ensureOverview().catch(() => {});
     }
-  }, []);
-
-  useEffect(() => {
-    const controller = new AbortController();
-    void loadDiagnostics(controller.signal);
-    return () => {
-      controller.abort();
-    };
-  }, [loadDiagnostics]);
+  }, [needsOverviewDiagnostics]);
 
   const handleCheckEnvironmentAgain = useCallback(async () => {
-    await loadDiagnostics();
-    if (!mountedRef.current) {
-      return;
+    try {
+      await appDataStore.refreshOverview();
+    } catch {
+      // Failure state is captured in `appDataStore`.
     }
     try {
       await webStore.refreshSnapshot();
     } catch {
       // SSE reconnect banner surfaces transport failures.
     }
-  }, [loadDiagnostics]);
+  }, []);
 
   const handleRefreshUsage = useCallback(async () => {
-    if (refreshingUsage) {
-      return;
-    }
-    setRefreshingUsage(true);
-    setUsageRefreshError(null);
     try {
-      await refreshAccountsUsage();
-      if (!mountedRef.current) {
-        return;
-      }
-      try {
-        await webStore.refreshSnapshot();
-      } catch {
-        // SSE stream will converge the updated snapshot.
-      }
-    } catch (error) {
-      if (!mountedRef.current) {
-        return;
-      }
-      setUsageRefreshError(formatApiError(error, t));
-    } finally {
-      if (mountedRef.current) {
-        setRefreshingUsage(false);
-      }
+      await appDataStore.refreshUsage();
+    } catch {
+      // Failure state is captured in `appDataStore.usageRefreshError`.
     }
-  }, [refreshingUsage, t]);
+  }, []);
 
   const handleAdoptAccount = useCallback(async () => {
-    if (snapshot === null || adopting) {
-      return;
-    }
-    setAdopting(true);
-    setAdoptError(null);
     try {
-      const adopted = await adoptActiveAccount(snapshot.account);
-      if (!mountedRef.current) {
-        return;
-      }
-      const email = adopted.email ?? t("app.accounts.no_email");
-      pushToast({ tone: "success", body: t("app.adopt.done", { email }) });
-      void webStore.refreshSnapshot().catch(() => {});
-    } catch (error) {
-      if (!mountedRef.current) {
-        return;
-      }
-      setAdoptError(formatApiError(error, t));
-    } finally {
-      if (mountedRef.current) {
-        setAdopting(false);
-      }
+      await appDataStore.adoptAccount();
+    } catch {
+      // Failure state is captured in `appDataStore.adoptError`.
     }
-  }, [adopting, pushToast, snapshot, t]);
+  }, []);
+
+  const diagnostics = appData.overview;
+  const diagnosticsLoading = appData.overviewLoading;
+  const refreshingUsage = appData.refreshingUsage;
+  const adopting = appData.adopting;
+  const usageRefreshError = useMemo(
+    () =>
+      appData.usageRefreshError !== null ? formatApiError(appData.usageRefreshError, t) : null,
+    [appData.usageRefreshError, t],
+  );
+  const adoptError = useMemo(
+    () => (appData.adoptError !== null ? formatApiError(appData.adoptError, t) : null),
+    [appData.adoptError, t],
+  );
 
   const gate = useMemo(
     () => resolveAccountsGate(snapshot, diagnostics),
     [diagnostics, snapshot],
   );
 
-  const accountChangeBlocked = isAccountChangeBlocked(snapshot);
+  const accountChangeBlocked = isAccountChangeBlocked(snapshot, appData);
   const shuttingDown = snapshot?.shutting_down === true;
   const canAdd = gate.kind === "ready" && !accountChangeBlocked && !shuttingDown;
   const addDisabledTitle =
@@ -599,7 +535,7 @@ export function AccountsPage({
                   const usageFailure =
                     row.usage?.last_error !== null &&
                     row.usage?.last_error !== undefined &&
-                    (row.usageSnapshot === null || row.isStale)
+                    (row.usageSnapshot === null || row.isFailed)
                       ? row.usage.last_error
                       : null;
 

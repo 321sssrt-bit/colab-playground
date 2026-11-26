@@ -7,22 +7,19 @@
  * never falls back to `/` or a hardcoded `/v1`.
  */
 
-import type { TunnelInfo, TunnelState } from "../../lib/types.ts";
+import { applyForwardOverlayToTunnel, type ForwardLiveOverlay } from "../../lib/forwards.ts";
+import type { TunnelInfo } from "../../lib/types.ts";
 import type { ForwardAddresses } from "../sessions/api.ts";
 import { safeHttpUrl } from "../sessions/format.ts";
 import type { ResolvedEndpoint } from "./types.ts";
+
+export type { ForwardLiveOverlay };
 
 const ESC_PREFIX = String.fromCharCode(0x1b);
 const ANSI_ESCAPE_RE = new RegExp(
   `${ESC_PREFIX}(?:\\[[0-?]*[ -/]*[@-~]|\\][^\\u0007]*(?:\\u0007|${ESC_PREFIX}\\\\))`,
   "g",
 );
-
-export interface ForwardLiveOverlay {
-  readonly snapshotVersion: number;
-  readonly state?: TunnelState;
-  readonly healthy?: boolean | null;
-}
 
 export interface ResolvedEndpointUrls {
   readonly openUrl: string | null;
@@ -180,16 +177,9 @@ export function selectEndpointTunnelById(
   if (!tunnel) {
     return null;
   }
-  const overlay = overlaysById[tunnel.id];
-  const activeOverlay =
-    overlay && overlay.snapshotVersion === snapshotVersion ? overlay : null;
-  const effectiveState = activeOverlay?.state ?? tunnel.state;
-  if (effectiveState.state === "failed" || effectiveState.state === "stopped") {
+  const effective = applyForwardOverlayToTunnel(tunnel, overlaysById, snapshotVersion);
+  if (effective.state.state === "failed" || effective.state.state === "stopped") {
     return null;
   }
-  return {
-    ...tunnel,
-    state: effectiveState,
-    healthy: activeOverlay?.healthy !== undefined ? activeOverlay.healthy : tunnel.healthy,
-  };
+  return effective;
 }
