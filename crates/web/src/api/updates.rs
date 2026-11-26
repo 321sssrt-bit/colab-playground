@@ -17,6 +17,7 @@ use colab_playground_core::{
 use colab_playground_shared::settings::Settings;
 use colab_playground_web::state::WebState;
 use serde::Serialize;
+use tokio::sync::watch;
 
 use super::{ApiError, ErrorMessage, WebSettings};
 use crate::http::StateData;
@@ -62,10 +63,33 @@ enum UpdateCheck {
     Failed(Error),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FlightOutcome {
+    Skipped,
+    Checked,
+}
+
+type FlightReceiver = watch::Receiver<Option<Result<FlightOutcome>>>;
+
 #[derive(Default)]
 struct UpdateState {
     check: UpdateCheck,
     attempted_at: Option<u64>,
+    // Shares an in-progress check across concurrent callers and survives client disconnects.
+    in_flight: Option<FlightReceiver>,
+}
+
+struct ClearInFlight {
+    state: Arc<Mutex<UpdateState>>,
+    armed: bool,
+}
+
+impl Drop for ClearInFlight {
+    fn drop(&mut self) {
+        if self.armed {
+            self.state.lock().expect("updates lock").in_flight = None;
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -73,8 +97,6 @@ pub(crate) struct WebUpdates {
     repository: UpdateRepository,
     http: Arc<dyn HttpClient>,
     state: Arc<Mutex<UpdateState>>,
-    // Serialises checks so concurrent Settings loads cannot stampede past the daily throttle.
-    check_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl WebUpdates {
@@ -87,7 +109,6 @@ impl WebUpdates {
             repository,
             http,
             state: Arc::new(Mutex::new(UpdateState::default())),
-            check_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -97,19 +118,64 @@ impl WebUpdates {
         settings: &WebSettings,
         manual: bool,
     ) -> std::result::Result<Response, ApiError> {
-        let _guard = self.check_lock.lock().await;
-        let current_settings = settings.current();
-        if !manual && !current_settings.check_updates.0 {
-            let state = self.state.lock().expect("updates lock");
-            return Ok(self.notice_response(&current_settings, &state));
-        }
+        loop {
+            let mut rx = {
+                let mut state = self.state.lock().expect("updates lock");
+                if let Some(existing) = &state.in_flight {
+                    existing.clone()
+                } else {
+                    let current_settings = settings.current();
+                    if !manual && !current_settings.check_updates.0 {
+                        return Ok(self.notice_response(&current_settings, &state));
+                    }
+                    let checked_at = current_settings.update_checked_at;
+                    let attempted_at = state.attempted_at;
+                    let (tx, rx) = watch::channel(None);
+                    state.in_flight = Some(rx.clone());
+                    let updates = self.clone();
+                    let web = web.clone();
+                    let settings = settings.clone();
+                    tokio::spawn(async move {
+                        let mut guard = ClearInFlight {
+                            state: updates.state.clone(),
+                            armed: true,
+                        };
+                        let outcome = updates
+                            .run_flight(&web, &settings, manual, checked_at, attempted_at)
+                            .await;
+                        guard.armed = false;
+                        let _ = tx.send(Some(outcome));
+                    });
+                    rx
+                }
+            };
 
-        let checked_at = current_settings.update_checked_at;
-        let attempted_at = self.state.lock().expect("updates lock").attempted_at;
+            let outcome = match rx.wait_for(|done| done.is_some()).await {
+                Ok(done) => done.as_ref().expect("wait_for guarantees Some").clone(),
+                Err(_) => return Err(Error::new(ErrorKind::Other).into()),
+            };
+            match outcome? {
+                FlightOutcome::Skipped if manual => continue,
+                FlightOutcome::Skipped | FlightOutcome::Checked => {
+                    let latest = settings.current();
+                    let state = self.state.lock().expect("updates lock");
+                    return Ok(self.notice_response(&latest, &state));
+                }
+            }
+        }
+    }
+
+    async fn run_flight(
+        &self,
+        web: &WebState,
+        settings: &WebSettings,
+        manual: bool,
+        checked_at: Option<u64>,
+        attempted_at: Option<u64>,
+    ) -> Result<FlightOutcome> {
         let repository = self.repository.clone();
         let http = self.http.clone();
-
-        let outcome = web
+        let execution = web
             .run_backend(move |backend, cancel| {
                 let now = secs(backend.now());
                 if !manual && !is_due(now, checked_at, attempted_at) {
@@ -123,50 +189,59 @@ impl WebUpdates {
                 }
                 Ok(CheckExecution::Checked { result, now })
             })
-            .await?;
+            .await;
 
-        match outcome {
-            CheckExecution::Skipped => {
-                let latest = settings.current();
-                let state = self.state.lock().expect("updates lock");
-                Ok(self.notice_response(&latest, &state))
+        let execution = match execution {
+            Ok(execution) => execution,
+            Err(error) => {
+                self.state.lock().expect("updates lock").in_flight = None;
+                return Err(error);
             }
-            CheckExecution::Checked { result, now } => match result {
-                Ok(UpdateStatus::UpToDate) => {
-                    let updated = settings.update_metadata(|s| {
-                        s.update_checked_at = Some(now);
-                        if s.update_latest
-                            .as_deref()
-                            .is_some_and(|v| newer_version(v).is_none())
-                        {
-                            s.update_latest = None;
-                        }
-                    });
-                    let mut state = self.state.lock().expect("updates lock");
-                    state.attempted_at = Some(now);
-                    state.check = UpdateCheck::UpToDate;
-                    Ok(self.notice_response(&updated, &state))
+        };
+
+        match execution {
+            CheckExecution::Skipped => {
+                self.state.lock().expect("updates lock").in_flight = None;
+                Ok(FlightOutcome::Skipped)
+            }
+            CheckExecution::Checked { result, now } => {
+                match result {
+                    Ok(UpdateStatus::UpToDate) => {
+                        settings.update_metadata(|s| {
+                            s.update_checked_at = Some(now);
+                            if s.update_latest
+                                .as_deref()
+                                .is_some_and(|v| newer_version(v).is_none())
+                            {
+                                s.update_latest = None;
+                            }
+                        });
+                        let mut state = self.state.lock().expect("updates lock");
+                        state.attempted_at = Some(now);
+                        state.check = UpdateCheck::UpToDate;
+                        state.in_flight = None;
+                    }
+                    Ok(UpdateStatus::Available(release)) => {
+                        let version = release.version.clone();
+                        settings.update_metadata(|s| {
+                            s.update_checked_at = Some(now);
+                            s.update_latest = Some(version);
+                        });
+                        let mut state = self.state.lock().expect("updates lock");
+                        state.attempted_at = Some(now);
+                        state.check = UpdateCheck::Available(release);
+                        state.in_flight = None;
+                    }
+                    Err(error) => {
+                        // A failed check does not record `update_checked_at`, so a restart retries.
+                        let mut state = self.state.lock().expect("updates lock");
+                        state.attempted_at = Some(now);
+                        state.check = UpdateCheck::Failed(error);
+                        state.in_flight = None;
+                    }
                 }
-                Ok(UpdateStatus::Available(release)) => {
-                    let version = release.version.clone();
-                    let updated = settings.update_metadata(|s| {
-                        s.update_checked_at = Some(now);
-                        s.update_latest = Some(version);
-                    });
-                    let mut state = self.state.lock().expect("updates lock");
-                    state.attempted_at = Some(now);
-                    state.check = UpdateCheck::Available(release);
-                    Ok(self.notice_response(&updated, &state))
-                }
-                Err(error) => {
-                    // A failed check does not record `update_checked_at`, so a restart retries.
-                    let updated = settings.current();
-                    let mut state = self.state.lock().expect("updates lock");
-                    state.attempted_at = Some(now);
-                    state.check = UpdateCheck::Failed(error);
-                    Ok(self.notice_response(&updated, &state))
-                }
-            },
+                Ok(FlightOutcome::Checked)
+            }
         }
     }
 

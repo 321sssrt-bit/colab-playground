@@ -460,3 +460,168 @@ async fn background_update_persistence_preserves_corrupt_settings_diagnostics() 
     })
     .await;
 }
+
+struct BlockingHttp {
+    started: std::sync::mpsc::Sender<()>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+    response: HttpResponse,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl HttpClient for BlockingHttp {
+    fn get(&self, _: &str, _: &[(&str, &str)]) -> Result<HttpResponse> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = self.started.send(());
+        self.release
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .expect("release signal");
+        Ok(self.response.clone())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_manual_checks_coalesce_and_disconnects_still_record_throttle() {
+    use std::io::Write as _;
+    use std::net::TcpStream;
+    use std::sync::atomic::Ordering;
+
+    // 1. Disconnecting an in-flight GET still completes and persists the 24h throttle.
+    let dir = tempfile::tempdir().unwrap();
+    let store = SettingsStore::new(Some(dir.path().to_owned()));
+    let settings = WebSettings::load(store.clone());
+    let (mut config, _) = MockConfig::headless(MockScenario::demo());
+    config.defaults = settings.initial_settings().defaults;
+    let backend = Arc::new(RealKindMock {
+        mock: MockBackend::new(config),
+    });
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let http = Arc::new(BlockingHttp {
+        started: started_tx,
+        release: Mutex::new(release_rx),
+        response: HttpResponse {
+            status: 404,
+            body: br#"{"message":"Not Found"}"#.to_vec(),
+        },
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let updates = WebUpdates::with_config(UpdateRepository::default_web(), http.clone());
+    let http_check = http.clone();
+
+    exercise_backend_with_updates(
+        dir.path(),
+        store,
+        settings,
+        updates,
+        backend,
+        (None, None),
+        vec![],
+        move |client, _, store| {
+            let addr = client.origin.strip_prefix("http://").unwrap().to_owned();
+            let mut raw = TcpStream::connect(&addr).unwrap();
+            write!(
+                raw,
+                "GET /api/updates HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+                client.token
+            )
+            .unwrap();
+            raw.flush().unwrap();
+
+            // Wait until the GitHub request is in flight, then drop the client socket.
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            drop(raw);
+            release_tx.send(()).unwrap();
+
+            // The follow-up GET reuses or sees the persisted throttle without a second HTTP call.
+            let notice = client.get("/api/updates");
+            assert_eq!(notice["current_version"], VERSION);
+            assert_eq!(notice["status"], "up_to_date");
+            assert!(notice["checked_at"].is_u64());
+            assert_eq!(http_check.calls.load(Ordering::SeqCst), 1);
+            assert!(store.load().settings.update_checked_at.is_some());
+        },
+    )
+    .await;
+
+    // 2. Two concurrent POST /api/updates/check calls coalesce onto one upstream HTTP request.
+    let dir = tempfile::tempdir().unwrap();
+    let store = SettingsStore::new(Some(dir.path().to_owned()));
+    let settings = WebSettings::load(store.clone());
+    let (mut config, _) = MockConfig::headless(MockScenario::demo());
+    config.defaults = settings.initial_settings().defaults;
+    let backend = Arc::new(RealKindMock {
+        mock: MockBackend::new(config),
+    });
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let http = Arc::new(BlockingHttp {
+        started: started_tx,
+        release: Mutex::new(release_rx),
+        response: HttpResponse {
+            status: 200,
+            body: br#"{"tag_name":"v9.4.0","html_url":"https://github.com/321sssrt-bit/colab-playground/releases/tag/v9.4.0"}"#.to_vec(),
+        },
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let updates = WebUpdates::with_config(UpdateRepository::default_web(), http.clone());
+    let http_check = http.clone();
+
+    exercise_backend_with_updates(
+        dir.path(),
+        store,
+        settings,
+        updates,
+        backend,
+        (None, None),
+        vec![],
+        move |client, _, _| {
+            let origin1 = client.origin.clone();
+            let token1 = client.token.clone();
+            let origin2 = client.origin.clone();
+            let token2 = client.token.clone();
+            let agent1 = client.agent.clone();
+            let agent2 = client.agent.clone();
+
+            let first = std::thread::spawn(move || {
+                json(
+                    super::request(
+                        &agent1,
+                        &origin1,
+                        "POST",
+                        "/api/updates/check",
+                        &token1,
+                        "{}",
+                    ),
+                    StatusCode::OK,
+                )
+            });
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+            let second = std::thread::spawn(move || {
+                json(
+                    super::request(
+                        &agent2,
+                        &origin2,
+                        "POST",
+                        "/api/updates/check",
+                        &token2,
+                        "{}",
+                    ),
+                    StatusCode::OK,
+                )
+            });
+            std::thread::sleep(Duration::from_millis(80));
+            release_tx.send(()).unwrap();
+
+            let r1 = first.join().unwrap();
+            let r2 = second.join().unwrap();
+            assert_eq!(http_check.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(r1["status"], "available");
+            assert_eq!(r1["latest_version"], "9.4.0");
+            assert_eq!(r1, r2);
+        },
+    )
+    .await;
+}
