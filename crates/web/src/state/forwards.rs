@@ -246,7 +246,7 @@ impl WebState {
                 }
             }
         });
-        let tunnels = self.0.backend.tunnels();
+        let tunnels = self.backend().tunnels();
         updates
             .receivers
             .retain(|id, _| tunnels.iter().any(|tunnel| tunnel.id == *id));

@@ -44,27 +44,29 @@ const MOCK_STEP_DELAY: Duration = Duration::from_millis(600);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(120);
 const INTERRUPTED: u8 = 130;
 
+fn build_real_backend(settings: &Settings) -> colab_playground_core::Result<Arc<dyn Backend>> {
+    let host = settings.host_setup();
+    let mut config = RealConfig::for_app(settings.defaults.clone())?;
+    if let Host::Wsl { distro } = &mut config.host {
+        *distro = host.wsl_distro;
+    }
+    config.toolchain = host.toolchain;
+    Ok(Arc::new(RealBackend::new(config)?))
+}
+
 fn build_backend(
-    selection: BackendSelection,
-    settings: Settings,
+    selection: &BackendSelection,
+    settings: &Settings,
 ) -> colab_playground_core::Result<Arc<dyn Backend>> {
     match selection {
         BackendSelection::Mock(flags) => {
             let mut config = MockConfig::interactive(MOCK_STEP_DELAY);
-            config.scenario = flags.scenario;
-            config.failures = flags.failures;
-            config.defaults = settings.defaults;
+            config.scenario = flags.scenario.clone();
+            config.failures = flags.failures.clone();
+            config.defaults = settings.defaults.clone();
             Ok(Arc::new(MockBackend::new(config)))
         }
-        BackendSelection::Real => {
-            let host = settings.host_setup();
-            let mut config = RealConfig::for_app(settings.defaults)?;
-            if let Host::Wsl { distro } = &mut config.host {
-                *distro = host.wsl_distro;
-            }
-            config.toolchain = host.toolchain;
-            Ok(Arc::new(RealBackend::new(config)?))
-        }
+        BackendSelection::Real => build_real_backend(settings),
     }
 }
 
@@ -91,9 +93,12 @@ async fn serve(options: Serve) -> Result<(), Box<dyn std::error::Error>> {
         BackendSelection::Real => "Real",
     };
     let (backend, settings) = tokio::task::spawn_blocking(move || {
-        let settings =
+        let mut settings =
             WebSettings::load(SettingsStore::new(config_dir(env::var_os(CONFIG_DIR_ENV))));
-        let backend = build_backend(options.backend, settings.initial_settings())?;
+        let backend = build_backend(&options.backend, &settings.initial_settings())?;
+        if matches!(options.backend, BackendSelection::Real) {
+            settings = settings.with_backend_builder(Arc::new(build_real_backend));
+        }
         Ok::<_, Error>((backend, settings))
     })
     .await??;

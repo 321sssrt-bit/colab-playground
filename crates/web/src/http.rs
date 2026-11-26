@@ -241,6 +241,7 @@ pub(crate) fn router_with_updates(
     settings: WebSettings,
     updates: WebUpdates,
 ) -> Router {
+    web.set_settings_notice(settings.notice());
     let state = StateData {
         auth: Arc::new(auth),
         key_changes,

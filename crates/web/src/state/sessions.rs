@@ -855,7 +855,8 @@ impl WebState {
     }
 
     fn stop_and_verify(&self, cancel: &CancelToken) -> Result<StopAllReport> {
-        let backend = &*self.0.backend;
+        let backend = self.backend();
+        let backend = &*backend;
         let before = backend
             .runtimes(cancel)
             .inspect_err(|error| self.record_runtimes(Err(error.clone())))?;
