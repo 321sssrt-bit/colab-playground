@@ -1317,3 +1317,55 @@ test("confirmOwnedPreviewCancel confirms server cancellation, handles proxy-dela
   });
   assert.equal(failed.kind, "failed");
 });
+
+test("pluginCacheStore queues a follow-up HF token check when refreshHfTokenStatus is called mid-flight", async () => {
+  const web = createFakeWebStore(makeSnapshot({ version: 1 }));
+  let tokenCalls = 0;
+  let releaseFirstCheck: ((res: { saved: boolean }) => void) | null = null;
+  let keyringBroken = false;
+
+  const harness = createFakeClient(async (method, path) => {
+    if (method === "GET" && path === "/api/plugins/hf/token") {
+      tokenCalls += 1;
+      if (tokenCalls === 1) {
+        return new Promise<{ saved: boolean }>((resolve) => {
+          releaseFirstCheck = resolve;
+        });
+      }
+      if (keyringBroken) {
+        throw new ApiError({
+          status: 503,
+          kind: "keyring_unavailable",
+          message: "keyring locked",
+        });
+      }
+      return { saved: true };
+    }
+    return [];
+  });
+
+  const pluginCache = createPluginCacheStore({ client: harness.client, store: web.store });
+
+  // First check starts while keyring still works.
+  const firstRefresh = pluginCache.refreshHfTokenStatus({ silent: true });
+  assert.equal(tokenCalls, 1);
+
+  // Keyring breaks before the first response arrives, and a plugin mutation requests a fresh check.
+  keyringBroken = true;
+  const queuedRefresh = pluginCache.refreshHfTokenStatus({ silent: true });
+  assert.equal(tokenCalls, 1, "must wait for in-flight request before issuing follow-up");
+
+  assert.ok(releaseFirstCheck);
+  (releaseFirstCheck as (res: { saved: boolean }) => void)({ saved: true });
+  await Promise.all([firstRefresh, queuedRefresh]);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(tokenCalls, 2, "must automatically issue follow-up check after in-flight settles");
+  assert.equal(
+    pluginCache.getState().hfToken.kind,
+    "error",
+    "follow-up keyring failure must overwrite the stale in-flight saved=true result",
+  );
+
+  pluginCache.dispose();
+});
