@@ -3,10 +3,11 @@
  *
  * Intentionally receives no SSE `snapshot` prop and is memoized so live
  * background snapshot pushes never re-render inputs, reset draft text, or
- * disturb active focus.
+ * disturb active focus. Draft state lives in `settingsDraftStore` so edits
+ * survive route navigation within a session and clear on sign-out.
  */
 
-import { memo, useEffect, useId, useRef, useState, type FormEvent } from "react";
+import { memo, useId, useRef, useState, type FormEvent } from "react";
 
 import { AlertIcon, CheckCircleIcon } from "../../components/Icons.tsx";
 import {
@@ -43,6 +44,7 @@ import {
   type DefaultsFieldKey,
   type DurationDraft,
 } from "./draft.ts";
+import { settingsDraftStore, useSettingsDraftStore } from "./draftStore.ts";
 
 const ACCELERATOR_LABEL_KEYS = {
   NONE: "app.acc.none",
@@ -163,23 +165,14 @@ export const DefaultsSection = memo(function DefaultsSection({
   onClearFeedback,
 }: DefaultsSectionProps) {
   const idBase = useId();
-  const [draft, setDraft] = useState<DefaultsDraft>(() => defaultsToDraft(serverDefaults));
-  const [forceInclude, setForceInclude] = useState<ReadonlySet<DefaultsFieldKey>>(
-    () => new Set<DefaultsFieldKey>(),
-  );
+  const headingId = `${idBase}-heading`;
+  const formRef = useRef<HTMLFormElement | null>(null);
+  // Subscribe to session draft store so edits persist across route switches and sync with LimitFocusCard.
+  useSettingsDraftStore();
+  const { draft, forceInclude } = settingsDraftStore.resolveDefaultsDraft(serverDefaults);
   const [invalidFields, setInvalidFields] = useState<ReadonlySet<DefaultsFieldId>>(
     () => new Set<DefaultsFieldId>(),
   );
-  const lastServerRef = useRef<RuntimeDefaults>(serverDefaults);
-
-  useEffect(() => {
-    if (lastServerRef.current !== serverDefaults) {
-      lastServerRef.current = serverDefaults;
-      setDraft(defaultsToDraft(serverDefaults));
-      setForceInclude(new Set<DefaultsFieldKey>());
-      setInvalidFields(new Set<DefaultsFieldId>());
-    }
-  }, [serverDefaults]);
 
   const dirty = isDraftDirty(draft, serverDefaults, forceInclude);
   const atCoreDefaults = isDraftAtCoreDefaults(draft, serverDefaults, forceInclude);
@@ -188,14 +181,10 @@ export const DefaultsSection = memo(function DefaultsSection({
     field: DefaultsFieldKey,
     updater: (prev: DefaultsDraft) => DefaultsDraft,
   ): void => {
-    setDraft(updater);
-    if (forceInclude.has(field)) {
-      setForceInclude((prev) => {
-        const next = new Set(prev);
-        next.delete(field);
-        return next;
-      });
-    }
+    const nextDraft = updater(draft);
+    const nextForce = new Set(forceInclude);
+    nextForce.delete(field);
+    settingsDraftStore.saveDefaultsDraft(serverDefaults, nextDraft, nextForce);
     if (invalidFields.size > 0) {
       setInvalidFields(new Set<DefaultsFieldId>());
     }
@@ -212,6 +201,10 @@ export const DefaultsSection = memo(function DefaultsSection({
     const result = buildDefaultsPatch(draft, serverDefaults, forceInclude);
     if (!result.ok) {
       setInvalidFields(result.invalidFields);
+      window.requestAnimationFrame(() => {
+        const firstInvalid = formRef.current?.querySelector<HTMLElement>('[aria-invalid="true"]');
+        firstInvalid?.focus();
+      });
       return;
     }
     if (!result.hasChanges) {
@@ -222,15 +215,17 @@ export const DefaultsSection = memo(function DefaultsSection({
   };
 
   const handleDiscard = (): void => {
-    setDraft(defaultsToDraft(serverDefaults));
-    setForceInclude(new Set<DefaultsFieldKey>());
+    settingsDraftStore.clearDefaultsDraft();
     setInvalidFields(new Set<DefaultsFieldId>());
     onClearFeedback();
   };
 
   const handleResetToDefaults = (): void => {
-    setDraft(defaultsToDraft(CORE_DEFAULTS));
-    setForceInclude(diffFieldsFromCore(serverDefaults));
+    settingsDraftStore.saveDefaultsDraft(
+      serverDefaults,
+      defaultsToDraft(CORE_DEFAULTS),
+      diffFieldsFromCore(serverDefaults),
+    );
     setInvalidFields(new Set<DefaultsFieldId>());
     onClearFeedback();
   };
@@ -245,13 +240,20 @@ export const DefaultsSection = memo(function DefaultsSection({
   const minVramId = `${idBase}-min-vram`;
 
   return (
-    <section className="card settings-section">
+    <section className="card settings-section" data-settings-defaults="true">
       <div className="card-heading">
-        <h2 className="card-title">{t("app.defaults.title")}</h2>
+        <h2 id={headingId} className="card-title">
+          {t("app.defaults.title")}
+        </h2>
         <p className="card-desc">{t("app.defaults.description")}</p>
       </div>
 
-      <form onSubmit={handleSubmit} noValidate>
+      <form
+        ref={formRef}
+        aria-labelledby={headingId}
+        onSubmit={(event) => void handleSubmit(event)}
+        noValidate
+      >
         <div className="settings-list">
           <div className="settings-row">
             <div className="settings-row-info">

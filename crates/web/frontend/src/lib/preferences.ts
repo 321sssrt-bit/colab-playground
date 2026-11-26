@@ -3,19 +3,47 @@
  *
  * All login-sync and post-login preference writes flow through one ordered
  * pipeline per auth session so an older login-sync PATCH can never land on the
- * server after a newer user change.
+ * server after a newer user change. Save failures are retained per field and
+ * retried alongside subsequent writes so an unresolved error is never dropped.
  */
 
-import { apiClient, type ApiClient } from "./api.ts";
+import { useSyncExternalStore } from "react";
+
+import { apiClient, ApiError, type ApiClient } from "./api.ts";
 import { i18nStore, isLanguagePref, type I18nStore } from "./i18n.ts";
 import { isAppearancePref, themeStore, type ThemeStore } from "./theme.ts";
 import type { AppearancePref, LanguagePref, SettingsPatch, SettingsView } from "./types.ts";
 
+export type PreferenceField = "language" | "appearance";
+
+export interface PreferenceSaveError {
+  readonly id: number;
+  readonly fields: readonly PreferenceField[];
+  readonly error: unknown;
+}
+
+export interface PreferenceSyncState {
+  readonly saving: boolean;
+  readonly lastError: PreferenceSaveError | null;
+}
+
+export interface PreferenceSyncOptions {
+  readonly onSettingsLoaded?: (view: SettingsView) => void;
+}
+
 export interface PreferenceSync {
-  syncSession(signal?: AbortSignal): void;
+  getState(): PreferenceSyncState;
+  subscribe(listener: () => void): () => void;
+  syncSession(signal?: AbortSignal, options?: PreferenceSyncOptions): void;
   cancelPending(): void;
   setLanguage(pref: LanguagePref): void;
   setAppearance(pref: AppearancePref): void;
+  retryLastFailed(): void;
+  clearError(): void;
+}
+
+function isIgnorableSaveError(error: unknown): boolean {
+  return error instanceof ApiError && (error.isAbort || error.isUnauthorized);
 }
 
 /**
@@ -30,7 +58,32 @@ export function createPreferenceSync(
   let activeController: AbortController | null = null;
   let pendingLanguage = false;
   let pendingAppearance = false;
+  const failedFields = new Set<PreferenceField>();
   let flushScheduled = false;
+  let errorSeq = 0;
+  let state: PreferenceSyncState = {
+    saving: false,
+    lastError: null,
+  };
+  const listeners = new Set<() => void>();
+
+  const emit = (): void => {
+    for (const listener of listeners) {
+      try {
+        listener();
+      } catch {
+        // Isolate subscriber exceptions so preference state listeners converge.
+      }
+    }
+  };
+
+  const setState = (next: PreferenceSyncState): void => {
+    if (next.saving === state.saving && next.lastError === state.lastError) {
+      return;
+    }
+    state = next;
+    emit();
+  };
 
   const isGenerationLive = (generation: number, signal?: AbortSignal): boolean => {
     return (
@@ -42,6 +95,74 @@ export function createPreferenceSync(
 
   const enqueue = (task: () => Promise<void>): void => {
     queue = queue.then(task, task);
+  };
+
+  const patchPreferences = async (
+    generation: number,
+    signal: AbortSignal | undefined,
+    patch: SettingsPatch,
+    langVersion: number | undefined,
+    appearanceVersion: number | undefined,
+  ): Promise<void> => {
+    const fields: PreferenceField[] = [];
+    if (patch.language !== undefined) {
+      fields.push("language");
+    }
+    if (patch.appearance !== undefined) {
+      fields.push("appearance");
+    }
+    if (fields.length === 0) {
+      return;
+    }
+
+    // Preserve any existing unresolved error until the PATCH actually succeeds.
+    setState({ saving: true, lastError: state.lastError });
+    try {
+      await client.request<SettingsView>("/api/settings", {
+        method: "PATCH",
+        body: patch,
+        signal,
+      });
+      if (isGenerationLive(generation, signal)) {
+        if (langVersion !== undefined) {
+          i18n.markSynced(langVersion);
+        }
+        if (appearanceVersion !== undefined) {
+          theme.markSynced(appearanceVersion);
+        }
+        for (const field of fields) {
+          failedFields.delete(field);
+        }
+        const remaining = Array.from(failedFields);
+        setState({
+          saving: false,
+          lastError:
+            remaining.length > 0 && state.lastError !== null
+              ? { ...state.lastError, fields: remaining }
+              : null,
+        });
+      }
+    } catch (error: unknown) {
+      if (!isGenerationLive(generation, signal) || isIgnorableSaveError(error)) {
+        if (state.saving) {
+          setState({ saving: false, lastError: state.lastError });
+        }
+        return;
+      }
+      // Keep the browser choice active locally and retain all failed fields until persisted.
+      for (const field of fields) {
+        failedFields.add(field);
+      }
+      errorSeq += 1;
+      setState({
+        saving: false,
+        lastError: {
+          id: errorSeq,
+          fields: Array.from(failedFields),
+          error,
+        },
+      });
+    }
   };
 
   const scheduleFlush = (generation: number): void => {
@@ -63,38 +184,19 @@ export function createPreferenceSync(
       let langVersion: number | undefined;
       let appearanceVersion: number | undefined;
 
-      if (pendingLanguage) {
+      // Re-include any previously failed field so all preferences converge together on the server.
+      if (pendingLanguage || failedFields.has("language")) {
         pendingLanguage = false;
         langVersion = i18n.getVersion();
         patch.language = i18n.getState().preference;
       }
-      if (pendingAppearance) {
+      if (pendingAppearance || failedFields.has("appearance")) {
         pendingAppearance = false;
         appearanceVersion = theme.getVersion();
         patch.appearance = theme.getState().preference;
       }
 
-      if (patch.language === undefined && patch.appearance === undefined) {
-        return;
-      }
-
-      try {
-        await client.request<SettingsView>("/api/settings", {
-          method: "PATCH",
-          body: patch,
-          signal,
-        });
-        if (isGenerationLive(generation, signal)) {
-          if (langVersion !== undefined) {
-            i18n.markSynced(langVersion);
-          }
-          if (appearanceVersion !== undefined) {
-            theme.markSynced(appearanceVersion);
-          }
-        }
-      } catch {
-        // Keep the browser choice active even if the server settings write fails.
-      }
+      await patchPreferences(generation, signal, patch, langVersion, appearanceVersion);
     });
   };
 
@@ -113,7 +215,18 @@ export function createPreferenceSync(
   };
 
   return {
-    syncSession(externalSignal?: AbortSignal): void {
+    getState(): PreferenceSyncState {
+      return state;
+    },
+
+    subscribe(listener: () => void): () => void {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+
+    syncSession(externalSignal?: AbortSignal, options?: PreferenceSyncOptions): void {
       if (!client.isAuthenticated()) {
         return;
       }
@@ -121,6 +234,8 @@ export function createPreferenceSync(
       const controller = resetController(externalSignal);
       const startLangVersion = i18n.getVersion();
       const startAppearanceVersion = theme.getVersion();
+      failedFields.clear();
+      setState({ saving: false, lastError: null });
 
       enqueue(async () => {
         const signal = controller.signal;
@@ -141,6 +256,8 @@ export function createPreferenceSync(
         if (!isGenerationLive(generation, signal)) {
           return;
         }
+
+        options?.onSettingsLoaded?.(server);
 
         const patch: SettingsPatch = {};
         let pushLangVersion: number | undefined;
@@ -178,36 +295,18 @@ export function createPreferenceSync(
           }
         }
 
-        if (patch.language === undefined && patch.appearance === undefined) {
-          return;
-        }
-
-        try {
-          await client.request<SettingsView>("/api/settings", {
-            method: "PATCH",
-            body: patch,
-            signal,
-          });
-          if (isGenerationLive(generation, signal)) {
-            if (pushLangVersion !== undefined) {
-              i18n.markSynced(pushLangVersion);
-            }
-            if (pushAppearanceVersion !== undefined) {
-              theme.markSynced(pushAppearanceVersion);
-            }
-          }
-        } catch {
-          // Keep the browser choice active even if the server settings write fails.
-        }
+        await patchPreferences(generation, signal, patch, pushLangVersion, pushAppearanceVersion);
       });
     },
 
     cancelPending(): void {
       pendingLanguage = false;
       pendingAppearance = false;
+      failedFields.clear();
       flushScheduled = false;
       activeController?.abort();
       activeController = null;
+      setState({ saving: false, lastError: null });
     },
 
     setLanguage(pref: LanguagePref): void {
@@ -227,8 +326,32 @@ export function createPreferenceSync(
       pendingAppearance = true;
       scheduleFlush(client.getSessionGeneration());
     },
+
+    retryLastFailed(): void {
+      if (failedFields.size === 0 || !client.isAuthenticated()) {
+        return;
+      }
+      if (failedFields.has("language")) {
+        pendingLanguage = true;
+      }
+      if (failedFields.has("appearance")) {
+        pendingAppearance = true;
+      }
+      scheduleFlush(client.getSessionGeneration());
+    },
+
+    clearError(): void {
+      failedFields.clear();
+      if (state.lastError !== null) {
+        setState({ saving: state.saving, lastError: null });
+      }
+    },
   };
 }
 
 /** Shared preference synchronizer for the Browser Client. */
 export const preferenceSync: PreferenceSync = createPreferenceSync();
+
+export function usePreferenceSync(sync: PreferenceSync = preferenceSync): PreferenceSyncState {
+  return useSyncExternalStore(sync.subscribe, sync.getState, sync.getState);
+}

@@ -1,5 +1,6 @@
 /**
- * Global read-only release update notice store backed by `GET /api/updates`.
+ * Global read-only release update notice store backed by `GET /api/updates`
+ * and `POST /api/updates/check`.
  *
  * Mirrors upstream `crates/app/src/state/updates.rs`, `ui/pages/mod.rs`, and
  * `ui/sidebar.rs` for the Web read-only release link contract: dismissing a
@@ -9,7 +10,7 @@
 
 import { useSyncExternalStore } from "react";
 
-import { apiClient, attachAbortSignal, type ApiClient } from "./api.ts";
+import { apiClient, ApiError, attachAbortSignal, type ApiClient } from "./api.ts";
 import type { UpdateNoticeResponse } from "./types.ts";
 
 export const UPDATE_DISMISSED_STORAGE_KEY = "cpg_update_dismissed_version";
@@ -24,6 +25,8 @@ export interface BannerUpdate {
 export interface UpdatesState {
   readonly notice: UpdateNoticeResponse | null;
   readonly loading: boolean;
+  readonly checkingManual: boolean;
+  readonly manualError: unknown;
   readonly dismissedVersion: string | null;
   readonly bannerUpdate: BannerUpdate | null;
   readonly badgeVersion: string | null;
@@ -42,15 +45,18 @@ export interface UpdatesStore {
   subscribe(listener: () => void): () => void;
   ensureChecked(signal?: AbortSignal): Promise<UpdateNoticeResponse | null>;
   refresh(signal?: AbortSignal): Promise<UpdateNoticeResponse | null>;
+  checkNow(signal?: AbortSignal): Promise<UpdateNoticeResponse>;
   applyNotice(notice: UpdateNoticeResponse): void;
+  setCheckUpdates(enabled: boolean): void;
   dismiss(version: string): void;
   dispose(): void;
 }
 
-interface InFlightUpdate {
+interface InFlightUpdate<T> {
   readonly generation: number;
+  readonly seq: number;
   readonly controller: AbortController;
-  readonly promise: Promise<UpdateNoticeResponse | null>;
+  readonly promise: Promise<T>;
 }
 
 /**
@@ -134,11 +140,17 @@ export function createUpdatesStore(options: UpdatesStoreOptions = {}): UpdatesSt
 
   let disposed = false;
   let checkedGeneration: number | null = null;
-  let inFlight: InFlightUpdate | null = null;
+  let requestSeq = 0;
+  let appliedSeq = 0;
+  let checkUpdatesOverride: { readonly seq: number; readonly enabled: boolean } | null = null;
+  let inFlightAuto: InFlightUpdate<UpdateNoticeResponse | null> | null = null;
+  let inFlightManual: InFlightUpdate<UpdateNoticeResponse> | null = null;
   let pollTimer: ReturnType<typeof setInterval> | null = null;
   let state: UpdatesState = {
     notice: null,
     loading: false,
+    checkingManual: false,
+    manualError: null,
     dismissedVersion: readDismissedVersion(storage),
     bannerUpdate: null,
     badgeVersion: null,
@@ -160,7 +172,7 @@ export function createUpdatesStore(options: UpdatesStoreOptions = {}): UpdatesSt
     }
     pollTimer = setIntervalFn(() => {
       if (!disposed && client.isAuthenticated()) {
-        void startFetch();
+        void startAutoFetch();
       }
     }, pollIntervalMs);
   };
@@ -178,16 +190,23 @@ export function createUpdatesStore(options: UpdatesStoreOptions = {}): UpdatesSt
   const updateState = (patch: {
     notice?: UpdateNoticeResponse | null;
     loading?: boolean;
+    checkingManual?: boolean;
+    manualError?: unknown;
     dismissedVersion?: string | null;
   }): void => {
     const notice = patch.notice !== undefined ? patch.notice : state.notice;
     const loading = patch.loading !== undefined ? patch.loading : state.loading;
+    const checkingManual =
+      patch.checkingManual !== undefined ? patch.checkingManual : state.checkingManual;
+    const manualError = patch.manualError !== undefined ? patch.manualError : state.manualError;
     const dismissedVersion =
       patch.dismissedVersion !== undefined ? patch.dismissedVersion : state.dismissedVersion;
     const derived = deriveUpdateFields(notice, dismissedVersion);
     if (
       notice === state.notice &&
       loading === state.loading &&
+      checkingManual === state.checkingManual &&
+      manualError === state.manualError &&
       dismissedVersion === state.dismissedVersion &&
       derived.badgeVersion === state.badgeVersion &&
       derived.bannerUpdate?.version === state.bannerUpdate?.version &&
@@ -198,6 +217,8 @@ export function createUpdatesStore(options: UpdatesStoreOptions = {}): UpdatesSt
     state = {
       notice,
       loading,
+      checkingManual,
+      manualError,
       dismissedVersion,
       bannerUpdate: derived.bannerUpdate,
       badgeVersion: derived.badgeVersion,
@@ -205,12 +226,29 @@ export function createUpdatesStore(options: UpdatesStoreOptions = {}): UpdatesSt
     emit();
   };
 
+  const applyCheckUpdatesOverride = (
+    notice: UpdateNoticeResponse,
+    seq: number,
+  ): UpdateNoticeResponse => {
+    if (checkUpdatesOverride !== null && seq <= checkUpdatesOverride.seq) {
+      if (notice.check_updates === checkUpdatesOverride.enabled) {
+        return notice;
+      }
+      return { ...notice, check_updates: checkUpdatesOverride.enabled };
+    }
+    return notice;
+  };
+
   const resetSession = (): void => {
     stopPolling();
-    inFlight?.controller.abort();
-    inFlight = null;
+    inFlightAuto?.controller.abort();
+    inFlightAuto = null;
+    inFlightManual?.controller.abort();
+    inFlightManual = null;
     checkedGeneration = null;
-    updateState({ notice: null, loading: false });
+    checkUpdatesOverride = null;
+    appliedSeq = ++requestSeq;
+    updateState({ notice: null, loading: false, checkingManual: false, manualError: null });
   };
 
   const unsubscribeAuth = client.subscribeAuth((event) => {
@@ -229,14 +267,15 @@ export function createUpdatesStore(options: UpdatesStoreOptions = {}): UpdatesSt
     startPolling();
   }
 
-  const startFetch = (signal?: AbortSignal): Promise<UpdateNoticeResponse | null> => {
+  const startAutoFetch = (signal?: AbortSignal): Promise<UpdateNoticeResponse | null> => {
     if (disposed || !client.isAuthenticated()) {
       return Promise.resolve(null);
     }
     const generation = client.getSessionGeneration();
-    if (inFlight !== null && inFlight.generation === generation) {
-      return attachAbortSignal(inFlight.promise, signal);
+    if (inFlightAuto !== null && inFlightAuto.generation === generation) {
+      return attachAbortSignal(inFlightAuto.promise, signal);
     }
+    const seq = ++requestSeq;
     const controller = new AbortController();
     updateState({ loading: true });
     const promise = client
@@ -244,10 +283,14 @@ export function createUpdatesStore(options: UpdatesStoreOptions = {}): UpdatesSt
         method: "GET",
         signal: controller.signal,
       })
-      .then((notice) => {
-        if (!disposed && client.getSessionGeneration() === generation) {
+      .then((rawNotice) => {
+        const notice = applyCheckUpdatesOverride(rawNotice, seq);
+        if (!disposed && client.getSessionGeneration() === generation && seq >= appliedSeq) {
+          appliedSeq = seq;
           checkedGeneration = generation;
           updateState({ notice, loading: false });
+        } else if (!disposed && client.getSessionGeneration() === generation) {
+          updateState({ loading: false });
         }
         return notice;
       })
@@ -260,11 +303,61 @@ export function createUpdatesStore(options: UpdatesStoreOptions = {}): UpdatesSt
         return null;
       })
       .finally(() => {
-        if (inFlight?.promise === promise) {
-          inFlight = null;
+        if (inFlightAuto?.promise === promise) {
+          inFlightAuto = null;
         }
       });
-    inFlight = { generation, controller, promise };
+    inFlightAuto = { generation, seq, controller, promise };
+    return attachAbortSignal(promise, signal);
+  };
+
+  const startManualCheck = (signal?: AbortSignal): Promise<UpdateNoticeResponse> => {
+    if (disposed || !client.isAuthenticated()) {
+      return Promise.reject(
+        new ApiError({ status: 401, kind: "unauthorized", message: "Unauthorized" }),
+      );
+    }
+    const generation = client.getSessionGeneration();
+    if (inFlightManual !== null && inFlightManual.generation === generation) {
+      return attachAbortSignal(inFlightManual.promise, signal);
+    }
+    const seq = ++requestSeq;
+    const controller = new AbortController();
+    updateState({ checkingManual: true, manualError: null });
+    const promise = client
+      .request<UpdateNoticeResponse>("/api/updates/check", {
+        method: "POST",
+        body: {},
+        signal: controller.signal,
+      })
+      .then((rawNotice) => {
+        const notice = applyCheckUpdatesOverride(rawNotice, seq);
+        if (!disposed && client.getSessionGeneration() === generation && seq >= appliedSeq) {
+          appliedSeq = seq;
+          checkedGeneration = generation;
+          updateState({ notice, checkingManual: false, manualError: null });
+        } else if (!disposed && client.getSessionGeneration() === generation) {
+          updateState({ checkingManual: false });
+        }
+        return notice;
+      })
+      .catch((error: unknown) => {
+        if (!disposed && client.getSessionGeneration() === generation) {
+          // Preserve existing `notice` so `current_version` stays accurate even if the request fails.
+          const isAbort = error instanceof ApiError && error.isAbort;
+          updateState({
+            checkingManual: false,
+            manualError: isAbort ? state.manualError : error,
+          });
+        }
+        throw error;
+      })
+      .finally(() => {
+        if (inFlightManual?.promise === promise) {
+          inFlightManual = null;
+        }
+      });
+    inFlightManual = { generation, seq, controller, promise };
     return attachAbortSignal(promise, signal);
   };
 
@@ -288,19 +381,37 @@ export function createUpdatesStore(options: UpdatesStoreOptions = {}): UpdatesSt
       if (checkedGeneration === generation && state.notice !== null) {
         return Promise.resolve(state.notice);
       }
-      return startFetch(signal);
+      return startAutoFetch(signal);
     },
 
     refresh(signal?: AbortSignal): Promise<UpdateNoticeResponse | null> {
-      return startFetch(signal);
+      return startAutoFetch(signal);
+    },
+
+    checkNow(signal?: AbortSignal): Promise<UpdateNoticeResponse> {
+      return startManualCheck(signal);
     },
 
     applyNotice(notice: UpdateNoticeResponse): void {
       if (disposed) {
         return;
       }
+      appliedSeq = ++requestSeq;
       checkedGeneration = client.getSessionGeneration();
-      updateState({ notice, loading: false });
+      updateState({ notice, loading: false, checkingManual: false, manualError: null });
+    },
+
+    setCheckUpdates(enabled: boolean): void {
+      if (disposed) {
+        return;
+      }
+      // Record the preference against the current request sequence without advancing `appliedSeq`,
+      // so an in-flight manual update check still lands its newer version/status result.
+      checkUpdatesOverride = { seq: requestSeq, enabled };
+      if (state.notice === null || state.notice.check_updates === enabled) {
+        return;
+      }
+      updateState({ notice: { ...state.notice, check_updates: enabled } });
     },
 
     dismiss(version: string): void {
@@ -316,8 +427,10 @@ export function createUpdatesStore(options: UpdatesStoreOptions = {}): UpdatesSt
       disposed = true;
       stopPolling();
       unsubscribeAuth();
-      inFlight?.controller.abort();
-      inFlight = null;
+      inFlightAuto?.controller.abort();
+      inFlightAuto = null;
+      inFlightManual?.controller.abort();
+      inFlightManual = null;
       listeners.clear();
     },
   };

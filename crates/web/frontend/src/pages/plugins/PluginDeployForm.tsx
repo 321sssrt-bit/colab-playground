@@ -18,7 +18,7 @@ import {
 } from "../../lib/constants.ts";
 import { resolveActiveAccount } from "../../lib/format.ts";
 import type { TranslateFn } from "../../lib/i18n.ts";
-import type { RouteId } from "../../lib/router.ts";
+import type { NavigateOptions, RouteId } from "../../lib/router.ts";
 import type {
   Locale,
   Runtime,
@@ -94,7 +94,7 @@ interface PluginDeployFormProps {
   readonly maxConcurrentSessions: number;
   readonly locale: Locale;
   readonly t: TranslateFn;
-  readonly navigate: (route: RouteId) => void;
+  readonly navigate: (route: RouteId, options?: NavigateOptions) => void;
   readonly onBack: () => void;
   readonly onOpenHfTokenDialog: () => void;
   readonly onRunStarted: (runId: number, summary: PluginRunSummary) => void;
@@ -1313,7 +1313,7 @@ export function PluginDeployForm({
                         type="button"
                         className="btn btn-sm"
                         data-plugin-limit-settings="true"
-                        onClick={() => navigate("settings")}
+                        onClick={() => navigate("settings", { settingsFocus: "limit" })}
                       >
                         {t("app.b3.new_open_settings")}
                       </button>
