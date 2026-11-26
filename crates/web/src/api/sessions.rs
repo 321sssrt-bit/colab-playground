@@ -12,10 +12,11 @@ use colab_playground_core::{
     backend::{Runtime, RuntimeRef, RuntimesView},
     clock::unix_secs,
     provision::{ProvisionEvent, ProvisionSpec},
+    sessions::HardwareRate,
 };
 use colab_playground_shared::i18n::keys;
 use colab_playground_web::state::{
-    AccountContext,
+    AccountContext, EndedRuntime, GuardEvent,
     sessions::{AutoStop, ProvisionUpdate},
 };
 use futures_util::stream;
@@ -33,6 +34,7 @@ pub(super) fn routes() -> Router<StateData> {
     Router::new()
         .route("/api/sessions", get(list).post(create))
         .route("/api/sessions/template", get(template))
+        .route("/api/sessions/guard/ack", post(ack_guard))
         .route("/api/sessions/{id}/events", post(events))
         .route("/api/sessions/{id}/cancel", post(cancel))
         .route("/api/sessions/stop", post(stop))
@@ -47,7 +49,17 @@ struct Sessions<'a> {
     runtimes: &'a [Runtime],
     errors: Vec<AccountFailure<'a>>,
     guard: Option<&'a colab_playground_core::backend::GuardReport>,
+    guard_events: &'a [GuardEvent],
     guard_error: Option<ErrorKind>,
+    ended: &'a [EndedRuntime],
+}
+
+#[derive(Serialize)]
+struct SessionTemplate {
+    #[serde(flatten)]
+    spec: ProvisionSpec,
+    measured_rates: Vec<HardwareRate>,
+    sampled_at: u64,
 }
 
 #[derive(Serialize)]
@@ -81,24 +93,47 @@ async fn list(State(state): State<StateData>) -> Result<Response, ApiError> {
         runtimes,
         errors: account_errors(errors),
         guard: snapshot.guard.as_ref(),
+        guard_events: &snapshot.guard_events,
         guard_error: snapshot.guard_error,
+        ended: &snapshot.ended,
     })
     .into_response())
 }
 
-async fn template(State(state): State<StateData>) -> Result<Json<ProvisionSpec>, ApiError> {
-    Ok(Json(
-        state
-            .web
-            .run_backend(|backend, _| {
-                let defaults = backend.defaults();
-                let mut spec = defaults.provision_spec(backend.new_session_name(None));
-                spec.high_mem &= spec.accelerator.supports_high_mem();
-                spec.min_vram_mib = spec.min_vram_mib.filter(|_| spec.accelerator.is_gpu());
-                Ok(spec)
-            })
-            .await?,
-    ))
+async fn template(State(state): State<StateData>) -> Result<Json<SessionTemplate>, ApiError> {
+    let (spec, measured_rates, now) = state
+        .web
+        .run_backend(|backend, _| {
+            let defaults = backend.defaults();
+            let mut spec = defaults.provision_spec(backend.new_session_name(None));
+            spec.high_mem &= spec.accelerator.supports_high_mem();
+            spec.min_vram_mib = spec.min_vram_mib.filter(|_| spec.accelerator.is_gpu());
+            Ok((spec, backend.measured_rates(), backend.now()))
+        })
+        .await?;
+    Ok(Json(SessionTemplate {
+        spec,
+        measured_rates,
+        sampled_at: unix_secs(now),
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GuardAck {
+    #[serde(default)]
+    up_to_id: Option<u64>,
+    #[serde(default)]
+    ids: Option<Vec<u64>>,
+}
+
+async fn ack_guard(
+    State(state): State<StateData>,
+    payload: Result<Json<GuardAck>, JsonRejection>,
+) -> Result<StatusCode, ApiError> {
+    let Json(GuardAck { up_to_id, ids }) = payload?;
+    state.web.ack_guard_events(up_to_id, ids.as_deref());
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]

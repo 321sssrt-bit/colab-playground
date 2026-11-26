@@ -667,28 +667,25 @@ async fn overview_refreshes_even_after_background_poll_recovers_accounts() {
             client.get("/api/overview")["keyring"]["status"],
             "unavailable"
         );
+        assert_eq!(
+            client.get("/api/snapshot")["accounts_error"],
+            "keyring_unavailable"
+        );
         backend.add_unmanaged_runtime(&active, Accelerator::None);
         backend.set_failures(MockFailures::default());
         assert!(!backend.usage_poll_due());
-
-        tokio::runtime::Handle::current().block_on(async {
-            tokio::time::timeout(
-                TIMEOUT,
-                client
-                    .web
-                    .subscribe()
-                    .wait_for(|snapshot| snapshot.accounts_error.is_none()),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        });
+        // Keyring-locked state must not spin the background poller.
         assert_eq!(backend.runtime_listings(), listed);
+        assert_eq!(
+            client.get("/api/snapshot")["accounts_error"],
+            "keyring_unavailable"
+        );
 
         let recovered = client.get("/api/overview");
         assert_eq!(recovered["keyring"]["status"], "ready");
         assert_eq!(recovered["usage"][0]["snapshot"]["assignments"], 4);
         assert_eq!(recovered["unmanaged_runtimes"]["count"], 2);
+        assert_eq!(client.get("/api/snapshot")["accounts_error"], Value::Null);
     })
     .await;
 }

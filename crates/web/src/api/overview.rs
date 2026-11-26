@@ -10,7 +10,9 @@ use colab_playground_core::{
     Error, ErrorKind,
     accounts::{AccountId, AccountsView},
     backend::{AccountUsageView, InstallMethod},
+    clock::unix_secs,
     host::{Line, ProbeReport},
+    sessions::HardwareRate,
 };
 use colab_playground_shared::i18n::keys;
 use colab_playground_web::state::{Access, Operation, Snapshot, Submission};
@@ -37,6 +39,8 @@ pub(super) struct Overview {
     accounts: Option<AccountsView>,
     accounts_error: Option<ErrorKind>,
     usage: Vec<AccountUsageView>,
+    measured_rates: Vec<HardwareRate>,
+    sampled_at: u64,
     unmanaged_runtimes: UnmanagedRuntimes,
     install_methods: Vec<InstallMethod>,
 }
@@ -134,7 +138,7 @@ impl UnmanagedRuntimes {
 }
 
 pub(super) async fn get(State(state): State<StateData>) -> Result<Json<Overview>, ApiError> {
-    let (environment, snapshot) = state.web.probe_environment().await?;
+    let (environment, snapshot, now) = state.web.probe_environment().await?;
     let host = HostCheck::from_probe(&environment, platform::uses_wsl());
     let cli_installed = environment.colab.is_some();
     let helper_available = environment.helper_python.is_some();
@@ -190,6 +194,8 @@ pub(super) async fn get(State(state): State<StateData>) -> Result<Json<Overview>
         } else {
             Vec::new()
         },
+        measured_rates: snapshot.measured_rates.clone(),
+        sampled_at: unix_secs(now),
         unmanaged_runtimes,
         install_methods,
     }))
@@ -208,11 +214,18 @@ pub(super) async fn install(
 ) -> Result<Response, ApiError> {
     let Json(install) = payload?;
     let (send, receive) = mpsc::channel::<Line>();
+    let web = state.web.clone();
     let submission = state.web.start_operation(
         INSTALL_CLI,
         String::new(),
         Access::HostWrite,
-        move |backend, cancel| backend.install_cli(install.method, send, cancel),
+        move |backend, cancel| {
+            let result = backend.install_cli(install.method, send, cancel);
+            if result.is_ok() {
+                web.reset_cli_probe();
+            }
+            result
+        },
     )?;
     let (id, job) = match submission {
         Submission::Started { id, job } => (id, job),

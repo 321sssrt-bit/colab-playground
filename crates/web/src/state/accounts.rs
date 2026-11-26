@@ -1,4 +1,4 @@
-use colab_playground_core::{accounts::Account, backend::SwitchImpact};
+use colab_playground_core::{accounts::Account, backend::SwitchImpact, clock::unix_secs};
 
 use super::*;
 
@@ -7,6 +7,7 @@ pub struct AccountSwitchPreview {
     #[serde(flatten)]
     approval: AccountSwitchApproval,
     impact: SwitchImpact,
+    sampled_at: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -32,7 +33,7 @@ struct SwitchConfirmation {
 
 impl WebState {
     pub fn accounts_snapshot(&self) -> Arc<Snapshot> {
-        self.mark_usage_age();
+        self.check_usage_age();
         self.snapshot()
     }
 
@@ -53,10 +54,7 @@ impl WebState {
         let state = self.clone();
         self.backend_job(Slot::Shared, move |backend, cancel| {
             let _poll = state.lock_poll_slot();
-            let accounts = backend.accounts(cancel);
-            state.record_accounts(accounts.clone());
-            accounts?;
-            state.refresh_account_usage(backend, &[], cancel);
+            state.refresh_all(backend, cancel)?;
             Ok(state.snapshot())
         })
         .await
@@ -138,6 +136,7 @@ impl WebState {
                     confirmation: SwitchConfirmation::from(&impact),
                 },
                 impact,
+                sampled_at: unix_secs(backend.now()),
             })
         })
         .await

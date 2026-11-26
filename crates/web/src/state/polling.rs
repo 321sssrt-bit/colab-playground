@@ -1,7 +1,11 @@
 use std::{collections::BTreeSet, time::SystemTime};
 
-use colab_playground_core::{guard::USAGE_STALE_AFTER, usage::UsageSnapshot};
-
+use colab_playground_core::{
+    backend::{AccountUsageView, GuardReport},
+    guard::USAGE_STALE_AFTER,
+    sessions::HardwareRate,
+    usage::UsageSnapshot,
+};
 use tokio::time::{MissedTickBehavior, interval};
 
 use super::*;
@@ -36,85 +40,266 @@ impl WebState {
     }
 
     pub(super) fn refresh_overview(&self, backend: &dyn Backend, cancel: &CancelToken) {
+        let _ = self.refresh_all(backend, cancel);
+    }
+
+    pub(super) fn refresh_all(&self, backend: &dyn Backend, cancel: &CancelToken) -> Result<()> {
         // An importable keyring module does not tell us whether the keyring is unlocked.
         let accounts = backend.accounts(cancel);
-        let ready = accounts.is_ok();
-        self.record_accounts(accounts);
-        if !ready {
-            return;
+        match accounts {
+            Ok(view) => {
+                let has_accounts = !view.accounts.is_empty();
+                self.record_accounts(Ok(view));
+                if !has_accounts {
+                    self.record_empty_when_signed_out(backend.measured_rates());
+                    self.sync_forwards();
+                    return Ok(());
+                }
+            }
+            Err(error) => {
+                let kind = error.kind;
+                self.record_accounts(Err(error.clone()));
+                if matches!(
+                    kind,
+                    ErrorKind::NotInstalled | ErrorKind::KeyringUnavailable
+                ) {
+                    self.record_runtimes(Err(Error::new(kind)));
+                }
+                return Err(error);
+            }
         }
 
-        self.refresh_account_usage(backend, &[], cancel);
-        self.record_runtimes(backend.runtimes(cancel));
+        let need_initial_runtimes = {
+            let snapshot = self.0.snapshots.borrow();
+            snapshot.runtimes.is_none() || snapshot.runtimes_error.is_some()
+        };
+        let list_first = need_initial_runtimes || !self.has_managed_runtimes();
+        let mut runtimes_result = if list_first {
+            let view = backend.runtimes(cancel);
+            self.record_runtimes(view.clone());
+            Some(view)
+        } else {
+            None
+        };
+
+        let guard_changed = self.sync_usage_and_guard(backend, true, cancel);
+
+        if !list_first || guard_changed {
+            let view = backend.runtimes(cancel);
+            self.record_runtimes(view.clone());
+            runtimes_result = Some(view);
+        }
+        self.sync_forwards();
+        runtimes_result.transpose().map(|_| ())
     }
 
-    pub(super) fn refresh_account_usage(
+    pub(super) fn has_managed_runtimes(&self) -> bool {
+        let snapshot = self.0.snapshots.borrow();
+        match (&snapshot.runtimes, snapshot.runtimes_error) {
+            (Some(view), None) => view.runtimes.iter().any(|runtime| runtime.managed),
+            _ => snapshot
+                .accounts
+                .as_ref()
+                .is_some_and(|view| !view.accounts.is_empty()),
+        }
+    }
+
+    /// Runs one usage + optional guard round matching desktop `AppState::fetch_usage`.
+    /// Returns `true` when the guard stopped or noticed a vanished runtime.
+    pub(super) fn sync_usage_and_guard(
         &self,
         backend: &dyn Backend,
-        accounts: &[AccountId],
+        manual: bool,
+        cancel: &CancelToken,
+    ) -> bool {
+        if self.has_managed_runtimes() {
+            match backend.guard_poll(cancel) {
+                Ok(report) => {
+                    let covered: BTreeSet<AccountId> = report
+                        .decisions
+                        .iter()
+                        .map(|decision| decision.session.account.clone())
+                        .chain(
+                            report
+                                .vanished
+                                .iter()
+                                .map(|runtime| runtime.account.clone()),
+                        )
+                        .collect();
+                    let uncovered: Vec<AccountId> = report
+                        .usage
+                        .iter()
+                        .map(|usage| usage.account.clone())
+                        .filter(|account| !covered.contains(account))
+                        .collect();
+                    let views = if !uncovered.is_empty() && (manual || backend.usage_poll_due()) {
+                        match backend.refresh_usage(&uncovered, cancel) {
+                            Ok(views) => views,
+                            Err(error) if error.is(ErrorKind::Busy) && !manual => {
+                                report.usage.clone()
+                            }
+                            Err(error) => failed_usage_views(backend, &uncovered, error),
+                        }
+                    } else {
+                        report.usage.clone()
+                    };
+                    self.apply_guard_and_usage(
+                        Some(Ok(report)),
+                        views,
+                        backend.measured_rates(),
+                        backend.now(),
+                    )
+                }
+                Err(error) if error.is(ErrorKind::Busy) => {
+                    // Transient contention must not surface a false guard-broken warning.
+                    self.refresh_usage_only(backend, manual, None, cancel);
+                    false
+                }
+                Err(error) => {
+                    self.refresh_usage_only(backend, manual, Some(error.kind), cancel);
+                    false
+                }
+            }
+        } else {
+            self.refresh_usage_only(backend, manual, None, cancel);
+            false
+        }
+    }
+
+    pub(super) fn refresh_usage_after_stop(&self, backend: &dyn Backend, cancel: &CancelToken) {
+        self.refresh_usage_only(backend, true, None, cancel);
+    }
+
+    fn refresh_usage_only(
+        &self,
+        backend: &dyn Backend,
+        manual: bool,
+        guard_error: Option<ErrorKind>,
         cancel: &CancelToken,
     ) {
-        let usage = backend
-            .refresh_usage(accounts, cancel)
-            .unwrap_or_else(|error| {
-                let mut usage = backend.usage();
-                for view in &mut usage {
-                    if accounts.is_empty() || accounts.contains(&view.account) {
-                        if let Some(snapshot) = &mut view.snapshot {
-                            snapshot.stale = true;
-                        }
-                        view.last_error = Some(error.clone());
-                    }
-                }
-                usage
-            });
-        self.record_usage(usage);
-    }
-
-    pub(super) fn record_usage(&self, mut usage: Vec<AccountUsageView>) {
-        let now = self.0.backend.now();
-        self.update(|snapshot| {
-            let _ = expire_usage(&mut usage, now);
-            let mut changed = false;
-            if let Some(accounts) = &mut snapshot.accounts {
-                for account in &mut accounts.accounts {
-                    if let Some(view) = usage.iter_mut().find(|view| view.account == account.id) {
-                        // After a restart, the account store can hold the only known sample.
-                        if view.snapshot.is_none()
-                            && let Some(sample) = account.usage
-                        {
-                            let sample = stale_sample(sample);
-                            view.eta = sample.eta();
-                            view.snapshot = Some(sample);
-                        }
-                        changed |= account.usage != view.snapshot;
-                        account.usage = view.snapshot;
-                    }
+        match backend.refresh_usage(&[], cancel) {
+            Ok(views) => {
+                let _ = self.apply_guard_and_usage(
+                    guard_error.map(Err),
+                    views,
+                    backend.measured_rates(),
+                    backend.now(),
+                );
+            }
+            Err(error) if error.is(ErrorKind::Busy) && !manual => {
+                if let Some(kind) = guard_error {
+                    let _ = self.apply_guard_and_usage(
+                        Some(Err(kind)),
+                        backend.usage(),
+                        backend.measured_rates(),
+                        backend.now(),
+                    );
                 }
             }
-            changed |= snapshot.usage != usage;
-            snapshot.usage = usage;
+            Err(error) => {
+                let views = failed_usage_views(backend, &[], error);
+                let _ = self.apply_guard_and_usage(
+                    guard_error.map(Err),
+                    views,
+                    backend.measured_rates(),
+                    backend.now(),
+                );
+            }
+        }
+    }
+
+    fn apply_guard_and_usage(
+        &self,
+        guard_result: Option<std::result::Result<GuardReport, ErrorKind>>,
+        usage: Vec<AccountUsageView>,
+        measured_rates: Vec<HardwareRate>,
+        now: SystemTime,
+    ) -> bool {
+        let mut guard_changed = false;
+        self.update(|snapshot| {
+            let mut changed = merge_usage_into_snapshot(snapshot, usage, now);
+            if snapshot.measured_rates != measured_rates {
+                snapshot.measured_rates = measured_rates;
+                changed = true;
+            }
+            match guard_result {
+                Some(Ok(report)) => {
+                    let (mutated_runtimes, ledger_changed) = snapshot.guard_state.apply_guard(
+                        report,
+                        snapshot.runtimes.as_ref(),
+                        snapshot.accounts.as_ref(),
+                        now,
+                    );
+                    guard_changed = mutated_runtimes;
+                    changed |= ledger_changed;
+                    changed |= snapshot.guard_error.take().is_some();
+                }
+                Some(Err(error_kind)) if snapshot.guard_error != Some(error_kind) => {
+                    snapshot.guard_error = Some(error_kind);
+                    changed = true;
+                }
+                Some(Err(_)) | None => {}
+            }
+            changed |= snapshot.sync_guard_projection();
+            changed
+        });
+        guard_changed
+    }
+
+    #[cfg(test)]
+    pub(super) fn record_usage(&self, usage: Vec<AccountUsageView>) {
+        let now = self.0.backend.now();
+        let rates = self.0.backend.measured_rates();
+        self.update(|snapshot| {
+            let mut changed = merge_usage_into_snapshot(snapshot, usage, now);
+            if snapshot.measured_rates != rates {
+                snapshot.measured_rates = rates;
+                changed = true;
+            }
+            changed |= snapshot.sync_guard_projection();
             changed
         });
     }
 
-    pub(super) fn mark_usage_age(&self) {
+    /// Publishes an updated `server_now` when any cached usage sample crosses `USAGE_STALE_AFTER`,
+    /// without mutating `sample.stale` (which stays reserved for failed/unverified fetches).
+    pub(super) fn check_usage_age(&self) {
         let now = self.0.backend.now();
-        self.update(|snapshot| {
-            let mut changed = expire_usage(&mut snapshot.usage, now);
-            if let Some(accounts) = &mut snapshot.accounts {
-                for account in &mut accounts.accounts {
-                    changed |= account
-                        .usage
-                        .as_mut()
-                        .is_some_and(|sample| expire_sample(sample, now));
-                }
+        self.0.snapshots.send_if_modified(|snapshot| {
+            let prev = snapshot.usage_now;
+            let age_crossed = snapshot
+                .usage
+                .iter()
+                .filter_map(|view| view.snapshot.as_ref())
+                .any(|sample| is_aged_or_stale(sample, now) != is_aged_or_stale(sample, prev));
+            if !age_crossed {
+                return false;
             }
+            let snapshot = Arc::make_mut(snapshot);
+            snapshot.usage_now = now;
+            snapshot.server_now = now;
+            snapshot.version += 1;
+            true
+        });
+    }
+
+    pub(super) fn record_empty_when_signed_out(&self, measured_rates: Vec<HardwareRate>) {
+        self.update(|snapshot| {
+            let empty = RuntimesView::default();
+            let mut changed = snapshot.runtimes.as_ref() != Some(&empty)
+                || snapshot.runtimes_error.take().is_some()
+                || !snapshot.usage.is_empty()
+                || snapshot.measured_rates != measured_rates;
+            snapshot.runtimes = Some(empty);
+            snapshot.usage.clear();
+            snapshot.measured_rates = measured_rates;
+            changed |= snapshot.guard_state.retain_live(&[]);
+            changed |= snapshot.sync_guard_projection();
             changed
         });
     }
 
-    pub(super) fn clear_overview(&self) {
+    pub(super) fn clear_overview(&self, measured_rates: Vec<HardwareRate>) {
         self.update(|snapshot| {
             let mut changed = snapshot.account.active.take().is_some();
             if changed {
@@ -126,8 +311,17 @@ impl WebState {
             changed |= snapshot.runtimes_error.take().is_some();
             changed |= snapshot.guard.take().is_some();
             changed |= snapshot.guard_error.take().is_some();
+            changed |= !snapshot.guard_events.is_empty();
+            snapshot.guard_events.clear();
+            changed |= !snapshot.ended.is_empty();
+            snapshot.ended.clear();
+            snapshot.guard_state.clear();
             changed |= !snapshot.usage.is_empty();
             snapshot.usage.clear();
+            if snapshot.measured_rates != measured_rates {
+                snapshot.measured_rates = measured_rates;
+                changed = true;
+            }
             changed
         });
     }
@@ -135,12 +329,22 @@ impl WebState {
     pub(super) fn record_runtimes(&self, result: Result<RuntimesView>) {
         self.update(|snapshot| {
             let (view, error) = match result {
-                Ok(view) => (Some(view), None),
-                Err(error) => (snapshot.runtimes.clone(), Some(error.kind)),
+                Ok(view) => {
+                    snapshot.cli_installed = Some(true);
+                    let _ = snapshot.guard_state.retain_live(&view.runtimes);
+                    (Some(view), None)
+                }
+                Err(error) => {
+                    if error.is(ErrorKind::NotInstalled) {
+                        snapshot.cli_installed = Some(false);
+                    }
+                    (snapshot.runtimes.clone(), Some(error.kind))
+                }
             };
-            let changed = snapshot.runtimes != view || snapshot.runtimes_error != error;
+            let mut changed = snapshot.runtimes != view || snapshot.runtimes_error != error;
             snapshot.runtimes = view;
             snapshot.runtimes_error = error;
+            changed |= snapshot.sync_guard_projection();
             changed
         });
     }
@@ -150,82 +354,137 @@ fn poll_backend(job: &Job, refresh: bool) {
     let state = &job.state;
     let backend = &*state.0.backend;
     let cancel = &job.cancel;
-    let due = backend.usage_poll_due();
-    let snapshot = state.snapshot();
+    let snapshot = state.0.snapshots.borrow().clone();
 
-    if refresh || due || snapshot.accounts.is_none() || snapshot.accounts_error.is_some() {
-        state.record_accounts(backend.accounts(cancel));
+    if snapshot.cli_installed == Some(false) {
+        return;
     }
-    if (refresh || due)
-        && state
-            .snapshot()
-            .accounts
-            .as_ref()
-            .is_some_and(|view| !view.accounts.is_empty())
+    if !refresh
+        && matches!(
+            snapshot.accounts_error,
+            Some(ErrorKind::NotInstalled | ErrorKind::KeyringUnavailable)
+        )
     {
-        let guard = backend.guard_poll(cancel);
-        let covered: BTreeSet<_> = guard
-            .as_ref()
-            .into_iter()
-            .flat_map(|report| {
-                report
-                    .decisions
-                    .iter()
-                    .map(|decision| decision.session.account.clone())
-                    .chain(
-                        report
-                            .vanished
-                            .iter()
-                            .map(|runtime| runtime.account.clone()),
-                    )
-            })
-            .collect();
-        let uncovered: Vec<_> = backend
-            .usage()
-            .into_iter()
-            .map(|usage| usage.account)
-            .filter(|account| !covered.contains(account))
-            .collect();
-        if !uncovered.is_empty() && (refresh || backend.usage_poll_due()) {
-            state.refresh_account_usage(backend, &uncovered, cancel);
-        } else {
-            state.record_usage(backend.usage());
-        }
-        state.update(|snapshot| {
-            match guard {
-                Ok(report) => {
-                    snapshot.guard = Some(report);
-                    snapshot.guard_error = None;
-                }
-                Err(error) => snapshot.guard_error = Some(error.kind),
-            }
-            true
-        });
-    } else {
-        state.mark_usage_age();
+        return;
     }
 
-    if refresh || due || snapshot.runtimes.is_none() {
+    let cold_start = snapshot.accounts.is_none() && snapshot.accounts_error.is_none();
+    let due = if cold_start {
+        true
+    } else {
+        backend.usage_poll_due()
+    };
+    if !refresh && !cold_start && !due && snapshot.runtimes.is_some() {
+        state.check_usage_age();
+        return;
+    }
+
+    if refresh || cold_start || due {
+        match backend.accounts(cancel) {
+            Ok(view) => {
+                let has_accounts = !view.accounts.is_empty();
+                state.record_accounts(Ok(view));
+                if !has_accounts {
+                    state.record_empty_when_signed_out(backend.measured_rates());
+                    state.sync_forwards();
+                    return;
+                }
+            }
+            Err(error) => {
+                let kind = error.kind;
+                state.record_accounts(Err(error));
+                if matches!(
+                    kind,
+                    ErrorKind::NotInstalled | ErrorKind::KeyringUnavailable
+                ) {
+                    state.record_runtimes(Err(Error::new(kind)));
+                }
+                return;
+            }
+        }
+    }
+
+    let snapshot = state.0.snapshots.borrow().clone();
+    if snapshot.accounts_error.is_some() {
+        return;
+    }
+    let has_accounts = snapshot
+        .accounts
+        .as_ref()
+        .is_some_and(|view| !view.accounts.is_empty());
+    if !has_accounts {
+        return;
+    }
+
+    let need_initial_runtimes =
+        refresh || snapshot.runtimes.is_none() || snapshot.runtimes_error.is_some();
+    if need_initial_runtimes {
+        state.record_runtimes(backend.runtimes(cancel));
+    }
+
+    let guard_changed = state.sync_usage_and_guard(backend, refresh, cancel);
+
+    if !need_initial_runtimes || guard_changed {
         state.record_runtimes(backend.runtimes(cancel));
     }
     state.sync_forwards();
 }
 
-fn expire_usage(usage: &mut [AccountUsageView], now: SystemTime) -> bool {
-    let mut changed = false;
-    for view in usage {
-        changed |= view
-            .snapshot
-            .as_mut()
-            .is_some_and(|sample| expire_sample(sample, now));
+fn failed_usage_views(
+    backend: &dyn Backend,
+    accounts: &[AccountId],
+    error: Error,
+) -> Vec<AccountUsageView> {
+    let mut usage = backend.usage();
+    for view in &mut usage {
+        if accounts.is_empty() || accounts.contains(&view.account) {
+            if let Some(snapshot) = &mut view.snapshot {
+                snapshot.stale = true;
+            }
+            view.last_error = Some(error.clone());
+        }
     }
-    changed
+    usage
 }
 
-pub(super) fn expire_sample(sample: &mut UsageSnapshot, now: SystemTime) -> bool {
-    let expired = !sample.is_fresh(now, USAGE_STALE_AFTER) && !sample.stale;
-    sample.stale |= expired;
-    expired
+fn merge_usage_into_snapshot(
+    snapshot: &mut Snapshot,
+    mut usage: Vec<AccountUsageView>,
+    now: SystemTime,
+) -> bool {
+    let mut changed = false;
+    if let Some(accounts) = &mut snapshot.accounts {
+        for account in &mut accounts.accounts {
+            if let Some(view) = usage.iter_mut().find(|view| view.account == account.id) {
+                // After a restart, the account store can hold the only known sample.
+                if view.snapshot.is_none()
+                    && let Some(sample) = account.usage
+                {
+                    let sample = stale_sample(sample);
+                    view.eta = sample.eta();
+                    view.snapshot = Some(sample);
+                }
+                changed |= account.usage != view.snapshot;
+                account.usage = view.snapshot;
+            }
+        }
+    }
+    if snapshot.usage != usage {
+        snapshot.usage = usage;
+        changed = true;
+    }
+    let prev = snapshot.usage_now;
+    let age_crossed = snapshot
+        .usage
+        .iter()
+        .filter_map(|view| view.snapshot.as_ref())
+        .any(|sample| is_aged_or_stale(sample, now) != is_aged_or_stale(sample, prev));
+    snapshot.usage_now = now;
+    changed | age_crossed
+}
+
+fn is_aged_or_stale(sample: &UsageSnapshot, now: SystemTime) -> bool {
+    !sample.is_fresh(now, USAGE_STALE_AFTER)
 }
 
 pub(super) fn stale_sample(mut sample: UsageSnapshot) -> UsageSnapshot {

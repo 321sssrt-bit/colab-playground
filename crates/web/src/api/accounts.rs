@@ -11,6 +11,7 @@ use colab_playground_core::{
     Error, ErrorKind,
     accounts::{Account, AccountId, AccountsView},
     backend::AccountUsageView,
+    clock::unix_secs,
 };
 use colab_playground_web::state::{
     AccountContext, AccountSwitchApproval, AccountSwitchPreview, CancelLoginOutcome, LoginPrompt,
@@ -45,6 +46,7 @@ struct Accounts {
     accounts: AccountsView,
     usage: Vec<AccountUsageView>,
     login_id: Option<u64>,
+    sampled_at: u64,
 }
 
 impl Accounts {
@@ -61,6 +63,7 @@ impl Accounts {
             accounts,
             usage: snapshot.usage.clone(),
             login_id: snapshot.login_id,
+            sampled_at: unix_secs(snapshot.server_now),
         }))
     }
 }
