@@ -9,17 +9,17 @@ import { useCallback, useEffect, useId, useRef, useState } from "react";
 
 import { AlertIcon, CheckCircleIcon, InfoIcon } from "../../components/Icons.tsx";
 import { apiClient, ApiError } from "../../lib/api.ts";
+import { appDataStore } from "../../lib/appCache.ts";
 import { formatDuration } from "../../lib/format.ts";
 import type { TranslateFn } from "../../lib/i18n.ts";
 import type { RouteId } from "../../lib/router.ts";
 import { webStore } from "../../lib/store.ts";
 import type { ToastInput } from "../../lib/toast.ts";
 import type { Locale, Runtime, Snapshot } from "../../lib/types.ts";
-import {
-  fetchSessions,
-  type ForwardAddresses,
-  type ForwardPolicyView,
-  type ProvisionProgressEvent,
+import type {
+  ForwardAddresses,
+  ForwardPolicyView,
+  ProvisionProgressEvent,
 } from "../sessions/api.ts";
 import {
   formatErrorMessage,
@@ -285,7 +285,7 @@ export function PluginRunView({
     });
 
     try {
-      const sessions = await fetchSessions();
+      const sessions = await appDataStore.refreshSessions();
       if (
         !mountedRef.current ||
         seq !== billingSeqRef.current ||
@@ -305,7 +305,6 @@ export function PluginRunView({
         accountErrored,
         snapshotVersion: webStore.getState().snapshot?.version ?? 0,
       });
-      void webStore.refreshSnapshot().catch(() => {});
     } catch (error) {
       if (
         !mountedRef.current ||

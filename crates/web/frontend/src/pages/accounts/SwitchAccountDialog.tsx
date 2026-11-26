@@ -10,6 +10,7 @@ import { useCallback, useEffect, useId, useRef, useState } from "react";
 
 import { AlertIcon } from "../../components/Icons.tsx";
 import { ApiError } from "../../lib/api.ts";
+import { serverClock } from "../../lib/clock.ts";
 import { formatDuration, useUsageClockSecs } from "../../lib/format.ts";
 import type { TranslateFn } from "../../lib/i18n.ts";
 import { webStore } from "../../lib/store.ts";
@@ -29,8 +30,6 @@ import {
   type FormattedApiError,
   type SwitchTarget,
 } from "./model.ts";
-
-const MS_PER_SECOND = 1000;
 
 type SwitchPhase =
   | { readonly kind: "idle" }
@@ -167,13 +166,22 @@ export function SwitchAccountDialog({
         if (previewControllerRef.current === controller) {
           previewControllerRef.current = null;
         }
+        if (typeof preview.sampled_at === "number") {
+          serverClock.sync(preview.sampled_at);
+        }
         if (seq !== requestSeqRef.current || targetRef.current?.id !== accountId) {
           return;
         }
+        const previewedAtSecs =
+          typeof preview.sampled_at === "number" &&
+          Number.isFinite(preview.sampled_at) &&
+          preview.sampled_at > 0
+            ? Math.floor(preview.sampled_at)
+            : serverClock.getNowSecs();
         setPhase({
           kind: "ready",
           preview,
-          previewedAtSecs: Math.floor(Date.now() / MS_PER_SECOND),
+          previewedAtSecs,
           confirming: false,
           confirmError: null,
           impactChanged: false,

@@ -5,7 +5,8 @@
 
 import { useSyncExternalStore } from "react";
 
-import { apiClient, ApiError, type ApiClient, type AuthEvent } from "./api.ts";
+import { apiClient, ApiError, attachAbortSignal, type ApiClient, type AuthEvent } from "./api.ts";
+import { serverClock, type ServerClock } from "./clock.ts";
 import type { SseFrame } from "./sse.ts";
 import type { Snapshot, TunnelEvent } from "./types.ts";
 
@@ -26,6 +27,7 @@ export interface WebStoreState {
 
 export interface WebStoreOptions {
   readonly client?: ApiClient;
+  readonly clock?: ServerClock;
   readonly initialReconnectDelayMs?: number;
   readonly maxReconnectDelayMs?: number;
   readonly stableConnectionMs?: number;
@@ -135,6 +137,7 @@ export function computeReconnectDelayMs(
  */
 export function createWebStore(options: WebStoreOptions = {}): WebStore {
   const client = options.client ?? apiClient;
+  const clock = options.clock ?? serverClock;
   const initialReconnectDelayMs =
     options.initialReconnectDelayMs ?? DEFAULT_INITIAL_RECONNECT_DELAY_MS;
   const maxReconnectDelayMs = options.maxReconnectDelayMs ?? DEFAULT_MAX_RECONNECT_DELAY_MS;
@@ -158,6 +161,18 @@ export function createWebStore(options: WebStoreOptions = {}): WebStore {
   let activeController: AbortController | null = null;
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
   let stableTimer: ReturnType<typeof setTimeout> | null = null;
+  let snapshotRefreshInFlight: {
+    readonly generation: number;
+    readonly controller: AbortController;
+    readonly promise: Promise<Snapshot>;
+  } | null = null;
+
+  const cancelSnapshotRefresh = (): void => {
+    if (snapshotRefreshInFlight !== null) {
+      snapshotRefreshInFlight.controller.abort();
+      snapshotRefreshInFlight = null;
+    }
+  };
 
   const clearStableTimer = (): void => {
     if (stableTimer !== null) {
@@ -222,7 +237,14 @@ export function createWebStore(options: WebStoreOptions = {}): WebStore {
       return false;
     }
     const current = state.snapshot;
-    if (current !== null && incoming.version <= current.version) {
+    if (current !== null && incoming.version < current.version) {
+      return false;
+    }
+    const isNewer = current === null || incoming.version > current.version;
+    if (typeof incoming.server_now === "number") {
+      clock.sync(incoming.server_now, { authoritative: isNewer });
+    }
+    if (!isNewer) {
       return false;
     }
     setState({
@@ -405,6 +427,8 @@ export function createWebStore(options: WebStoreOptions = {}): WebStore {
       return;
     }
     if (event.type === "authenticated") {
+      cancelSnapshotRefresh();
+      clock.reset();
       setState({
         authStatus: "authenticated",
         connectionStatus: "connecting",
@@ -418,10 +442,14 @@ export function createWebStore(options: WebStoreOptions = {}): WebStore {
       startStreamForGeneration(event.generation, false);
     } else if (event.type === "logged_out") {
       stopTransport();
+      cancelSnapshotRefresh();
+      clock.reset();
       activeGeneration = event.generation;
       setState({ ...INITIAL_STATE, authStatus: "signed_out" });
     } else if (event.type === "unauthorized") {
       stopTransport();
+      cancelSnapshotRefresh();
+      clock.reset();
       activeGeneration = event.generation;
       setState({
         ...INITIAL_STATE,
@@ -464,16 +492,32 @@ export function createWebStore(options: WebStoreOptions = {}): WebStore {
       client.logout();
       if (!wasAuthenticated && !disposed) {
         stopTransport();
+        cancelSnapshotRefresh();
+        clock.reset();
         activeGeneration = client.getSessionGeneration();
         setState({ ...INITIAL_STATE, authStatus: "signed_out" });
       }
     },
 
-    async refreshSnapshot(signal?: AbortSignal): Promise<Snapshot> {
+    refreshSnapshot(signal?: AbortSignal): Promise<Snapshot> {
       const requestGeneration = client.getSessionGeneration();
-      const snapshot = await client.getSnapshot(signal);
-      applySnapshot(requestGeneration, snapshot);
-      return snapshot;
+      if (snapshotRefreshInFlight !== null && snapshotRefreshInFlight.generation === requestGeneration) {
+        return attachAbortSignal(snapshotRefreshInFlight.promise, signal);
+      }
+      const controller = new AbortController();
+      const promise = client
+        .getSnapshot(controller.signal)
+        .then((snapshot) => {
+          applySnapshot(requestGeneration, snapshot);
+          return snapshot;
+        })
+        .finally(() => {
+          if (snapshotRefreshInFlight?.promise === promise) {
+            snapshotRefreshInFlight = null;
+          }
+        });
+      snapshotRefreshInFlight = { generation: requestGeneration, controller, promise };
+      return attachAbortSignal(promise, signal);
     },
 
     reconnectNow(): void {
@@ -489,6 +533,7 @@ export function createWebStore(options: WebStoreOptions = {}): WebStore {
       disposed = true;
       unsubscribeAuth();
       stopTransport();
+      cancelSnapshotRefresh();
       listeners.clear();
       forwardListeners.clear();
     },

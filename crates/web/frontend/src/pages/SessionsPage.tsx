@@ -8,16 +8,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { AlertIcon, SessionsIcon } from "../components/Icons.tsx";
-import { ApiError } from "../lib/api.ts";
+import { appDataStore, useAppDataStore } from "../lib/appCache.ts";
+import { forwardsStore, selectRuntimeForwards, useForwardsStore } from "../lib/forwards.ts";
 import { webStore } from "../lib/store.ts";
 import type { GuardDecision, Runtime, Snapshot } from "../lib/types.ts";
-import { fetchSessions, type AccountFailureResponse } from "./sessions/api.ts";
 import {
   AutoStopDialog,
   type AutoStopDialogMode,
   type AutoStopDialogRequest,
 } from "./sessions/AutoStopDialog.tsx";
-import { syncServerClock } from "./sessions/clock.tsx";
 import { EndedCard } from "./sessions/EndedCard.tsx";
 import {
   ForwardDialog,
@@ -30,7 +29,6 @@ import {
   formatHardware,
   groupRuntimesByAccount,
   runtimeKey,
-  type FormattedError,
 } from "./sessions/format.ts";
 import { AlertTriangleIcon, CircleStopIcon, PlusIcon, RefreshIcon } from "./sessions/Icons.tsx";
 import {
@@ -46,14 +44,10 @@ import {
   type StopRuntimeDialogRequest,
 } from "./sessions/StopRuntimeDialog.tsx";
 import {
-  applyForwardEvent,
   claimProvisionHandled,
   clearEndedRuntimes,
+  ensureRearmDuration,
   observeSnapshotTransitions,
-  refreshForwards,
-  refreshOverviewHints,
-  refreshRearmDuration,
-  selectForwardsForRuntime,
   trackProvision,
   useSessionsLocalState,
 } from "./sessions/store.ts";
@@ -61,11 +55,8 @@ import type { PageProps } from "./types.ts";
 
 export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageProps) {
   const localState = useSessionsLocalState();
-  const [refreshing, setRefreshing] = useState(false);
-  const [refreshError, setRefreshError] = useState<FormattedError | null>(null);
-  const [accountErrorsOverride, setAccountErrorsOverride] = useState<
-    readonly AccountFailureResponse[] | null
-  >(null);
+  const appData = useAppDataStore();
+  const forwardsState = useForwardsStore();
   const [autoStopDialog, setAutoStopDialog] = useState<AutoStopDialogRequest | null>(null);
   const [forwardDialog, setForwardDialog] = useState<ForwardDialogRequest | null>(null);
   const [newSessionDialog, setNewSessionDialog] = useState<NewSessionDialogRequest | null>(null);
@@ -74,83 +65,62 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
 
   const prevSnapshotRef = useRef<Snapshot | null>(null);
   const dialogSeqRef = useRef(0);
-  const refreshInFlightRef = useRef(false);
   const dialogTrackingOpIdRef = useRef<number | null>(null);
   const tRef = useRef(t);
   tRef.current = t;
 
   const loadSessions = useCallback(async () => {
-    if (refreshInFlightRef.current) {
-      return;
-    }
-    refreshInFlightRef.current = true;
-    setRefreshing(true);
     try {
-      const response = await fetchSessions();
-      syncServerClock(response.sampled_at);
-      setRefreshError(null);
-      setAccountErrorsOverride(response.errors);
-      void webStore.refreshSnapshot().catch(() => {});
-      void refreshForwards().catch(() => {});
-    } catch (error) {
-      if (!(error instanceof ApiError && error.isUnauthorized)) {
-        setRefreshError(formatErrorMessage(error, tRef.current));
-      }
-    } finally {
-      refreshInFlightRef.current = false;
-      setRefreshing(false);
+      await appDataStore.refreshSessions();
+      void forwardsStore.refresh().catch(() => {});
+    } catch {
+      // Failure state is captured in `appDataStore.sessionsError`.
     }
   }, []);
+
+  const refreshing = appData.sessionsRefreshing;
+  const refreshError = useMemo(
+    () => (appData.sessionsError !== null ? formatErrorMessage(appData.sessionsError, t) : null),
+    [appData.sessionsError, t],
+  );
+  const accountErrorsOverride = appData.sessionsAccountErrors;
+
+  const accounts = snapshot?.accounts?.accounts ?? null;
+  const cliReady =
+    appData.overview !== null
+      ? appData.overview.cli_installed
+      : snapshot?.accounts_error !== "not_installed";
+  const hasSavedAccounts = accounts === null ? true : accounts.length > 0;
+  const environmentReady = snapshot !== null && cliReady && hasSavedAccounts;
 
   useEffect(() => {
     const controller = new AbortController();
-    void loadSessions();
-    void refreshForwards(controller.signal).catch(() => {});
-    void refreshRearmDuration(controller.signal).catch(() => {});
-    void refreshOverviewHints().catch(() => {});
+    void ensureRearmDuration(controller.signal).catch(() => {});
     return () => {
       controller.abort();
     };
-  }, [loadSessions]);
-
-  useEffect(() => {
-    return webStore.subscribeForwards((event) => {
-      applyForwardEvent(event);
-    });
   }, []);
 
-  const tunnelAddressSignature = useMemo(() => {
-    const tunnels = snapshot?.tunnels ?? [];
-    return tunnels
-      .map((item) => `${item.id}:${item.spec.bind}:${item.spec.local_port}:${item.spec.remote_port}`)
-      .join(",");
-  }, [snapshot?.tunnels]);
+  // Only list runtimes on mount when the live snapshot does not already hold them.
+  const needsInitialSessions =
+    environmentReady &&
+    snapshot !== null &&
+    snapshot.runtimes === null &&
+    snapshot.runtimes_error === null;
+
+  useEffect(() => {
+    if (needsInitialSessions) {
+      void appDataStore.ensureSessions().catch(() => {});
+    }
+  }, [needsInitialSessions]);
 
   useEffect(() => {
     if (!snapshot) {
       return;
-    }
-    void refreshForwards().catch(() => {});
-  }, [tunnelAddressSignature, Boolean(snapshot)]);
-
-  useEffect(() => {
-    if (!snapshot) {
-      return;
-    }
-    if (snapshot.runtimes && snapshot.runtimes.errors.length === 0) {
-      setAccountErrorsOverride(null);
     }
     observeSnapshotTransitions(prevSnapshotRef.current, snapshot, locale, t, pushToast);
     prevSnapshotRef.current = snapshot;
   }, [snapshot, localState.reconcileSeq, locale, t, pushToast]);
-
-  const accounts = snapshot?.accounts?.accounts ?? null;
-  const cliReady =
-    localState.cliInstalled !== null
-      ? localState.cliInstalled
-      : snapshot?.accounts_error !== "not_installed";
-  const hasSavedAccounts = accounts === null ? true : accounts.length > 0;
-  const environmentReady = snapshot !== null && cliReady && hasSavedAccounts;
 
   const runtimesView = snapshot?.runtimes ?? null;
   const runtimesError = snapshot?.runtimes_error ?? null;
@@ -304,13 +274,16 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
       });
       return;
     }
-    const ctx = snapshot?.account ?? { revision: 0, active: null };
+    if (!snapshot) {
+      return;
+    }
+    const ctx = snapshot.account;
     setNewSessionDialog({
       id: dialogSeqRef.current,
       mode: "create",
       accountContext: { revision: ctx.revision, active: ctx.active },
     });
-  }, [activeProvisionOp, trackedProvision, snapshot?.account]);
+  }, [activeProvisionOp, trackedProvision, snapshot]);
 
   const handleDialogTrackingOperation = useCallback((operationId: number | null) => {
     dialogTrackingOpIdRef.current = operationId;
@@ -318,7 +291,10 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
 
   const openAutoStopModal = useCallback(
     (runtime: Runtime, mode: AutoStopDialogMode) => {
-      const ctx = snapshot?.account ?? { revision: 0, active: null };
+      if (!snapshot) {
+        return;
+      }
+      const ctx = snapshot.account;
       dialogSeqRef.current += 1;
       setAutoStopDialog({
         id: dialogSeqRef.current,
@@ -328,26 +304,26 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
         defaultSeconds: localState.rearmDurationSecs,
       });
     },
-    [snapshot?.account, localState.rearmDurationSecs],
+    [snapshot, localState.rearmDurationSecs],
   );
 
   const openForwardModal = useCallback(
     (runtime: Runtime) => {
-      if (!runtime.on_active_account || !runtime.id.name) {
+      if (!snapshot || !runtime.on_active_account || !runtime.id.name) {
         return;
       }
-      const ctx = snapshot?.account ?? { revision: 0, active: null };
+      const ctx = snapshot.account;
       dialogSeqRef.current += 1;
       setForwardDialog({
         id: dialogSeqRef.current,
         runtime,
         accountContext: { revision: ctx.revision, active: ctx.active },
       });
-      if (localState.forwardPolicy === null) {
-        void refreshOverviewHints().catch(() => {});
+      if (appData.overview === null) {
+        void appDataStore.ensureOverview().catch(() => {});
       }
     },
-    [snapshot?.account, localState.forwardPolicy],
+    [snapshot, appData.overview],
   );
 
   const handleExtendAutoStop = useCallback(
@@ -370,11 +346,11 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
   }, [navigate]);
 
   const handleRetryForwardPolicy = useCallback(() => {
-    void refreshOverviewHints().catch(() => {});
+    void appDataStore.refreshOverview().catch(() => {});
   }, []);
 
   const handleForwardChanged = useCallback(() => {
-    void refreshForwards().catch(() => {});
+    void forwardsStore.refresh().catch(() => {});
     void webStore.refreshSnapshot().catch(() => {});
   }, []);
 
@@ -382,12 +358,14 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
     if (!forwardDialog || !snapshot) {
       return [];
     }
-    return selectForwardsForRuntime(forwardDialog.runtime, localState, snapshot);
-  }, [forwardDialog, localState, snapshot]);
+    return selectRuntimeForwards(forwardDialog.runtime, forwardsState, snapshot);
+  }, [forwardDialog, forwardsState, snapshot]);
 
-  const handleAutoStopCompleted = useCallback(() => {
-    void loadSessions();
-  }, [loadSessions]);
+  // Single-stop, auto-stop, and stop-all already publish updated runtimes into the
+  // backend Snapshot; converge via `/api/snapshot` instead of re-listing `/api/sessions`.
+  const handleRuntimeMutationCompleted = useCallback(() => {
+    void webStore.refreshSnapshot().catch(() => {});
+  }, []);
 
   const findAccountEmail = (accountId: string): string => {
     const matched = accounts?.find((item) => item.id === accountId) ?? null;
@@ -637,9 +615,9 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
                                   key={key}
                                   runtime={runtime}
                                   guardDecision={guardDecisionMap.get(key) ?? null}
-                                  forwards={selectForwardsForRuntime(
+                                  forwards={selectRuntimeForwards(
                                     runtime,
-                                    localState,
+                                    forwardsState,
                                     snapshot,
                                   )}
                                   rearmDurationSecs={localState.rearmDurationSecs}
@@ -683,15 +661,15 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
         t={t}
         pushToast={pushToast}
         onClose={() => setAutoStopDialog(null)}
-        onCompleted={handleAutoStopCompleted}
+        onCompleted={handleRuntimeMutationCompleted}
       />
 
       <ForwardDialog
         request={forwardDialog}
         currentAccountContext={snapshot?.account ?? null}
-        forwardPolicy={localState.forwardPolicy}
-        forwardPolicyLoading={localState.forwardPolicyLoading}
-        forwardPolicyError={localState.forwardPolicyError}
+        forwardPolicy={appData.overview?.forward_policy ?? null}
+        forwardPolicyLoading={appData.overviewLoading}
+        forwardPolicyError={appData.overviewError}
         existingForwards={forwardDialogForwards}
         t={t}
         pushToast={pushToast}
@@ -705,7 +683,7 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
         t={t}
         pushToast={pushToast}
         onClose={() => setStopRuntimeDialog(null)}
-        onStopped={handleAutoStopCompleted}
+        onStopped={handleRuntimeMutationCompleted}
       />
 
       <NewSessionDialog
@@ -728,7 +706,7 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
         t={t}
         pushToast={pushToast}
         onClose={() => setStopAllDialogId(null)}
-        onCompleted={handleAutoStopCompleted}
+        onCompleted={handleRuntimeMutationCompleted}
       />
     </>
   );

@@ -9,6 +9,7 @@ import { useEffect, useId, useRef, useState, type FormEvent, type SyntheticEvent
 
 import { AlertIcon, CheckCircleIcon } from "../../components/Icons.tsx";
 import { apiClient, ApiError } from "../../lib/api.ts";
+import { serverClock } from "../../lib/clock.ts";
 import { CORE_DEFAULTS } from "../../lib/constants.ts";
 import { resolveActiveAccount } from "../../lib/format.ts";
 import type { TranslateFn } from "../../lib/i18n.ts";
@@ -187,6 +188,9 @@ export function NewSessionDialog({
 
     void Promise.all([templatePromise, settingsPromise]).then(
       ([template, resolvedMaxConcurrent]) => {
+        if (typeof template.sampled_at === "number") {
+          serverClock.sync(template.sampled_at);
+        }
         if (
           signal.aborted ||
           apiClient.getSessionGeneration() !== gen ||

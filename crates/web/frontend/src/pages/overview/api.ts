@@ -11,65 +11,29 @@ import type {
   AccountsView,
   AccountUsageView,
   ApiErrorPayload,
-  ErrorKind,
+  ForwardPolicyView,
+  InstallMethod,
+  OverviewResponse,
   PendingOperation,
+  ProbeReport,
   Snapshot,
+  UnmanagedRuntimes,
 } from "../../lib/types.ts";
 import {
   buildAccountRows,
   buildUnmanagedWarning,
   formatApiError,
   type FormattedApiError,
-  type HostCheck,
-  type KeyringCheck,
   type UnmanagedWarningView,
 } from "../accounts/model.ts";
 
-export type InstallMethod = "uv" | "install_uv_then_cli" | "pip_user";
-
-export interface ProbeReport {
-  readonly wsl_installed: boolean;
-  readonly wsl_distros: readonly string[];
-  readonly bash: string | null;
-  readonly ssh: string | null;
-  readonly ssh_keygen: string | null;
-  readonly git: string | null;
-  readonly uv: string | null;
-  readonly python3: string | null;
-  readonly colab: string | null;
-  readonly colab_version: string | null;
-  readonly helper_python: string | null;
-  readonly keyring_ok: boolean;
-  readonly ssh_key_present: boolean;
-  readonly home: string | null;
-  readonly errors: readonly string[];
-}
-
-export interface ForwardPolicyView {
-  readonly all_interfaces_allowed: boolean;
-  readonly restriction: string | null;
-}
-
-export interface UnmanagedRuntimes {
-  readonly count: number | null;
-  readonly incomplete: boolean;
-  readonly unverified_accounts: readonly AccountId[];
-  readonly warning_key: string | null;
-}
-
-export interface OverviewResponse {
-  readonly environment: ProbeReport;
-  readonly host: HostCheck;
-  readonly forward_policy: ForwardPolicyView;
-  readonly cli_installed: boolean;
-  readonly helper_available: boolean;
-  readonly keyring: KeyringCheck;
-  readonly accounts: AccountsView | null;
-  readonly accounts_error: ErrorKind | null;
-  readonly usage: readonly AccountUsageView[];
-  readonly unmanaged_runtimes: UnmanagedRuntimes;
-  readonly install_methods: readonly InstallMethod[];
-}
+export type {
+  ForwardPolicyView,
+  InstallMethod,
+  OverviewResponse,
+  ProbeReport,
+  UnmanagedRuntimes,
+};
 
 export interface InstallLine {
   readonly stream: "stdout" | "stderr";
@@ -183,14 +147,6 @@ function parseInstallFrame(frame: SseFrame, callbacks: InstallStreamCallbacks): 
  */
 export function stripAnsi(text: string): string {
   return text.replace(ANSI_ESCAPE_RE, "");
-}
-
-/** Fetches the full environment probe, readiness checks, and overview snapshot. */
-export function fetchOverview(signal?: AbortSignal): Promise<OverviewResponse> {
-  return apiClient.request<OverviewResponse>("/api/overview", {
-    method: "GET",
-    signal,
-  });
 }
 
 /** Starts a streaming Colab CLI install via `POST /api/overview/cli/install`. */

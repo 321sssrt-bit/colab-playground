@@ -7,22 +7,16 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { ApiError } from "../lib/api.ts";
+import {
+  appDataStore,
+  isAccountChangeBlocked,
+  resolveEffectiveOverview,
+  useAppDataStore,
+} from "../lib/appCache.ts";
 import { useUsageClockSecs } from "../lib/format.ts";
 import { webStore } from "../lib/store.ts";
-import {
-  adoptActiveAccount,
-  formatApiError,
-  isAccountChangeBlocked,
-  refreshAccountsUsage,
-  type FormattedApiError,
-} from "./accounts/model.ts";
-import {
-  deriveChecklist,
-  fetchOverview,
-  findRunningInstallOp,
-  type OverviewResponse,
-} from "./overview/api.ts";
+import { formatApiError } from "./accounts/model.ts";
+import { deriveChecklist, findRunningInstallOp } from "./overview/api.ts";
 import { ChecklistCard } from "./overview/ChecklistCard.tsx";
 import { QuickDeploySection } from "./overview/QuickDeploySection.tsx";
 import { SummaryCard } from "./overview/SummaryCard.tsx";
@@ -33,174 +27,61 @@ import type { PageProps } from "./types.ts";
 
 export function OverviewPage({ snapshot, locale, t, navigate, pushToast }: PageProps) {
   const nowSecs = useUsageClockSecs();
+  const appData = useAppDataStore();
 
-  const [overview, setOverview] = useState<OverviewResponse | null>(null);
   const [plugins, setPlugins] = useState<readonly PluginInfo[]>([]);
-  const [probing, setProbing] = useState(true);
-  const [probeError, setProbeError] = useState<FormattedApiError | null>(null);
-  const [refreshingUsage, setRefreshingUsage] = useState(false);
-  const [usageRefreshError, setUsageRefreshError] = useState<FormattedApiError | null>(null);
-  const [adopting, setAdopting] = useState(false);
-  const [adoptError, setAdoptError] = useState<FormattedApiError | null>(null);
 
-  const probeSeqRef = useRef(0);
   const pluginsSeqRef = useRef(0);
   const mountedRef = useRef(true);
-  const activeProbeControllerRef = useRef<AbortController | null>(null);
   const activePluginsControllerRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
-      activeProbeControllerRef.current?.abort();
-      activeProbeControllerRef.current = null;
       activePluginsControllerRef.current?.abort();
       activePluginsControllerRef.current = null;
     };
   }, []);
 
-  const loadOverview = useCallback(
-    async (signal?: AbortSignal) => {
-      activeProbeControllerRef.current?.abort();
-      const controller = new AbortController();
-      activeProbeControllerRef.current = controller;
-
-      const onExternalAbort = () => controller.abort();
-      if (signal) {
-        if (signal.aborted) {
-          controller.abort();
-        } else {
-          signal.addEventListener("abort", onExternalAbort, { once: true });
-        }
-      }
-
-      const seq = ++probeSeqRef.current;
-      setProbing(true);
-      setProbeError(null);
-      try {
-        const data = await fetchOverview(controller.signal);
-        if (!mountedRef.current || seq !== probeSeqRef.current) {
-          return;
-        }
-        setOverview(data);
-        setProbeError(null);
-      } catch (error) {
-        if (!mountedRef.current || seq !== probeSeqRef.current) {
-          return;
-        }
-        if (error instanceof ApiError && error.isAbort) {
-          return;
-        }
-        setProbeError(formatApiError(error, t));
-      } finally {
-        signal?.removeEventListener("abort", onExternalAbort);
-        if (activeProbeControllerRef.current === controller) {
-          activeProbeControllerRef.current = null;
-        }
-        if (mountedRef.current && seq === probeSeqRef.current) {
-          setProbing(false);
-        }
-      }
-    },
-    [t],
-  );
-
-  // Re-probe when account revision, saved account membership, or account error changes
-  // so Overview converges after sign-in, account switching, or keyring recovery.
-  const accountSyncKey =
-    snapshot === null
-      ? "none"
-      : [
-          snapshot.account.revision,
-          snapshot.account.active ?? "",
-          snapshot.accounts?.accounts.length ?? -1,
-          snapshot.accounts?.unadopted ? "1" : "0",
-          snapshot.accounts_error ?? "",
-        ].join(":");
-
+  // Ensure the host probe runs once per session; cached results survive route switches
+  // and live SSE snapshots update accounts, usage, and keyring state without re-probing.
   useEffect(() => {
-    const controller = new AbortController();
-    void loadOverview(controller.signal);
-    return () => {
-      controller.abort();
-    };
-  }, [accountSyncKey, loadOverview]);
+    void appDataStore.ensureOverview().catch(() => {});
+  }, []);
 
   const handleCheckAgain = useCallback(async () => {
-    await loadOverview();
-    if (!mountedRef.current) {
-      return;
+    try {
+      await appDataStore.refreshOverview();
+    } catch {
+      // Failure state is captured in `appDataStore.overviewError`.
     }
     try {
       await webStore.refreshSnapshot();
     } catch {
       // SSE reconnect banner surfaces transport failures.
     }
-  }, [loadOverview]);
+  }, []);
 
   const handleInstallSucceeded = useCallback(async () => {
     await handleCheckAgain();
   }, [handleCheckAgain]);
 
   const handleRefreshUsage = useCallback(async () => {
-    if (refreshingUsage) {
-      return;
-    }
-    setRefreshingUsage(true);
-    setUsageRefreshError(null);
     try {
-      await refreshAccountsUsage();
-      if (!mountedRef.current) {
-        return;
-      }
-      try {
-        await webStore.refreshSnapshot();
-      } catch {
-        // SSE stream will converge the updated snapshot.
-      }
-      await loadOverview();
-    } catch (error) {
-      if (!mountedRef.current) {
-        return;
-      }
-      setUsageRefreshError(formatApiError(error, t));
-    } finally {
-      if (mountedRef.current) {
-        setRefreshingUsage(false);
-      }
+      await appDataStore.refreshUsage();
+    } catch {
+      // Failure state is captured in `appDataStore.usageRefreshError`.
     }
-  }, [loadOverview, refreshingUsage, t]);
+  }, []);
 
   const handleAdoptAccount = useCallback(async () => {
-    if (adopting) {
-      return;
-    }
-    const accountContext = snapshot?.account ?? {
-      revision: 0,
-      active: overview?.accounts?.active ?? null,
-    };
-    setAdopting(true);
-    setAdoptError(null);
     try {
-      const adopted = await adoptActiveAccount(accountContext);
-      if (!mountedRef.current) {
-        return;
-      }
-      const email = adopted.email ?? t("app.accounts.no_email");
-      pushToast({ tone: "success", body: t("app.adopt.done", { email }) });
-      await handleCheckAgain();
-    } catch (error) {
-      if (!mountedRef.current) {
-        return;
-      }
-      setAdoptError(formatApiError(error, t));
-    } finally {
-      if (mountedRef.current) {
-        setAdopting(false);
-      }
+      await appDataStore.adoptAccount();
+    } catch {
+      // Failure state is captured in `appDataStore.adoptError`.
     }
-  }, [adopting, handleCheckAgain, overview, pushToast, snapshot, t]);
+  }, []);
 
   const loadPlugins = useCallback(async (signal: AbortSignal) => {
     activePluginsControllerRef.current?.abort();
@@ -238,6 +119,27 @@ export function OverviewPage({ snapshot, locale, t, navigate, pushToast }: PageP
     },
     [navigate],
   );
+
+  const overview = useMemo(
+    () => resolveEffectiveOverview(appData.overview, snapshot),
+    [appData.overview, snapshot],
+  );
+  const probeError = useMemo(
+    () => (appData.overviewError !== null ? formatApiError(appData.overviewError, t) : null),
+    [appData.overviewError, t],
+  );
+  const usageRefreshError = useMemo(
+    () =>
+      appData.usageRefreshError !== null ? formatApiError(appData.usageRefreshError, t) : null,
+    [appData.usageRefreshError, t],
+  );
+  const adoptError = useMemo(
+    () => (appData.adoptError !== null ? formatApiError(appData.adoptError, t) : null),
+    [appData.adoptError, t],
+  );
+  const probing = appData.overviewLoading || (overview === null && probeError === null);
+  const refreshingUsage = appData.refreshingUsage;
+  const adopting = appData.adopting;
 
   const runningInstallOp = useMemo(() => findRunningInstallOp(snapshot), [snapshot]);
   const checklist = useMemo(
