@@ -1,6 +1,6 @@
 use std::{
     collections::{HashSet, VecDeque},
-    path::{Component, Path},
+    path::{Component, Path, PathBuf},
     sync::mpsc,
 };
 
@@ -8,25 +8,48 @@ use colab_playground_core::{
     accounts::nonce,
     backend::RunTarget,
     plugins::{
-        InputKind, InputValue, Manifest, PluginInfo, PluginOrigin, PluginPreview, discard_preview,
-        resolve_endpoints, resolve_inputs, validate_git_url,
+        Capability, InputKind, InputValue, Manifest, PluginInfo, PluginOrigin, PluginPreview,
+        discard_preview, resolve_endpoints, resolve_inputs, validate_git_url,
     },
     provision::ProvisionEvent,
+    quant::GgufListing,
     vm::RunStatus,
 };
 use serde_json::Value;
 
 use super::*;
 
+/// Matches the desktop run log retention (`crates/app/src/state/runs.rs`).
+pub const RUN_LOG_LINES_KEPT: usize = 2_000;
 const PREVIEW_LIMIT: usize = 16;
 const FINISHED_RUN_LIMIT: usize = 8;
-const EVENT_LIMIT: usize = 256;
-const EVENT_BYTES: usize = 256 * 1024;
+const GGUF_CACHE_LIMIT: usize = 32;
+const REPLAY_LOG_CHUNK: usize = 256;
+// Reserve room above `RUN_LOG_LINES_KEPT` so lifecycle events do not evict kept log lines.
+const EVENT_LIMIT: usize = RUN_LOG_LINES_KEPT + 512;
+const EVENT_BYTES: usize = 4 * 1024 * 1024;
+const INSPECT_PLUGIN_OP: &str = "inspect_plugin";
 
 #[derive(Default)]
 pub(super) struct Plugins {
     previews: Mutex<VecDeque<(String, StagedPreview)>>,
     runs: Mutex<BTreeMap<u64, Arc<PluginRun>>>,
+    gguf_cache: Mutex<GgufCache>,
+}
+
+#[derive(Default)]
+struct GgufCache {
+    generation: u64,
+    next_seq: u64,
+    entries: VecDeque<(String, GgufListing)>,
+    inflight: BTreeMap<String, Arc<InflightGguf>>,
+    latest_seq: BTreeMap<String, u64>,
+}
+
+struct InflightGguf {
+    generation: u64,
+    seq: u64,
+    result: watch::Sender<Option<Result<GgufListing>>>,
 }
 
 struct StagedPreview(PluginPreview);
@@ -41,6 +64,26 @@ pub struct Preview {
 impl Drop for StagedPreview {
     fn drop(&mut self) {
         discard_preview(&self.0);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunPhase {
+    #[default]
+    Running,
+    Ready,
+    Failed,
+    Cancelled,
+}
+
+impl RunPhase {
+    pub fn from_error(error: Option<&Error>) -> Self {
+        match error.map(|error| error.kind) {
+            None => Self::Ready,
+            Some(ErrorKind::Cancelled) => Self::Cancelled,
+            Some(_) => Self::Failed,
+        }
     }
 }
 
@@ -77,7 +120,8 @@ pub struct RunSummary {
     pub id: u64,
     #[serde(flatten)]
     metadata: RunMetadata,
-    finished: bool,
+    pub finished: bool,
+    pub phase: RunPhase,
 }
 
 pub struct PluginRun {
@@ -86,13 +130,27 @@ pub struct PluginRun {
     changes: watch::Sender<()>,
 }
 
+struct JournalEntry {
+    event: RunEvent,
+    bytes: usize,
+    log_lines: usize,
+    log_end: usize,
+}
+
 #[derive(Default)]
 struct Journal {
     first: usize,
+    // Tracks an in-place trimmed front log batch so reconnects still emit `history_skipped`.
+    trimmed_front: Option<usize>,
     bytes: usize,
-    entries: VecDeque<(RunEvent, usize)>,
+    entries_log_lines: usize,
+    total_log_lines: usize,
+    // Retains the exact newest `RUN_LOG_LINES_KEPT` lines even if `entries` rolls over on
+    // byte or non-log event caps, matching desktop `RunLog`.
+    log_tail: VecDeque<String>,
+    entries: VecDeque<JournalEntry>,
     checkpoints: BTreeMap<&'static str, (usize, RunEvent)>,
-    finished: bool,
+    phase: RunPhase,
 }
 
 impl PluginRun {
@@ -106,7 +164,9 @@ impl PluginRun {
 
     fn push(&self, event: RunEvent, size: usize) {
         let mut journal = lock(&self.journal);
-        journal.finished = matches!(event, RunEvent::Finished { .. });
+        if let RunEvent::Finished { error, .. } = &event {
+            journal.phase = RunPhase::from_error(error.as_ref());
+        }
         if let RunEvent::Progress {
             kind: kind @ ("provision" | "launched" | "status"),
             ..
@@ -115,20 +175,56 @@ impl PluginRun {
             let index = journal.first + journal.entries.len();
             journal.checkpoints.insert(kind, (index, event.clone()));
         }
-        journal.entries.push_back((event, size));
+        let log_lines = push_log_tail(&mut journal.log_tail, &event);
+        journal.total_log_lines += log_lines;
+        let log_end = journal.total_log_lines;
+        journal.entries.push_back(JournalEntry {
+            event,
+            bytes: size,
+            log_lines,
+            log_end,
+        });
         journal.bytes += size;
+        journal.entries_log_lines += log_lines;
+
+        while journal.entries_log_lines > RUN_LOG_LINES_KEPT {
+            let excess = journal.entries_log_lines - RUN_LOG_LINES_KEPT;
+            let pop_whole = journal.entries.len() > 1
+                && journal
+                    .entries
+                    .front()
+                    .is_some_and(|front| front.log_lines <= excess);
+            if pop_whole {
+                pop_front(&mut journal);
+            } else if let Some(front) = journal.entries.front_mut() {
+                let old_bytes = front.bytes;
+                let removed = trim_log_entry(front, excess);
+                if removed == 0 {
+                    break;
+                }
+                let new_bytes = front.bytes;
+                journal.bytes = journal.bytes - old_bytes + new_bytes;
+                journal.entries_log_lines -= removed;
+                journal.trimmed_front = Some(journal.first);
+            } else {
+                break;
+            }
+        }
+
         while journal.entries.len() > EVENT_LIMIT
             || (journal.entries.len() > 1 && journal.bytes > EVENT_BYTES)
         {
-            let (_, size) = journal.entries.pop_front().expect("journal entry");
-            journal.first += 1;
-            journal.bytes -= size;
+            pop_front(&mut journal);
         }
         self.changes.send_replace(());
     }
 
+    pub fn phase(&self) -> RunPhase {
+        lock(&self.journal).phase
+    }
+
     fn is_finished(&self) -> bool {
-        lock(&self.journal).finished
+        self.phase() != RunPhase::Running
     }
 
     pub fn metadata(&self) -> &RunMetadata {
@@ -140,6 +236,8 @@ impl PluginRun {
             run: self.clone(),
             changes: self.changes.subscribe(),
             next: 0,
+            delivered_log_lines: 0,
+            trimmed_reported: None,
             recovery: VecDeque::new(),
         }
     }
@@ -149,6 +247,8 @@ pub struct RunEvents {
     run: Arc<PluginRun>,
     changes: watch::Receiver<()>,
     next: usize,
+    delivered_log_lines: usize,
+    trimmed_reported: Option<usize>,
     recovery: VecDeque<RunEvent>,
 }
 
@@ -170,17 +270,55 @@ impl RunEvents {
                     checkpoints.sort_by_key(|(index, _)| *index);
                     self.recovery
                         .extend(checkpoints.into_iter().map(|(_, event)| event.clone()));
+
+                    let log_tail_start = journal.total_log_lines - journal.log_tail.len();
+                    let entries_log_start = journal.total_log_lines - journal.entries_log_lines;
+                    let recover_from = self.delivered_log_lines.max(log_tail_start);
+                    if recover_from < entries_log_start {
+                        let start = recover_from - log_tail_start;
+                        let end = entries_log_start - log_tail_start;
+                        let missing: Vec<&str> = journal
+                            .log_tail
+                            .range(start..end)
+                            .map(String::as_str)
+                            .collect();
+                        for chunk in missing.chunks(REPLAY_LOG_CHUNK) {
+                            self.recovery.push_back(RunEvent::Progress {
+                                kind: "log",
+                                data: serde_json::json!({
+                                    "event": "log",
+                                    "lines": chunk,
+                                }),
+                            });
+                        }
+                    }
+                    self.delivered_log_lines = self.delivered_log_lines.max(entries_log_start);
                     self.next = journal.first;
+                    if journal.trimmed_front == Some(journal.first) {
+                        self.trimmed_reported = Some(journal.first);
+                    }
                     return Some(RunEvent::Progress {
                         kind: "history_skipped",
                         data: Value::Null,
                     });
                 }
-                if let Some((event, _)) = journal.entries.get(self.next - journal.first) {
-                    self.next += 1;
-                    return Some(event.clone());
+                if journal.trimmed_front == Some(self.next)
+                    && self.trimmed_reported != Some(self.next)
+                {
+                    self.trimmed_reported = Some(self.next);
+                    return Some(RunEvent::Progress {
+                        kind: "history_skipped",
+                        data: Value::Null,
+                    });
                 }
-                if journal.finished {
+                if let Some(entry) = journal.entries.get(self.next - journal.first) {
+                    self.next += 1;
+                    if entry.log_lines > 0 {
+                        self.delivered_log_lines = self.delivered_log_lines.max(entry.log_end);
+                    }
+                    return Some(entry.event.clone());
+                }
+                if journal.phase != RunPhase::Running {
                     return None;
                 }
             }
@@ -189,49 +327,275 @@ impl RunEvents {
     }
 }
 
-impl WebState {
-    pub async fn preview_plugin(&self, origin: PluginOrigin) -> Result<Preview> {
-        let state = self.clone();
-        self.run_backend(move |backend, cancel| {
-            let preview = match origin {
-                PluginOrigin::Folder { path } => {
-                    let path = Path::new(path.trim());
-                    if path.as_os_str().is_empty()
-                        || path.components().any(|part| part == Component::ParentDir)
-                    {
-                        return Err(Error::invalid("path", "expected a plugin directory"));
-                    }
-                    backend.inspect_plugin_folder(path)?
-                }
-                PluginOrigin::Git { url } => {
-                    let url = url.trim();
-                    validate_git_url(url).map_err(safe_git_error)?;
-                    backend
-                        .inspect_plugin_git(url, cancel)
-                        .map_err(safe_git_error)?
-                }
-            };
-            let staged = StagedPreview(preview);
-            cancel.check()?;
-            let id = nonce();
-            let mut previews = lock(&state.0.plugins.previews);
-            if previews.len() == PREVIEW_LIMIT {
-                previews.pop_front();
+enum ValidatedOrigin {
+    Folder(PathBuf),
+    Git(String),
+}
+
+fn validate_preview_origin(origin: PluginOrigin) -> Result<ValidatedOrigin> {
+    match origin {
+        PluginOrigin::Folder { path } => {
+            let path = Path::new(path.trim());
+            if path.as_os_str().is_empty()
+                || path.components().any(|part| part == Component::ParentDir)
+            {
+                return Err(Error::invalid("path", "expected a plugin directory"));
             }
-            let preview = Preview {
-                id: id.clone(),
-                manifest: staged.0.manifest.clone(),
-                script_bytes: staged.0.script_bytes,
-                replaces_version: backend
+            Ok(ValidatedOrigin::Folder(path.to_path_buf()))
+        }
+        PluginOrigin::Git { url } => {
+            let url = url.trim();
+            validate_git_url(url).map_err(safe_git_error)?;
+            Ok(ValidatedOrigin::Git(url.to_owned()))
+        }
+    }
+}
+
+struct CancelOperationOnDrop {
+    state: WebState,
+    id: u64,
+    armed: bool,
+}
+
+impl CancelOperationOnDrop {
+    fn new(state: WebState, id: u64) -> Self {
+        Self {
+            state,
+            id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancelOperationOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.state.cancel(self.id);
+        }
+    }
+}
+
+impl WebState {
+    pub fn start_plugin_preview(&self, origin: PluginOrigin) -> Result<Submission<Preview>> {
+        let origin = validate_preview_origin(origin)?;
+        let state = self.clone();
+        self.start_operation(
+            INSPECT_PLUGIN_OP,
+            String::new(),
+            Access::Independent,
+            move |backend, cancel| {
+                let preview = match origin {
+                    ValidatedOrigin::Folder(path) => backend.inspect_plugin_folder(&path)?,
+                    ValidatedOrigin::Git(url) => backend
+                        .inspect_plugin_git(&url, cancel)
+                        .map_err(safe_git_error)?,
+                };
+                let staged = StagedPreview(preview);
+                let mut previews = lock(&state.0.plugins.previews);
+                let replaces_version = backend
                     .plugins()
                     .into_iter()
                     .find(|p| p.manifest.id == staged.0.manifest.id)
-                    .map(|p| p.manifest.version),
-            };
-            previews.push_back((id, staged));
-            Ok(preview)
-        })
-        .await
+                    .map(|p| p.manifest.version);
+                cancel.commit()?;
+                if previews.len() == PREVIEW_LIMIT {
+                    previews.pop_front();
+                }
+                let id = nonce();
+                let preview = Preview {
+                    id: id.clone(),
+                    manifest: staged.0.manifest.clone(),
+                    script_bytes: staged.0.script_bytes,
+                    replaces_version,
+                };
+                previews.push_back((id, staged));
+                Ok(preview)
+            },
+        )
+    }
+
+    pub async fn finish_plugin_preview(
+        &self,
+        id: u64,
+        job: JoinHandle<Result<Preview>>,
+    ) -> Result<Preview> {
+        let mut guard = CancelOperationOnDrop::new(self.clone(), id);
+        let result = job.await.map_err(|_| Error::new(ErrorKind::Other))?;
+        guard.disarm();
+        result
+    }
+
+    pub async fn preview_plugin(&self, origin: PluginOrigin) -> Result<Preview> {
+        match self.start_plugin_preview(origin)? {
+            Submission::Started { id, job } => self.finish_plugin_preview(id, job).await,
+            Submission::AlreadyRunning { .. } => Err(Error::new(ErrorKind::Busy)),
+        }
+    }
+
+    pub fn cancel_plugin_preview(&self) -> bool {
+        let snapshot = self.snapshot();
+        let Some(operation) = snapshot.operations.iter().find(|op| {
+            matches!(
+                &op.operation,
+                Operation::Domain {
+                    name: INSPECT_PLUGIN_OP,
+                    ..
+                }
+            )
+        }) else {
+            return false;
+        };
+        self.cancel(operation.id) || operation.cancelling
+    }
+
+    pub async fn hf_gguf_listing(&self, repo: String, refresh: bool) -> Result<GgufListing> {
+        let repo = repo.trim().to_owned();
+        let (mut rx, start) = {
+            let mut cache = lock(&self.0.plugins.gguf_cache);
+            if !refresh {
+                if let Some(index) = cache.entries.iter().position(|(key, _)| key == &repo) {
+                    let entry = cache.entries.remove(index).expect("cached gguf listing");
+                    let listing = entry.1.clone();
+                    cache.entries.push_back(entry);
+                    return Ok(listing);
+                }
+                if let Some(inflight) = cache.inflight.get(&repo)
+                    && inflight.generation == cache.generation
+                {
+                    (inflight.result.subscribe(), None)
+                } else {
+                    cache.next_seq += 1;
+                    let seq = cache.next_seq;
+                    let inflight = Arc::new(InflightGguf {
+                        generation: cache.generation,
+                        seq,
+                        result: watch::channel(None).0,
+                    });
+                    let rx = inflight.result.subscribe();
+                    cache.latest_seq.insert(repo.clone(), seq);
+                    cache.inflight.insert(repo.clone(), inflight.clone());
+                    (rx, Some(inflight))
+                }
+            } else {
+                cache.next_seq += 1;
+                let seq = cache.next_seq;
+                let inflight = Arc::new(InflightGguf {
+                    generation: cache.generation,
+                    seq,
+                    result: watch::channel(None).0,
+                });
+                let rx = inflight.result.subscribe();
+                cache.latest_seq.insert(repo.clone(), seq);
+                cache.inflight.insert(repo.clone(), inflight.clone());
+                (rx, Some(inflight))
+            }
+        };
+
+        if let Some(flight) = start {
+            // Detached so aborting one HTTP requester lets concurrent waiters reuse the fetch.
+            let state = self.clone();
+            let generation = flight.generation;
+            let seq = flight.seq;
+            tokio::spawn(async move {
+                let lookup_repo = repo.clone();
+                let result = state
+                    .run_backend(move |backend, cancel| backend.hf_files(&lookup_repo, cancel))
+                    .await;
+                {
+                    let mut cache = lock(&state.0.plugins.gguf_cache);
+                    if cache
+                        .inflight
+                        .get(&repo)
+                        .is_some_and(|current| Arc::ptr_eq(current, &flight))
+                    {
+                        cache.inflight.remove(&repo);
+                    }
+                    if cache.generation == generation && cache.latest_seq.get(&repo) == Some(&seq) {
+                        match &result {
+                            Ok(listing) => {
+                                if let Some(index) =
+                                    cache.entries.iter().position(|(key, _)| key == &repo)
+                                {
+                                    cache.entries.remove(index);
+                                } else if cache.entries.len() == GGUF_CACHE_LIMIT
+                                    && let Some((evicted, _)) = cache.entries.pop_front()
+                                    && !cache.inflight.contains_key(&evicted)
+                                {
+                                    cache.latest_seq.remove(&evicted);
+                                }
+                                cache.entries.push_back((repo, listing.clone()));
+                            }
+                            Err(_) => {
+                                if refresh
+                                    && let Some(index) =
+                                        cache.entries.iter().position(|(key, _)| key == &repo)
+                                {
+                                    cache.entries.remove(index);
+                                }
+                                if !cache.entries.iter().any(|(key, _)| key == &repo) {
+                                    cache.latest_seq.remove(&repo);
+                                }
+                            }
+                        }
+                    }
+                }
+                let _ = flight.result.send(Some(result));
+            });
+        }
+
+        let outcome = rx
+            .wait_for(Option::is_some)
+            .await
+            .map_err(|_| Error::new(ErrorKind::Other))?;
+        outcome
+            .clone()
+            .unwrap_or_else(|| Err(Error::new(ErrorKind::Other)))
+    }
+
+    pub fn save_hf_token(&self, token: String) -> Result<Submission<()>> {
+        let token = token.trim().to_owned();
+        if token.is_empty() {
+            return Err(Error::invalid("token", "empty token"));
+        }
+        let state = self.clone();
+        self.start_operation(
+            "hf_token",
+            String::new(),
+            Access::Independent,
+            move |backend, cancel| {
+                cancel.commit()?;
+                backend.set_secret(Capability::HfToken.secret_name(), &token, cancel)?;
+                state.clear_gguf_cache();
+                Ok(())
+            },
+        )
+    }
+
+    pub fn delete_hf_token(&self) -> Result<Submission<()>> {
+        let state = self.clone();
+        self.start_operation(
+            "hf_token",
+            String::new(),
+            Access::Independent,
+            move |backend, cancel| {
+                cancel.commit()?;
+                backend.delete_secret(Capability::HfToken.secret_name(), cancel)?;
+                state.clear_gguf_cache();
+                Ok(())
+            },
+        )
+    }
+
+    pub fn clear_gguf_cache(&self) {
+        let mut cache = lock(&self.0.plugins.gguf_cache);
+        cache.generation += 1;
+        cache.entries.clear();
+        cache.inflight.clear();
+        cache.latest_seq.clear();
     }
 
     pub fn install_plugin(&self, id: String) -> Result<Submission<PluginInfo>> {
@@ -316,10 +680,14 @@ impl WebState {
         lock(&self.0.plugins.runs)
             .iter()
             .rev()
-            .map(|(&id, run)| RunSummary {
-                id,
-                metadata: run.metadata.clone(),
-                finished: run.is_finished(),
+            .map(|(&id, run)| {
+                let phase = run.phase();
+                RunSummary {
+                    id,
+                    metadata: run.metadata.clone(),
+                    finished: phase != RunPhase::Running,
+                    phase,
+                }
             })
             .collect()
     }
@@ -525,6 +893,52 @@ impl WebState {
 
 fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
     value.lock().unwrap_or_else(|error| error.into_inner())
+}
+
+fn push_log_tail(log_tail: &mut VecDeque<String>, event: &RunEvent) -> usize {
+    let RunEvent::Progress { kind: "log", data } = event else {
+        return 0;
+    };
+    let Some(lines) = data.get("lines").and_then(Value::as_array) else {
+        return 0;
+    };
+    let mut added = 0;
+    for value in lines {
+        if let Some(line) = value.as_str() {
+            log_tail.push_back(line.to_owned());
+            added += 1;
+        }
+    }
+    let extra = log_tail.len().saturating_sub(RUN_LOG_LINES_KEPT);
+    log_tail.drain(..extra);
+    added
+}
+
+fn pop_front(journal: &mut Journal) {
+    let entry = journal.entries.pop_front().expect("journal entry");
+    if journal.trimmed_front == Some(journal.first) {
+        journal.trimmed_front = None;
+    }
+    journal.first += 1;
+    journal.bytes -= entry.bytes;
+    journal.entries_log_lines -= entry.log_lines;
+}
+
+fn trim_log_entry(entry: &mut JournalEntry, drop_lines: usize) -> usize {
+    let RunEvent::Progress { kind: "log", data } = &mut entry.event else {
+        return 0;
+    };
+    let Some(lines) = data.get_mut("lines").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+    let removed = drop_lines.min(lines.len());
+    if removed == 0 {
+        return 0;
+    }
+    lines.drain(..removed);
+    entry.log_lines = lines.len();
+    entry.bytes = data.to_string().len();
+    removed
 }
 
 fn preview_index(previews: &VecDeque<(String, StagedPreview)>, id: &str) -> Result<usize> {
