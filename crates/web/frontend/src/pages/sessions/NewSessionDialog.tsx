@@ -5,7 +5,7 @@
  * and cancellation at any point.
  */
 
-import { useEffect, useId, useRef, useState, type FormEvent, type SyntheticEvent } from "react";
+import { useEffect, useId, useMemo, useRef, useState, type FormEvent, type SyntheticEvent } from "react";
 
 import { AlertIcon, CheckCircleIcon } from "../../components/Icons.tsx";
 import { apiClient, ApiError } from "../../lib/api.ts";
@@ -18,6 +18,7 @@ import type { ToastInput } from "../../lib/toast.ts";
 import type {
   AccountContext,
   AccountId,
+  HardwareRate,
   Locale,
   PendingOperation,
   Snapshot,
@@ -32,11 +33,11 @@ import {
 import { formatEmail, formatErrorMessage, type FormattedError } from "./format.ts";
 import { AlertTriangleIcon, PlayIcon, SmallAlertIcon, SmallInfoIcon } from "./Icons.tsx";
 import {
-  acceleratorPrefix,
   buildProvisionSpecFromDraft,
   findMeasuredRate,
   MAX_SESSION_NAME_LEN,
   ProvisionFields,
+  resolveNextSuggestedName,
   specToProvisionDraft,
   type ProvisionDraft,
   type ProvisionFieldErrorId,
@@ -49,7 +50,9 @@ import {
 } from "./ProvisionProgress.tsx";
 import {
   refreshRearmDuration,
+  setProvisionDialogOperationId,
   trackProvision,
+  type SubmittedProvisionForm,
   type TrackedProvision,
 } from "./store.ts";
 
@@ -155,8 +158,11 @@ export function NewSessionDialog({
 
   const [phase, setPhase] = useState<DialogPhase>({ kind: "loading" });
   const [nameDraft, setNameDraft] = useState("");
+  const [suggestedName, setSuggestedName] = useState("");
   const [baseTemplate, setBaseTemplate] = useState<ProvisionSpec | null>(null);
+  const [templateMeasuredRates, setTemplateMeasuredRates] = useState<readonly HardwareRate[]>([]);
   const [provisionDraft, setProvisionDraft] = useState<ProvisionDraft | null>(null);
+  const [formAccountContext, setFormAccountContext] = useState<AccountContext | null>(null);
   const [retryDelaySecs, setRetryDelaySecs] = useState<number>(CORE_DEFAULTS.retry_delay);
   const [submitting, setSubmitting] = useState(false);
   const [cancelRequested, setCancelRequested] = useState(false);
@@ -166,20 +172,35 @@ export function NewSessionDialog({
   const [submitError, setSubmitError] = useState<FormattedError | null>(null);
   const [attachedOperationId, setAttachedOperationId] = useState<number | null>(null);
   const [reloadSeq, setReloadSeq] = useState(0);
+  const reloadAsCreateRef = useRef(false);
+
+  const reportTrackingOperation = (operationId: number | null) => {
+    setProvisionDialogOperationId(operationId);
+    onTrackingOperationRef.current(operationId);
+  };
+
+  useEffect(() => {
+    return () => {
+      setProvisionDialogOperationId(null);
+      onTrackingOperationRef.current(null);
+    };
+  }, []);
 
   const loadTemplateAndLimit = (
     requestId: number,
-    targetAccount: AccountId | null,
+    targetAccountContext: AccountContext | null,
     signal: AbortSignal,
   ) => {
     const gen = apiClient.getSessionGeneration();
+    const targetAccount = targetAccountContext?.active ?? null;
     setPhase({ kind: "loading" });
+    setFormAccountContext(targetAccountContext);
     setSubmitting(false);
     setCancelRequested(false);
     setInvalidFields(new Set<ProvisionFieldErrorId>());
     setSubmitError(null);
     setAttachedOperationId(null);
-    onTrackingOperationRef.current(null);
+    reportTrackingOperation(null);
 
     const templatePromise = fetchSessionTemplate(signal);
     const settingsPromise = refreshRearmDuration(signal)
@@ -201,8 +222,10 @@ export function NewSessionDialog({
         const counted = countNamedRuntimesOnAccount(snapshotRef.current, targetAccount);
         const cap = Math.max(1, resolvedMaxConcurrent);
         setNameDraft(template.name);
+        setSuggestedName(template.name);
         autoNameRef.current = template.name;
         setBaseTemplate(template);
+        setTemplateMeasuredRates(template.measured_rates ?? []);
         setProvisionDraft(specToProvisionDraft(template));
         setRetryDelaySecs(template.retry_delay);
         if (counted.length >= cap) {
@@ -240,29 +263,35 @@ export function NewSessionDialog({
     const dialog = dialogRef.current;
     if (!request) {
       activeRequestIdRef.current = 0;
+      reloadAsCreateRef.current = false;
       setAttachedOperationId(null);
-      onTrackingOperationRef.current(null);
+      reportTrackingOperation(null);
       if (dialog?.open) {
         dialog.close();
       }
       return;
     }
 
+    const isSameRequest = activeRequestIdRef.current === request.id;
+    const reloadAsCreate = isSameRequest && reloadAsCreateRef.current;
+    reloadAsCreateRef.current = false;
     activeRequestIdRef.current = request.id;
     if (dialog && !dialog.open) {
       dialog.returnValue = "";
       dialog.showModal();
     }
 
-    if (request.mode === "running") {
+    if (request.mode === "running" && !reloadAsCreate) {
       setSubmitting(false);
       setCancelRequested(false);
       setSubmitError(null);
       setInvalidFields(new Set<ProvisionFieldErrorId>());
       setBaseTemplate(null);
+      setTemplateMeasuredRates([]);
       setProvisionDraft(null);
+      setFormAccountContext(snapshotRef.current?.account ?? null);
       setAttachedOperationId(request.operationId);
-      onTrackingOperationRef.current(request.operationId);
+      reportTrackingOperation(request.operationId);
       trackProvision(
         request.operationId,
         request.sessionName,
@@ -277,7 +306,11 @@ export function NewSessionDialog({
     }
 
     const controller = new AbortController();
-    loadTemplateAndLimit(request.id, request.accountContext.active, controller.signal);
+    const targetAccountContext =
+      request.mode === "create"
+        ? request.accountContext
+        : (snapshotRef.current?.account ?? null);
+    loadTemplateAndLimit(request.id, targetAccountContext, controller.signal);
     return () => {
       controller.abort();
     };
@@ -347,9 +380,11 @@ export function NewSessionDialog({
   const originAccountContext =
     request === null
       ? null
-      : request.mode === "create"
-        ? request.accountContext
-        : (attachedTracked?.accountContext ?? null);
+      : formAccountContext !== null
+        ? formAccountContext
+        : request.mode === "create"
+          ? request.accountContext
+          : (attachedTracked?.accountContext ?? null);
   const accountChanged =
     originAccountContext !== null &&
     currentAccountContext !== null &&
@@ -360,11 +395,23 @@ export function NewSessionDialog({
   const blockedByActiveProvision =
     (activeProvisionOp !== null || trackedProvision?.phase === "running") && phase.kind === "form";
 
+  const combinedMeasuredRates = useMemo(() => {
+    const fromSnapshot = snapshot?.measured_rates ?? [];
+    if (fromSnapshot.length === 0) {
+      return templateMeasuredRates;
+    }
+    if (templateMeasuredRates.length === 0) {
+      return fromSnapshot;
+    }
+    return [...templateMeasuredRates, ...fromSnapshot];
+  }, [snapshot?.measured_rates, templateMeasuredRates]);
+
   const measuredRate = provisionDraft
     ? findMeasuredRate(
         snapshot?.runtimes?.runtimes,
         provisionDraft.accelerator,
         provisionDraft.high_mem,
+        combinedMeasuredRates,
       )
     : null;
 
@@ -374,17 +421,18 @@ export function NewSessionDialog({
   ) => {
     setProvisionDraft(nextDraft);
     if (meta?.acceleratorChanged) {
-      const oldPrefix = `${acceleratorPrefix(meta.acceleratorChanged.prev)}-`;
-      const newPrefix = `${acceleratorPrefix(meta.acceleratorChanged.next)}-`;
-      const trimmedCurrent = nameDraft.trim();
-      if (
-        autoNameRef.current.length > 0 &&
-        trimmedCurrent === autoNameRef.current &&
-        trimmedCurrent.startsWith(oldPrefix)
-      ) {
-        const renamed = `${newPrefix}${trimmedCurrent.slice(oldPrefix.length)}`;
-        autoNameRef.current = renamed;
-        setNameDraft(renamed);
+      const resolved = resolveNextSuggestedName(
+        nameDraft,
+        autoNameRef.current,
+        meta.acceleratorChanged.prev,
+        meta.acceleratorChanged.next,
+      );
+      if (resolved.suggestedName !== autoNameRef.current) {
+        autoNameRef.current = resolved.suggestedName;
+        setSuggestedName(resolved.suggestedName);
+      }
+      if (resolved.nextDraft !== nameDraft) {
+        setNameDraft(resolved.nextDraft);
       }
     }
     if (invalidFields.size > 0) {
@@ -408,11 +456,13 @@ export function NewSessionDialog({
 
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    const submitAccountContext =
+      formAccountContext ?? (request?.mode === "create" ? request.accountContext : null);
     if (
       !request ||
-      request.mode !== "create" ||
       phase.kind !== "form" ||
       !provisionDraft ||
+      !submitAccountContext ||
       submitting ||
       accountChanged ||
       blockedByActiveProvision ||
@@ -426,6 +476,7 @@ export function NewSessionDialog({
       provisionDraft,
       retryDelaySecs,
       baseTemplate,
+      autoNameRef.current,
     );
     if (!built.ok) {
       setInvalidFields(built.invalidFields);
@@ -433,14 +484,27 @@ export function NewSessionDialog({
       return;
     }
 
+    if (nameDraft.trim() !== built.spec.name) {
+      setNameDraft(built.spec.name);
+    }
+
     const requestId = request.id;
     const sessionGeneration = apiClient.getSessionGeneration();
+    const submittedForm: SubmittedProvisionForm = {
+      name: built.spec.name,
+      suggestedName: autoNameRef.current,
+      draft: provisionDraft,
+      baseTemplate,
+      retryDelaySecs,
+      measuredRates: combinedMeasuredRates,
+      accountContext: submitAccountContext,
+    };
     setSubmitting(true);
     setInvalidFields(new Set<ProvisionFieldErrorId>());
     setSubmitError(null);
 
     try {
-      const accepted = await startProvision(request.accountContext, built.spec);
+      const accepted = await startProvision(submitAccountContext, built.spec);
       if (
         apiClient.getSessionGeneration() !== sessionGeneration ||
         activeRequestIdRef.current !== requestId
@@ -450,8 +514,8 @@ export function NewSessionDialog({
       setSubmitting(false);
       setCancelRequested(false);
       setAttachedOperationId(accepted.id);
-      onTrackingOperationRef.current(accepted.id);
-      trackProvision(accepted.id, built.spec.name, request.accountContext);
+      reportTrackingOperation(accepted.id);
+      trackProvision(accepted.id, built.spec.name, submitAccountContext, submittedForm);
       setPhase({
         kind: "running",
         operationId: accepted.id,
@@ -481,10 +545,10 @@ export function NewSessionDialog({
           limit: cap,
           email: resolveAccountEmail(
             snapshotRef.current,
-            request.accountContext.active,
+            submitAccountContext.active,
             tRef.current,
           ),
-          counted: countNamedRuntimesOnAccount(snapshotRef.current, request.accountContext.active),
+          counted: countNamedRuntimesOnAccount(snapshotRef.current, submitAccountContext.active),
         });
         return;
       }
@@ -524,18 +588,31 @@ export function NewSessionDialog({
     setSubmitError(null);
     setInvalidFields(new Set<ProvisionFieldErrorId>());
     setAttachedOperationId(null);
-    onTrackingOperationRef.current(null);
-    if (provisionDraft && request?.mode === "create") {
+    reportTrackingOperation(null);
+    if (provisionDraft) {
+      setFormAccountContext((prev) => snapshotRef.current?.account ?? prev);
       setPhase({ kind: "form" });
-    } else if (request?.mode === "create") {
-      setReloadSeq((seq) => seq + 1);
-    } else {
-      onClose();
+      return;
     }
+    const saved = attachedTracked?.submittedForm ?? null;
+    if (saved) {
+      setNameDraft(saved.name);
+      setSuggestedName(saved.suggestedName);
+      autoNameRef.current = saved.suggestedName;
+      setBaseTemplate(saved.baseTemplate);
+      setTemplateMeasuredRates(saved.measuredRates);
+      setProvisionDraft(saved.draft);
+      setRetryDelaySecs(saved.retryDelaySecs);
+      setFormAccountContext(snapshotRef.current?.account ?? saved.accountContext);
+      setPhase({ kind: "form" });
+      return;
+    }
+    reloadAsCreateRef.current = true;
+    setReloadSeq((seq) => seq + 1);
   };
 
   const events = attachedTracked?.events ?? [];
-  const waitingSinceMs = attachedTracked?.waitingSinceMs ?? null;
+  const waitingSinceSecs = attachedTracked?.waitingSinceSecs ?? null;
   const reconnecting = Boolean(attachedTracked?.reconnecting);
 
   const closedByAttr = {
@@ -718,9 +795,8 @@ export function NewSessionDialog({
                     spellCheck={false}
                     enterKeyHint="done"
                     className="input"
-                    required
                     maxLength={MAX_SESSION_NAME_LEN}
-                    placeholder={t("app.b2.new_name_placeholder")}
+                    placeholder={suggestedName || t("app.b2.new_name_placeholder")}
                     aria-invalid={invalidFields.has("name") ? "true" : undefined}
                     aria-describedby={invalidFields.has("name") ? validationErrorId : undefined}
                     data-new-session-name="true"
@@ -787,7 +863,7 @@ export function NewSessionDialog({
                 <ProvisionProgress
                   events={events}
                   live={true}
-                  waitingSinceMs={waitingSinceMs}
+                  waitingSinceSecs={waitingSinceSecs}
                   locale={locale}
                   t={t}
                 />
@@ -884,16 +960,14 @@ export function NewSessionDialog({
                 <button type="button" className="btn btn-ghost" onClick={onClose}>
                   {t("app.action.close")}
                 </button>
-                {request.mode === "create" && (
-                  <button
-                    type="button"
-                    className="btn btn-primary"
-                    data-new-session-change="true"
-                    onClick={handleEditAgain}
-                  >
-                    {t("app.b2.new_change")}
-                  </button>
-                )}
+                <button
+                  type="button"
+                  className="btn btn-primary"
+                  data-new-session-change="true"
+                  onClick={handleEditAgain}
+                >
+                  {t("app.b2.new_change")}
+                </button>
               </div>
             </>
           )}

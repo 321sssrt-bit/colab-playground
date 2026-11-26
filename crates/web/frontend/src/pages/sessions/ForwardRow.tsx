@@ -105,10 +105,16 @@ export function ForwardRow({ forward, t, pushToast, onAfterClose }: ForwardRowPr
       return;
     }
     const gen = apiClient.getSessionGeneration();
+    const wasTerminal = terminal;
     setClosing(true);
     try {
       const closed = await closeForward(forward.id);
       if (apiClient.getSessionGeneration() !== gen) {
+        return;
+      }
+      if (wasTerminal) {
+        // Dismissing a failed/stopped forward silently drops the row without claiming a live tunnel closed.
+        onAfterClose?.();
         return;
       }
       const title = t("app.b2.forward_closed");

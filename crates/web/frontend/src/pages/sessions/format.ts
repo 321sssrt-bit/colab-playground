@@ -3,17 +3,20 @@
  */
 
 import { ApiError } from "../../lib/api.ts";
+import { isCliInstalledFromSnapshot } from "../../lib/appCache.ts";
 import { formatCu, formatDuration } from "../../lib/format.ts";
 import type { I18nParams, TranslateFn } from "../../lib/i18n.ts";
 import type {
   ApiErrorPayload,
   Concern,
   CoreError,
+  EndedRuntime,
   ErrorKind,
   Limit,
   Locale,
   Runtime,
   RuntimeRef,
+  Snapshot,
 } from "../../lib/types.ts";
 
 const MIB_PER_GIB = 1024;
@@ -106,6 +109,50 @@ export function runtimeKey(ref: RuntimeRef | null | undefined): string {
     return "";
   }
   return `${ref.account}/${ref.endpoint || ""}`;
+}
+
+/**
+ * Mirrors upstream `AppState::cli_installed() && AppState::has_saved_accounts()`:
+ * returns false whenever the snapshot is missing, CLI is absent, the OS keyring is
+ * unavailable, accounts have not loaded (`accounts === null`), or zero accounts exist.
+ */
+export function isSessionsEnvironmentReady(
+  snapshot: Snapshot | null,
+  overviewCliInstalled: boolean | null = null,
+): boolean {
+  if (snapshot === null) {
+    return false;
+  }
+  const liveCli = isCliInstalledFromSnapshot(snapshot);
+  const cliReady =
+    liveCli !== null
+      ? liveCli
+      : overviewCliInstalled !== null
+        ? overviewCliInstalled
+        : true;
+  if (!cliReady) {
+    return false;
+  }
+  if (snapshot.accounts_error === "keyring_unavailable" || snapshot.accounts === null) {
+    return false;
+  }
+  return snapshot.accounts.accounts.length > 0;
+}
+
+/**
+ * Builds a collision-free key for an `EndedCard` entry even when `runtime.endpoint`
+ * is empty or multiple entries share the same account and fallback label.
+ */
+export function endedRuntimeRowKey(item: EndedRuntime, index: number): string {
+  const { account, endpoint, name } = item.runtime;
+  const identity =
+    endpoint.length > 0
+      ? `ep:${endpoint}`
+      : name && name.length > 0
+        ? `name:${name}`
+        : `label:${item.label}`;
+  const timestamp = item.at !== null ? String(item.at) : "na";
+  return `${account}/${identity}/${timestamp}/${index}`;
 }
 
 export function formatRuntimeCardLabel(runtime: Runtime): string {

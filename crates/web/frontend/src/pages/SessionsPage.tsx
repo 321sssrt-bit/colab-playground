@@ -8,15 +8,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { AlertIcon, SessionsIcon } from "../components/Icons.tsx";
-import {
-  appDataStore,
-  isCliInstalledFromSnapshot,
-  useAppDataStore,
-} from "../lib/appCache.ts";
+import { appDataStore, useAppDataStore } from "../lib/appCache.ts";
 import { forwardsStore, selectRuntimeForwards, useForwardsStore } from "../lib/forwards.ts";
 import { stopDialogsStore } from "../lib/stopDialogs.ts";
 import { webStore } from "../lib/store.ts";
 import type { GuardDecision, Runtime } from "../lib/types.ts";
+import {
+  SwitchAccountDialog,
+  type SwitchAccountDialogProps,
+} from "./accounts/SwitchAccountDialog.tsx";
 import {
   AutoStopDialog,
   type AutoStopDialogMode,
@@ -31,8 +31,8 @@ import {
   formatEmail,
   formatErrorKind,
   formatErrorMessage,
-  formatHardware,
   groupRuntimesByAccount,
+  isSessionsEnvironmentReady,
   runtimeKey,
 } from "./sessions/format.ts";
 import { AlertTriangleIcon, CircleStopIcon, PlusIcon, RefreshIcon } from "./sessions/Icons.tsx";
@@ -44,13 +44,13 @@ import { ProvisioningCard } from "./sessions/ProvisioningCard.tsx";
 import { RuntimeCard } from "./sessions/RuntimeCard.tsx";
 import { stopTargetFromRuntime } from "./sessions/StopRuntimeDialog.tsx";
 import {
-  claimProvisionHandled,
   clearEndedRuntimes,
   refreshRearmDuration,
-  trackProvision,
   useSessionsLocalState,
 } from "./sessions/store.ts";
 import type { PageProps } from "./types.ts";
+
+type SwitchAccountTarget = NonNullable<SwitchAccountDialogProps["target"]>;
 
 export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageProps) {
   const localState = useSessionsLocalState();
@@ -59,11 +59,9 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
   const [autoStopDialog, setAutoStopDialog] = useState<AutoStopDialogRequest | null>(null);
   const [forwardDialog, setForwardDialog] = useState<ForwardDialogRequest | null>(null);
   const [newSessionDialog, setNewSessionDialog] = useState<NewSessionDialogRequest | null>(null);
+  const [switchTarget, setSwitchTarget] = useState<SwitchAccountTarget | null>(null);
 
   const dialogSeqRef = useRef(0);
-  const dialogTrackingOpIdRef = useRef<number | null>(null);
-  const tRef = useRef(t);
-  tRef.current = t;
 
   const loadSessions = useCallback(async () => {
     try {
@@ -82,15 +80,16 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
   const accountErrorsOverride = appData.sessionsAccountErrors;
 
   const accounts = snapshot?.accounts?.accounts ?? null;
-  const liveCli = isCliInstalledFromSnapshot(snapshot);
-  const cliReady =
-    liveCli !== null
-      ? liveCli
-      : appData.overview !== null
-        ? appData.overview.cli_installed
-        : true;
-  const hasSavedAccounts = accounts === null ? true : accounts.length > 0;
-  const environmentReady = snapshot !== null && cliReady && hasSavedAccounts;
+  const environmentReady = isSessionsEnvironmentReady(
+    snapshot,
+    appData.overview !== null ? appData.overview.cli_installed : null,
+  );
+
+  useEffect(() => {
+    if (snapshot === null) {
+      setSwitchTarget(null);
+    }
+  }, [snapshot]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -174,66 +173,6 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
 
   const trackedProvision = localState.trackedProvision;
 
-  useEffect(() => {
-    if (activeProvisionOp) {
-      trackProvision(
-        activeProvisionOp.op.id,
-        activeProvisionOp.sessionName,
-        snapshot?.account ?? null,
-      );
-    }
-  }, [activeProvisionOp?.op.id, activeProvisionOp?.sessionName]);
-
-  useEffect(() => {
-    if (!trackedProvision || trackedProvision.phase === "running") {
-      return;
-    }
-    if (!claimProvisionHandled(trackedProvision.operationId)) {
-      return;
-    }
-    void loadSessions();
-    const dialogShowingThisOp =
-      newSessionDialog !== null &&
-      dialogTrackingOpIdRef.current === trackedProvision.operationId;
-    if (dialogShowingThisOp) {
-      return;
-    }
-    if (trackedProvision.phase === "ready") {
-      const name = trackedProvision.outcome?.name ?? trackedProvision.sessionName;
-      if (trackedProvision.outcome?.below_spec) {
-        const hardware =
-          formatHardware(
-            trackedProvision.outcome.hardware?.gpu,
-            trackedProvision.outcome.hardware?.vram_mib,
-            locale,
-            tRef.current,
-          ) ?? tRef.current("app.b2.prov_no_gpu");
-        pushToast({
-          tone: "warning",
-          title: tRef.current("app.b2.provision_ready_toast", { name }),
-          body: tRef.current("app.b2.prov_ready_below", { hardware }),
-        });
-      } else {
-        pushToast({
-          tone: "success",
-          body: tRef.current("app.b2.provision_ready_toast", { name }),
-        });
-      }
-    } else if (trackedProvision.phase === "failed") {
-      const formatted = formatErrorMessage(trackedProvision.finishedError, tRef.current);
-      pushToast({
-        tone: "danger",
-        title: tRef.current("app.b2.new_failed"),
-        body: [formatted.message, formatted.hint].filter(Boolean).join("\n"),
-      });
-    } else if (trackedProvision.phase === "cancelled") {
-      pushToast({
-        tone: "info",
-        body: tRef.current("app.b2.new_cancelled"),
-      });
-    }
-  }, [trackedProvision, newSessionDialog, locale, loadSessions, pushToast]);
-
   const runningProvisionCardTarget = activeProvisionOp
     ? { op: activeProvisionOp.op, sessionName: activeProvisionOp.sessionName }
     : trackedProvision?.phase === "running"
@@ -271,9 +210,7 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
     });
   }, [activeProvisionOp, trackedProvision, snapshot]);
 
-  const handleDialogTrackingOperation = useCallback((operationId: number | null) => {
-    dialogTrackingOpIdRef.current = operationId;
-  }, []);
+  const handleDialogTrackingOperation = useCallback(() => {}, []);
 
   const openAutoStopModal = useCallback(
     (runtime: Runtime, mode: AutoStopDialogMode) => {
@@ -327,9 +264,20 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
     [openAutoStopModal],
   );
 
-  const handleSwitchAccount = useCallback(() => {
-    navigate("accounts");
-  }, [navigate]);
+  const handleSwitchAccount = useCallback(
+    (runtime: Runtime) => {
+      const matched = accounts?.find((item) => item.id === runtime.id.account) ?? null;
+      setSwitchTarget({
+        id: runtime.id.account,
+        emailLabel: formatEmail(runtime.account_email ?? matched?.email, t),
+      });
+    },
+    [accounts, t],
+  );
+
+  const handleCloseSwitchDialog = useCallback(() => {
+    setSwitchTarget(null);
+  }, []);
 
   const handleRetryForwardPolicy = useCallback(() => {
     void appDataStore.refreshOverview().catch(() => {});
@@ -677,6 +625,16 @@ export function SessionsPage({ snapshot, locale, t, navigate, pushToast }: PageP
         onClose={() => setNewSessionDialog(null)}
         onTrackingOperation={handleDialogTrackingOperation}
       />
+
+      {snapshot && (
+        <SwitchAccountDialog
+          target={switchTarget}
+          snapshot={snapshot}
+          t={t}
+          pushToast={pushToast}
+          onClose={handleCloseSwitchDialog}
+        />
+      )}
     </>
   );
 }
