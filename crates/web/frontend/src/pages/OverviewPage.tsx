@@ -247,9 +247,12 @@ export function OverviewPage({ snapshot, locale, t, navigate, pushToast }: PageP
     [overview, probeError, probing, runningInstallOp],
   );
   const ready = checklist.complete && overview !== null;
+  const snapshotVersion = snapshot?.version ?? -1;
   const accountChangeBlocked = isAccountChangeBlocked(snapshot);
   const shuttingDown = snapshot?.shutting_down === true;
 
+  // Reload plugins when entering ready state and whenever the monotonic snapshot version
+  // advances (including cross-tab plugin catalog changes and SSE reconnect convergence).
   useEffect(() => {
     if (!ready) {
       activePluginsControllerRef.current?.abort();
@@ -263,29 +266,7 @@ export function OverviewPage({ snapshot, locale, t, navigate, pushToast }: PageP
     return () => {
       controller.abort();
     };
-  }, [loadPlugins, ready]);
-
-  // Refresh quick-deploy cards when another tab finishes installing, toggling, or removing a plugin.
-  const pluginCatalogOpIds = (snapshot?.operations ?? [])
-    .filter(
-      ({ operation }) =>
-        operation.kind === "domain" &&
-        (operation.name === "install_plugin" ||
-          operation.name === "set_plugin_enabled" ||
-          operation.name === "remove_plugin"),
-    )
-    .map((op) => op.id)
-    .join(",");
-  const prevPluginCatalogOpIdsRef = useRef(pluginCatalogOpIds);
-
-  useEffect(() => {
-    const prev = prevPluginCatalogOpIdsRef.current;
-    prevPluginCatalogOpIdsRef.current = pluginCatalogOpIds;
-    if (!ready || prev === pluginCatalogOpIds) {
-      return;
-    }
-    void loadPlugins();
-  }, [loadPlugins, pluginCatalogOpIds, ready]);
+  }, [loadPlugins, ready, snapshotVersion]);
 
   const initialLoading =
     overview === null && probeError === null && probing && runningInstallOp === null;
