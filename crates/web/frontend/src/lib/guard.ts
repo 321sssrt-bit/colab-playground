@@ -48,7 +48,7 @@ const CORE_ERROR_KIND_KEYS: Readonly<Record<ErrorKind, string>> = {
   port_reserved: "app.err.port_reserved",
   invalid_input: "app.err.invalid_input",
   no_active_account: "app.err.no_active_account",
-  active_account_not_adopted: "app.err.active_account_not_adopted",
+  active_account_not_adopted: "app.err.active_not_adopted",
   account_not_active: "app.err.account_not_active",
   account_not_found: "app.err.account_not_found",
   keyring_unavailable: "app.err.keyring_unavailable",
