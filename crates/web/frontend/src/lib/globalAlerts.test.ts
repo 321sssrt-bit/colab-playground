@@ -459,9 +459,42 @@ test("guardStore deduplicates repeated stop_failed poll events and resets warn o
 
   // Only ONE persistent danger toast is shown, and dismissing it acks BOTH event IDs [20, 21].
   assert.equal(toast.getToasts().length, 1);
+
+  // Transient per-account listing error omits acct-1 from runtimes; must NOT clear stop_failed dedupe!
+  const fail3: GuardEvent = { ...fail1, id: 22, at: 1_700_000_055 };
+  sse.sendFrame(
+    "snapshot",
+    makeSnapshot({
+      version: 4,
+      runtimes: {
+        runtimes: [],
+        errors: [
+          {
+            account: "acct-1",
+            error: { kind: "http", params: {}, detail: "transient", next_step: "try_again" },
+          },
+        ],
+      },
+      guard_events: [fail1, fail2],
+    }),
+    "4",
+  );
+  await flushAsync();
+  sse.sendFrame(
+    "snapshot",
+    makeSnapshot({
+      version: 5,
+      runtimes: { runtimes: [rt], errors: [] },
+      guard_events: [fail1, fail2, fail3],
+    }),
+    "5",
+  );
+  await flushAsync();
+  assert.equal(toast.getToasts().length, 1);
+
   toast.dismiss(toast.getToasts()[0]!.id);
   await flushAsync();
-  assert.deepEqual(ackPayloads[0], { ids: [20, 21] });
+  assert.deepEqual(ackPayloads[0], { ids: [20, 21, 22] });
 
   // Warn -> Decision::Ok -> Warn (same limit kind) raises a fresh warning toast.
   const warn1: GuardEvent = {
@@ -475,8 +508,8 @@ test("guardStore deduplicates repeated stop_failed poll events and resets warn o
   };
   sse.sendFrame(
     "snapshot",
-    makeSnapshot({ version: 4, runtimes: { runtimes: [rt], errors: [] }, guard_events: [warn1] }),
-    "4",
+    makeSnapshot({ version: 6, runtimes: { runtimes: [rt], errors: [] }, guard_events: [warn1] }),
+    "6",
   );
   await flushAsync();
   assert.equal(toast.getToasts().length, 1);
@@ -484,7 +517,7 @@ test("guardStore deduplicates repeated stop_failed poll events and resets warn o
   sse.sendFrame(
     "snapshot",
     makeSnapshot({
-      version: 5,
+      version: 7,
       runtimes: { runtimes: [rt], errors: [] },
       guard: {
         decisions: [{ session: rt.id, decision: { decision: "ok" }, stopped: false, error: null }],
@@ -493,7 +526,7 @@ test("guardStore deduplicates repeated stop_failed poll events and resets warn o
       },
       guard_events: [],
     }),
-    "5",
+    "7",
   );
   await flushAsync();
   assert.equal(toast.getToasts().length, 0);
@@ -501,8 +534,8 @@ test("guardStore deduplicates repeated stop_failed poll events and resets warn o
   const warn2: GuardEvent = { ...warn1, id: 31, at: 1_700_000_090 };
   sse.sendFrame(
     "snapshot",
-    makeSnapshot({ version: 6, runtimes: { runtimes: [rt], errors: [] }, guard_events: [warn2] }),
-    "6",
+    makeSnapshot({ version: 8, runtimes: { runtimes: [rt], errors: [] }, guard_events: [warn2] }),
+    "8",
   );
   await flushAsync();
   assert.equal(toast.getToasts().length, 1);

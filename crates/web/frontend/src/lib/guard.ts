@@ -656,19 +656,23 @@ export function createGuardStore(options: GuardStoreOptions = {}): GuardStore {
     }
 
     if (snapshot.runtimes && snapshot.runtimes_error === null) {
+      const erroredAccounts = new Set(snapshot.runtimes.errors.map((e) => e.account));
       const liveKeysAll = new Set(nextRuntimes.map((rt) => guardRuntimeKey(rt.id)));
+      const belongsToErroredAccount = (key: string): boolean => {
+        const slash = key.indexOf("/");
+        return slash > 0 && erroredAccounts.has(key.slice(0, slash));
+      };
       for (const key of Array.from(activeWarnings.keys())) {
-        if (!liveKeysAll.has(key)) {
+        if (!liveKeysAll.has(key) && !belongsToErroredAccount(key)) {
           activeWarnings.delete(key);
         }
       }
       for (const key of Array.from(activeStopFailures)) {
-        if (!liveKeysAll.has(key)) {
+        if (!liveKeysAll.has(key) && !belongsToErroredAccount(key)) {
           activeStopFailures.delete(key);
         }
       }
 
-      const erroredAccounts = new Set(snapshot.runtimes.errors.map((e) => e.account));
       const nextByAccount = new Map<AccountId, Runtime[]>();
       for (const rt of nextRuntimes) {
         const list = nextByAccount.get(rt.id.account);
