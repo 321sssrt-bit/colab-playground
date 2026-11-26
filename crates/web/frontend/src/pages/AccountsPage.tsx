@@ -4,9 +4,15 @@
  * pending-account adoption, OAuth sign-in dialog, and remove-account protection.
  */
 
-import { useCallback, useEffect, useId, useMemo, useState } from "react";
+import { useCallback, useEffect, useId, useMemo } from "react";
 
 import { AccountsIcon, AlertIcon, CloseIcon, InfoIcon } from "../components/Icons.tsx";
+import {
+  accountDialogsStore,
+  openAddAccountDialog,
+  openRemoveAccountDialog,
+  useAccountDialogsStore,
+} from "../lib/accountDialogs.ts";
 import { appDataStore, isAccountChangeBlocked, useAppDataStore } from "../lib/appCache.ts";
 import {
   formatCu,
@@ -20,6 +26,7 @@ import {
   buildAccountRows,
   buildUnmanagedWarning,
   computeAccountsTotals,
+  findActiveServerLoginId,
   formatAccountTimeLeft,
   formatApiError,
   formatCoreError,
@@ -27,13 +34,10 @@ import {
   resolveAccountsGate,
   type SwitchTarget,
 } from "./accounts/model.ts";
-import { RemoveAccountDialog, type RemoveTarget } from "./accounts/RemoveAccountDialog.tsx";
 import type { PageProps } from "./types.ts";
 
 export interface AccountsPageProps extends PageProps {
   readonly onRequestSwitchAccount: (target: SwitchTarget) => void;
-  readonly onRequestAddAccount: () => void;
-  readonly addAccountDialogOpen: boolean;
 }
 
 export function AccountsPage({
@@ -41,19 +45,13 @@ export function AccountsPage({
   locale,
   t,
   navigate,
-  pushToast,
   onRequestSwitchAccount,
-  onRequestAddAccount,
-  addAccountDialogOpen,
 }: AccountsPageProps) {
   const idPrefix = useId();
   const nowSecs = useUsageClockSecs();
   const appData = useAppDataStore();
-
-  const [recoveredVisible, setRecoveredVisible] = useState(false);
-  const [recoveredDismissed, setRecoveredDismissed] = useState(false);
-  const [removeTarget, setRemoveTarget] = useState<RemoveTarget | null>(null);
-  const [removingAccount, setRemovingAccount] = useState(false);
+  const accountDialogs = useAccountDialogsStore();
+  const removingAccount = accountDialogs.remove.removing;
 
   const needsOverviewDiagnostics =
     snapshot !== null &&
@@ -132,25 +130,6 @@ export function AccountsPage({
   const totals = useMemo(() => computeAccountsTotals(rows), [rows]);
   const unmanagedWarning = useMemo(() => buildUnmanagedWarning(rows, t), [rows, t]);
 
-  // Latch the one-shot server recovery flag so a subsequent background poll does not hide it.
-  useEffect(() => {
-    if (gate.kind === "ready" && gate.accounts.recovered_pending_add && !recoveredDismissed) {
-      setRecoveredVisible(true);
-    }
-  }, [gate, recoveredDismissed]);
-
-  // Clear remove target if the account disappears while idle (not mid-confirm, so the
-  // in-flight remove handler can still finish its success toast cleanly).
-  useEffect(() => {
-    if (removeTarget === null || removingAccount || gate.kind !== "ready") {
-      return;
-    }
-    const stillExists = gate.accounts.accounts.some((account) => account.id === removeTarget.id);
-    if (!stillExists) {
-      setRemoveTarget(null);
-    }
-  }, [gate, removeTarget, removingAccount]);
-
   const totalsKnown = totals.known > 0;
   const totalBalanceText = totalsKnown
     ? formatCu(totals.balanceCu, locale, t)
@@ -168,9 +147,8 @@ export function AccountsPage({
 
   const hasActiveLoginBanner =
     gate.kind === "ready" &&
-    snapshot !== null &&
-    snapshot.login_id !== null &&
-    !addAccountDialogOpen;
+    findActiveServerLoginId(snapshot) !== null &&
+    !accountDialogs.add.open;
 
   return (
     <>
@@ -185,7 +163,7 @@ export function AccountsPage({
             className="btn btn-primary"
             disabled={!canAdd}
             title={addDisabledTitle}
-            onClick={onRequestAddAccount}
+            onClick={openAddAccountDialog}
           >
             <UserPlusIcon />
             <span>{t("app.action.add_account")}</span>
@@ -324,7 +302,7 @@ export function AccountsPage({
 
         {gate.kind === "ready" && (
           <>
-            {(recoveredVisible || gate.accounts.recovered_pending_add) && !recoveredDismissed && (
+            {gate.accounts.recovered_pending_add && !accountDialogs.recoveredDismissed && (
               <div className="alert alert-info" role="status">
                 <span className="alert-icon icon-info">
                   <InfoIcon />
@@ -337,9 +315,9 @@ export function AccountsPage({
                   type="button"
                   className="btn btn-ghost btn-sm btn-icon alert-dismiss"
                   aria-label={t("app.action.dismiss")}
+                  disabled={shuttingDown}
                   onClick={() => {
-                    setRecoveredVisible(false);
-                    setRecoveredDismissed(true);
+                    void accountDialogsStore.dismissRecoveredPendingAdd();
                   }}
                 >
                   <CloseIcon />
@@ -359,7 +337,7 @@ export function AccountsPage({
                       type="button"
                       className="btn btn-sm"
                       disabled={shuttingDown}
-                      onClick={onRequestAddAccount}
+                      onClick={openAddAccountDialog}
                     >
                       {t("web.add.cancel_existing")}
                     </button>
@@ -422,7 +400,7 @@ export function AccountsPage({
                       className="btn btn-primary"
                       disabled={!canAdd}
                       title={addDisabledTitle}
-                      onClick={onRequestAddAccount}
+                      onClick={openAddAccountDialog}
                     >
                       <UserPlusIcon />
                       <span>{t("app.action.add_account")}</span>
@@ -581,7 +559,7 @@ export function AccountsPage({
                               title={removeTitle}
                               aria-describedby={blockNoteId}
                               onClick={() =>
-                                setRemoveTarget({
+                                openRemoveAccountDialog({
                                   id: row.account.id,
                                   emailLabel: row.emailLabel,
                                 })
@@ -638,17 +616,6 @@ export function AccountsPage({
           </>
         )}
       </div>
-
-      {snapshot !== null && (
-        <RemoveAccountDialog
-          target={removeTarget}
-          snapshot={snapshot}
-          t={t}
-          pushToast={pushToast}
-          onRemovingChange={setRemovingAccount}
-          onClose={() => setRemoveTarget(null)}
-        />
-      )}
     </>
   );
 }

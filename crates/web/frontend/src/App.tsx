@@ -7,6 +7,11 @@ import {
 } from "./components/AppShell.tsx";
 import { BrandIcon } from "./components/Icons.tsx";
 import { ToastViewport } from "./components/ToastViewport.tsx";
+import {
+  accountDialogsStore,
+  openAddAccountDialog,
+  useAccountDialogsStore,
+} from "./lib/accountDialogs.ts";
 import { useAppDataStore } from "./lib/appCache.ts";
 // Ensure the global Cost Guard observer is initialized at application scope across all routes.
 import "./lib/guard.ts";
@@ -23,6 +28,7 @@ import { AccountsPage, type AccountsPageProps } from "./pages/AccountsPage.tsx";
 import { AccountSwitcherMenu } from "./pages/accounts/AccountSwitcherMenu.tsx";
 import { AddAccountDialog } from "./pages/accounts/AddAccountDialog.tsx";
 import type { SwitchTarget } from "./pages/accounts/model.ts";
+import { RemoveAccountDialog } from "./pages/accounts/RemoveAccountDialog.tsx";
 import { SwitchAccountDialog } from "./pages/accounts/SwitchAccountDialog.tsx";
 import { LoginPage } from "./pages/LoginPage.tsx";
 import { OverviewPage } from "./pages/OverviewPage.tsx";
@@ -33,10 +39,7 @@ import { StopRuntimeDialog } from "./pages/sessions/StopRuntimeDialog.tsx";
 import { SettingsPage } from "./pages/SettingsPage.tsx";
 import type { PageProps } from "./pages/types.ts";
 
-type AccountDialogCallbacks = Pick<
-  AccountsPageProps,
-  "onRequestSwitchAccount" | "onRequestAddAccount" | "addAccountDialogOpen"
->;
+type AccountDialogCallbacks = Pick<AccountsPageProps, "onRequestSwitchAccount">;
 
 function renderRoutePage(
   route: RouteId,
@@ -62,13 +65,13 @@ export function App() {
   const appData = useAppDataStore();
   const updatesState = useUpdatesStore();
   const stopDialogsState = useStopDialogsStore();
+  const accountDialogsState = useAccountDialogsStore();
   const i18n = useI18n();
   const theme = useTheme();
   const { route, navigate } = useRouter();
   const toasts = useToasts();
   const [modalDrawerOpen, setModalDrawerOpen] = useState(false);
   const [switchTarget, setSwitchTarget] = useState<SwitchTarget | null>(null);
-  const [addAccountDialogOpen, setAddAccountDialogOpen] = useState(false);
   const { t } = i18n;
 
   useEffect(() => {
@@ -77,7 +80,6 @@ export function App() {
       toastStore.clear();
       setModalDrawerOpen(false);
       setSwitchTarget(null);
-      setAddAccountDialogOpen(false);
       return;
     }
 
@@ -132,7 +134,6 @@ export function App() {
   const handleSignOut = useCallback(() => {
     toastStore.clear();
     setSwitchTarget(null);
-    setAddAccountDialogOpen(false);
     webStore.signOut();
   }, []);
 
@@ -141,7 +142,31 @@ export function App() {
   }, []);
 
   const handleRequestAddAccount = useCallback(() => {
-    setAddAccountDialogOpen(true);
+    openAddAccountDialog();
+  }, []);
+
+  const handleStartAddLogin = useCallback(() => {
+    void accountDialogsStore.startAddLogin();
+  }, []);
+
+  const handleSubmitAddLoginCode = useCallback((code: string) => {
+    void accountDialogsStore.submitAddLoginCode(code);
+  }, []);
+
+  const handleCancelExistingLogin = useCallback(() => {
+    void accountDialogsStore.cancelExistingLogin();
+  }, []);
+
+  const handleCancelOrCloseAddAccount = useCallback(() => {
+    accountDialogsStore.cancelOrCloseAddAccount();
+  }, []);
+
+  const handleCloseRemoveAccount = useCallback(() => {
+    accountDialogsStore.closeRemoveAccount();
+  }, []);
+
+  const handleConfirmRemoveAccount = useCallback(() => {
+    void accountDialogsStore.confirmRemoveAccount();
   }, []);
 
   const handleNavigateAccounts = useCallback(() => {
@@ -236,8 +261,6 @@ export function App() {
 
   const accountCallbacks: AccountDialogCallbacks = {
     onRequestSwitchAccount: handleRequestSwitchAccount,
-    onRequestAddAccount: handleRequestAddAccount,
-    addAccountDialogOpen,
   };
 
   const stopRuntimeRequest =
@@ -268,23 +291,31 @@ export function App() {
         {renderRoutePage(route, pageProps, accountCallbacks)}
       </AppShell>
       {storeState.snapshot !== null && (
-        <>
-          <SwitchAccountDialog
-            target={switchTarget}
-            snapshot={storeState.snapshot}
-            t={t}
-            pushToast={pushToast}
-            onClose={() => setSwitchTarget(null)}
-          />
-          <AddAccountDialog
-            open={addAccountDialogOpen}
-            snapshot={storeState.snapshot}
-            t={t}
-            pushToast={pushToast}
-            onClose={() => setAddAccountDialogOpen(false)}
-          />
-        </>
+        <SwitchAccountDialog
+          target={switchTarget}
+          snapshot={storeState.snapshot}
+          t={t}
+          pushToast={pushToast}
+          onClose={() => setSwitchTarget(null)}
+        />
       )}
+      <AddAccountDialog
+        state={accountDialogsState.add}
+        snapshot={storeState.snapshot}
+        t={t}
+        pushToast={pushToast}
+        onStartLogin={handleStartAddLogin}
+        onSubmitCode={handleSubmitAddLoginCode}
+        onCancelExisting={handleCancelExistingLogin}
+        onCancelOrClose={handleCancelOrCloseAddAccount}
+      />
+      <RemoveAccountDialog
+        state={accountDialogsState.remove}
+        snapshot={storeState.snapshot}
+        t={t}
+        onClose={handleCloseRemoveAccount}
+        onConfirm={handleConfirmRemoveAccount}
+      />
       <StopRuntimeDialog
         request={stopRuntimeRequest}
         t={t}

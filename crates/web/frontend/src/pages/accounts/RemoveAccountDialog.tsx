@@ -1,61 +1,48 @@
 /**
- * Native `<dialog>` confirmation modal for removing a saved Google account.
+ * Global native `<dialog>` confirmation modal for removing a saved Google account.
+ *
+ * State and request execution live in `lib/accountDialogs.ts` so navigating away
+ * mid-removal never drops the result or completion toast.
  */
 
-import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef } from "react";
 
 import { AlertIcon } from "../../components/Icons.tsx";
+import type { RemoveAccountDialogState } from "../../lib/accountDialogs.ts";
+import { isAccountChangeBlocked, useAppDataStore } from "../../lib/appCache.ts";
 import type { TranslateFn } from "../../lib/i18n.ts";
-import { webStore } from "../../lib/store.ts";
-import type { ToastInput } from "../../lib/toast.ts";
-import type { AccountId, Snapshot } from "../../lib/types.ts";
-import {
-  formatApiError,
-  getAccountRemoveBlock,
-  isAccountChangeBlocked,
-  removeSavedAccount,
-  type FormattedApiError,
-} from "./model.ts";
-
-export interface RemoveTarget {
-  readonly id: AccountId;
-  readonly emailLabel: string;
-}
+import type { Snapshot } from "../../lib/types.ts";
+import { getAccountRemoveBlock } from "./model.ts";
 
 export interface RemoveAccountDialogProps {
-  readonly target: RemoveTarget | null;
-  readonly snapshot: Snapshot;
+  readonly state: RemoveAccountDialogState;
+  readonly snapshot: Snapshot | null;
   readonly t: TranslateFn;
-  readonly pushToast: (toast: ToastInput) => number;
-  readonly onRemovingChange?: (removing: boolean) => void;
   readonly onClose: () => void;
+  readonly onConfirm: () => void;
 }
 
 export function RemoveAccountDialog({
-  target,
+  state,
   snapshot,
   t,
-  pushToast,
-  onRemovingChange,
   onClose,
+  onConfirm,
 }: RemoveAccountDialogProps) {
   const titleId = useId();
   const dialogRef = useRef<HTMLDialogElement | null>(null);
   const cancelButtonRef = useRef<HTMLButtonElement | null>(null);
+  const appData = useAppDataStore();
 
-  const [removing, setRemoving] = useState(false);
-  const [error, setError] = useState<FormattedApiError | null>(null);
-
+  const { target, openSeq, removing, error } = state;
   const targetRef = useRef(target);
   targetRef.current = target;
-  const snapshotRef = useRef(snapshot);
-  snapshotRef.current = snapshot;
   const removingRef = useRef(removing);
   removingRef.current = removing;
-  const requestSeqRef = useRef(0);
 
-  const removeBlock = target !== null ? getAccountRemoveBlock(target.id, snapshot) : null;
-  const accountChangeBlocked = isAccountChangeBlocked(snapshot);
+  const removeBlock =
+    target !== null && snapshot !== null ? getAccountRemoveBlock(target.id, snapshot) : null;
+  const accountChangeBlocked = isAccountChangeBlocked(snapshot, appData);
   const removeBlockReason =
     removeBlock === "active"
       ? t("app.accounts.remove_active")
@@ -66,21 +53,11 @@ export function RemoveAccountDialog({
           : null;
 
   useEffect(() => {
-    onRemovingChange?.(removing);
-    return () => {
-      onRemovingChange?.(false);
-    };
-  }, [onRemovingChange, removing]);
-
-  useEffect(() => {
     const dialog = dialogRef.current;
     if (!dialog) {
       return;
     }
     if (target !== null) {
-      requestSeqRef.current += 1;
-      setRemoving(false);
-      setError(null);
       if (!dialog.open) {
         dialog.showModal();
       }
@@ -89,42 +66,7 @@ export function RemoveAccountDialog({
       dialog.returnValue = "";
       dialog.close();
     }
-  }, [target]);
-
-  const handleConfirm = useCallback(async () => {
-    const current = targetRef.current;
-    const liveSnapshot = snapshotRef.current;
-    if (current === null || removingRef.current) {
-      return;
-    }
-    // Re-check remove protection against the latest snapshot before sending DELETE.
-    if (
-      getAccountRemoveBlock(current.id, liveSnapshot) !== null ||
-      isAccountChangeBlocked(liveSnapshot) ||
-      liveSnapshot.shutting_down
-    ) {
-      return;
-    }
-    const seq = requestSeqRef.current;
-    setRemoving(true);
-    setError(null);
-
-    try {
-      await removeSavedAccount(current.id, liveSnapshot.account);
-      if (seq !== requestSeqRef.current || targetRef.current === null) {
-        return;
-      }
-      pushToast({ tone: "success", body: t("app.remove.done", { email: current.emailLabel }) });
-      void webStore.refreshSnapshot().catch(() => {});
-      onClose();
-    } catch (err) {
-      if (seq !== requestSeqRef.current || targetRef.current === null) {
-        return;
-      }
-      setRemoving(false);
-      setError(formatApiError(err, t));
-    }
-  }, [onClose, pushToast, t]);
+  }, [target, openSeq]);
 
   const handleDialogCancel = useCallback(
     (event: React.SyntheticEvent<HTMLDialogElement>) => {
@@ -137,15 +79,24 @@ export function RemoveAccountDialog({
   );
 
   const handleDialogClose = useCallback(() => {
-    if (dialogRef.current) {
-      dialogRef.current.returnValue = "";
+    const dialog = dialogRef.current;
+    if (dialog) {
+      dialog.returnValue = "";
     }
-    if (targetRef.current !== null && !removingRef.current) {
-      onClose();
+    if (targetRef.current === null) {
+      return;
     }
+    if (removingRef.current) {
+      if (dialog && !dialog.open) {
+        dialog.showModal();
+      }
+      return;
+    }
+    onClose();
   }, [onClose]);
 
   const email = target?.emailLabel ?? "";
+  const shuttingDown = snapshot?.shutting_down === true;
 
   return (
     <dialog
@@ -200,11 +151,11 @@ export function RemoveAccountDialog({
         <button
           type="button"
           className="btn btn-danger"
-          disabled={removing || removeBlockReason !== null || snapshot.shutting_down}
+          disabled={
+            removing || snapshot === null || removeBlockReason !== null || shuttingDown
+          }
           title={removeBlockReason ?? undefined}
-          onClick={() => {
-            void handleConfirm();
-          }}
+          onClick={onConfirm}
         >
           {removing && <span className="spinner" aria-hidden="true" />}
           <span>{t("app.remove.confirm")}</span>

@@ -3,7 +3,7 @@
  * per-account row derivation, unmanaged runtime warnings, and remove protection.
  */
 
-import { apiClient, ApiError } from "../../lib/api.ts";
+import { apiClient, ApiError, type ApiClient } from "../../lib/api.ts";
 import { isAccountChangeBlocked } from "../../lib/appCache.ts";
 import { evaluateUsageSampleFreshness, formatDuration } from "../../lib/format.ts";
 import type { TranslateFn } from "../../lib/i18n.ts";
@@ -15,6 +15,7 @@ import type {
   AccountsApiResponse,
   AccountsView,
   AccountUsageView,
+  ApiErrorPayload,
   CoreError,
   ErrorKind,
   HostCheck,
@@ -32,6 +33,11 @@ export { isAccountChangeBlocked };
 export type { AccountsApiResponse, HostCheck, KeyringCheck };
 
 export interface SwitchTarget {
+  readonly id: AccountId;
+  readonly emailLabel: string;
+}
+
+export interface RemoveTarget {
   readonly id: AccountId;
   readonly emailLabel: string;
 }
@@ -73,6 +79,15 @@ export interface OverviewDiagnostics {
 export interface LoginPrompt {
   readonly id: number;
   readonly auth_url: string;
+}
+
+export interface CancelLoginSettlement {
+  readonly outcome: "cancelled" | "completed" | "failed";
+  readonly account_context?: AccountContext;
+  readonly accounts?: AccountsView;
+  readonly accounts_error?: ErrorKind;
+  readonly account?: Account;
+  readonly error?: ApiErrorPayload;
 }
 
 export type RemoveBlock = "active" | "running";
@@ -186,6 +201,23 @@ export interface FormattedApiError {
   readonly hint: string | null;
 }
 
+export function formatApiErrorPayload(
+  payload: ApiErrorPayload | null | undefined,
+  t: TranslateFn,
+): FormattedApiError {
+  if (!payload) {
+    return { message: t("app.err.other"), hint: null };
+  }
+  const fromServer = payload.message_key ? t(payload.message_key, payload.args) : "";
+  const message =
+    fromServer ||
+    (hasErrorKindKey(payload.kind)
+      ? t(ERROR_KIND_KEYS[payload.kind], payload.args)
+      : t("app.err.other"));
+  const hint = payload.hint_key ? t(payload.hint_key, payload.args) || null : null;
+  return { message, hint };
+}
+
 export function formatApiError(error: unknown, t: TranslateFn): FormattedApiError {
   if (error instanceof ApiError) {
     // Wrap server-provided keys in `*_key` fields so the static i18n checker recognizes them.
@@ -244,8 +276,9 @@ export async function copyTextToClipboard(text: string): Promise<boolean> {
 export function beginAccountLogin(
   accountContext: AccountContext,
   signal?: AbortSignal,
+  client: ApiClient = apiClient,
 ): Promise<LoginPrompt> {
-  return apiClient.request<LoginPrompt>("/api/accounts/login", {
+  return client.request<LoginPrompt>("/api/accounts/login", {
     method: "POST",
     body: { account_context: accountContext },
     signal,
@@ -256,28 +289,80 @@ export function submitAccountLoginCode(
   loginId: number,
   code: string,
   signal?: AbortSignal,
+  client: ApiClient = apiClient,
 ): Promise<Account> {
-  return apiClient.request<Account>(`/api/accounts/login/${loginId}`, {
+  return client.request<Account>(`/api/accounts/login/${loginId}`, {
     method: "POST",
     body: { code },
     signal,
   });
 }
 
-export function cancelAccountLogin(loginId: number, signal?: AbortSignal): Promise<void> {
-  return apiClient.request<void>(`/api/accounts/login/${loginId}`, {
+export function cancelAccountLogin(
+  loginId: number,
+  signal?: AbortSignal,
+  client: ApiClient = apiClient,
+): Promise<CancelLoginSettlement | undefined> {
+  return client.request<CancelLoginSettlement | undefined>(`/api/accounts/login/${loginId}`, {
     method: "DELETE",
     body: {},
     signal,
   });
 }
 
+export function dismissRecoveredPendingAdd(
+  signal?: AbortSignal,
+  client: ApiClient = apiClient,
+): Promise<void> {
+  return client.request<void>("/api/accounts/recovered/dismiss", {
+    method: "POST",
+    body: {},
+    signal,
+  });
+}
+
+/**
+ * Returns the active server login id visible in a snapshot (either an awaiting
+ * `PendingLogin` prompt or an in-flight `Operation::Login` start/submit/cancel).
+ */
+export function findActiveServerLoginId(snapshot: Snapshot | null): number | null {
+  if (snapshot === null) {
+    return null;
+  }
+  if (snapshot.login_id !== null) {
+    return snapshot.login_id;
+  }
+  for (const pending of snapshot.operations) {
+    if (pending.operation.kind === "login") {
+      return pending.operation.login_id ?? pending.id;
+    }
+  }
+  return null;
+}
+
+/**
+ * Returns true when the server snapshot shows the given login id is actively
+ * being cancelled/rolled back.
+ */
+export function isServerLoginCancelling(snapshot: Snapshot | null, loginId: number): boolean {
+  if (snapshot === null) {
+    return false;
+  }
+  return snapshot.operations.some(
+    (pending) =>
+      pending.operation.kind === "login" &&
+      (pending.operation.login_id ?? pending.id) === loginId &&
+      pending.cancelling,
+  );
+}
+
 export function removeSavedAccount(
   accountId: AccountId,
   accountContext: AccountContext,
   signal?: AbortSignal,
+  client: ApiClient = apiClient,
 ): Promise<void> {
-  return apiClient.request<void>(`/api/accounts/${encodeURIComponent(accountId)}`, {
+  return client.request<void>(`/api/accounts/${encodeURIComponent(accountId)}`, {
     method: "DELETE",
     body: { account_context: accountContext },
     signal,
@@ -378,9 +463,12 @@ export function formatAccountTimeLeft(
   if (usageSnap === null) {
     return t("app.summary.unknown");
   }
+  if (usageSnap.rate_cu_per_hour <= 0) {
+    return t("app.summary.not_burning");
+  }
   if (usageView !== null) {
     if (usageView.eta === null) {
-      return usageSnap.balance_cu <= 0 ? t("app.summary.empty") : t("app.summary.not_burning");
+      return t("app.summary.not_burning");
     }
     if (usageView.eta <= 0) {
       return t("app.summary.empty");
@@ -389,9 +477,6 @@ export function formatAccountTimeLeft(
   }
   if (usageSnap.balance_cu <= 0) {
     return t("app.summary.empty");
-  }
-  if (usageSnap.rate_cu_per_hour <= 0) {
-    return t("app.summary.not_burning");
   }
   return t("app.summary.unknown");
 }
@@ -483,7 +568,7 @@ export function buildAccountRows(
     usageByAccount.set(item.account, item);
   }
 
-  return accountsView.accounts.map((account) => {
+  const rows = accountsView.accounts.map((account) => {
     const usage = usageByAccount.get(account.id) ?? null;
     const usageSnapshot = usage?.snapshot ?? account.usage ?? null;
     const active = accountsView.active === account.id;
@@ -506,6 +591,9 @@ export function buildAccountRows(
       removeBlock,
     };
   });
+  // Keep the active account pinned first while preserving the relative order of inactive accounts.
+  rows.sort((a, b) => Number(b.active) - Number(a.active));
+  return rows;
 }
 
 export function computeAccountsTotals(rows: readonly AccountRowView[]): AccountsTotalsView {
