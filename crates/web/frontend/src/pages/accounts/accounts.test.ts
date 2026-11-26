@@ -280,7 +280,7 @@ test("buildAccountRows pins the active account first while preserving inactive o
   );
 });
 
-test("zero-balance idle account shows not burning without warning tone, while active depletion warns", () => {
+test("zero-balance idle account shows not burning without warning tone (both eta=null and core eta=0), while active depletion warns", () => {
   const zeroIdleSnap = makeUsageSnapshot({
     balance_cu: 0,
     rate_cu_per_hour: 0,
@@ -288,20 +288,26 @@ test("zero-balance idle account shows not burning without warning tone, while ac
     fetched_at: 1000,
     stale: false,
   });
-  const zeroIdleUsage = makeUsageView("acct-2", "second@example.com", {
-    snapshot: zeroIdleSnap,
-    eta: null,
-  });
 
-  assert.equal(formatAccountTimeLeft(zeroIdleUsage, zeroIdleSnap, translate), "app.summary.not_burning");
-  assert.equal(formatAccountTimeLeft(null, zeroIdleSnap, translate), "app.summary.not_burning");
+  for (const eta of [null, 0] as const) {
+    const zeroIdleUsage = makeUsageView("acct-2", "second@example.com", {
+      snapshot: zeroIdleSnap,
+      eta,
+    });
 
-  const idleSnapshot = makeSnapshot({ usage: [zeroIdleUsage] });
-  const idleActive = resolveActiveAccount(idleSnapshot, translate);
-  const idleBadge = buildUsageBadge(idleActive, 1050, "en-US", translate);
-  assert.equal(idleBadge.tone, "neutral");
-  assert.equal(idleBadge.outdated, false);
-  assert.ok(idleBadge.tooltip.startsWith("app.usage.tip.idle\n"));
+    assert.equal(
+      formatAccountTimeLeft(zeroIdleUsage, zeroIdleSnap, translate),
+      "app.summary.not_burning",
+    );
+    assert.equal(formatAccountTimeLeft(null, zeroIdleSnap, translate), "app.summary.not_burning");
+
+    const idleSnapshot = makeSnapshot({ usage: [zeroIdleUsage] });
+    const idleActive = resolveActiveAccount(idleSnapshot, translate);
+    const idleBadge = buildUsageBadge(idleActive, 1050, "en-US", translate);
+    assert.equal(idleBadge.tone, "neutral");
+    assert.equal(idleBadge.outdated, false);
+    assert.ok(idleBadge.tooltip.startsWith("app.usage.tip.idle\n"));
+  }
 
   const depletedSnap = makeUsageSnapshot({
     balance_cu: 0,
@@ -368,10 +374,9 @@ test("openAddAccount shows warning toast when blocked by non-login operation", (
   harness.dialogStore.dispose();
 });
 
-test("cancelling AddAccountDialog during starting aborts POST and calls DELETE for backend settlement", async () => {
+test("cancelling AddAccountDialog during starting aborts own POST without deleting another tab's login", async () => {
   const harness = createHarness();
   const beginDeferred = createDeferred<LoginPrompt>();
-  const deleteDeferred = createDeferred<CancelLoginSettlement | undefined>();
   let beginAborted = false;
 
   harness.setRequestHandler((path, options) => {
@@ -384,9 +389,6 @@ test("cancelling AddAccountDialog during starting aborts POST and calls DELETE f
       });
       return beginDeferred.promise;
     }
-    if (path === "/api/accounts/login/55" && options.method === "DELETE") {
-      return deleteDeferred.promise;
-    }
     return Promise.resolve(undefined);
   });
 
@@ -394,7 +396,7 @@ test("cancelling AddAccountDialog during starting aborts POST and calls DELETE f
   const startPromise = harness.dialogStore.startAddLogin();
   assert.deepEqual(harness.dialogStore.getState().add.phase, { kind: "starting" });
 
-  // Backend publishes the starting login operation with id 55.
+  // Another tab's login operation appears in the shared snapshot before our POST returns.
   harness.pushSnapshot(
     makeSnapshot({
       version: 2,
@@ -413,17 +415,123 @@ test("cancelling AddAccountDialog during starting aborts POST and calls DELETE f
   harness.dialogStore.cancelOrCloseAddAccount();
   assert.equal(harness.dialogStore.getState().add.open, true);
 
-  deleteDeferred.resolve(undefined);
   await startPromise;
-  await Promise.resolve();
-  await Promise.resolve();
 
+  // Must NOT send DELETE using the shared snapshot's login id (55 could belong to another tab).
   assert.equal(
-    harness.requests.some((req) => req.method === "DELETE" && req.path === "/api/accounts/login/55"),
-    true,
+    harness.requests.some((req) => req.method === "DELETE"),
+    false,
   );
   assert.equal(harness.dialogStore.getState().add.open, false);
   assert.deepEqual(harness.toasts, [{ tone: "info", body: "web.add.cancelled_notice" }]);
+
+  harness.dialogStore.dispose();
+});
+
+test("409 busy conflict before SSE snapshot transitions to other_active without claiming rollback", async () => {
+  const harness = createHarness();
+  harness.setRequestHandler(async (path, options) => {
+    if (path === "/api/accounts/login" && options.method === "POST") {
+      throw new ApiError({
+        status: 409,
+        kind: "busy",
+        messageKey: "app.err.busy",
+        message: "busy",
+      });
+    }
+    return undefined;
+  });
+
+  harness.dialogStore.openAddAccount();
+  await harness.dialogStore.startAddLogin();
+
+  // Before the other tab's login snapshot arrives, busy failure does not claim rollback.
+  assert.deepEqual(harness.dialogStore.getState().add.phase, {
+    kind: "failed",
+    error: { message: "app.err.busy", hint: null },
+    rolledBack: false,
+    busyConflict: true,
+  });
+
+  // As soon as SSE delivers the other tab's login_id, the dialog automatically offers Cancel existing.
+  harness.pushSnapshot(makeSnapshot({ version: 2, login_id: 88 }));
+  assert.deepEqual(harness.dialogStore.getState().add.phase, {
+    kind: "other_active",
+    loginId: 88,
+  });
+
+  harness.dialogStore.dispose();
+});
+
+test("submitting transport drop stays locked until backend settles and never falsely claims rollback", async () => {
+  const harness = createHarness();
+  const submitDeferred = createDeferred<Account>();
+
+  harness.setRequestHandler((path, options) => {
+    if (path === "/api/accounts/login" && options.method === "POST") {
+      harness.pushSnapshot(makeSnapshot({ version: 2, login_id: 95 }));
+      return Promise.resolve({ id: 95, auth_url: "https://accounts.google.com/o/oauth2/auth" });
+    }
+    if (path === "/api/accounts/login/95" && options.method === "POST") {
+      return submitDeferred.promise;
+    }
+    return Promise.resolve(undefined);
+  });
+
+  harness.dialogStore.openAddAccount();
+  await harness.dialogStore.startAddLogin();
+  const submitPromise = harness.dialogStore.submitAddLoginCode("auth-code-drop");
+
+  // Server still has the submitting login operation running when the HTTP response drops.
+  const inFlightSubmitSnapshot = makeSnapshot({
+    version: 3,
+    login_id: null,
+    operations: [{ id: 101, operation: { kind: "login", login_id: 95 }, cancelling: false }],
+  });
+  harness.pushSnapshot(inFlightSubmitSnapshot);
+  harness.setRefreshHandler(async () => inFlightSubmitSnapshot);
+
+  submitDeferred.reject(
+    new ApiError({
+      status: 0,
+      kind: "connection_lost",
+      message: "network drop",
+    }),
+  );
+  await submitPromise;
+
+  // Dialog MUST remain locked in submitting while server login op is still running.
+  assert.equal(harness.dialogStore.getState().add.open, true);
+  assert.equal(harness.dialogStore.getState().add.phase.kind, "submitting");
+  harness.dialogStore.cancelOrCloseAddAccount();
+  assert.equal(harness.dialogStore.getState().add.open, true);
+
+  // Server completes the sign-in and broadcasts the newly added active account.
+  harness.pushSnapshot(
+    makeSnapshot({
+      version: 4,
+      login_id: null,
+      operations: [],
+      account: { revision: 2, active: "acct-3" },
+      accounts: {
+        accounts: [
+          makeAccount("acct-1", "first@example.com"),
+          makeAccount("acct-2", "second@example.com"),
+          makeAccount("acct-3", "recovered-submit@example.com"),
+        ],
+        active: "acct-3",
+        has_token: true,
+        unadopted: false,
+        active_email: "recovered-submit@example.com",
+        recovered_pending_add: false,
+      },
+    }),
+  );
+
+  assert.equal(harness.dialogStore.getState().add.open, false);
+  assert.deepEqual(harness.toasts, [
+    { tone: "success", body: "app.add.done(email=recovered-submit@example.com)" },
+  ]);
 
   harness.dialogStore.dispose();
 });

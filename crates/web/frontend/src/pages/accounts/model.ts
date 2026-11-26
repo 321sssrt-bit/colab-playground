@@ -341,22 +341,6 @@ export function findActiveServerLoginId(snapshot: Snapshot | null): number | nul
 }
 
 /**
- * Returns the login id of an in-flight `begin_login` start operation published
- * in `snapshot.operations`, if present.
- */
-export function findStartingServerLoginId(snapshot: Snapshot | null): number | null {
-  if (snapshot === null) {
-    return null;
-  }
-  for (const pending of snapshot.operations) {
-    if (pending.operation.kind === "login" && pending.operation.login_id === undefined) {
-      return pending.id;
-    }
-  }
-  return null;
-}
-
-/**
  * Returns true when the server snapshot shows the given login id is actively
  * being cancelled/rolled back.
  */
@@ -479,6 +463,9 @@ export function formatAccountTimeLeft(
   if (usageSnap === null) {
     return t("app.summary.unknown");
   }
+  if (usageSnap.rate_cu_per_hour <= 0) {
+    return t("app.summary.not_burning");
+  }
   if (usageView !== null) {
     if (usageView.eta === null) {
       return t("app.summary.not_burning");
@@ -487,9 +474,6 @@ export function formatAccountTimeLeft(
       return t("app.summary.empty");
     }
     return t("app.fmt.approx", { value: formatDuration(usageView.eta, t) });
-  }
-  if (usageSnap.rate_cu_per_hour <= 0) {
-    return t("app.summary.not_burning");
   }
   if (usageSnap.balance_cu <= 0) {
     return t("app.summary.empty");

@@ -216,7 +216,9 @@ export function buildUsageBadge(
 
   const tipLines: string[] = [];
   let isDepleted = false;
-  if (active.usage !== null) {
+  if (snap.rate_cu_per_hour <= 0) {
+    tipLines.push(t("app.usage.tip.idle"));
+  } else if (active.usage !== null) {
     if (active.usage.eta === null) {
       tipLines.push(t("app.usage.tip.idle"));
     } else if (active.usage.eta <= 0) {
@@ -225,8 +227,6 @@ export function buildUsageBadge(
     } else {
       tipLines.push(t("app.usage.tip.left", { time: formatDuration(active.usage.eta, t) }));
     }
-  } else if (snap.rate_cu_per_hour <= 0) {
-    tipLines.push(t("app.usage.tip.idle"));
   } else if (snap.balance_cu <= 0) {
     tipLines.push(t("app.usage.tip.empty"));
     isDepleted = true;

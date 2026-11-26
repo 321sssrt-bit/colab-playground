@@ -20,7 +20,6 @@ import {
   cancelAccountLogin,
   dismissRecoveredPendingAdd,
   findActiveServerLoginId,
-  findStartingServerLoginId,
   formatApiError,
   formatApiErrorPayload,
   getAccountRemoveBlock,
@@ -38,7 +37,12 @@ export type AddPhase =
   | { readonly kind: "submitting"; readonly loginId: number; readonly authUrl: string }
   | { readonly kind: "cancelling"; readonly reopenIntroAfter: boolean }
   | { readonly kind: "expired" }
-  | { readonly kind: "failed"; readonly error: FormattedApiError; readonly rolledBack: boolean };
+  | {
+      readonly kind: "failed";
+      readonly error: FormattedApiError;
+      readonly rolledBack: boolean;
+      readonly busyConflict?: boolean;
+    };
 
 export interface AddAccountDialogState {
   readonly open: boolean;
@@ -118,6 +122,18 @@ function isLoginOpRunningFor(snapshot: Snapshot, loginId: number): boolean {
   );
 }
 
+function isTransportUnknownError(error: unknown): boolean {
+  return !(error instanceof ApiError) || error.status === 0 || error.kind === "connection_lost";
+}
+
+interface PendingSubmitRecovery {
+  readonly seq: number;
+  readonly loginId: number;
+  readonly preAccountIds: ReadonlySet<string>;
+  readonly preActive: string | null;
+  readonly error: unknown;
+}
+
 /**
  * Creates an isolated application-level store for account dialogs and recovery
  * notice dismissal.
@@ -138,6 +154,7 @@ export function createAccountDialogsStore(
   let postBeginVersion: number | null = null;
   let cancelStartRequested = false;
   let cancelInFlight = false;
+  let pendingSubmitRecovery: PendingSubmitRecovery | null = null;
   let addController: AbortController | null = null;
   let cancelController: AbortController | null = null;
   let syncController: AbortController | null = null;
@@ -198,6 +215,7 @@ export function createAccountDialogsStore(
     postBeginVersion = null;
     cancelStartRequested = false;
     cancelInFlight = false;
+    pendingSubmitRecovery = null;
     abortAddControllers();
     if (!state.add.open) {
       return;
@@ -217,6 +235,7 @@ export function createAccountDialogsStore(
     postBeginVersion = null;
     cancelStartRequested = false;
     cancelInFlight = false;
+    pendingSubmitRecovery = null;
     abortAddControllers();
 
     removeSeq += 1;
@@ -357,18 +376,62 @@ export function createAccountDialogsStore(
     }
   };
 
+  const reconcilePendingSubmit = (snapshot: Snapshot): void => {
+    const pending = pendingSubmitRecovery;
+    if (
+      pending === null ||
+      pending.seq !== loginSeq ||
+      !state.add.open ||
+      state.add.phase.kind !== "submitting" ||
+      state.add.phase.loginId !== pending.loginId
+    ) {
+      return;
+    }
+    if (isLoginOpRunningFor(snapshot, pending.loginId) || snapshot.login_id === pending.loginId) {
+      return;
+    }
+    pendingSubmitRecovery = null;
+    const accounts = snapshot.accounts?.accounts ?? [];
+    const activeId = snapshot.accounts?.active ?? snapshot.account.active;
+    const addedAccount =
+      accounts.find((account) => !pending.preAccountIds.has(account.id)) ??
+      (activeId !== null && activeId !== pending.preActive
+        ? (accounts.find((account) => account.id === activeId) ?? null)
+        : null);
+    if (addedAccount !== null) {
+      const emailLabel = addedAccount.email ?? t("app.accounts.no_email");
+      toast.push({ tone: "success", body: t("app.add.done", { email: emailLabel }) });
+      closeAddDialogInternal();
+      return;
+    }
+    // Connection dropped before the response arrived and no new active account appeared;
+    // do not claim rollback succeeded when the server outcome is unknown.
+    setAddPhase({
+      kind: "failed",
+      error: formatApiError(pending.error, t),
+      rolledBack: false,
+    });
+  };
+
   const syncWithSnapshot = (): void => {
     const storeState = store.getState();
     const { snapshot, connectionStatus } = storeState;
 
-    if (
-      prevConnectionStatus !== "connected" &&
-      connectionStatus === "connected" &&
-      state.add.open &&
-      state.add.phase.kind === "code" &&
-      postBeginVersion === null
-    ) {
-      void syncPromptSnapshot(state.add.phase.loginId, loginSeq);
+    if (prevConnectionStatus !== "connected" && connectionStatus === "connected") {
+      if (state.add.open && state.add.phase.kind === "code" && postBeginVersion === null) {
+        void syncPromptSnapshot(state.add.phase.loginId, loginSeq);
+      } else if (pendingSubmitRecovery !== null) {
+        const pendingSeq = pendingSubmitRecovery.seq;
+        const generation = client.getSessionGeneration();
+        void store
+          .refreshSnapshot()
+          .then((latest) => {
+            if (!disposed && generation === client.getSessionGeneration() && pendingSeq === loginSeq) {
+              reconcilePendingSubmit(latest);
+            }
+          })
+          .catch(() => {});
+      }
     }
     prevConnectionStatus = connectionStatus;
 
@@ -407,7 +470,12 @@ export function createAccountDialogsStore(
     }
 
     const phase = state.add.phase;
-    if (phase.kind === "intro") {
+    if (phase.kind === "submitting") {
+      reconcilePendingSubmit(snapshot);
+      return;
+    }
+
+    if (phase.kind === "intro" || (phase.kind === "failed" && phase.busyConflict)) {
       const activeServerLoginId = findActiveServerLoginId(snapshot);
       if (activeServerLoginId !== null) {
         setAddPhase({ kind: "other_active", loginId: activeServerLoginId });
@@ -513,6 +581,7 @@ export function createAccountDialogsStore(
     const generation = client.getSessionGeneration();
     cancelStartRequested = false;
     cancelInFlight = false;
+    pendingSubmitRecovery = null;
     postBeginVersion = null;
     abortAddControllers();
     setAddPhase({ kind: "starting" });
@@ -530,6 +599,7 @@ export function createAccountDialogsStore(
       }
 
       if (cancelStartRequested || !state.add.open || seq !== loginSeq) {
+        // `201 Created` guarantees this tab owns `prompt.id`, so rolling it back never touches another tab.
         if (!cancelInFlight) {
           await performCancelLogin(prompt.id, false, seq);
         }
@@ -549,31 +619,12 @@ export function createAccountDialogsStore(
         if (cancelInFlight) {
           return;
         }
-        const liveSnapshot = store.getState().snapshot;
-        const knownLoginId =
-          findStartingServerLoginId(liveSnapshot) ?? liveSnapshot?.login_id ?? null;
-        if (knownLoginId !== null) {
-          await performCancelLogin(knownLoginId, false, seq);
-          return;
-        }
+        // Aborting `POST /api/accounts/login` triggers backend `CancelBeginOnDrop` only when
+        // this request owned the start slot; never send `DELETE` using a shared snapshot login id.
         try {
-          const fresh = await store.refreshSnapshot();
-          if (
-            disposed ||
-            generation !== client.getSessionGeneration() ||
-            seq !== loginSeq ||
-            !state.add.open ||
-            cancelInFlight
-          ) {
-            return;
-          }
-          const freshLoginId = findStartingServerLoginId(fresh) ?? fresh.login_id ?? null;
-          if (freshLoginId !== null) {
-            await performCancelLogin(freshLoginId, false, seq);
-            return;
-          }
+          await store.refreshSnapshot();
         } catch {
-          // If snapshot refresh fails after HTTP abort, still release the modal cleanly.
+          // Still close cleanly if snapshot refresh fails after cancelling start.
         }
         if (
           !disposed &&
@@ -589,16 +640,37 @@ export function createAccountDialogsStore(
       if (error instanceof ApiError && (error.isAbort || error.isUnauthorized)) {
         return;
       }
-      void store.refreshSnapshot().catch(() => {});
-      const activeServerLoginId = findActiveServerLoginId(store.getState().snapshot);
-      if (
-        error instanceof ApiError &&
-        (error.kind === "add_in_progress" || error.kind === "busy") &&
-        activeServerLoginId !== null
-      ) {
-        setAddPhase({ kind: "other_active", loginId: activeServerLoginId });
+      if (error instanceof ApiError && (error.kind === "add_in_progress" || error.kind === "busy")) {
+        let latestSnapshot = store.getState().snapshot;
+        if (findActiveServerLoginId(latestSnapshot) === null) {
+          try {
+            latestSnapshot = await store.refreshSnapshot();
+          } catch {
+            latestSnapshot = store.getState().snapshot;
+          }
+          if (
+            disposed ||
+            generation !== client.getSessionGeneration() ||
+            seq !== loginSeq ||
+            !state.add.open
+          ) {
+            return;
+          }
+        }
+        const activeServerLoginId = findActiveServerLoginId(latestSnapshot);
+        if (activeServerLoginId !== null) {
+          setAddPhase({ kind: "other_active", loginId: activeServerLoginId });
+          return;
+        }
+        setAddPhase({
+          kind: "failed",
+          error: formatApiError(error, t),
+          rolledBack: false,
+          busyConflict: true,
+        });
         return;
       }
+      void store.refreshSnapshot().catch(() => {});
       setAddPhase({
         kind: "failed",
         error: formatApiError(error, t),
@@ -619,6 +691,12 @@ export function createAccountDialogsStore(
     const seq = loginSeq;
     const generation = client.getSessionGeneration();
     const { loginId, authUrl } = state.add.phase;
+    const preSnapshot = store.getState().snapshot;
+    const preAccountIds = new Set(
+      (preSnapshot?.accounts?.accounts ?? []).map((account) => account.id),
+    );
+    const preActive = preSnapshot?.accounts?.active ?? preSnapshot?.account.active ?? null;
+    pendingSubmitRecovery = null;
     syncController?.abort();
     syncController = null;
     setAddPhase({ kind: "submitting", loginId, authUrl });
@@ -658,6 +736,30 @@ export function createAccountDialogsStore(
       if (error instanceof ApiError && (error.isAbort || error.isUnauthorized)) {
         return;
       }
+      if (isTransportUnknownError(error)) {
+        pendingSubmitRecovery = {
+          seq,
+          loginId,
+          preAccountIds,
+          preActive,
+          error,
+        };
+        try {
+          const latest = await store.refreshSnapshot();
+          if (
+            disposed ||
+            generation !== client.getSessionGeneration() ||
+            seq !== loginSeq ||
+            !state.add.open
+          ) {
+            return;
+          }
+          reconcilePendingSubmit(latest);
+        } catch {
+          // Stay locked in submitting until connectivity returns and SSE/snapshot reconciles.
+        }
+        return;
+      }
       void store.refreshSnapshot().catch(() => {});
       if (
         error instanceof ApiError &&
@@ -691,18 +793,11 @@ export function createAccountDialogsStore(
       return;
     }
     if (current.kind === "starting") {
-      const seq = loginSeq;
       cancelStartRequested = true;
       setAddPhase({ kind: "cancelling", reopenIntroAfter: false });
-      const liveSnapshot = store.getState().snapshot;
-      const startingId =
-        findStartingServerLoginId(liveSnapshot) ?? liveSnapshot?.login_id ?? null;
-      // Abort the pending HTTP request so the server's `CancelBeginOnDrop` immediately cancels `begin_login`.
+      // Abort the pending HTTP request so backend `CancelBeginOnDrop` cancels only our own start.
       addController?.abort();
       addController = null;
-      if (startingId !== null) {
-        void performCancelLogin(startingId, false, seq);
-      }
       return;
     }
     if (current.kind === "code") {
