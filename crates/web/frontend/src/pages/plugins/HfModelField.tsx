@@ -2,39 +2,36 @@ import { useCallback, useEffect, useId, useRef, useState, type KeyboardEvent } f
 
 import { ApiError } from "../../lib/api.ts";
 import type { TranslateFn } from "../../lib/i18n.ts";
-import type { Accelerator, Locale } from "../../lib/types.ts";
+import type { Locale } from "../../lib/types.ts";
 import { formatVram } from "../sessions/format.ts";
 import { AlertTriangleIcon, SmallAlertIcon } from "../sessions/Icons.tsx";
 import {
+  buildGgufFitKey,
   fetchHfGgufEstimate,
   formatInteger,
   formatPluginApiError,
   formatScriptBytes,
   isValidHfRepoId,
+  planGgufEstimateFetch,
   resolveLocalizedText,
   searchHfModels,
+  type HfGgufFitParams,
 } from "./api.ts";
 import type {
   GgufEstimateRequest,
-  GgufEstimateResponse,
   GgufFitOptions,
+  GgufPreviewData,
   HfModel,
-  KvType,
+  PluginDeployHfDraft,
   PluginInputSpec,
 } from "./types.ts";
+
+export type { HfGgufFitParams };
 
 const SEARCH_DEBOUNCE_MS = 300;
 const REPO_DEBOUNCE_MS = 350;
 const FIT_RECALC_DEBOUNCE_MS = 180;
 const IME_PROCESS_KEY_CODE = 229;
-
-export interface HfGgufFitParams {
-  readonly accelerator: Accelerator | null;
-  readonly vramMib: number | null;
-  readonly ctx: number;
-  readonly quant: string | null;
-  readonly kv: KvType | null;
-}
 
 interface HfModelFieldProps {
   readonly input: PluginInputSpec;
@@ -42,6 +39,8 @@ interface HfModelFieldProps {
   readonly error: string | null;
   readonly disabled: boolean;
   readonly fitParams: HfGgufFitParams;
+  readonly persistedDraft?: PluginDeployHfDraft;
+  readonly onPersistDraft?: (draft: PluginDeployHfDraft) => void;
   readonly locale: Locale;
   readonly t: TranslateFn;
   readonly onChange: (nextValue: string) => void;
@@ -53,12 +52,6 @@ type SearchState =
   | { readonly kind: "loading" }
   | { readonly kind: "ready"; readonly models: readonly HfModel[] }
   | { readonly kind: "error"; readonly message: string };
-
-interface GgufPreviewData {
-  readonly repo: string;
-  readonly requestedCtx: number;
-  readonly response: GgufEstimateResponse;
-}
 
 type GgufState =
   | { readonly kind: "idle" }
@@ -91,6 +84,8 @@ export function HfModelField({
   error,
   disabled,
   fitParams,
+  persistedDraft,
+  onPersistDraft,
   locale,
   t,
   onChange,
@@ -106,26 +101,56 @@ export function HfModelField({
   const mountedRef = useRef(true);
   const tRef = useRef(t);
   tRef.current = t;
+  const onPersistDraftRef = useRef(onPersistDraft);
+  onPersistDraftRef.current = onPersistDraft;
 
   const searchAbortRef = useRef<AbortController | null>(null);
   const searchTimerRef = useRef<number | null>(null);
   const searchSeqRef = useRef(0);
+  const skipInitialSearchEffectRef = useRef(
+    Boolean(persistedDraft?.searchQuery && persistedDraft.searchModels !== null),
+  );
 
   const repoTimerRef = useRef<number | null>(null);
   const ggufAbortRef = useRef<AbortController | null>(null);
   const ggufTimerRef = useRef<number | null>(null);
   const ggufSeqRef = useRef(0);
   const immediateGgufRef = useRef(false);
+  const forceRefreshGgufRef = useRef(false);
+  const pendingRefreshRepoRef = useRef<string | null>(null);
 
-  const [searchQuery, setSearchQuery] = useState("");
-  const [searchState, setSearchState] = useState<SearchState>({ kind: "idle" });
+  const [searchQuery, setSearchQuery] = useState(() => persistedDraft?.searchQuery ?? "");
+  const [searchState, setSearchState] = useState<SearchState>(() =>
+    persistedDraft?.searchModels !== null && persistedDraft?.searchModels !== undefined
+      ? { kind: "ready", models: persistedDraft.searchModels }
+      : { kind: "idle" },
+  );
   const [activeRepo, setActiveRepo] = useState<string | null>(() => {
+    if (persistedDraft?.activeRepo !== undefined) {
+      return persistedDraft.activeRepo;
+    }
     const trimmed = value.trim();
     return isValidHfRepoId(trimmed) ? trimmed : null;
   });
-  const [ggufState, setGgufState] = useState<GgufState>({ kind: "idle" });
+  const [ggufState, setGgufState] = useState<GgufState>(() =>
+    persistedDraft?.ggufPreview
+      ? { kind: "ready", data: persistedDraft.ggufPreview }
+      : { kind: "idle" },
+  );
   const [repoPromptError, setRepoPromptError] = useState<string | null>(null);
   const [manualCheckSeq, setManualCheckSeq] = useState(0);
+
+  const ggufStateRef = useRef(ggufState);
+  ggufStateRef.current = ggufState;
+
+  useEffect(() => {
+    onPersistDraftRef.current?.({
+      searchQuery,
+      searchModels: searchState.kind === "ready" ? searchState.models : null,
+      activeRepo,
+      ggufPreview: ggufState.kind === "ready" ? ggufState.data : null,
+    });
+  }, [searchQuery, searchState, activeRepo, ggufState]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -190,6 +215,10 @@ export function HfModelField({
   }, []);
 
   useEffect(() => {
+    if (skipInitialSearchEffectRef.current) {
+      skipInitialSearchEffectRef.current = false;
+      return;
+    }
     if (searchTimerRef.current !== null) {
       window.clearTimeout(searchTimerRef.current);
       searchTimerRef.current = null;
@@ -253,17 +282,60 @@ export function HfModelField({
 
     if (!activeRepo) {
       ggufSeqRef.current += 1;
+      forceRefreshGgufRef.current = false;
+      pendingRefreshRepoRef.current = null;
       setGgufState({ kind: "idle" });
       return;
     }
 
     const immediate = immediateGgufRef.current;
     immediateGgufRef.current = false;
-    const delayMs = immediate ? 0 : FIT_RECALC_DEBOUNCE_MS;
-    const targetRepo = activeRepo;
+    const explicitRefresh = forceRefreshGgufRef.current;
+    forceRefreshGgufRef.current = false;
 
-    // Clear stale fit lines immediately when parameters change so outdated numbers are never shown.
-    setGgufState({ kind: "loading", repo: targetRepo });
+    const targetRepo = activeRepo;
+    if (explicitRefresh) {
+      pendingRefreshRepoRef.current = targetRepo;
+    } else if (
+      pendingRefreshRepoRef.current !== null &&
+      pendingRefreshRepoRef.current !== targetRepo
+    ) {
+      pendingRefreshRepoRef.current = null;
+    }
+    const forceRefresh = pendingRefreshRepoRef.current === targetRepo;
+    const targetFitKey = buildGgufFitKey(targetRepo, {
+      accelerator,
+      vramMib,
+      ctx,
+      quant,
+      kv,
+    });
+    const currentGguf = ggufStateRef.current;
+    const plan = planGgufEstimateFetch({
+      targetRepo,
+      targetFitKey,
+      currentKind: currentGguf.kind,
+      currentRepo:
+        currentGguf.kind === "ready"
+          ? currentGguf.data.repo
+          : currentGguf.kind === "loading"
+            ? currentGguf.repo
+            : null,
+      currentFitKey: currentGguf.kind === "ready" ? currentGguf.data.fitKey : null,
+      forceRefresh,
+    });
+
+    if (plan.action === "skip") {
+      return;
+    }
+
+    const delayMs = immediate ? 0 : FIT_RECALC_DEBOUNCE_MS;
+
+    // Keep the current preview visible during backend-cached parameter recalculations to avoid
+    // clearing and flickering; only enter loading for a different repo or explicit refresh.
+    if (plan.showLoading) {
+      setGgufState({ kind: "loading", repo: targetRepo });
+    }
 
     const runFetch = () => {
       const seq = ++ggufSeqRef.current;
@@ -280,6 +352,7 @@ export function HfModelField({
         ...(accelerator !== null ? { accelerator } : {}),
         fit,
         ...(quant !== null ? { quant } : {}),
+        ...(plan.refresh ? { refresh: true } : {}),
       };
 
       void fetchHfGgufEstimate(request, controller.signal)
@@ -287,9 +360,12 @@ export function HfModelField({
           if (controller.signal.aborted || !mountedRef.current || seq !== ggufSeqRef.current) {
             return;
           }
+          if (plan.refresh && pendingRefreshRepoRef.current === targetRepo) {
+            pendingRefreshRepoRef.current = null;
+          }
           setGgufState({
             kind: "ready",
-            data: { repo: targetRepo, requestedCtx: ctx, response },
+            data: { repo: targetRepo, requestedCtx: ctx, fitKey: targetFitKey, response },
           });
         })
         .catch((err: unknown) => {
@@ -300,6 +376,9 @@ export function HfModelField({
             (err instanceof ApiError && err.isAbort)
           ) {
             return;
+          }
+          if (plan.refresh && pendingRefreshRepoRef.current === targetRepo) {
+            pendingRefreshRepoRef.current = null;
           }
           setGgufState({ kind: "error", message: formatPluginApiError(err, tRef.current) });
         })
@@ -347,6 +426,7 @@ export function HfModelField({
     }
     setRepoPromptError(null);
     immediateGgufRef.current = true;
+    forceRefreshGgufRef.current = false;
     onChange(repo);
     setActiveRepo(repo);
     setManualCheckSeq((seq) => seq + 1);
@@ -365,6 +445,7 @@ export function HfModelField({
     }
     setRepoPromptError(null);
     immediateGgufRef.current = true;
+    forceRefreshGgufRef.current = true;
     setActiveRepo(trimmed);
     setManualCheckSeq((seq) => seq + 1);
   };

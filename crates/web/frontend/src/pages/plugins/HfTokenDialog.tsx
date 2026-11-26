@@ -20,12 +20,8 @@ import {
 import { AlertIcon, CheckCircleIcon } from "../../components/Icons.tsx";
 import { ApiError } from "../../lib/api.ts";
 import type { TranslateFn } from "../../lib/i18n.ts";
-import {
-  deleteHfToken,
-  formatPluginApiError,
-  getHfTokenStatus,
-  saveHfToken,
-} from "./api.ts";
+import { formatPluginApiError } from "./api.ts";
+import { pluginCacheStore, usePluginCacheStore } from "./pluginCache.ts";
 
 export interface HfTokenDialogProps {
   readonly open: boolean;
@@ -34,11 +30,6 @@ export interface HfTokenDialogProps {
   readonly onClose: () => void;
   readonly onStatusChange?: (saved: boolean) => void;
 }
-
-type TokenLoadState =
-  | { readonly kind: "loading" }
-  | { readonly kind: "ready"; readonly saved: boolean }
-  | { readonly kind: "error"; readonly message: string };
 
 type TokenMutation = "idle" | "saving" | "deleting";
 
@@ -59,7 +50,6 @@ export function HfTokenDialog({
   const dialogRef = useRef<HTMLDialogElement | null>(null);
   const tokenInputRef = useRef<HTMLInputElement | null>(null);
   const closeButtonRef = useRef<HTMLButtonElement | null>(null);
-  const loadAbortRef = useRef<AbortController | null>(null);
   const mutateAbortRef = useRef<AbortController | null>(null);
   const statusSeqRef = useRef(0);
   const openRef = useRef(open);
@@ -70,14 +60,12 @@ export function HfTokenDialog({
   const onStatusChangeRef = useRef(onStatusChange);
   onStatusChangeRef.current = onStatusChange;
 
-  const [loadState, setLoadState] = useState<TokenLoadState>({ kind: "loading" });
+  const { hfToken } = usePluginCacheStore();
   const [mutation, setMutation] = useState<TokenMutation>("idle");
   const [feedback, setFeedback] = useState<TokenFeedback>("none");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [tokenInvalid, setTokenInvalid] = useState(false);
 
-  const loadStateRef = useRef(loadState);
-  loadStateRef.current = loadState;
   const mutationRef = useRef(mutation);
   mutationRef.current = mutation;
   const prevOpenRef = useRef(open);
@@ -89,43 +77,12 @@ export function HfTokenDialog({
     }
   }, []);
 
-  const fetchTokenStatus = useCallback(async (options?: { readonly silent?: boolean }) => {
-    loadAbortRef.current?.abort();
-    const controller = new AbortController();
-    loadAbortRef.current = controller;
-    const seq = ++statusSeqRef.current;
-
-    if (!options?.silent) {
-      setLoadState({ kind: "loading" });
-    }
-
-    try {
-      const result = await getHfTokenStatus(controller.signal);
-      if (
-        controller.signal.aborted ||
-        !mountedRef.current ||
-        !openRef.current ||
-        seq !== statusSeqRef.current
-      ) {
-        return;
-      }
-      setLoadState({ kind: "ready", saved: result.saved });
-      onStatusChangeRef.current?.(result.saved);
-    } catch (error) {
-      if (
-        controller.signal.aborted ||
-        !mountedRef.current ||
-        !openRef.current ||
-        seq !== statusSeqRef.current ||
-        (error instanceof ApiError && error.isAbort)
-      ) {
-        return;
-      }
-      setLoadState({ kind: "error", message: formatPluginApiError(error, tRef.current) });
-    } finally {
-      if (loadAbortRef.current === controller) {
-        loadAbortRef.current = null;
-      }
+  const refreshTokenStatus = useCallback(async (options?: { readonly silent?: boolean }) => {
+    const next = await pluginCacheStore
+      .refreshHfTokenStatus({ silent: options?.silent })
+      .catch(() => null);
+    if (next && next.kind === "ready") {
+      onStatusChangeRef.current?.(next.saved);
     }
   }, []);
 
@@ -136,9 +93,9 @@ export function HfTokenDialog({
     prevDisabledRef.current = disabled;
     if (open && wasOpen && wasDisabled && !disabled && mutationRef.current === "idle") {
       // Refresh token state after an external hf_token operation (e.g. another tab) finishes.
-      void fetchTokenStatus({ silent: true });
+      void refreshTokenStatus({ silent: true });
     }
-  }, [open, disabled, fetchTokenStatus]);
+  }, [open, disabled, refreshTokenStatus]);
 
   useEffect(() => {
     const dialog = dialogRef.current;
@@ -146,8 +103,6 @@ export function HfTokenDialog({
       return;
     }
     if (open) {
-      loadAbortRef.current?.abort();
-      loadAbortRef.current = null;
       mutateAbortRef.current?.abort();
       mutateAbortRef.current = null;
       statusSeqRef.current += 1;
@@ -160,19 +115,25 @@ export function HfTokenDialog({
         dialog.showModal();
       }
       tokenInputRef.current?.focus();
-      void fetchTokenStatus();
+      // Reuse the global cached status when already `ready` instead of re-reading keyring on every open.
+      void pluginCacheStore
+        .ensureHfTokenStatus()
+        .then((next) => {
+          if (next.kind === "ready") {
+            onStatusChangeRef.current?.(next.saved);
+          }
+        })
+        .catch(() => {});
     } else if (dialog.open) {
       dialog.close();
     }
-  }, [open, clearTokenInput, fetchTokenStatus]);
+  }, [open, clearTokenInput]);
 
   useEffect(() => {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
       statusSeqRef.current += 1;
-      loadAbortRef.current?.abort();
-      loadAbortRef.current = null;
       mutateAbortRef.current?.abort();
       mutateAbortRef.current = null;
       clearTokenInput();
@@ -191,8 +152,6 @@ export function HfTokenDialog({
       dialog.returnValue = "";
     }
     statusSeqRef.current += 1;
-    loadAbortRef.current?.abort();
-    loadAbortRef.current = null;
     mutateAbortRef.current?.abort();
     mutateAbortRef.current = null;
     clearTokenInput();
@@ -234,8 +193,6 @@ export function HfTokenDialog({
 
     // Clear the masked input before awaiting the request so the plaintext never lingers in DOM.
     clearTokenInput();
-    loadAbortRef.current?.abort();
-    loadAbortRef.current = null;
     mutateAbortRef.current?.abort();
     const controller = new AbortController();
     mutateAbortRef.current = controller;
@@ -247,7 +204,7 @@ export function HfTokenDialog({
     setMutation("saving");
 
     try {
-      const result = await saveHfToken(trimmed, controller.signal);
+      const result = await pluginCacheStore.saveHfToken(trimmed, controller.signal);
       if (
         controller.signal.aborted ||
         !mountedRef.current ||
@@ -256,7 +213,6 @@ export function HfTokenDialog({
       ) {
         return;
       }
-      setLoadState({ kind: "ready", saved: result.saved });
       onStatusChangeRef.current?.(result.saved);
       setFeedback("saved");
       setMutation("idle");
@@ -275,10 +231,6 @@ export function HfTokenDialog({
       }
       setMutation("idle");
       setErrorMessage(formatPluginApiError(error, tRef.current));
-      if (loadStateRef.current.kind === "loading") {
-        // Recover token status if saving aborted the initial status check and then failed.
-        void fetchTokenStatus();
-      }
       queueMicrotask(() => {
         tokenInputRef.current?.focus();
       });
@@ -290,13 +242,11 @@ export function HfTokenDialog({
   };
 
   const handleDelete = async () => {
-    if (disabled || mutation !== "idle" || loadState.kind !== "ready" || !loadState.saved) {
+    if (disabled || mutation !== "idle" || hfToken.kind !== "ready" || !hfToken.saved) {
       return;
     }
 
     clearTokenInput();
-    loadAbortRef.current?.abort();
-    loadAbortRef.current = null;
     mutateAbortRef.current?.abort();
     const controller = new AbortController();
     mutateAbortRef.current = controller;
@@ -308,7 +258,7 @@ export function HfTokenDialog({
     setMutation("deleting");
 
     try {
-      const result = await deleteHfToken(controller.signal);
+      const result = await pluginCacheStore.deleteHfToken(controller.signal);
       if (
         controller.signal.aborted ||
         !mountedRef.current ||
@@ -317,7 +267,6 @@ export function HfTokenDialog({
       ) {
         return;
       }
-      setLoadState({ kind: "ready", saved: result.saved });
       onStatusChangeRef.current?.(result.saved);
       setFeedback("deleted");
       setMutation("idle");
@@ -346,23 +295,26 @@ export function HfTokenDialog({
   const isSaving = mutation === "saving";
   const isDeleting = mutation === "deleting";
   const isMutating = mutation !== "idle";
-  const isSaved = loadState.kind === "ready" && loadState.saved;
+  const isSaved = hfToken.kind === "ready" && hfToken.saved;
   const controlsDisabled = disabled || isMutating;
 
+  const loadStateErrorMessage =
+    hfToken.kind === "error" ? formatPluginApiError(hfToken.error, t) : null;
+
   const badgeClass =
-    loadState.kind === "ready"
-      ? loadState.saved
+    hfToken.kind === "ready"
+      ? hfToken.saved
         ? "badge badge-success"
         : "badge"
-      : loadState.kind === "error"
+      : hfToken.kind === "error"
         ? "badge badge-warning"
         : "badge";
   const badgeText =
-    loadState.kind === "ready"
-      ? loadState.saved
+    hfToken.kind === "ready"
+      ? hfToken.saved
         ? t("app.b2.hf_token_stored")
         : t("app.b2.hf_token_none")
-      : loadState.kind === "error"
+      : hfToken.kind === "error"
         ? t("app.b2.hf_token_unknown")
         : t("app.summary.unknown");
 
@@ -389,19 +341,19 @@ export function HfTokenDialog({
             {t("app.b2.hf_token_hint")}
           </p>
 
-          {loadState.kind === "error" && (
+          {loadStateErrorMessage !== null && (
             <div className="alert alert-warning" role="alert">
               <span className="alert-icon icon-warning">
                 <AlertIcon />
               </span>
               <div className="alert-text">
-                <p className="alert-body">{loadState.message}</p>
+                <p className="alert-body">{loadStateErrorMessage}</p>
                 <div className="alert-actions">
                   <button
                     type="button"
                     className="btn btn-sm"
                     disabled={controlsDisabled}
-                    onClick={() => void fetchTokenStatus()}
+                    onClick={() => void refreshTokenStatus()}
                   >
                     {t("app.action.retry")}
                   </button>

@@ -11,9 +11,11 @@ import type {
   AccountContext,
   AccountId,
   ApiErrorPayload,
+  Runtime,
   RuntimeRef,
 } from "../../lib/types.ts";
 import type { ForwardView, ProvisionProgressEvent, ProvisionSpec } from "../sessions/api.ts";
+import type { ProvisionDraft } from "../sessions/ProvisionFields.tsx";
 
 export type LocalizedText = Readonly<Record<string, string>>;
 
@@ -127,18 +129,18 @@ export interface HfModel {
 
 export type KvType = "f16" | "q8_0" | "q4_0";
 
-interface GgufFile {
+export interface GgufFile {
   readonly path: string;
   readonly size: number;
 }
 
-interface GgufVariant {
+export interface GgufVariant {
   readonly quant: string;
   readonly files: readonly string[];
   readonly size: number;
 }
 
-interface GgufListing {
+export interface GgufListing {
   readonly variants: readonly GgufVariant[];
   readonly mmproj: readonly GgufFile[];
 }
@@ -157,9 +159,10 @@ export interface GgufEstimateRequest {
   readonly accelerator?: Accelerator | null;
   readonly fit?: GgufFitOptions;
   readonly quant?: string | null;
+  readonly refresh?: boolean;
 }
 
-interface GgufFitChoice {
+export interface GgufFitChoice {
   readonly quant: string;
   readonly kv: KvType;
   readonly ctx: number;
@@ -169,7 +172,7 @@ interface GgufFitChoice {
   readonly kv_reduced: boolean;
 }
 
-interface GgufFitEntry {
+export interface GgufFitEntry {
   readonly vram_mib: number;
   readonly fit: GgufFitChoice | null;
   readonly fit_error: ApiErrorPayload | null;
@@ -190,6 +193,7 @@ export interface PluginRunMetadata {
 export interface PluginRunSummary extends PluginRunMetadata {
   readonly id: number;
   readonly finished: boolean;
+  readonly phase: PluginRunPhase;
 }
 
 export type PluginRunState = "starting" | "running" | "ready" | "failed";
@@ -250,4 +254,67 @@ export interface PluginRunDetail {
   readonly streamError: unknown | null;
   readonly cancelRequested: boolean;
   readonly finishedLive: boolean;
+}
+
+export interface PluginRunBillingCheck {
+  readonly runId: number;
+  readonly status: "checking" | "verified" | "error";
+  readonly runtime: Runtime | null;
+  readonly accountErrored: boolean;
+  readonly snapshotVersion: number;
+}
+
+export type PluginRunBillingPhase = "checking" | "billing" | "unknown" | "no_session" | "stopped";
+
+export interface PluginRunBillingState {
+  readonly phase: PluginRunBillingPhase;
+  readonly runtime: Runtime | null;
+}
+
+export type HfTokenState =
+  | { readonly kind: "idle" }
+  | { readonly kind: "loading" }
+  | { readonly kind: "ready"; readonly saved: boolean }
+  | { readonly kind: "error"; readonly error: unknown };
+
+export interface GgufPreviewData {
+  readonly repo: string;
+  readonly requestedCtx: number;
+  readonly fitKey: string;
+  readonly response: GgufEstimateResponse;
+}
+
+export interface PluginDeployHfDraft {
+  readonly searchQuery: string;
+  readonly searchModels: readonly HfModel[] | null;
+  readonly activeRepo: string | null;
+  readonly ggufPreview: GgufPreviewData | null;
+}
+
+export interface SelectedExistingTarget {
+  readonly name: string;
+  readonly account: AccountId;
+  readonly runtime: RuntimeRef;
+}
+
+export type TargetLost =
+  | { readonly kind: "ended"; readonly name: string }
+  | { readonly kind: "other_account"; readonly name: string };
+
+export interface PluginDeployFormDraft {
+  readonly pluginId: string;
+  readonly openSeq: number;
+  readonly loadPhase: "loading" | "ready" | "error";
+  readonly loadError: unknown | null;
+  readonly textValues: Readonly<Record<string, string>>;
+  readonly boolValues: Readonly<Record<string, boolean>>;
+  readonly baseProvisionSpec: ProvisionSpec | null;
+  readonly provisionDraft: ProvisionDraft | null;
+  readonly sessionName: string;
+  readonly retryDelaySecs: number;
+  readonly stopOnFailure: boolean;
+  readonly selectedExisting: SelectedExistingTarget | null;
+  readonly targetLost: TargetLost | null;
+  readonly originAccountContext: AccountContext | null;
+  readonly hfByInputId: Readonly<Record<string, PluginDeployHfDraft>>;
 }

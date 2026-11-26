@@ -17,15 +17,19 @@ import {
 import { AlertIcon, InfoIcon } from "../../components/Icons.tsx";
 import { ApiError } from "../../lib/api.ts";
 import type { TranslateFn } from "../../lib/i18n.ts";
+import { webStore } from "../../lib/store.ts";
 import type { Locale } from "../../lib/types.ts";
 import {
+  cancelPluginPreview,
   discardPluginPreview,
+  findInspectPluginOpId,
   formatPluginApiError,
   formatScriptBytes,
   installPluginPreview,
   parsePluginOrigin,
   previewPlugin,
   resolveLocalizedText,
+  shouldSendGlobalPreviewCancel,
 } from "./api.ts";
 import type { PluginInfo, PluginPreviewResponse } from "./types.ts";
 
@@ -55,6 +59,9 @@ export function InstallPluginDialog({
   const sourceInputRef = useRef<HTMLInputElement | null>(null);
   const previewCancelRef = useRef<HTMLButtonElement | null>(null);
   const checkSeqRef = useRef(0);
+  const checkAbortRef = useRef<AbortController | null>(null);
+  const checkingRef = useRef(false);
+  const preExistingInspectOpIdRef = useRef<number | null>(null);
   const installAbortRef = useRef<AbortController | null>(null);
   const activePreviewIdRef = useRef<string | null>(null);
   const openRef = useRef(open);
@@ -79,8 +86,28 @@ export function InstallPluginDialog({
     void discardPluginPreview(previewId).catch(() => {});
   }, []);
 
+  const cancelInFlightCheck = useCallback(() => {
+    const wasChecking = checkingRef.current;
+    const preExistingOpId = preExistingInspectOpIdRef.current;
+    checkingRef.current = false;
+    preExistingInspectOpIdRef.current = null;
+    // Always abort our own HTTP request so backend `CancelOperationOnDrop` cancels only
+    // an operation started by this request.
+    checkAbortRef.current?.abort();
+    checkAbortRef.current = null;
+    if (
+      wasChecking &&
+      shouldSendGlobalPreviewCancel(preExistingOpId, webStore.getState().snapshot?.operations)
+    ) {
+      // Proxy-buffering fallback: only call the global cancel endpoint when this tab did not
+      // collide with a pre-existing `inspect_plugin` op owned by another tab.
+      void cancelPluginPreview().catch(() => {});
+    }
+  }, []);
+
   const resetForOpen = useCallback(() => {
     checkSeqRef.current += 1;
+    cancelInFlightCheck();
     installAbortRef.current?.abort();
     installAbortRef.current = null;
     discardStagedPreview(activePreviewIdRef.current);
@@ -90,7 +117,7 @@ export function InstallPluginDialog({
     setPreview(null);
     setErrorMessage(null);
     setSourceInvalid(false);
-  }, [discardStagedPreview]);
+  }, [cancelInFlightCheck, discardStagedPreview]);
 
   useEffect(() => {
     const dialog = dialogRef.current;
@@ -121,11 +148,12 @@ export function InstallPluginDialog({
     return () => {
       mountedRef.current = false;
       checkSeqRef.current += 1;
+      cancelInFlightCheck();
       installAbortRef.current?.abort();
       installAbortRef.current = null;
       discardStagedPreview(activePreviewIdRef.current);
     };
-  }, [discardStagedPreview]);
+  }, [cancelInFlightCheck, discardStagedPreview]);
 
   const handleDialogCancel = (event: SyntheticEvent<HTMLDialogElement>) => {
     if (phase === "installing") {
@@ -138,8 +166,8 @@ export function InstallPluginDialog({
     if (dialog) {
       dialog.returnValue = "";
     }
-    // Invalidate any in-flight check without aborting its HTTP response so late previews get discarded.
     checkSeqRef.current += 1;
+    cancelInFlightCheck();
     installAbortRef.current?.abort();
     installAbortRef.current = null;
     discardStagedPreview(activePreviewIdRef.current);
@@ -178,6 +206,13 @@ export function InstallPluginDialog({
     }
 
     const seq = ++checkSeqRef.current;
+    checkAbortRef.current?.abort();
+    const controller = new AbortController();
+    checkAbortRef.current = controller;
+    checkingRef.current = true;
+    preExistingInspectOpIdRef.current = findInspectPluginOpId(
+      webStore.getState().snapshot?.operations,
+    );
 
     setSourceInvalid(false);
     setErrorMessage(null);
@@ -185,10 +220,13 @@ export function InstallPluginDialog({
     setCheckedSource(trimmed);
 
     try {
-      // Do not abort the preview request on cancel: the backend still finishes staging it, so
-      // receiving the late response lets us immediately DELETE its preview_id.
-      const result = await previewPlugin(parsePluginOrigin(trimmed));
-      if (!mountedRef.current || !openRef.current || seq !== checkSeqRef.current) {
+      const result = await previewPlugin(parsePluginOrigin(trimmed), controller.signal);
+      if (
+        controller.signal.aborted ||
+        !mountedRef.current ||
+        !openRef.current ||
+        seq !== checkSeqRef.current
+      ) {
         discardStagedPreview(result.preview_id);
         return;
       }
@@ -197,6 +235,7 @@ export function InstallPluginDialog({
       setPhase("preview");
     } catch (error) {
       if (
+        controller.signal.aborted ||
         !mountedRef.current ||
         !openRef.current ||
         seq !== checkSeqRef.current ||
@@ -207,6 +246,12 @@ export function InstallPluginDialog({
       setPhase("source");
       setErrorMessage(formatPluginApiError(error, t));
       sourceInputRef.current?.focus();
+    } finally {
+      if (checkAbortRef.current === controller) {
+        checkAbortRef.current = null;
+        checkingRef.current = false;
+        preExistingInspectOpIdRef.current = null;
+      }
     }
   };
 
