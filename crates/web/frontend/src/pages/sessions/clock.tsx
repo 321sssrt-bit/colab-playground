@@ -18,13 +18,6 @@ export function getServerNowSecs(): number {
   return serverClock.getNowSecs();
 }
 
-/**
- * Anchors the shared server clock baseline to a backend timestamp in Unix seconds.
- */
-export function syncServerClock(sampledAtSecs: UnixSecs): void {
-  serverClock.sync(sampledAtSecs);
-}
-
 function useSessionClockSecs(): number {
   return useServerClockSecs(SESSION_TICK_INTERVAL_MS);
 }

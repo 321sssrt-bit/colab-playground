@@ -458,10 +458,6 @@ export function recordForwardAddresses(view: ForwardView): void {
   forwardsStore.recordForward(view);
 }
 
-export function refreshForwards(signal?: AbortSignal): Promise<ForwardView[]> {
-  return forwardsStore.refresh(signal);
-}
-
 export function refreshRearmDuration(signal?: AbortSignal): Promise<SessionSettingsSummary> {
   return appDataStore.refreshSessionDefaults(signal);
 }

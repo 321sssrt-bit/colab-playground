@@ -370,14 +370,6 @@ export function isSwitchConflictError(error: unknown): boolean {
   );
 }
 
-export function isUsageOutdated(
-  usageSnap: UsageSnapshot | null,
-  usageView: AccountUsageView | null,
-  nowSecs: number,
-): boolean {
-  return evaluateUsageSampleFreshness(usageSnap, usageView, nowSecs)?.outdated ?? false;
-}
-
 export function formatAccountTimeLeft(
   usageView: AccountUsageView | null,
   usageSnap: UsageSnapshot | null,
