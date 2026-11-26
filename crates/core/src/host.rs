@@ -629,7 +629,7 @@ fn parse_wsl_distros(stdout: &str) -> Vec<String> {
 /// `$1`, read from its shebang, following shell wrapper `exec` targets (bounded depth, cycle-safe)
 /// and the `uv` / pip `#!/bin/sh` sibling-`python` launcher. Never returns a shell interpreter;
 /// prints nothing when no Python interpreter can be resolved.
-const SHEBANG_PYTHON: &str = r#"shebang_python() (
+const SHEBANG_PYTHON: &str = r##"shebang_python() (
   set -f
   IFS=$(printf ' \t\n')
   cr=$(printf '\r')
@@ -674,17 +674,41 @@ const SHEBANG_PYTHON: &str = r#"shebang_python() (
     ws=${rest%%[! $tab]*}
     rest=${rest#"$ws"}
     case "$rest" in
-      ""|'#'*|';'*|'&'*|'|'*) return 1 ;;
+      ""|'#'*|';'*|'|'*) return 1 ;;
+      '&>'*) ;;
+      '&'*) return 1 ;;
+    esac
+    case "$rest" in
+      '&>>'*) tok='&>>'; rest=${rest#???}; return 0 ;;
+      '&>'*) tok='&>'; rest=${rest#??}; return 0 ;;
     esac
     while [ -n "$rest" ]; do
       ch=${rest%"${rest#?}"}
       case "$ch" in
-        ' '|"$tab"|';'|'|') break ;;
-        '&')
-          case "$tok" in
-            *'>'|*'<')
+        ' '|"$tab"|';'|'|'|'&') break ;;
+        '<'|'>')
+          case "$tok_quoted:$tok" in
+            0:|0:[0-9]|0:[0-9][0-9])
               tok="${tok}${ch}"
               rest=${rest#?}
+              case "$rest" in
+                '>'*|'<'*|'|'*)
+                  tok="${tok}${rest%"${rest#?}"}"
+                  rest=${rest#?}
+                  ;;
+                '&'*)
+                  tok="${tok}&"
+                  rest=${rest#?}
+                  while [ -n "$rest" ]; do
+                    ch=${rest%"${rest#?}"}
+                    case "$ch" in
+                      ' '|"$tab"|';'|'|'|'&'|'<'|'>') break ;;
+                      *) tok="${tok}${ch}"; rest=${rest#?} ;;
+                    esac
+                  done
+                  ;;
+              esac
+              break
               ;;
             *) break ;;
           esac
@@ -740,9 +764,115 @@ const SHEBANG_PYTHON: &str = r#"shebang_python() (
     return 0
   }
 
+  _cpg_scan_heredoc() {
+    local s=$1 ch prev=" " ws delim strip
+    while [ -n "$s" ]; do
+      ch=${s%"${s#?}"}
+      case "$ch" in
+        "'")
+          s=${s#?}
+          case "$s" in
+            *\'*) s=${s#*\'} ;;
+            *) return 0 ;;
+          esac
+          prev="'"
+          ;;
+        '"')
+          s=${s#?}
+          while [ -n "$s" ]; do
+            ch=${s%"${s#?}"}
+            case "$ch" in
+              '"') s=${s#?}; break ;;
+              '\') s=${s#?}; [ -n "$s" ] && s=${s#?} ;;
+              *) s=${s#?} ;;
+            esac
+          done
+          prev='"'
+          ;;
+        '\')
+          s=${s#?}
+          [ -n "$s" ] && s=${s#?}
+          prev="x"
+          ;;
+        '#')
+          case "$prev" in
+            ' '|"$tab"|';'|'&'|'|'|'('|')') return 0 ;;
+          esac
+          s=${s#?}
+          prev="#"
+          ;;
+        '<')
+          case "$s" in
+            '<<<'*)
+              s=${s#???}
+              prev="<"
+              ;;
+            '<<'*)
+              s=${s#??}
+              strip=0
+              case "$s" in
+                '-'*) strip=1; s=${s#?} ;;
+              esac
+              ws=${s%%[! $tab]*}
+              s=${s#"$ws"}
+              delim=""
+              while [ -n "$s" ]; do
+                ch=${s%"${s#?}"}
+                case "$ch" in
+                  ' '|"$tab"|';'|'&'|'|'|'<'|'>'|'('|')') break ;;
+                  "'")
+                    s=${s#?}
+                    case "$s" in
+                      *\'*) delim="${delim}${s%%\'*}"; s=${s#*\'} ;;
+                      *) return 0 ;;
+                    esac
+                    ;;
+                  '"')
+                    s=${s#?}
+                    while [ -n "$s" ]; do
+                      ch=${s%"${s#?}"}
+                      case "$ch" in
+                        '"') s=${s#?}; break ;;
+                        '\') s=${s#?}; [ -n "$s" ] && { delim="${delim}${s%"${s#?}"}"; s=${s#?}; } ;;
+                        *) delim="${delim}${ch}"; s=${s#?} ;;
+                      esac
+                    done
+                    ;;
+                  '\')
+                    s=${s#?}
+                    [ -n "$s" ] && { delim="${delim}${s%"${s#?}"}"; s=${s#?}; }
+                    ;;
+                  *)
+                    delim="${delim}${ch}"
+                    s=${s#?}
+                    ;;
+                esac
+              done
+              if [ -n "$delim" ]; then
+                hd_delim=$delim
+                hd_strip=$strip
+                return 0
+              fi
+              prev="<"
+              ;;
+            *)
+              s=${s#?}
+              prev="<"
+              ;;
+          esac
+          ;;
+        *)
+          s=${s#?}
+          prev=$ch
+          ;;
+      esac
+    done
+  }
+
   _cpg_resolve() {
     local cur=$1 depth=$2
     local l1 sb interp base line ws rest tok tok_quoted polyglot dir fallback_py="" lines=0
+    local hd_delim="" hd_strip=0
     [ "$depth" -lt 8 ] || return 1
     [ "$total" -lt 32 ] || return 1
     total=$((total + 1))
@@ -800,10 +930,24 @@ const SHEBANG_PYTHON: &str = r#"shebang_python() (
       [ "$lines" -eq 1 ] && continue
       [ "$lines" -gt 200 ] && break
       line=${line%$cr}
+      if [ -n "$hd_delim" ]; then
+        if [ "$hd_strip" = 1 ]; then
+          ws=${line%%[!$tab]*}
+          [ "${line#"$ws"}" = "$hd_delim" ] && hd_delim=""
+        else
+          [ "$line" = "$hd_delim" ] && hd_delim=""
+        fi
+        continue
+      fi
       ws=${line%%[! $tab]*}
       rest=${line#"$ws"}
       case "$rest" in
         ""|'#'*) continue ;;
+      esac
+      case "$rest" in
+        *'<<'*) _cpg_scan_heredoc "$rest" ;;
+      esac
+      case "$rest" in
         *exec*) ;;
         *) continue ;;
       esac
@@ -825,14 +969,6 @@ const SHEBANG_PYTHON: &str = r#"shebang_python() (
       done
       [ "$tok" = "exec" ] || continue
 
-      if [ "$lines" -eq 2 ] && [ "$base" = "sh" ]; then
-        dir=$(dirname -- "$cur")
-        if [ -x "$dir/python" ]; then
-          printf %s "$dir/python"
-          return 0
-        fi
-      fi
-
       while _cpg_next_tok; do
         if [ "$tok_quoted" = 0 ]; then
           case "$tok" in
@@ -841,7 +977,7 @@ const SHEBANG_PYTHON: &str = r#"shebang_python() (
             -*) ;;
             *'<'*|*'>'*)
               case "$tok" in
-                *'<'|*'>') _cpg_next_tok || { tok=""; break; } ;;
+                *'<'|*'>'|*'>|') _cpg_next_tok || { tok=""; break; } ;;
               esac
               ;;
             *) break ;;
@@ -895,6 +1031,13 @@ const SHEBANG_PYTHON: &str = r#"shebang_python() (
       case "$tok" in
         */*) ;;
         *)
+          if [ "$lines" -eq 2 ] && [ "$base" = "sh" ] && _cpg_is_python "$tok"; then
+            dir=$(dirname -- "$cur")
+            if [ -x "$dir/python" ]; then
+              printf %s "$dir/python"
+              return 0
+            fi
+          fi
           tok=$(command -v -- "$tok" 2>/dev/null) || continue
           case "$tok" in */*) ;; *) continue ;; esac
           ;;
@@ -923,7 +1066,7 @@ const SHEBANG_PYTHON: &str = r#"shebang_python() (
 
   _cpg_resolve "$1" 0 || true
 )
-"#;
+"##;
 
 fn with_shebang_python(script: &str) -> String {
     format!("{SHEBANG_PYTHON}{script}")
@@ -2058,13 +2201,38 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
 
-        let venv_python = root.join("venv/bin/python3");
-        write_exec(
-            &venv_python,
-            "#!/bin/sh\nif [ \"$1\" = \"-c\" ] && [ \"$2\" = \"import keyring\" ]; then exit 0; fi\necho 'Version: 0.8.0-fake'\n",
+        // Symlink to the host's compiled `python3` binary (not a `#!/bin/sh` script) because
+        // macOS rejects nested shebangs when `PROBE_SCRIPT` executes `"$c" version`.
+        let real_python = Host::Local
+            .run_quiet(
+                ScriptRequest::new(
+                    "python3 -c 'import os, sys; print(os.path.realpath(sys.executable))'",
+                )
+                .timeout(Duration::from_secs(20)),
+                &CancelToken::new(),
+            )
+            .unwrap()
+            .stdout;
+        assert!(
+            !real_python.is_empty(),
+            "python3 is required for unix tests"
         );
+        let venv_python = root.join("venv/bin/python3");
+        std::fs::create_dir_all(venv_python.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&real_python, &venv_python).unwrap();
+
         let venv_colab = root.join("venv/bin/colab");
-        write_exec(&venv_colab, &format!("#!{}\n", venv_python.display()));
+        write_exec(
+            &venv_colab,
+            &format!(
+                "#!{}\nprint('Version: 0.8.0-fake')\n",
+                venv_python.display()
+            ),
+        );
+
+        let py_lib = root.join("py_lib");
+        std::fs::create_dir_all(&py_lib).unwrap();
+        std::fs::write(py_lib.join("keyring.py"), "").unwrap();
 
         // Multi-line `#!/usr/bin/env bash` wrapper with umask, export, comments, and FD redirect.
         let wrapper_bin = root.join("bin");
@@ -2091,7 +2259,8 @@ mod tests {
             .unwrap();
         assert_eq!(resolved.helper_python, expected);
 
-        // Run PROBE_SCRIPT with isolated PATH and HOME so no host `colab` is touched.
+        // Run PROBE_SCRIPT with isolated PATH, HOME, and stub keyring so no host `colab` or
+        // system keyring is touched.
         let fake_home = root.join("home");
         std::fs::create_dir_all(&fake_home).unwrap();
         let probe_req = ScriptRequest::new(format!(
@@ -2100,6 +2269,7 @@ mod tests {
         ))
         .arg(wrapper_bin.to_string_lossy().to_string())
         .env("HOME", fake_home.to_string_lossy().to_string())
+        .env("PYTHONPATH", py_lib.to_string_lossy().to_string())
         .timeout(Duration::from_secs(20));
         let out = Host::Local
             .run_quiet(probe_req, &CancelToken::new())
@@ -2110,7 +2280,8 @@ mod tests {
         assert!(report.keyring_ok);
         assert_eq!(report.colab_version.as_deref(), Some("0.8.0-fake"));
 
-        // Quoted paths with spaces, exec flags, env prefix, multi-hop chain, and direct python exec.
+        // Quoted paths with spaces, exec flags, env prefix, redirections, heredocs, multi-hop
+        // chain, and direct python exec.
         let spaced_colab = root.join("dir with spaces/venv/bin/colab");
         write_exec(&spaced_colab, &format!("#!{}\n", venv_python.display()));
 
@@ -2143,6 +2314,55 @@ mod tests {
             ),
         );
         assert_eq!(run_shebang_python(&via_env, None), expected);
+
+        let attached_redir = root.join("wrap_attached_redir");
+        let log_file = root.join("colab.log");
+        write_exec(
+            &attached_redir,
+            &format!(
+                "#!/usr/bin/env bash\nexec {}>{} \"$@\"\n",
+                venv_colab.display(),
+                log_file.display()
+            ),
+        );
+        assert_eq!(run_shebang_python(&attached_redir, None), expected);
+
+        let prefixed_redir = root.join("wrap_prefixed_redir");
+        write_exec(
+            &prefixed_redir,
+            &format!(
+                "#!/usr/bin/env bash\nexec 2>>{} &>/dev/null {} \"$@\"\n",
+                log_file.display(),
+                venv_colab.display()
+            ),
+        );
+        assert_eq!(run_shebang_python(&prefixed_redir, None), expected);
+
+        let after_heredoc = root.join("wrap_after_heredoc");
+        write_exec(
+            &after_heredoc,
+            &format!(
+                "#!/usr/bin/env bash\n\
+                 cat <<-\"END\" >/dev/null\n\
+                 exec /wrong/python3\n\
+                 \tEND\n\
+                 read -r _ <<< \"ignored\"\n\
+                 exec {} \"$@\"\n",
+                venv_colab.display()
+            ),
+        );
+        assert_eq!(run_shebang_python(&after_heredoc, None), expected);
+
+        // `#!/bin/sh` wrapper forwarding to an explicit target path follows that target even if a
+        // sibling `python` exists in the wrapper's own directory.
+        let sh_with_sibling_dir = root.join("sh_sibling");
+        write_exec(&sh_with_sibling_dir.join("python"), "#!/bin/sh\nexit 0\n");
+        let sh_forward = sh_with_sibling_dir.join("colab");
+        write_exec(
+            &sh_forward,
+            &format!("#!/bin/sh\nexec {} \"$@\"\n", venv_colab.display()),
+        );
+        assert_eq!(run_shebang_python(&sh_forward, None), expected);
 
         let hop1 = root.join("hop1");
         write_exec(
@@ -2278,7 +2498,7 @@ mod tests {
         assert_eq!(report.helper_python, None);
         assert!(!report.keyring_ok);
 
-        // Bash wrapper exec'ing a non-Python script must return empty, even if sibling python exists.
+        // Shell wrappers exec'ing a non-Python script must return empty, even if sibling python exists.
         let mixed_dir = root.join("mixed");
         write_exec(&mixed_dir.join("python"), "#!/bin/sh\nexit 0\n");
         let non_py_target = root.join("tool");
@@ -2290,13 +2510,36 @@ mod tests {
         );
         assert_eq!(run_shebang_python(&exec_non_py, None), "");
 
-        // `#!/bin/sh` wrapper exec'ing a non-Python script (no sibling python) must return empty.
-        let sh_non_py = root.join("sh_non_py/colab");
+        let sh_non_py_with_sibling = mixed_dir.join("colab_sh");
         write_exec(
-            &sh_non_py,
+            &sh_non_py_with_sibling,
             &format!("#!/bin/sh\nexec {} \"$@\"\n", non_py_target.display()),
         );
-        assert_eq!(run_shebang_python(&sh_non_py, None), "");
+        assert_eq!(run_shebang_python(&sh_non_py_with_sibling, None), "");
+
+        // `#!/bin/sh` self-loop in a directory with sibling `python` must still detect the cycle.
+        let sh_self_loop = mixed_dir.join("colab_sh_loop");
+        write_exec(
+            &sh_self_loop,
+            &format!("#!/bin/sh\nexec {} \"$@\"\n", sh_self_loop.display()),
+        );
+        assert_eq!(run_shebang_python(&sh_self_loop, None), "");
+
+        // Here-document body containing `exec /.../python3` must be ignored.
+        let heredoc_only = root.join("heredoc_only");
+        write_exec(
+            &heredoc_only,
+            &format!(
+                "#!/usr/bin/env bash\n\
+                 : <<'NOTE'\n\
+                 exec {}\n\
+                 NOTE\n\
+                 exec {} \"$@\"\n",
+                mixed_dir.join("python").display(),
+                non_py_target.display()
+            ),
+        );
+        assert_eq!(run_shebang_python(&heredoc_only, None), "");
 
         // Dynamic uv/pip launcher without sibling `python` returns empty.
         let orphan_uv = root.join("orphan_uv/colab");
