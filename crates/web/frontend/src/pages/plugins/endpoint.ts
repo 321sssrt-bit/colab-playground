@@ -213,27 +213,3 @@ export function selectEndpointTunnelByPort(
 
   return preferredMatch ?? bestUp ?? firstActive;
 }
-
-/**
- * Looks up the specific live tunnel bound to a plugin endpoint by its exact tunnel ID
- * and applies any same-version SSE `forward` transition overlays.
- */
-export function selectEndpointTunnelById(
-  tunnels: readonly TunnelInfo[],
-  tunnelId: number | null,
-  overlaysById: Readonly<Record<number, ForwardLiveOverlay>>,
-  snapshotVersion: number,
-): TunnelInfo | null {
-  if (tunnelId === null) {
-    return null;
-  }
-  const tunnel = tunnels.find((item) => item.id === tunnelId);
-  if (!tunnel) {
-    return null;
-  }
-  const effective = applyForwardOverlayToTunnel(tunnel, overlaysById, snapshotVersion);
-  if (effective.state.state === "failed" || effective.state.state === "stopped") {
-    return null;
-  }
-  return effective;
-}
