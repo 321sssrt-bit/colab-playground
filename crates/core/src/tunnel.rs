@@ -143,7 +143,8 @@ pub enum TunnelEvent {
 }
 
 /// `colab --config <state> ssh --proxy-mode -s <name>` as a shell string for
-/// OpenSSH's `ProxyCommand` (which always runs through a shell).
+/// OpenSSH's `ProxyCommand` (which expands `%` tokens in it, then always runs
+/// it through a shell).
 pub fn proxy_command(colab: &str, state_file: &HostPath, session: &str) -> String {
     format!(
         "{} --config {} ssh --proxy-mode -s {}",
@@ -151,6 +152,7 @@ pub fn proxy_command(colab: &str, state_file: &HostPath, session: &str) -> Strin
         shell_quote(state_file.as_str()),
         shell_quote(session)
     )
+    .replace('%', "%%")
 }
 
 pub fn ssh_args(colab: &str, state_file: &HostPath, spec: &TunnelSpec) -> Result<Vec<String>> {
@@ -710,6 +712,19 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<TunnelSpec>(explicit).unwrap(),
             decoded
+        );
+    }
+
+    #[test]
+    fn proxy_command_escapes_openssh_percent_tokens() {
+        let p = proxy_command(
+            "/opt/100%h/colab",
+            &HostPath::new("/d/a%p/b%%r/s.json"),
+            "s1",
+        );
+        assert_eq!(
+            p,
+            "'/opt/100%%h/colab' --config '/d/a%%p/b%%%%r/s.json' ssh --proxy-mode -s s1"
         );
     }
 
