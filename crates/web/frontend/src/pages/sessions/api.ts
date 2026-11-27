@@ -20,7 +20,6 @@ import type {
   HardwareRate,
   RuntimeRef,
   SessionsListResponse,
-  StopAllResponse,
   UnixSecs,
   WatchdogInfo,
 } from "../../lib/types.ts";
@@ -168,15 +167,6 @@ export function stopRuntime(target: RuntimeRef): Promise<void> {
     method: "POST",
     body: {
       target,
-      confirmed: true,
-    },
-  });
-}
-
-export function stopAllRuntimes(): Promise<StopAllResponse> {
-  return apiClient.request<StopAllResponse>("/api/sessions/stop-all", {
-    method: "POST",
-    body: {
       confirmed: true,
     },
   });
