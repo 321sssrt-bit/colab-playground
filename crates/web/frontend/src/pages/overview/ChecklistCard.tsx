@@ -1,34 +1,31 @@
 /**
- * Ordered four-step environment readiness checklist: host tools (WSL or shell),
- * streaming Colab CLI installer with cancel, OS keyring & helper interpreter
- * diagnostics, and Google account sign-in or in-place adoption.
+ * Ordered three-step environment readiness checklist aligned with upstream
+ * `crates/app/src/ui/pages/overview.rs`: host tools (WSL or shell),
+ * persistent streaming/replaying Colab CLI installer with `fa25d8c` not-found
+ * warning loop, and Google account sign-in (in-place modal) or adoption.
  */
 
-import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef } from "react";
 
 import { AlertIcon, CheckCircleIcon } from "../../components/Icons.tsx";
+import { openAddAccountDialog } from "../../lib/accountDialogs.ts";
 import { ApiError } from "../../lib/api.ts";
 import type { TranslateFn } from "../../lib/i18n.ts";
-import type { RouteId } from "../../lib/router.ts";
+import type { NavigateOptions, RouteId } from "../../lib/router.ts";
 import type { ToastInput } from "../../lib/toast.ts";
-import type { PendingOperation } from "../../lib/types.ts";
+import type { ErrorKind, InstallMethod, PendingOperation } from "../../lib/types.ts";
 import {
   formatApiError,
   formatErrorKind,
   type FormattedApiError,
 } from "../accounts/model.ts";
 import {
-  cancelCliInstall,
   formatInstallErrorPayload,
   formatInstallMethod,
-  INSTALL_LOG_MAX_LINES,
   resolveInstallMethods,
-  startCliInstallStream,
   WSL_INSTALL_URL,
   type ChecklistModel,
   type ChecklistStepStatus,
-  type InstallLine,
-  type InstallMethod,
   type OverviewResponse,
 } from "./api.ts";
 import {
@@ -38,8 +35,7 @@ import {
   LogInIcon,
   RefreshIcon,
 } from "./Icons.tsx";
-
-type InstallPhase = "idle" | "running" | "done" | "cancelled" | "failed";
+import { cliInstallStore, useCliInstallStore } from "./installStore.ts";
 
 const LOG_BOTTOM_THRESHOLD_PX = 24;
 
@@ -47,6 +43,8 @@ export interface ChecklistCardProps {
   readonly overview: OverviewResponse | null;
   readonly checklist: ChecklistModel;
   readonly probeError: FormattedApiError | null;
+  readonly probeErrorKind: ErrorKind | null;
+  readonly usesWsl: boolean | null;
   readonly probing: boolean;
   readonly runningInstallOp: PendingOperation | null;
   readonly adopting: boolean;
@@ -54,11 +52,10 @@ export interface ChecklistCardProps {
   readonly accountChangeBlocked: boolean;
   readonly shuttingDown: boolean;
   readonly t: TranslateFn;
-  readonly navigate: (route: RouteId) => void;
+  readonly navigate: (route: RouteId, options?: NavigateOptions) => void;
   readonly pushToast: (toast: ToastInput) => number;
   readonly onCheckAgain: () => Promise<void>;
   readonly onAdoptAccount: () => Promise<void>;
-  readonly onInstallSucceeded: () => Promise<void>;
 }
 
 function StepMarker({ status }: { readonly status: ChecklistStepStatus }) {
@@ -88,6 +85,8 @@ export function ChecklistCard({
   overview,
   checklist,
   probeError,
+  probeErrorKind,
+  usesWsl,
   probing,
   runningInstallOp,
   adopting,
@@ -99,57 +98,20 @@ export function ChecklistCard({
   pushToast,
   onCheckAgain,
   onAdoptAccount,
-  onInstallSucceeded,
 }: ChecklistCardProps) {
   const methodSelectId = useId();
   const offeredMethods = resolveInstallMethods(overview);
+  const installState = useCliInstallStore();
 
-  const [preferredMethod, setPreferredMethod] = useState<InstallMethod | null>(null);
-  const [installPhase, setInstallPhase] = useState<InstallPhase>("idle");
-  const [installId, setInstallId] = useState<number | null>(null);
-  const [installLines, setInstallLines] = useState<readonly InstallLine[]>([]);
-  const [installError, setInstallError] = useState<FormattedApiError | null>(null);
-  const [cancelRequested, setCancelRequested] = useState(false);
-
-  const mountedRef = useRef(true);
-  const streamAbortRef = useRef<AbortController | null>(null);
-  const streamActiveRef = useRef(false);
   const logRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef(true);
-  const prevServerOpIdRef = useRef<number | null>(runningInstallOp?.id ?? null);
-
-  useEffect(() => {
-    mountedRef.current = true;
-    return () => {
-      mountedRef.current = false;
-      streamAbortRef.current?.abort();
-      streamAbortRef.current = null;
-      streamActiveRef.current = false;
-    };
-  }, []);
-
-  // Re-probe automatically when a server-side install started elsewhere finishes.
-  useEffect(() => {
-    const prevId = prevServerOpIdRef.current;
-    const nextId = runningInstallOp?.id ?? null;
-    prevServerOpIdRef.current = nextId;
-
-    if (prevId !== null && nextId === null && !streamActiveRef.current) {
-      setCancelRequested(false);
-      setInstallId(null);
-      if (installPhase === "running") {
-        setInstallPhase("idle");
-      }
-      void onCheckAgain();
-    }
-  }, [installPhase, onCheckAgain, runningInstallOp]);
 
   useEffect(() => {
     const el = logRef.current;
     if (el !== null && stickToBottomRef.current) {
       el.scrollTop = el.scrollHeight;
     }
-  }, [installLines]);
+  }, [installState.lines]);
 
   const handleLogScroll = useCallback(() => {
     const el = logRef.current;
@@ -161,132 +123,39 @@ export function ChecklistCard({
   }, []);
 
   const selectedMethod: InstallMethod =
-    preferredMethod !== null && offeredMethods.includes(preferredMethod)
-      ? preferredMethod
+    installState.preferredMethod !== null && offeredMethods.includes(installState.preferredMethod)
+      ? installState.preferredMethod
       : offeredMethods[0];
 
-  const activeInstallId = installId ?? runningInstallOp?.id ?? null;
-  const installing = installPhase === "running" || runningInstallOp !== null;
-  const cancelling = cancelRequested || runningInstallOp?.cancelling === true;
+  const activeInstallId = installState.id ?? runningInstallOp?.id ?? null;
+  const installing =
+    installState.phase === "running" ||
+    (runningInstallOp !== null && installState.phase === "idle");
+  const checkingAfterInstall =
+    installState.phase === "checking" ||
+    ((installState.phase === "not_found" || installState.phase === "probe_failed") && probing);
+  const cancelling = installState.cancelling || runningInstallOp?.cancelling === true;
 
   const handleStartInstall = useCallback(async () => {
-    if (installing || shuttingDown) {
+    if (installing || checkingAfterInstall || shuttingDown) {
       return;
     }
-    streamAbortRef.current?.abort();
-    const controller = new AbortController();
-    streamAbortRef.current = controller;
-    streamActiveRef.current = true;
     stickToBottomRef.current = true;
-
-    setInstallPhase("running");
-    setInstallId(null);
-    setInstallLines([]);
-    setInstallError(null);
-    setCancelRequested(false);
-
-    let receivedFinished = false;
-    try {
-      await startCliInstallStream(selectedMethod, {
-        signal: controller.signal,
-        onStarted: (id) => {
-          if (!mountedRef.current) {
-            return;
-          }
-          setInstallId(id);
-        },
-        onLine: (line) => {
-          if (!mountedRef.current) {
-            return;
-          }
-          setInstallLines((prev) => {
-            if (prev.length >= INSTALL_LOG_MAX_LINES) {
-              return [...prev.slice(prev.length - INSTALL_LOG_MAX_LINES + 1), line];
-            }
-            return [...prev, line];
-          });
-        },
-        onFinished: (event) => {
-          receivedFinished = true;
-          if (!mountedRef.current) {
-            return;
-          }
-          setCancelRequested(false);
-          setInstallId(null);
-          if (event.status === "succeeded") {
-            setInstallPhase("done");
-            setInstallError(null);
-            void onInstallSucceeded();
-          } else if (event.status === "cancelled") {
-            setInstallPhase("cancelled");
-            setInstallError(null);
-          } else {
-            setInstallPhase("failed");
-            setInstallError(formatInstallErrorPayload(event.error, t));
-          }
-        },
-      });
-
-      if (!mountedRef.current) {
-        return;
-      }
-      if (!receivedFinished) {
-        setInstallPhase("failed");
-        setInstallError({ message: t("app.err.connection_lost"), hint: null });
-        void onCheckAgain();
-      }
-    } catch (error) {
-      if (!mountedRef.current) {
-        return;
-      }
-      if (error instanceof ApiError && error.isAbort) {
-        return;
-      }
-      if (error instanceof ApiError && error.status === 409 && error.operationId !== null) {
-        setInstallId(error.operationId);
-        setInstallPhase("running");
-        return;
-      }
-      if (!receivedFinished) {
-        setInstallPhase("failed");
-        setInstallError(formatApiError(error, t));
-      }
-    } finally {
-      if (streamAbortRef.current === controller) {
-        streamAbortRef.current = null;
-      }
-      streamActiveRef.current = false;
-      if (mountedRef.current) {
-        setCancelRequested(false);
-      }
-    }
-  }, [installing, onCheckAgain, onInstallSucceeded, selectedMethod, shuttingDown, t]);
+    await cliInstallStore.startInstall(selectedMethod);
+  }, [checkingAfterInstall, installing, selectedMethod, shuttingDown]);
 
   const handleCancelInstall = useCallback(async () => {
-    if (activeInstallId === null || cancelling) {
-      return;
-    }
-    setCancelRequested(true);
     try {
-      await cancelCliInstall(activeInstallId);
+      await cliInstallStore.cancelInstall();
     } catch (error) {
-      if (!mountedRef.current) {
-        return;
-      }
-      if (error instanceof ApiError && error.status === 404) {
-        setInstallId(null);
-        setCancelRequested(false);
-        void onCheckAgain();
-        return;
-      }
-      setCancelRequested(false);
-      if (!(error instanceof ApiError && error.isUnauthorized)) {
+      if (!(error instanceof ApiError && (error.isUnauthorized || error.isAbort))) {
         pushToast({ tone: "danger", body: formatApiError(error, t).message });
       }
     }
-  }, [activeInstallId, cancelling, onCheckAgain, pushToast, t]);
+  }, [pushToast, t]);
 
-  const hostIsWsl = overview?.host.kind === "wsl";
+  const hostIsWsl =
+    overview !== null ? overview.host.kind === "wsl" : (usesWsl ?? probeErrorKind === "wsl_unavailable");
   const hostTitle = t(hostIsWsl ? "app.step.wsl.title" : "app.step.shell.title");
 
   let hostDescription: string | null = null;
@@ -294,7 +163,7 @@ export function ChecklistCard({
     hostDescription = t("app.step.checking");
   } else if (checklist.hostStatus === "done" && overview !== null) {
     if (hostIsWsl) {
-      const distro = overview.environment.wsl_distros[0] ?? "";
+      const distro = overview.host.wsl_distro ?? overview.environment.wsl_distros[0] ?? "";
       hostDescription = t("app.step.wsl.done", { distro });
     } else if (overview.host.hint_key !== null) {
       hostDescription = t(overview.host.hint_key);
@@ -305,8 +174,14 @@ export function ChecklistCard({
     hostDescription = t(hostIsWsl ? "app.step.wsl.todo" : "app.step.shell.todo");
   }
 
+  const cliStepStatus: ChecklistStepStatus =
+    installing || checkingAfterInstall ? "checking" : checklist.cliStatus;
+  const showCliInstallSection = checklist.cliStatus === "todo" || installing || checkingAfterInstall;
+
   let cliDescription: string | null = null;
-  if (!installing) {
+  if (checkingAfterInstall) {
+    cliDescription = t("app.step.checking");
+  } else if (!installing) {
     if (checklist.cliStatus === "waiting") {
       cliDescription = t("app.step.waiting");
     } else if (checklist.cliStatus === "done" && overview !== null) {
@@ -314,9 +189,9 @@ export function ChecklistCard({
         ? t("app.step.cli.done", { version: overview.environment.colab_version })
         : t("app.step.cli.done_unknown");
     } else if (checklist.cliStatus === "todo") {
-      if (installPhase === "done") {
-        cliDescription = t("app.install.done");
-      } else if (installPhase === "cancelled") {
+      if (installState.phase === "not_found") {
+        cliDescription = null;
+      } else if (installState.phase === "cancelled") {
         cliDescription = t("app.install.cancelled");
       } else {
         cliDescription = t("app.step.cli.todo");
@@ -324,30 +199,22 @@ export function ChecklistCard({
     }
   }
 
-  const helperDescription =
-    overview !== null && checklist.cliStatus === "done"
-      ? t(overview.helper_available ? "web.overview.helper_ready" : "web.overview.helper_missing")
+  const installError: FormattedApiError | null =
+    installState.phase === "failed" || installState.phase === "probe_failed"
+      ? installState.streamError !== null
+        ? formatApiError(installState.streamError, t)
+        : formatInstallErrorPayload(installState.error, t)
       : null;
 
-  const keyringUnavailable =
-    overview !== null &&
-    (overview.keyring.status === "unavailable" ||
-      overview.accounts_error === "keyring_unavailable");
-  const keyringAlertBody =
-    overview !== null && overview.keyring.hint_key !== null
-      ? t(overview.keyring.hint_key) || t("app.accounts.keyring.body")
-      : t("app.accounts.keyring.body");
-
-  let keyringDescription: string | null = null;
-  if (checklist.keyringStatus === "waiting") {
-    keyringDescription = t("web.overview.keyring_unknown");
-  } else if (checklist.keyringStatus === "checking") {
-    keyringDescription = t("app.step.checking");
-  } else if (checklist.keyringStatus === "done") {
-    keyringDescription = t("web.overview.keyring_ready");
-  } else if (checklist.keyringStatus === "todo") {
-    keyringDescription = t("web.overview.keyring_unknown");
-  }
+  // Wrap server-provided keys in `*_key` fields so the static i18n checker recognizes them.
+  const notFoundKeys = {
+    title_key: installState.warningTitleKey,
+    body_key: installState.warningBodyKey,
+  };
+  const notFoundTitle =
+    (notFoundKeys.title_key ? t(notFoundKeys.title_key) : "") || t("app.install.not_found.title");
+  const notFoundBody =
+    (notFoundKeys.body_key ? t(notFoundKeys.body_key) : "") || t("app.install.not_found.body");
 
   const unadopted = overview?.accounts?.unadopted === true;
   const activeEmail =
@@ -356,7 +223,9 @@ export function ChecklistCard({
     null;
 
   let signinDescription: string | null = null;
-  if (checklist.signinStatus === "waiting") {
+  if (checklist.signinStatus === "checking") {
+    signinDescription = t("app.step.checking");
+  } else if (checklist.signinStatus === "waiting") {
     signinDescription = t("app.step.waiting");
   } else if (checklist.signinStatus === "done") {
     signinDescription = t("app.step.signin.done", {
@@ -366,6 +235,24 @@ export function ChecklistCard({
     signinDescription = t(unadopted ? "app.step.signin.unadopted" : "app.step.signin.todo");
   }
 
+  const signinKeyringUnavailable =
+    overview !== null &&
+    (overview.accounts_error === "keyring_unavailable" ||
+      (overview.accounts_error === null && overview.keyring.status === "unavailable"));
+  const signinErrorTitle =
+    checklist.signinStatus === "failed" && overview !== null
+      ? signinKeyringUnavailable
+        ? t("app.err.keyring_unavailable")
+        : overview.accounts_error !== null
+          ? formatErrorKind(overview.accounts_error, t)
+          : t("app.err.other")
+      : null;
+  const signinErrorBody =
+    checklist.signinStatus === "failed" && overview !== null && signinKeyringUnavailable
+      ? (overview.keyring.hint_key !== null ? t(overview.keyring.hint_key) : "") ||
+        t("app.ns.unlock_keyring")
+      : null;
+
   return (
     <section className="card" data-overview-checklist="true">
       <div className="card-header">
@@ -373,33 +260,7 @@ export function ChecklistCard({
           <h2 className="card-title">{t("app.checklist.title")}</h2>
           <p className="card-desc">{t("app.checklist.description")}</p>
         </div>
-        <div className="card-actions">
-          <button
-            type="button"
-            className="btn btn-ghost btn-sm"
-            data-overview-check-again="true"
-            disabled={probing || installing || shuttingDown}
-            onClick={() => {
-              void onCheckAgain();
-            }}
-          >
-            {probing ? <span className="spinner" aria-hidden="true" /> : <RefreshIcon />}
-            <span>{t("app.action.check_again")}</span>
-          </button>
-        </div>
       </div>
-
-      {overview !== null && probeError !== null && (
-        <div className="alert alert-danger" role="alert">
-          <span className="alert-icon icon-danger">
-            <AlertIcon />
-          </span>
-          <div className="alert-text">
-            <p className="alert-title">{probeError.message}</p>
-            {probeError.hint !== null && <p className="alert-body">{probeError.hint}</p>}
-          </div>
-        </div>
-      )}
 
       <ol className="checklist" role="list">
         <li
@@ -426,6 +287,7 @@ export function ChecklistCard({
                     <button
                       type="button"
                       className="btn btn-sm"
+                      data-overview-check-again="true"
                       disabled={probing || shuttingDown}
                       onClick={() => {
                         void onCheckAgain();
@@ -454,6 +316,7 @@ export function ChecklistCard({
                 <button
                   type="button"
                   className="btn btn-ghost btn-sm"
+                  data-overview-check-again="true"
                   disabled={probing || shuttingDown}
                   onClick={() => {
                     void onCheckAgain();
@@ -470,10 +333,10 @@ export function ChecklistCard({
         <li
           className="checklist-item"
           data-overview-step="cli"
-          data-overview-step-status={checklist.cliStatus}
+          data-overview-step-status={cliStepStatus}
         >
           <span className="checklist-icon">
-            <StepMarker status={installing ? "checking" : checklist.cliStatus} />
+            <StepMarker status={cliStepStatus} />
           </span>
           <div className="checklist-body">
             <p className="checklist-title">{t("app.step.cli.title")}</p>
@@ -501,7 +364,70 @@ export function ChecklistCard({
             ) : (
               checklist.cliStatus === "todo" && (
                 <>
-                  {installPhase === "failed" && installError !== null && (
+                  {installState.phase === "not_found" && !checkingAfterInstall && (
+                    <div className="alert alert-warning" role="alert" data-install-not-found="true">
+                      <span className="alert-icon icon-warning">
+                        <AlertIcon />
+                      </span>
+                      <div className="alert-text">
+                        <p className="alert-title">{notFoundTitle}</p>
+                        <p className="alert-body">{notFoundBody}</p>
+                        <div className="alert-actions">
+                          <button
+                            type="button"
+                            className="btn btn-sm"
+                            data-install-open-settings="true"
+                            onClick={() => navigate("settings", { settingsFocus: "host" })}
+                          >
+                            {t("app.b3.new_open_settings")}
+                          </button>
+                          <button
+                            type="button"
+                            className="btn btn-ghost btn-sm"
+                            data-install-check-again="true"
+                            disabled={probing || shuttingDown}
+                            onClick={() => {
+                              void onCheckAgain();
+                            }}
+                          >
+                            <RefreshIcon />
+                            <span>{t("app.action.check_again")}</span>
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {installState.phase === "probe_failed" &&
+                    !checkingAfterInstall &&
+                    installError !== null && (
+                      <div className="alert alert-danger" role="alert">
+                        <span className="alert-icon icon-danger">
+                          <AlertIcon />
+                        </span>
+                        <div className="alert-text">
+                          <p className="alert-title">{installError.message}</p>
+                          {installError.hint !== null && (
+                            <p className="alert-body">{installError.hint}</p>
+                          )}
+                          <div className="alert-actions">
+                            <button
+                              type="button"
+                              className="btn btn-sm"
+                              data-install-check-again="true"
+                              disabled={probing || shuttingDown}
+                              onClick={() => {
+                                void onCheckAgain();
+                              }}
+                            >
+                              {t("app.action.check_again")}
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
+                  {installState.phase === "failed" && installError !== null && (
                     <div className="alert alert-danger" role="alert">
                       <span className="alert-icon icon-danger">
                         <AlertIcon />
@@ -516,7 +442,7 @@ export function ChecklistCard({
                           <button
                             type="button"
                             className="btn btn-sm"
-                            disabled={shuttingDown}
+                            disabled={checkingAfterInstall || shuttingDown}
                             onClick={() => {
                               void handleStartInstall();
                             }}
@@ -539,11 +465,11 @@ export function ChecklistCard({
                           className="select select-sm select-inline"
                           data-install-method="true"
                           value={selectedMethod}
-                          disabled={shuttingDown}
+                          disabled={checkingAfterInstall || shuttingDown}
                           onChange={(event) => {
                             const next = event.target.value as InstallMethod;
                             if (offeredMethods.includes(next)) {
-                              setPreferredMethod(next);
+                              cliInstallStore.setPreferredMethod(next);
                             }
                           }}
                         >
@@ -562,7 +488,7 @@ export function ChecklistCard({
                       type="button"
                       className="btn btn-primary btn-sm"
                       data-install-start="true"
-                      disabled={shuttingDown}
+                      disabled={checkingAfterInstall || shuttingDown}
                       onClick={() => {
                         void handleStartInstall();
                       }}
@@ -575,7 +501,7 @@ export function ChecklistCard({
               )
             )}
 
-            {installLines.length > 0 && (
+            {showCliInstallSection && installState.lines.length > 0 && (
               <div
                 ref={logRef}
                 className="install-log"
@@ -584,7 +510,7 @@ export function ChecklistCard({
                 data-install-log="true"
                 onScroll={handleLogScroll}
               >
-                {installLines.map((line, index) => (
+                {installState.lines.map((line, index) => (
                   <div
                     key={index}
                     className={line.stream === "stderr" ? "log-stderr" : undefined}
@@ -592,65 +518,6 @@ export function ChecklistCard({
                     {line.text}
                   </div>
                 ))}
-              </div>
-            )}
-          </div>
-        </li>
-
-        <li
-          className="checklist-item"
-          data-overview-step="keyring"
-          data-overview-step-status={checklist.keyringStatus}
-        >
-          <span className="checklist-icon">
-            <StepMarker status={checklist.keyringStatus} />
-          </span>
-          <div className="checklist-body">
-            <p className="checklist-title">{t("web.overview.keyring_title")}</p>
-            {keyringDescription !== null && <p className="checklist-desc">{keyringDescription}</p>}
-            {helperDescription !== null && <p className="checklist-desc">{helperDescription}</p>}
-
-            {checklist.keyringStatus === "failed" && (
-              <div className="alert alert-danger" role="alert">
-                <span className="alert-icon icon-danger">
-                  <AlertIcon />
-                </span>
-                <div className="alert-text">
-                  <p className="alert-title">
-                    {keyringUnavailable
-                      ? t("app.accounts.keyring.title")
-                      : t("web.overview.helper_missing")}
-                  </p>
-                  {keyringUnavailable && <p className="alert-body">{keyringAlertBody}</p>}
-                  <div className="alert-actions">
-                    <button
-                      type="button"
-                      className="btn btn-sm"
-                      disabled={probing || shuttingDown}
-                      onClick={() => {
-                        void onCheckAgain();
-                      }}
-                    >
-                      {t("app.action.check_again")}
-                    </button>
-                  </div>
-                </div>
-              </div>
-            )}
-
-            {checklist.keyringStatus === "todo" && (
-              <div className="checklist-actions">
-                <button
-                  type="button"
-                  className="btn btn-ghost btn-sm"
-                  disabled={probing || shuttingDown}
-                  onClick={() => {
-                    void onCheckAgain();
-                  }}
-                >
-                  <RefreshIcon />
-                  <span>{t("app.action.check_again")}</span>
-                </button>
               </div>
             )}
           </div>
@@ -668,30 +535,30 @@ export function ChecklistCard({
             <p className="checklist-title">{t("app.step.signin.title")}</p>
             {signinDescription !== null && <p className="checklist-desc">{signinDescription}</p>}
 
-            {checklist.signinStatus === "failed" &&
-              overview !== null &&
-              overview.accounts_error !== null && (
-                <div className="alert alert-danger" role="alert">
-                  <span className="alert-icon icon-danger">
-                    <AlertIcon />
-                  </span>
-                  <div className="alert-text">
-                    <p className="alert-title">{formatErrorKind(overview.accounts_error, t)}</p>
-                    <div className="alert-actions">
-                      <button
-                        type="button"
-                        className="btn btn-sm"
-                        disabled={probing || shuttingDown}
-                        onClick={() => {
-                          void onCheckAgain();
-                        }}
-                      >
-                        {t("app.action.check_again")}
-                      </button>
-                    </div>
+            {checklist.signinStatus === "failed" && signinErrorTitle !== null && (
+              <div className="alert alert-danger" role="alert">
+                <span className="alert-icon icon-danger">
+                  <AlertIcon />
+                </span>
+                <div className="alert-text">
+                  <p className="alert-title">{signinErrorTitle}</p>
+                  {signinErrorBody !== null && <p className="alert-body">{signinErrorBody}</p>}
+                  <div className="alert-actions">
+                    <button
+                      type="button"
+                      className="btn btn-sm"
+                      data-overview-check-again="true"
+                      disabled={probing || shuttingDown}
+                      onClick={() => {
+                        void onCheckAgain();
+                      }}
+                    >
+                      {t("app.action.check_again")}
+                    </button>
                   </div>
                 </div>
-              )}
+              </div>
+            )}
 
             {checklist.signinStatus === "todo" && (
               <>
@@ -724,7 +591,7 @@ export function ChecklistCard({
                       className="btn btn-primary btn-sm"
                       data-overview-sign-in="true"
                       disabled={shuttingDown}
-                      onClick={() => navigate("accounts")}
+                      onClick={() => openAddAccountDialog()}
                     >
                       <LogInIcon />
                       <span>{t("app.action.sign_in")}</span>

@@ -135,7 +135,6 @@ catalog_keys! {
     INSTALL_START => "app.install.start",
     INSTALL_RUNNING => "app.install.running",
     INSTALL_CANCELLING => "app.install.cancelling",
-    INSTALL_DONE => "app.install.done",
     INSTALL_FAILED => "app.install.failed",
     INSTALL_CANCELLED => "app.install.cancelled",
     INSTALL_NOT_FOUND_TITLE => "app.install.not_found.title",

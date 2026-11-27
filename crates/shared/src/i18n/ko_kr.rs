@@ -187,7 +187,6 @@ pub(super) const MESSAGES: Messages = &[
     (INSTALL_START, "설치"),
     (INSTALL_RUNNING, "Colab CLI를 설치하는 중…"),
     (INSTALL_CANCELLING, "취소하는 중…"),
-    (INSTALL_DONE, "Colab CLI가 설치되었습니다."),
     (INSTALL_FAILED, "설치하지 못했습니다"),
     (INSTALL_CANCELLED, "설치가 취소되었습니다."),
     (

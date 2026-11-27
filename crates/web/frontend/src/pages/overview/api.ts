@@ -1,9 +1,10 @@
 /**
- * Overview wire adapters, streaming CLI installer client, checklist state
- * derivation, and ready-state summary helpers.
+ * Overview wire adapters, streaming/replay CLI installer client, upstream
+ * three-step checklist state derivation, quick-deploy filtering, and
+ * ready/checklist unmanaged runtime warning builders.
  */
 
-import { apiClient, ApiError } from "../../lib/api.ts";
+import { apiClient, ApiError, type ApiClient } from "../../lib/api.ts";
 import type { TranslateFn } from "../../lib/i18n.ts";
 import type { SseFrame } from "../../lib/sse.ts";
 import type {
@@ -11,6 +12,10 @@ import type {
   AccountsView,
   AccountUsageView,
   ApiErrorPayload,
+  CliInstallLine,
+  CliInstallPhase,
+  CliInstallView,
+  ErrorKind,
   ForwardPolicyView,
   InstallMethod,
   OverviewResponse,
@@ -26,6 +31,7 @@ import {
   type FormattedApiError,
   type UnmanagedWarningView,
 } from "../accounts/model.ts";
+import type { PluginInfo } from "../plugins/types.ts";
 
 export type {
   ForwardPolicyView,
@@ -35,22 +41,17 @@ export type {
   UnmanagedRuntimes,
 };
 
-export interface InstallLine {
-  readonly stream: "stdout" | "stderr";
-  readonly text: string;
-}
-
-export type InstallFinishedStatus = "succeeded" | "cancelled" | "failed";
-
 export interface InstallFinishedEvent {
-  readonly status: InstallFinishedStatus;
+  readonly phase: CliInstallPhase;
+  readonly warning_title_key: string | null;
+  readonly warning_body_key: string | null;
   readonly error: ApiErrorPayload | null;
 }
 
 export interface InstallStreamCallbacks {
   readonly signal?: AbortSignal;
-  readonly onStarted?: (id: number) => void;
-  readonly onLine?: (line: InstallLine) => void;
+  readonly onStarted?: (id: number, method: InstallMethod | null) => void;
+  readonly onLine?: (line: CliInstallLine) => void;
   readonly onFinished?: (event: InstallFinishedEvent) => void;
 }
 
@@ -60,8 +61,12 @@ export interface ChecklistModel {
   readonly complete: boolean;
   readonly hostStatus: ChecklistStepStatus;
   readonly cliStatus: ChecklistStepStatus;
-  readonly keyringStatus: ChecklistStepStatus;
   readonly signinStatus: ChecklistStepStatus;
+}
+
+export interface DeriveChecklistOptions {
+  readonly probeErrorKind?: ErrorKind | null;
+  readonly installing?: boolean;
 }
 
 export interface OverviewRuntimesSummary {
@@ -83,10 +88,35 @@ export const INSTALL_METHOD_KEYS = {
 
 const MAX_UNCOUNTED_EMAILS = 2;
 
+const CLI_INSTALL_PHASES: ReadonlySet<string> = new Set<CliInstallPhase>([
+  "idle",
+  "running",
+  "checking",
+  "succeeded",
+  "not_found",
+  "probe_failed",
+  "cancelled",
+  "failed",
+]);
+
+const INSTALL_METHODS: ReadonlySet<string> = new Set<InstallMethod>([
+  "uv",
+  "install_uv_then_cli",
+  "pip_user",
+]);
+
 const ANSI_ESCAPE_RE = /\u001B(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|\u001B\\)|[@-Z\\-_])/g;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isCliInstallPhase(value: unknown): value is CliInstallPhase {
+  return typeof value === "string" && CLI_INSTALL_PHASES.has(value);
+}
+
+function isInstallMethod(value: unknown): value is InstallMethod {
+  return typeof value === "string" && INSTALL_METHODS.has(value);
 }
 
 function parseErrorPayload(raw: unknown): ApiErrorPayload | null {
@@ -122,7 +152,7 @@ function parseInstallFrame(frame: SseFrame, callbacks: InstallStreamCallbacks): 
     return;
   }
   if (frame.event === "started" && typeof raw.id === "number" && Number.isFinite(raw.id)) {
-    callbacks.onStarted?.(raw.id);
+    callbacks.onStarted?.(raw.id, isInstallMethod(raw.method) ? raw.method : null);
     return;
   }
   if (frame.event === "line" && typeof raw.text === "string") {
@@ -130,47 +160,108 @@ function parseInstallFrame(frame: SseFrame, callbacks: InstallStreamCallbacks): 
     callbacks.onLine?.({ stream, text: stripAnsi(raw.text) });
     return;
   }
-  if (
-    frame.event === "finished" &&
-    (raw.status === "succeeded" || raw.status === "cancelled" || raw.status === "failed")
-  ) {
+  if (frame.event === "finished") {
+    const rawStatus =
+      raw.status === "succeeded" || raw.status === "cancelled" || raw.status === "failed"
+        ? raw.status
+        : null;
+    const phase: CliInstallPhase | null = isCliInstallPhase(raw.phase)
+      ? raw.phase
+      : rawStatus === "succeeded"
+        ? "succeeded"
+        : rawStatus === "cancelled"
+          ? "cancelled"
+          : rawStatus === "failed"
+            ? "failed"
+            : null;
+    if (phase === null) {
+      return;
+    }
     callbacks.onFinished?.({
-      status: raw.status,
+      phase,
+      warning_title_key: typeof raw.warning_title_key === "string" ? raw.warning_title_key : null,
+      warning_body_key: typeof raw.warning_body_key === "string" ? raw.warning_body_key : null,
       error: parseErrorPayload(raw.error),
     });
   }
 }
 
 /**
- * Strips ANSI terminal control sequences so streamed CLI installer output
- * renders cleanly as plain text lines.
+ * Strips ANSI terminal control sequences so streamed or replayed CLI installer
+ * output renders cleanly as plain text lines.
  */
 export function stripAnsi(text: string): string {
   return text.replace(ANSI_ESCAPE_RE, "");
+}
+
+/** Strips ANSI sequences and caps hydrated install lines to `INSTALL_LOG_MAX_LINES`. */
+export function sanitizeInstallLines(lines: readonly CliInstallLine[]): readonly CliInstallLine[] {
+  const sliced =
+    lines.length > INSTALL_LOG_MAX_LINES
+      ? lines.slice(lines.length - INSTALL_LOG_MAX_LINES)
+      : lines;
+  return sliced.map((line) => ({
+    stream: line.stream === "stderr" ? "stderr" : "stdout",
+    text: stripAnsi(line.text),
+  }));
+}
+
+/** Reads the latest server-side CLI install snapshot via `GET /api/overview/cli/install`. */
+export function getCliInstallStatus(
+  signal?: AbortSignal,
+  client: ApiClient = apiClient,
+): Promise<CliInstallView> {
+  return client.request<CliInstallView>("/api/overview/cli/install", {
+    method: "GET",
+    signal,
+  });
 }
 
 /** Starts a streaming Colab CLI install via `POST /api/overview/cli/install`. */
 export function startCliInstallStream(
   method: InstallMethod,
   callbacks: InstallStreamCallbacks,
+  client: ApiClient = apiClient,
 ): Promise<void> {
-  return apiClient.openEventStream("/api/overview/cli/install", {
+  return client.openEventStream("/api/overview/cli/install", {
     body: { method },
     signal: callbacks.signal,
     onFrame: (frame) => parseInstallFrame(frame, callbacks),
   });
 }
 
+/**
+ * Attaches to a server-side CLI install replay/live stream via
+ * `POST /api/overview/cli/install/{id}/events` (or `/events` for latest).
+ */
+export function subscribeCliInstallEvents(
+  id: number | null,
+  callbacks: InstallStreamCallbacks,
+  client: ApiClient = apiClient,
+): Promise<void> {
+  const path =
+    id !== null ? `/api/overview/cli/install/${id}/events` : "/api/overview/cli/install/events";
+  return client.openEventStream(path, {
+    body: {},
+    signal: callbacks.signal,
+    onFrame: (frame) => parseInstallFrame(frame, callbacks),
+  });
+}
+
 /** Cancels a running Colab CLI install by operation id. */
-export function cancelCliInstall(id: number, signal?: AbortSignal): Promise<void> {
-  return apiClient.request<void>(`/api/overview/cli/install/${id}/cancel`, {
+export function cancelCliInstall(
+  id: number,
+  signal?: AbortSignal,
+  client: ApiClient = apiClient,
+): Promise<void> {
+  return client.request<void>(`/api/overview/cli/install/${id}/cancel`, {
     method: "POST",
     body: {},
     signal,
   });
 }
 
-/** Formats a structured server error payload emitted inside an SSE `finished` frame. */
+/** Formats a structured server error payload emitted inside an SSE `finished` frame or status view. */
 export function formatInstallErrorPayload(
   payload: ApiErrorPayload | null,
   t: TranslateFn,
@@ -218,28 +309,58 @@ export function resolveInstallMethods(overview: OverviewResponse | null): readon
   return ["install_uv_then_cli"];
 }
 
-/** Derives the ordered four-step readiness checklist state from the latest overview probe. */
+/**
+ * Filters Overview quick-deploy plugins to enabled bundled plugins only,
+ * matching upstream `AppState::quick_deploys()`.
+ */
+export function selectQuickDeployPlugins(
+  plugins: readonly PluginInfo[],
+): readonly PluginInfo[] {
+  return plugins.filter((plugin) => plugin.enabled && plugin.source.kind === "bundled");
+}
+
+/**
+ * Derives the ordered three-step readiness checklist state (`host`, `cli`, `signin`)
+ * matching upstream `crates/app/src/state/environment.rs::checklist`.
+ */
 export function deriveChecklist(
   overview: OverviewResponse | null,
   probeError: FormattedApiError | null,
-  probing: boolean,
-  installing = false,
+  options: DeriveChecklistOptions = {},
 ): ChecklistModel {
+  const probeErrorKind = options.probeErrorKind ?? null;
+  const installing = options.installing === true;
+
+  if (probeErrorKind === "not_installed") {
+    return {
+      complete: false,
+      hostStatus: "done",
+      cliStatus: "todo",
+      signinStatus: "waiting",
+    };
+  }
+  if (probeError !== null) {
+    return {
+      complete: false,
+      hostStatus: "failed",
+      cliStatus: "waiting",
+      signinStatus: "waiting",
+    };
+  }
+
   if (overview === null) {
     if (installing) {
       return {
         complete: false,
         hostStatus: "checking",
-        cliStatus: "checking",
-        keyringStatus: "waiting",
+        cliStatus: "todo",
         signinStatus: "waiting",
       };
     }
     return {
       complete: false,
-      hostStatus: probeError !== null ? "failed" : "checking",
+      hostStatus: "checking",
       cliStatus: "waiting",
-      keyringStatus: "waiting",
       signinStatus: "waiting",
     };
   }
@@ -248,46 +369,23 @@ export function deriveChecklist(
   const cliStatus: ChecklistStepStatus =
     hostStatus !== "done" ? "waiting" : overview.cli_installed ? "done" : "todo";
 
-  let keyringStatus: ChecklistStepStatus;
-  if (cliStatus !== "done") {
-    keyringStatus = "waiting";
-  } else if (
-    overview.keyring.status === "unavailable" ||
-    overview.accounts_error === "keyring_unavailable"
-  ) {
-    keyringStatus = "failed";
-  } else if (overview.keyring.status === "ready") {
-    keyringStatus = "done";
-  } else if (!overview.helper_available) {
-    keyringStatus = "failed";
-  } else if (overview.accounts_error !== null) {
-    keyringStatus = "waiting";
-  } else {
-    keyringStatus = probing ? "checking" : "todo";
-  }
-
   let signinStatus: ChecklistStepStatus;
-  if (cliStatus !== "done" || keyringStatus === "failed") {
+  if (cliStatus !== "done") {
     signinStatus = "waiting";
   } else if (overview.accounts_error !== null) {
     signinStatus = "failed";
-  } else if (keyringStatus !== "done") {
-    signinStatus = "waiting";
-  } else if (overview.accounts?.active !== null && overview.accounts?.active !== undefined) {
-    signinStatus = "done";
+  } else if (overview.accounts !== null) {
+    signinStatus = overview.accounts.active !== null ? "done" : "todo";
+  } else if (overview.keyring.status === "unavailable") {
+    signinStatus = "failed";
   } else {
-    signinStatus = "todo";
+    signinStatus = "checking";
   }
 
   return {
-    complete:
-      hostStatus === "done" &&
-      cliStatus === "done" &&
-      keyringStatus === "done" &&
-      signinStatus === "done",
+    complete: hostStatus === "done" && cliStatus === "done" && signinStatus === "done",
     hostStatus,
     cliStatus,
-    keyringStatus,
     signinStatus,
   };
 }
@@ -360,10 +458,74 @@ export function summarizeCrossAccountRuntimes(
   };
 }
 
+function buildUnmanagedWarningFromRuntimes(
+  snapshot: Snapshot,
+  accountsView: AccountsView | null,
+  t: TranslateFn,
+): UnmanagedWarningView | null {
+  const runtimes = snapshot.runtimes?.runtimes ?? [];
+  const countsByAccount = new Map<AccountId, { email: string; count: number }>();
+
+  for (const runtime of runtimes) {
+    if (runtime.managed) {
+      continue;
+    }
+    const existing = countsByAccount.get(runtime.id.account);
+    if (existing) {
+      existing.count += 1;
+      continue;
+    }
+    const accountEmail =
+      runtime.account_email ??
+      accountsView?.accounts.find((account) => account.id === runtime.id.account)?.email ??
+      t("app.accounts.no_email");
+    countsByAccount.set(runtime.id.account, { email: accountEmail, count: 1 });
+  }
+
+  if (countsByAccount.size === 0) {
+    return null;
+  }
+
+  const lines: string[] = [];
+  for (const { email, count } of countsByAccount.values()) {
+    lines.push(
+      count === 1 ? t("app.unmanaged.one", { email }) : t("app.unmanaged.many", { count, email }),
+    );
+  }
+  return {
+    title: t("app.unmanaged.title"),
+    body: lines.join("\n"),
+  };
+}
+
+function isEnvironmentBlockedError(kind: ErrorKind | null): boolean {
+  return kind === "not_installed" || kind === "keyring_unavailable" || kind === "wsl_unavailable";
+}
+
+function buildOverviewFallbackWarning(
+  overviewUnmanaged: UnmanagedRuntimes | null,
+  t: TranslateFn,
+): UnmanagedWarningView | null {
+  if (overviewUnmanaged === null || overviewUnmanaged.warning_key === null) {
+    return null;
+  }
+  const body =
+    overviewUnmanaged.count !== null
+      ? t(overviewUnmanaged.warning_key, { count: overviewUnmanaged.count })
+      : t(overviewUnmanaged.warning_key);
+  if (!body) {
+    return null;
+  }
+  const title =
+    overviewUnmanaged.count === null ? t("app.unmanaged.unknown_title") : t("app.unmanaged.title");
+  return { title, body };
+}
+
 /**
- * Builds the unmanaged-runtime warning from live SSE snapshot data once
- * available, falling back to `/api/overview`'s initial summary only before the
- * first snapshot arrives so stopping a runtime elsewhere clears it immediately.
+ * Builds the unmanaged-runtime warning for both ready and checklist states from
+ * live SSE snapshot data once available, falling back to `/api/overview`'s
+ * initial summary only before live runtime data arrives so stopping a runtime
+ * clears it immediately.
  */
 export function buildOverviewUnmanagedWarning(
   accountsView: AccountsView | null,
@@ -372,12 +534,39 @@ export function buildOverviewUnmanagedWarning(
   nowSecs: number,
   t: TranslateFn,
 ): UnmanagedWarningView | null {
-  if (snapshot !== null && accountsView !== null) {
-    const rows = buildAccountRows(accountsView, snapshot, nowSecs, t);
-    const primary = buildUnmanagedWarning(rows, t);
+  if (snapshot !== null) {
+    let primary: UnmanagedWarningView | null = null;
+    if (accountsView !== null) {
+      const rows = buildAccountRows(accountsView, snapshot, nowSecs, t);
+      primary = buildUnmanagedWarning(rows, t);
+    }
+    if (primary === null && snapshot.runtimes !== null) {
+      primary = buildUnmanagedWarningFromRuntimes(snapshot, accountsView, t);
+    }
+    if (
+      primary === null &&
+      snapshot.runtimes === null &&
+      overviewUnmanaged !== null &&
+      overviewUnmanaged.count !== null &&
+      overviewUnmanaged.count > 0
+    ) {
+      primary = buildOverviewFallbackWarning(overviewUnmanaged, t);
+    }
+
+    // Backend mirrors environment-blocked errors (`keyring_unavailable`, `not_installed`,
+    // `wsl_unavailable`) onto `runtimes_error`; those mean setup is incomplete, not billing risk.
+    const envBlocked =
+      isEnvironmentBlockedError(snapshot.accounts_error) ||
+      isEnvironmentBlockedError(snapshot.runtimes_error);
+    const hasAccountContext =
+      (accountsView !== null && accountsView.accounts.length > 0) ||
+      overviewUnmanaged?.warning_key !== null;
     const liveIncomplete =
-      snapshot.runtimes_error !== null ||
-      (snapshot.runtimes !== null && snapshot.runtimes.errors.length > 0);
+      !envBlocked &&
+      snapshot.accounts_error === null &&
+      hasAccountContext &&
+      (snapshot.runtimes_error !== null ||
+        (snapshot.runtimes !== null && snapshot.runtimes.errors.length > 0));
 
     if (primary !== null) {
       if (liveIncomplete) {
@@ -398,21 +587,11 @@ export function buildOverviewUnmanagedWarning(
         body: t("web.runtimes.unmanaged_unknown"),
       };
     }
-    return null;
+
+    if (envBlocked || snapshot.runtimes !== null) {
+      return null;
+    }
   }
 
-  if (overviewUnmanaged === null || overviewUnmanaged.warning_key === null) {
-    return null;
-  }
-
-  const body =
-    overviewUnmanaged.count !== null
-      ? t(overviewUnmanaged.warning_key, { count: overviewUnmanaged.count })
-      : t(overviewUnmanaged.warning_key);
-  if (!body) {
-    return null;
-  }
-  const title =
-    overviewUnmanaged.count === null ? t("app.unmanaged.unknown_title") : t("app.unmanaged.title");
-  return { title, body };
+  return buildOverviewFallbackWarning(overviewUnmanaged, t);
 }

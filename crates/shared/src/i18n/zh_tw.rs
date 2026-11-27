@@ -177,7 +177,6 @@ pub(super) const MESSAGES: Messages = &[
     (INSTALL_START, "安裝"),
     (INSTALL_RUNNING, "正在安裝 Colab CLI…"),
     (INSTALL_CANCELLING, "正在取消…"),
-    (INSTALL_DONE, "Colab CLI 已安裝。"),
     (INSTALL_FAILED, "安裝失敗"),
     (INSTALL_CANCELLED, "安裝已取消。"),
     (INSTALL_NOT_FOUND_TITLE, "安裝已完成，但找不到 colab"),
